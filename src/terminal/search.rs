@@ -23,6 +23,8 @@ const MAX_MATCHES: usize = 10_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum LinkTarget {
     Url(String),
+    /// An existing local file — or directory (`line`/`column` then `None`;
+    /// dirs never match a `path:line` form).
     File {
         path: PathBuf,
         line: Option<u32>,
@@ -335,7 +337,7 @@ pub(super) fn url_at(text: &str, col: usize) -> Option<String> {
 }
 
 /// Detect a link spanning column `col` within a line's text: a bare URL
-/// always (see [`url_span_at`]), plus an existing file path when
+/// always (see [`url_span_at`]), plus an existing file or directory path when
 /// `include_files` — URL detection wins when both would match. `cwd` anchors
 /// relative paths and `~` expansion.
 pub(super) fn link_at(
@@ -455,7 +457,10 @@ fn file_span_at(text: &str, col: usize, cwd: Option<&Path>) -> Option<LinkMatch>
         location = split_file_location(&token);
     }
 
-    let path = resolve_existing_file(&location.path, cwd)?;
+    // A `:line` suffix only makes sense for a file — without requiring one,
+    // `localhost:8080` would link whenever a directory named `localhost`
+    // happens to exist in the cwd.
+    let path = resolve_existing_path(&location.path, cwd, location.line.is_some())?;
     (start..=end).contains(&col).then_some(LinkMatch {
         start,
         end,
@@ -565,7 +570,7 @@ fn strip_numeric_suffix(token: &str) -> Option<(&str, u32)> {
     Some((prefix, value))
 }
 
-fn resolve_existing_file(path: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+fn resolve_existing_path(path: &str, cwd: Option<&Path>, require_file: bool) -> Option<PathBuf> {
     if path.is_empty() {
         return None;
     }
@@ -575,7 +580,8 @@ fn resolve_existing_file(path: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     } else {
         cwd?.join(path)
     };
-    candidate.is_file().then_some(candidate)
+    let hit = candidate.is_file() || (!require_file && candidate.is_dir());
+    hit.then_some(candidate)
 }
 
 fn expand_home(path: &str, cwd: Option<&Path>) -> Option<PathBuf> {
@@ -1049,5 +1055,45 @@ mod tests {
                 target: LinkTarget::Url(url.to_string()),
             }
         );
+    }
+
+    #[test]
+    fn link_at_detects_directory_paths() {
+        let file = temp_file("dircase/nested/inner.txt");
+        let dir = file.parent().unwrap();
+        let cwd = dir.parent().and_then(Path::parent).unwrap();
+
+        let link = link_at("artifacts in dircase/nested here", 14, Some(cwd), true)
+            .expect("directory link");
+        assert_eq!((link.start, link.end), (13, 26));
+        match link.target {
+            LinkTarget::File { path, line, column } => {
+                assert_eq!(path, dir);
+                assert_eq!(line, None);
+                assert_eq!(column, None);
+            }
+            LinkTarget::Url(url) => panic!("expected directory link, got URL {url}"),
+        }
+
+        // `ls -p` style trailing slash resolves too.
+        assert!(link_at("ls dircase/nested/ done", 5, Some(cwd), true).is_some());
+        // Off without the modifier, like files.
+        assert!(link_at("artifacts in dircase/nested here", 14, Some(cwd), false).is_none());
+    }
+
+    #[test]
+    fn link_at_requires_a_file_when_a_line_suffix_is_present() {
+        // `localhost:8080` must not become a link just because a directory
+        // named `localhost` exists in the cwd — `:line` only makes sense for
+        // files.
+        let file = temp_file("localhost/keep.txt");
+        let cwd = file.parent().and_then(Path::parent).unwrap();
+
+        assert_eq!(
+            link_at("listening on localhost:8080", 15, Some(cwd), true),
+            None
+        );
+        // The bare directory still links.
+        assert!(link_at("listening on localhost", 15, Some(cwd), true).is_some());
     }
 }

@@ -2871,7 +2871,7 @@ impl TerminalView {
     }
 
     /// Open the link under the given cell, if any (OSC 8 hyperlink, plain URL or
-    /// existing file path detected in the row text). Returns true if one opened.
+    /// existing file or directory path detected in the row text). Returns true if one opened.
     pub fn open_link_at(&self, col: usize, row: usize, cx: &mut Context<Self>) -> bool {
         if !cx.global::<Config>().link_url {
             return false;
@@ -2960,7 +2960,7 @@ impl TerminalView {
 
     /// Resolve the link span at screen cell `(col, row)`: an OSC 8 hyperlink (the
     /// contiguous run of cells sharing the same target), a bare URL token, or an
-    /// existing file path in the row text. Mirrors [`open_link_at`](Self::open_link_at)'s
+    /// existing file or directory path in the row text. Mirrors [`open_link_at`](Self::open_link_at)'s
     /// detection so the underline covers exactly what a Cmd+click would open.
     fn link_span_at(&self, col: usize, row: usize, include_files: bool) -> Option<HoveredLink> {
         let term = self.terminal.term.lock();
