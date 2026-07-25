@@ -66,6 +66,12 @@ pub(crate) struct RightPanelState {
     /// generation no longer matches drops its result and stops rescheduling, so the
     /// freshly started loop for the new pane is the only one left running.
     pub(crate) procs_gen: u64,
+    /// Whether the current pane also wants its SSH forwards re-listed on the
+    /// procs tick. Kept here rather than only captured by the running loop
+    /// because it can flip *without* a pane switch — a native-SSH pane you are
+    /// already watching finishes connecting — and the loop reads this on each
+    /// reschedule so it picks the change up on the next tick.
+    pub(crate) procs_forwards: bool,
 }
 
 /// How often the Info tab re-queries processes and ports while it's open. Fast
@@ -113,12 +119,7 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.right_panel_open(cx) {
-            return None;
-        }
-        let width = self.right_panel_px(window, cx);
-        let tab = cx.global::<Config>().right_panel_tab;
-
+        let panel_open = self.right_panel_open(cx);
         // The remote browser follows the detail pane on *every* paint, not only
         // while Files is on screen. Opening it is the Files tab's job (no point
         // listing a directory nobody asked to see), but retiring it can't be:
@@ -126,11 +127,22 @@ impl Tty7App {
         // tabs, so a pane switch made from Info has to drop the old pane's
         // browser too — otherwise the footer would report a transfer belonging
         // to a pane you're no longer looking at.
+        //
+        // This runs *before* the closed-panel bail, and treats a closed panel as
+        // "not looking at that pane": the browser owns a 500ms transfer poll that
+        // only ends when the browser does, so leaving it open behind a closed
+        // panel would keep a daemon round-trip (and a full re-render) running
+        // twice a second for a column nobody can see.
         if let Some(open) = self.sftp_panel.open_pane_id
-            && self.remote_files_pane(window, cx).map(|(id, _)| id) != Some(open)
+            && (!panel_open || self.remote_files_pane(window, cx).map(|(id, _)| id) != Some(open))
         {
             self.sftp_close_browser(cx);
         }
+        if !panel_open {
+            return None;
+        }
+        let width = self.right_panel_px(window, cx);
+        let tab = cx.global::<Config>().right_panel_tab;
 
         let body = match tab {
             RightPanelTab::Info => self.render_panel_info(window, cx),
@@ -776,8 +788,14 @@ impl Tty7App {
     /// the UI touching it — a remote bind that loses its listener goes to `Error`
     /// on the daemon, and only a re-list finds out. Off for a non-SSH pane, so a
     /// local shell doesn't pay for a round-trip that can only answer "none".
+    ///
+    /// It's recorded on the state as well as passed down because it can flip
+    /// while the loop is already running — a pane you're watching on Info
+    /// finishes connecting, and neither the pane id nor the generation changes,
+    /// so nothing would otherwise tell the loop to start asking.
     fn sync_procs(&mut self, pane_id: Option<u64>, forwards: bool, cx: &mut Context<Self>) {
         let Some(pane_id) = pane_id else { return };
+        self.right_panel.procs_forwards = forwards;
         if self.right_panel.procs_pane != Some(pane_id) {
             self.right_panel.procs_pane = Some(pane_id);
             // Drop the previous pane's answer rather than showing it under the new
@@ -861,6 +879,10 @@ impl Tty7App {
                 let cfg = cx.global::<Config>();
                 let wanted = cfg.right_panel_visible && cfg.right_panel_tab == RightPanelTab::Info;
                 if wanted {
+                    // Re-read rather than carrying the flag forward: the pane may
+                    // have finished connecting since this cycle started, which is
+                    // the one way it changes without a pane switch to retire us.
+                    let forwards = app.right_panel.procs_forwards;
                     app.spawn_procs_query(pane_id, generation, forwards, cx);
                 } else {
                     app.right_panel.procs_loading = false;

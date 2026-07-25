@@ -289,6 +289,10 @@ impl Tty7App {
         self.sftp_panel.editing = None;
         self.sftp_panel.editing_path = None;
         self.sftp_panel.editing_path_sub.clear();
+        // The jobs are one pane's. Leaving them would have the footer report the
+        // old pane's transfers under the next one until its first poll lands —
+        // the same flash `sync_procs` clears the process list for.
+        self.sftp_panel.jobs.clear();
         // Invalidate the poll loop.
         self.sftp_panel.poll_gen = self.sftp_panel.poll_gen.wrapping_add(1);
         cx.notify();
