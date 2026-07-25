@@ -632,6 +632,13 @@ async fn run_op(sftp: &SftpSession, op: &SftpOp) -> Result<SftpOpResult, String>
                 .map_err(|e| format!("{e}"))?;
             SftpOpResult::Link(target)
         }
+        SftpOp::Realpath { path } => {
+            let resolved = sftp
+                .canonicalize(path.clone())
+                .await
+                .map_err(|e| format!("{e}"))?;
+            SftpOpResult::Link(resolved)
+        }
     })
 }
 

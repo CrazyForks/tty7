@@ -29,23 +29,30 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Selectable as _, Sizable as _,
-    h_flex, v_flex,
+    ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, h_flex, v_flex,
 };
 
 use crate::daemon::protocol::{
-    RemoteContext, RemoteKind, SftpEntry, SftpEntryKind, SftpJobProgress, SftpJobState, SftpOp,
-    SftpOpResult, SftpTransferKind, SftpTransferSpec,
+    SftpEntry, SftpEntryKind, SftpJobProgress, SftpJobState, SftpOp, SftpOpResult,
+    SftpTransferKind, SftpTransferSpec,
 };
 use crate::daemon::ssh::sftp::{remote_basename, remote_join, remote_parent, safe_local_name};
 use crate::terminal::RemoteTerminal;
-use crate::ui::app::Tty7App;
+use crate::ui::app::{CONTENT_INSET, Tty7App};
 
-/// The panel docks along the bottom of the terminal body (tabby-style) and
-/// takes this fraction of its height, leaving the shell visible above.
-const SFTP_PANEL_HEIGHT_FRAC: f32 = 0.7;
+/// The remote Files header's `⋯` entries. The directory-wide actions that used
+/// to be a row of toolbar buttons; per-row actions stay on the row's own
+/// right-click menu.
+#[derive(Clone, Copy)]
+enum SftpMenuAction {
+    NewFolder,
+    NewFile,
+    Upload,
+    GotoShellCwd,
+    ToggleHistory,
+}
 
 /// One in-progress inline edit form in the panel.
 pub(crate) enum SftpEdit {
@@ -57,15 +64,28 @@ pub(crate) enum SftpEdit {
     },
     Chmod {
         path: String,
+        /// The entry's current mode as `rwxr-xr-x`, shown beside the form's octal
+        /// field. The row itself no longer has room for a permissions column, so
+        /// this is where the readable form lives now.
+        readable: String,
         input: gpui::Entity<InputState>,
     },
 }
 
-/// State for the SFTP side panel. One panel at a time, bound to a pane id.
+/// State for the remote file browser. One pane's listing at a time, bound to a
+/// pane id — the detail panel shows one pane, so the browser follows it.
 pub(crate) struct SftpPanelState {
+    /// The pane whose listing is on screen, or `None` while the Files tab is
+    /// showing a local tree. Set by the Files render path from the detail pane,
+    /// not by a toggle: the browser is a *view of the pane*, so which pane you're
+    /// looking at is the only thing that decides it.
     pub(crate) open_pane_id: Option<u64>,
     /// The remote directory currently listed (absolute POSIX path).
     pub(crate) cwd: String,
+    /// Where each pane was last browsing, so switching panes — or tabs — and
+    /// coming back lands where you left rather than back at the shell cwd. Keyed
+    /// by pane id and dropped with the pane.
+    pub(crate) cwds: std::collections::HashMap<u64, String>,
     pub(crate) entries: Vec<SftpEntry>,
     pub(crate) filter_input: gpui::Entity<InputState>,
     /// Last listing error, shown in place of the list.
@@ -75,9 +95,12 @@ pub(crate) struct SftpPanelState {
     /// Job ids the user dismissed from the tray; filtered out until a fresh
     /// transfer (a new id) reopens it. Cleared when the panel closes/reopens.
     dismissed_jobs: HashSet<u64>,
-    /// When set, the transfers tray is pinned open and shows the full history
-    /// (every job, including dismissed ones), toggled by the header button.
+    /// When set, the transfers footer is pinned open and shows the full history
+    /// (every job, including dismissed ones), toggled from the Files `⋯` menu.
     show_history: bool,
+    /// Whether the transfers footer is showing its per-job list. Collapsed by
+    /// default: a running transfer is a glance, not a watch.
+    tray_expanded: bool,
     /// A directory listing is in flight (the daemon round-trip runs off-thread,
     /// so the UI never blocks). Guards feedback while the old listing stays up.
     pub(crate) loading: bool,
@@ -107,12 +130,14 @@ impl SftpPanelState {
         Self {
             open_pane_id: None,
             cwd: "/".to_string(),
+            cwds: std::collections::HashMap::new(),
             entries: Vec::new(),
             filter_input,
             error: None,
             jobs: Vec::new(),
             dismissed_jobs: HashSet::new(),
             show_history: false,
+            tray_expanded: false,
             loading: false,
             nav_gen: 0,
             editing: None,
@@ -218,34 +243,52 @@ fn local_download_dir() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 impl Tty7App {
-    /// Toggle the SFTP panel for the focused SSH pane. Every native-SSH pane has a
-    /// russh connection to browse over; a pane with no native connection (e.g. a
-    /// foreground `ssh` typed into a local shell) has nothing to list, so the
-    /// toggle simply doesn't open. A non-SSH focused pane closes any open panel.
-    pub(crate) fn toggle_sftp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((pane_id, remote)) = self.active_ssh_pane(window, cx) else {
-            self.close_sftp_panel(cx);
-            return;
-        };
-        if self.sftp_panel.open_pane_id == Some(pane_id) {
-            self.close_sftp_panel(cx);
-            return;
-        }
-        if remote.kind == RemoteKind::NativeSsh {
-            self.sftp_open_at(pane_id, window, cx);
-        } else {
-            // No native connection to browse (a manually-typed foreground ssh).
-            self.close_sftp_panel(cx);
-        }
+    /// `ToggleSftp` / the palette's "SFTP Panel": show the remote browser, which
+    /// means putting the detail panel on its Files tab. The tab renders the
+    /// browser by itself once it's looking at a native-SSH pane, so this is only
+    /// ever "take me there" — there is no separate panel to open.
+    ///
+    /// A pane with no native connection (a foreground `ssh` typed into a local
+    /// shell, or a plain PTY) has nothing to list; the Files tab shows its local
+    /// tree instead, which is the right answer rather than an error.
+    pub(crate) fn toggle_sftp(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_right_panel_tab(crate::core::config::RightPanelTab::Files, cx);
     }
 
-    pub(crate) fn close_sftp_panel(&mut self, cx: &mut Context<Self>) {
+    /// Point the browser at `pane_id`, or tear it down when the Files tab has
+    /// moved to a local pane (`None`). Called from the Files render path, so the
+    /// browser's lifetime is exactly "the detail panel is showing this remote
+    /// pane" — no open/close state of its own to fall out of step.
+    ///
+    /// Returns `true` when the caller should render the remote browser.
+    pub(crate) fn sftp_sync_pane(
+        &mut self,
+        pane_id: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pane_id) = pane_id else {
+            if self.sftp_panel.open_pane_id.is_some() {
+                self.sftp_close_browser(cx);
+            }
+            return false;
+        };
+        if self.sftp_panel.open_pane_id != Some(pane_id) {
+            self.sftp_open_at(pane_id, window, cx);
+        }
+        true
+    }
+
+    /// Stop browsing: drop the listing and retire the poll loops. Transfers are
+    /// untouched — they run in the daemon and keep running; only this view of
+    /// them goes away.
+    pub(crate) fn sftp_close_browser(&mut self, cx: &mut Context<Self>) {
         self.sftp_panel.open_pane_id = None;
+        self.sftp_panel.entries.clear();
+        self.sftp_panel.error = None;
         self.sftp_panel.editing = None;
         self.sftp_panel.editing_path = None;
         self.sftp_panel.editing_path_sub.clear();
-        self.sftp_panel.dismissed_jobs.clear();
-        self.sftp_panel.show_history = false;
         // Invalidate the poll loop.
         self.sftp_panel.poll_gen = self.sftp_panel.poll_gen.wrapping_add(1);
         cx.notify();
@@ -253,18 +296,59 @@ impl Tty7App {
 
     fn sftp_open_at(&mut self, pane_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.sftp_panel.open_pane_id = Some(pane_id);
+        self.sftp_panel.entries.clear();
+        self.sftp_panel.error = None;
         self.sftp_panel.editing = None;
         self.sftp_panel.editing_path = None;
         self.sftp_panel.editing_path_sub.clear();
-        self.sftp_panel.dismissed_jobs.clear();
         self.sftp_panel.show_history = false;
-        // Start at the shell's OSC-7 cwd when known, else the filesystem root.
-        let start = self
-            .pane_shell_cwd(pane_id, window, cx)
-            .unwrap_or_else(|| "/".to_string());
-        self.sftp_navigate(start, cx);
         self.sftp_poll_jobs(cx);
         self.sftp_start_polling(cx);
+
+        // Where this pane was last time you looked, else the shell's cwd.
+        if let Some(start) = self
+            .sftp_panel
+            .cwds
+            .get(&pane_id)
+            .cloned()
+            .or_else(|| self.pane_shell_cwd(pane_id, window, cx))
+        {
+            self.sftp_navigate(start, cx);
+            return;
+        }
+        // Neither: ask the far side where "." is. The shell only reports its cwd
+        // when tty7's shell integration is installed on the remote — which on a
+        // host you just connected to it usually isn't — and `/` is a poor place
+        // to open a file browser. SFTP's own REALPATH resolves to the login
+        // directory, which is where a fresh session actually is.
+        self.sftp_navigate_login_dir(pane_id, cx);
+    }
+
+    /// Resolve the session's login directory (`realpath "."`) and open there.
+    /// Falls back to `/` when the round-trip fails — a browser at the root still
+    /// works, and the error would be noise on a path nobody typed.
+    fn sftp_navigate_login_dir(&mut self, pane_id: u64, cx: &mut Context<Self>) {
+        self.sftp_panel.loading = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    RemoteTerminal::sftp_op(pane_id, SftpOp::Realpath { path: ".".into() })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // The browser may have moved on (pane switch, or the user typed a
+                // path) while the round-trip was out.
+                if this.sftp_panel.open_pane_id != Some(pane_id) {
+                    return;
+                }
+                let home = match result {
+                    SftpOpResult::Link(path) if path.starts_with('/') => path,
+                    _ => "/".to_string(),
+                };
+                this.sftp_navigate(home, cx);
+            });
+        })
+        .detach();
     }
 
     /// The focused pane's OSC-7 cwd as an absolute remote path, if tracked.
@@ -315,6 +399,11 @@ impl Tty7App {
                 match result {
                     Ok(mut entries) => {
                         entries.sort_by(|a, b| a.name.cmp(&b.name));
+                        // Remember where this pane got to, so coming back to it
+                        // resumes rather than restarts. Recorded on arrival, not
+                        // on the way out: only a directory that actually listed is
+                        // worth returning to.
+                        this.sftp_panel.cwds.insert(pane_id, path.clone());
                         this.sftp_panel.cwd = path;
                         this.sftp_panel.entries = entries;
                         this.sftp_panel.error = None;
@@ -571,9 +660,14 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         let octal = format!("{:o}", entry.permissions & 0o777);
+        let readable = mode_string(entry.permissions);
         let path = remote_join(&self.sftp_panel.cwd, &entry.name);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(octal));
-        self.sftp_panel.editing = Some(SftpEdit::Chmod { path, input });
+        self.sftp_panel.editing = Some(SftpEdit::Chmod {
+            path,
+            readable,
+            input,
+        });
         cx.notify();
     }
 
@@ -617,7 +711,7 @@ impl Tty7App {
                     to: remote_join(&self.sftp_panel.cwd, &name),
                 })
             }
-            Some(SftpEdit::Chmod { path, input }) => {
+            Some(SftpEdit::Chmod { path, input, .. }) => {
                 match u32::from_str_radix(input.read(cx).value().trim(), 8) {
                     Ok(mode) => Some(SftpOp::Chmod {
                         path: path.clone(),
@@ -707,6 +801,13 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// Expand/collapse the transfers footer's per-job list (clicking its summary
+    /// line). History mode forces it open, so this only bites outside history.
+    pub(crate) fn sftp_toggle_tray(&mut self, cx: &mut Context<Self>) {
+        self.sftp_panel.tray_expanded = !self.sftp_panel.tray_expanded;
+        cx.notify();
+    }
+
     /// Close the transfers tray: leave the history view and hide every
     /// currently-known job. A later transfer (a new job id) reopens the auto-tray.
     pub(crate) fn sftp_dismiss_tray(&mut self, cx: &mut Context<Self>) {
@@ -778,159 +879,160 @@ impl Tty7App {
     // Rendering.
     // ---------------------------------------------------------------------
 
-    /// The bottom-docked SFTP panel (tabby-style), mounted over the lower part of
-    /// the terminal body when open for `pane_id`. Returns `None` when not open for
-    /// this pane.
-    pub(crate) fn render_sftp_overlay(
-        &self,
-        pane_id: u64,
-        remote: &RemoteContext,
-        _window: &Window,
+    /// The Files tab's remote mode: the pane's SFTP browser, rendered as the
+    /// panel's own column rather than the bottom dock it used to be. Same
+    /// interaction as before — a breadcrumb you can type into, a filter, a
+    /// dir-first list led by `..`, per-row right-click actions — relaid out for a
+    /// ~260px column: the toolbar collapses to a refresh tile plus a `⋯`, and the
+    /// permissions column goes (it's still on the right-click `chmod…`), because
+    /// name + size + mode can't share this width without all three truncating.
+    ///
+    /// `host` names the machine in the header's count slot. It earns that slot:
+    /// this tab silently swaps between a local tree and a remote filesystem as the
+    /// detail pane changes, and the list carries rename and delete — so which
+    /// machine you're deleting on is not something to leave implicit.
+    pub(crate) fn render_panel_sftp(
+        &mut self,
+        host: String,
+        _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if self.sftp_panel.open_pane_id != Some(pane_id) {
-            return None;
-        }
-        // Only native-SSH panes open the browser (see `toggle_sftp`); nothing else
-        // reaches here with the panel open.
-        if remote.kind != RemoteKind::NativeSsh {
-            return None;
-        }
-        let popover = cx.theme().popover;
-        let border = cx.theme().border;
-
-        let panel = v_flex()
-            .id("sftp-panel")
-            .absolute()
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .h(gpui::relative(SFTP_PANEL_HEIGHT_FRAC))
-            .bg(popover)
-            .border_t_1()
-            .border_color(border)
-            .shadow_lg()
-            // The panel sits over the terminal body (a sibling), which has its own
-            // right-click menu. Occlude so clicks — especially the row right-click —
-            // don't also fall through and pop the terminal's context menu.
-            .occlude()
-            .child(self.render_sftp_header(pane_id, cx))
-            .when_some(self.render_sftp_edit_form(cx), |this, form| {
-                this.child(form)
-            })
-            .child(self.render_sftp_list(cx))
-            .when_some(self.render_sftp_tray(cx), |this, tray| this.child(tray))
-            // FR-T5: a Finder drop uploads onto the current directory.
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
-                this.sftp_upload_paths(paths.paths().to_vec(), cx);
-            }));
-
-        Some(panel.into_any_element())
-    }
-
-    /// The panel header: a single row with the breadcrumb path (left, growing)
-    /// and a light, borderless action cluster (right), over an always-visible
-    /// search box. Kept deliberately compact — the breadcrumb root reads `SFTP`,
-    /// so there's no separate redundant title.
-    fn render_sftp_header(&self, pane_id: u64, cx: &mut Context<Self>) -> Div {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted_foreground;
-
-        // Ghost icon buttons (with tooltips) read as a light toolbar rather than a
-        // row of heavy labelled pills.
-        let actions = h_flex()
-            .flex_none()
-            .items_center()
-            .gap_0p5()
-            .child(
-                Button::new("sftp-refresh")
-                    .icon(IconName::LoaderCircle)
-                    .ghost()
-                    .small()
-                    .tooltip("Refresh")
-                    .on_click(cx.listener(|this, _, _w, cx| this.sftp_refresh(cx))),
-            )
-            .child(
-                Button::new("sftp-newfolder")
-                    .icon(IconName::FolderClosed)
-                    .ghost()
-                    .small()
-                    .tooltip("New folder")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.sftp_begin_new_folder(window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("sftp-newfile")
-                    .icon(IconName::File)
-                    .ghost()
-                    .small()
-                    .tooltip("New file")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.sftp_begin_new_file(window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("sftp-upload")
-                    .icon(IconName::ArrowUp)
-                    .ghost()
-                    .small()
-                    .tooltip("Upload")
-                    .on_click(cx.listener(|this, _, _w, cx| this.sftp_pick_upload(cx))),
-            )
-            .child(
-                Button::new("sftp-history")
-                    .icon(IconName::Inbox)
-                    .ghost()
-                    .small()
-                    .selected(self.sftp_panel.show_history)
-                    .tooltip("Transfers")
-                    .on_click(cx.listener(|this, _, _w, cx| this.sftp_toggle_history(cx))),
-            )
-            .child(
-                Button::new(("sftp-close", pane_id))
-                    .icon(IconName::Close)
-                    .ghost()
-                    .small()
-                    .tooltip("Close")
-                    .on_click(cx.listener(|this, _, _w, cx| this.close_sftp_panel(cx))),
-            );
-
-        let top = h_flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_1p5()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(self.render_sftp_breadcrumb(cx)),
-            )
-            .child(actions);
-
-        // Always-visible search box with a leading magnifier; Esc clears it.
-        let search = h_flex()
-            .id("sftp-search")
-            .px_3()
-            .pb_2()
-            .child(
-                Input::new(&self.sftp_panel.filter_input)
-                    .small()
-                    .cleanable(true)
-                    .prefix(Icon::new(IconName::Search).small().text_color(muted)),
-            )
+    ) -> AnyElement {
+        let controls = self.sftp_controls(cx);
+        let title = self.panel_title("Files", Some(host), Some(controls), cx);
+        let breadcrumb = self.render_sftp_breadcrumb(cx);
+        // The shared panel search box, plus the one behaviour the old SFTP header
+        // had that the local tree's doesn't: Esc clears the filter rather than
+        // falling through to the terminal.
+        let filter = div()
+            .id("panel-sftp-filter")
+            .child(self.panel_search(&self.sftp_panel.filter_input.clone(), cx))
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
                     this.sftp_clear_filter(window, cx);
                 }
             }));
+        let form = self.render_sftp_edit_form(cx);
+        let list = self.render_sftp_list(cx);
 
         v_flex()
-            .border_b_1()
-            .border_color(border)
-            .child(top)
-            .child(search)
+            .id("panel-sftp")
+            .flex_1()
+            .min_h_0()
+            .child(title)
+            .child(breadcrumb)
+            .child(filter)
+            .children(form)
+            .child(list)
+            // FR-T5: a Finder drop uploads onto the current directory.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                this.sftp_upload_paths(paths.paths().to_vec(), cx);
+            }))
+            .into_any_element()
+    }
+
+    /// The remote Files header's controls: refresh, and a `⋯` for everything that
+    /// isn't a per-row action. Two tiles is what the header has room for beside a
+    /// hostname, and refresh is the one that earns a permanent slot — a remote
+    /// listing has no watcher behind it, so it's the only way to see a change
+    /// somebody else made.
+    fn sftp_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let history = self.sftp_panel.show_history;
+        let tile = |button: Button, selected: bool, cx: &mut Context<Self>| {
+            crate::ui::tab_strip::chrome_tile(button, selected, cx)
+                .xsmall()
+                .w(px(24.))
+                .h(px(24.))
+                .rounded_md()
+        };
+
+        h_flex()
+            .items_center()
+            .gap(px(2.))
+            .child(
+                tile(
+                    Button::new("panel-sftp-refresh")
+                        .icon(Icon::empty().path("icons/refresh.svg").size(px(13.))),
+                    false,
+                    cx,
+                )
+                .tooltip("Refresh")
+                .on_click(cx.listener(|this, _, _w, cx| this.sftp_refresh(cx))),
+            )
+            .child(
+                div().occlude().child(
+                    tile(
+                        Button::new("panel-sftp-menu")
+                            .icon(Icon::empty().path("icons/ellipsis.svg").size(px(13.))),
+                        false,
+                        cx,
+                    )
+                    .tooltip("More")
+                    .dropdown_menu_with_anchor(gpui::Anchor::TopRight, {
+                        let app = cx.entity().downgrade();
+                        move |menu, _window, _cx| {
+                            let mut menu = menu.min_w(px(190.));
+                            for (label, action) in [
+                                ("New folder", SftpMenuAction::NewFolder),
+                                ("New file", SftpMenuAction::NewFile),
+                                ("Upload…", SftpMenuAction::Upload),
+                                ("Go to shell directory", SftpMenuAction::GotoShellCwd),
+                            ] {
+                                menu = menu.item(PopupMenuItem::new(label).on_click({
+                                    let app = app.clone();
+                                    move |_, window, cx| {
+                                        let _ = app.update(cx, |this, cx| {
+                                            this.sftp_menu_action(action, window, cx)
+                                        });
+                                    }
+                                }));
+                            }
+                            menu.separator().item(
+                                PopupMenuItem::new(if history {
+                                    "Hide transfer history"
+                                } else {
+                                    "Transfer history"
+                                })
+                                .on_click({
+                                    let app = app.clone();
+                                    move |_, window, cx| {
+                                        let _ = app.update(cx, |this, cx| {
+                                            this.sftp_menu_action(
+                                                SftpMenuAction::ToggleHistory,
+                                                window,
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                            )
+                        }
+                    }),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// One arm per `⋯` entry. A single dispatcher rather than five closures each
+    /// re-deriving the weak handle, since the menu items all need `&mut Window`.
+    fn sftp_menu_action(
+        &mut self,
+        action: SftpMenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            SftpMenuAction::NewFolder => self.sftp_begin_new_folder(window, cx),
+            SftpMenuAction::NewFile => self.sftp_begin_new_file(window, cx),
+            SftpMenuAction::Upload => self.sftp_pick_upload(cx),
+            SftpMenuAction::GotoShellCwd => {
+                if let Some(pane_id) = self.sftp_panel.open_pane_id
+                    && let Some(cwd) = self.pane_shell_cwd(pane_id, window, cx)
+                {
+                    self.sftp_navigate(cwd, cx);
+                }
+            }
+            SftpMenuAction::ToggleHistory => self.sftp_toggle_history(cx),
+        }
     }
 
     /// The path bar. Normally a clickable breadcrumb (root shown as `SFTP`, like
@@ -941,9 +1043,9 @@ impl Tty7App {
         if let Some(input) = &self.sftp_panel.editing_path {
             return h_flex()
                 .id("sftp-path-edit")
-                .px_2()
-                .py_1()
-                .child(Input::new(input).small())
+                .px(px(CONTENT_INSET))
+                .pb(px(2.))
+                .child(Input::new(input).xsmall())
                 // Esc cancels back to the breadcrumb (blur also cancels, via the
                 // input subscription).
                 .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
@@ -961,13 +1063,15 @@ impl Tty7App {
             .flex_wrap()
             .items_center()
             .gap_0p5()
-            .px_2()
-            .py_1()
+            .px(px(CONTENT_INSET))
+            .pb(px(4.))
             .on_double_click(
                 cx.listener(|this, _, window, cx| this.sftp_begin_edit_path(window, cx)),
             );
-        // Root: labelled "SFTP", navigates to "/". The current (last) segment reads
-        // in full ink; ancestors are muted but still clearly legible (the theme
+        // Root: `/`, the actual path — the header above already says which machine
+        // this is, so the old "SFTP" label would be naming the protocol in the one
+        // place the user is reading a path. The current (last) segment reads in
+        // full ink; ancestors are muted but still clearly legible (the theme
         // `accent` was near-invisible here).
         let segments = breadcrumb_segments(&self.sftp_panel.cwd);
         let last = segments.len().saturating_sub(1);
@@ -976,7 +1080,7 @@ impl Tty7App {
                 row = row.child(div().text_xs().text_color(muted).child("›"));
             }
             let is_current = i == last;
-            let label = if i == 0 { "SFTP".to_string() } else { label };
+            let label = if i == 0 { "/".to_string() } else { label };
             let weight = if i == 0 || is_current {
                 FontWeight::MEDIUM
             } else {
@@ -1007,17 +1111,20 @@ impl Tty7App {
         let secondary = cx.theme().secondary;
         let border = cx.theme().border;
         let foreground = cx.theme().foreground;
-        let (title, input) = match self.sftp_panel.editing.as_ref()? {
-            SftpEdit::NewFolder(input) => ("New folder", input),
-            SftpEdit::NewFile(input) => ("New file", input),
-            SftpEdit::Rename { input, .. } => ("Rename", input),
-            SftpEdit::Chmod { input, .. } => ("Permissions (octal)", input),
+        let (title, input): (String, _) = match self.sftp_panel.editing.as_ref()? {
+            SftpEdit::NewFolder(input) => ("New folder".to_string(), input),
+            SftpEdit::NewFile(input) => ("New file".to_string(), input),
+            SftpEdit::Rename { input, .. } => ("Rename".to_string(), input),
+            SftpEdit::Chmod {
+                readable, input, ..
+            } => (format!("Permissions · {readable}"), input),
         };
         Some(
             v_flex()
-                .gap_2()
-                .m_2()
-                .p_2()
+                .gap(px(5.))
+                .mx(px(CONTENT_INSET - 4.))
+                .mb(px(4.))
+                .p(px(6.))
                 .bg(secondary)
                 .border_1()
                 .border_color(border)
@@ -1029,21 +1136,22 @@ impl Tty7App {
                         .text_color(foreground)
                         .child(title),
                 )
-                .child(Input::new(input).small())
+                .child(Input::new(input).xsmall())
                 .child(
                     h_flex()
-                        .gap_2()
+                        .gap(px(4.))
                         .justify_end()
                         .child(
                             Button::new("sftp-edit-cancel")
                                 .label("Cancel")
-                                .small()
+                                .ghost()
+                                .xsmall()
                                 .on_click(cx.listener(|this, _, _w, cx| this.sftp_cancel_edit(cx))),
                         )
                         .child(
                             Button::new("sftp-edit-ok")
                                 .label("OK")
-                                .small()
+                                .xsmall()
                                 .primary()
                                 .on_click(cx.listener(|this, _, _w, cx| this.sftp_commit_edit(cx))),
                         ),
@@ -1054,15 +1162,27 @@ impl Tty7App {
     fn render_sftp_list(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let danger = cx.theme().danger;
         let muted = cx.theme().muted_foreground;
+        // Rows inset themselves so their hover capsule bleeds into the gutter, the
+        // same way the local tree's and the Changes list's do.
         let container = div()
             .id("sftp-list")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px_1();
+            .px(px(CONTENT_INSET - 6.))
+            .pb(px(4.));
+
+        let note = |text: gpui::SharedString, color| {
+            div()
+                .px(px(6.))
+                .py(px(4.))
+                .text_size(px(12.))
+                .text_color(color)
+                .child(text)
+        };
 
         if let Some(err) = &self.sftp_panel.error {
-            return container.child(div().p_3().text_xs().text_color(danger).child(err.clone()));
+            return container.child(note(err.clone().into(), danger));
         }
 
         let filter = self.sftp_panel.filter_input.read(cx).value().to_string();
@@ -1075,15 +1195,15 @@ impl Tty7App {
         if entries.is_empty() && !show_go_up {
             // Distinguish "still loading" from a genuinely empty directory so a
             // slow listing doesn't read as empty.
-            let note = if self.sftp_panel.loading {
+            let text = if self.sftp_panel.loading {
                 "Loading…"
             } else {
                 "Empty directory."
             };
-            return container.child(div().p_3().text_xs().text_color(muted).child(note));
+            return container.child(note(text.into(), muted));
         }
 
-        let mut list = v_flex().gap_0p5().py_1();
+        let mut list = v_flex().gap(px(1.)).py(px(2.));
         if show_go_up {
             list = list.child(self.render_sftp_go_up_row(cx));
         }
@@ -1098,31 +1218,32 @@ impl Tty7App {
     /// "the parent folder" and matches the rows below rather than a toolbar action.
     fn render_sftp_go_up_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let foreground = cx.theme().foreground;
-        let list_hover = cx.theme().list_hover;
         h_flex()
             .id("sftp-go-up")
             .items_center()
-            .gap_2()
-            .px_3()
+            .gap_1()
+            .pl(px(6.))
+            .pr_1()
             .py_1()
-            .rounded_md()
+            .rounded(cx.theme().radius)
             .cursor_pointer()
-            .hover(|s| s.bg(list_hover))
-            .child(Icon::new(IconName::Folder).small().text_color(foreground))
+            .hover(|s| s.bg(cx.theme().accent.opacity(0.5)))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_sm()
-                    .text_color(foreground)
-                    .child(".."),
+                Icon::new(IconName::FolderOpen)
+                    .xsmall()
+                    .text_color(foreground),
             )
+            .child(div().flex_1().min_w_0().text_sm().child(".."))
             .on_click(cx.listener(|this, _, _w, cx| this.sftp_up(cx)))
             .into_any_element()
     }
 
-    /// One entry row: icon + name (+ a `→` marker for symlinks) + a muted
-    /// size/mode column. Per-row actions (open/download, follow, rename, chmod,
+    /// One entry row: icon + name (+ a `→` marker for symlinks) + a muted size.
+    /// The permissions column the bottom dock had is gone — at panel width, name,
+    /// size and mode all three truncated, and mode is a specialist datum that the
+    /// row's `chmod…` still reads out on demand.
+    ///
+    /// Per-row actions (open/download, follow, rename, chmod,
     /// delete) live in the right-click context menu built by
     /// [`sftp_row_context_menu`](Self::sftp_row_context_menu) rather than as a
     /// row of inline buttons (PRD §6.3: hotkeys + right-click, not a permanent
@@ -1165,10 +1286,11 @@ impl Tty7App {
         h_flex()
             .id(row_id)
             .items_center()
-            .gap_2()
-            .px_3()
+            .gap_1()
+            .pl(px(6.))
+            .pr_1()
             .py_1()
-            .rounded_md()
+            .rounded(cx.theme().radius)
             .cursor_pointer()
             .hover(|s| s.bg(list_hover))
             // Double-click enters a directory; files never download from a click
@@ -1178,7 +1300,7 @@ impl Tty7App {
             )
             .child(
                 Icon::new(icon)
-                    .small()
+                    .xsmall()
                     .text_color(if dir_like { dir_color } else { muted }),
             )
             .child(
@@ -1190,31 +1312,10 @@ impl Tty7App {
                     .truncate()
                     .child(name_label),
             )
-            // Right-hand metadata: size then mode, each in its own fixed,
-            // right-aligned column so they line up down the list.
-            .child(
-                h_flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_5()
-                    .child(
-                        h_flex()
-                            .w(px(56.))
-                            .justify_end()
-                            .child(div().text_xs().text_color(muted).child(size)),
-                    )
-                    .when(entry.permissions != 0, |this| {
-                        this.child(
-                            h_flex().w(px(88.)).justify_end().child(
-                                div()
-                                    .text_xs()
-                                    .font_family("monospace")
-                                    .text_color(muted)
-                                    .child(mode_string(entry.permissions)),
-                            ),
-                        )
-                    }),
-            )
+            // Size trails the name, right-aligned in its own column so the sizes
+            // line up down the list. Directories contribute an empty string, so
+            // the column simply doesn't draw for them.
+            .child(div().flex_none().text_xs().text_color(muted).child(size))
             .context_menu(move |menu, _window, cx| {
                 let danger = cx.theme().danger;
                 Self::sftp_row_context_menu(menu, &menu_entry, dir_like, is_symlink, danger, &app)
@@ -1294,10 +1395,27 @@ impl Tty7App {
         )
     }
 
-    /// The bottom transfer tray. Shows in "auto" mode whenever there are
-    /// non-dismissed jobs; the header Transfers button pins it open in history
-    /// mode, where it lists every job (dismissed or not) and stays up even empty.
-    fn render_sftp_tray(&self, cx: &mut Context<Self>) -> Option<Div> {
+    /// The transfers footer, pinned to the bottom of the detail panel across all
+    /// four of its tabs rather than living inside Files.
+    ///
+    /// That placement is deliberate: a transfer belongs to the *pane*, not to the
+    /// tab you happen to be reading, so going to Info to check a port shouldn't
+    /// make a running upload disappear. It stays pane-scoped for the same reason —
+    /// aggregating every pane's jobs would quietly turn the panel into a
+    /// window-level transfer centre, which is not what this column is.
+    ///
+    /// Nothing is lost when it goes away: the jobs live in the daemon, keyed by
+    /// pane (`sftp_transfer_list`), so switching panes and coming back re-queries
+    /// them intact.
+    ///
+    /// Collapsed by default — one line summarising the run, with its own progress
+    /// underline — because a transfer is something you glance at, not something
+    /// you watch. Clicking the line expands the per-job list.
+    pub(crate) fn sftp_transfers_footer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Only the pane the panel is showing. `open_pane_id` is set by the Files
+        // tab, so a transfer started there stays visible from any tab — but only
+        // while that pane is the one on screen.
+        self.sftp_panel.open_pane_id?;
         let history = self.sftp_panel.show_history;
         let jobs: Vec<&SftpJobProgress> = self
             .sftp_panel
@@ -1305,60 +1423,145 @@ impl Tty7App {
             .iter()
             .filter(|j| history || !self.sftp_panel.dismissed_jobs.contains(&j.job_id))
             .collect();
-        // Auto mode with nothing to show → hide. History mode stays open (with an
-        // empty-state note) so the button always reveals a panel.
+        // Auto mode with nothing to show → no footer at all. History mode stays up
+        // (with an empty-state note) so the menu item always reveals something.
         if jobs.is_empty() && !history {
             return None;
         }
-        let border = cx.theme().border;
-        let secondary = cx.theme().secondary;
-        let muted = cx.theme().muted_foreground;
 
-        let body = if jobs.is_empty() {
-            v_flex().child(
-                div()
-                    .py_1()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("No transfers yet."),
-            )
+        // Colours copied out rather than held as a `theme` binding: the expanded
+        // body below needs `&mut cx` for its rows, which an outstanding theme
+        // borrow would block.
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let accent = cx.theme().accent;
+        let border = cx.theme().border;
+        let sidebar = cx.theme().sidebar;
+        let hover = cx.theme().sidebar_accent.opacity(0.4);
+        let expanded = self.sftp_panel.tray_expanded || history;
+
+        // The summary line: how many are moving and how far along the run is, as
+        // one number. Bytes across jobs, not a mean of percentages, so a big file
+        // beside a small one doesn't read as half done the moment the small one is.
+        let running = jobs
+            .iter()
+            .filter(|j| matches!(j.state, SftpJobState::Running))
+            .count();
+        let (done, total): (u64, u64) = jobs
+            .iter()
+            .filter(|j| matches!(j.state, SftpJobState::Running))
+            .fold((0, 0), |(d, t), j| (d + j.bytes_done, t + j.bytes_total));
+        let failed = jobs
+            .iter()
+            .filter(|j| matches!(j.state, SftpJobState::Error))
+            .count();
+        let pct = if total > 0 {
+            ((done as f64 / total as f64) * 100.0).min(100.0)
         } else {
-            let mut list = v_flex().gap_1();
-            for job in jobs {
-                list = list.child(self.render_sftp_job(job, cx));
-            }
-            list
+            0.0
         };
-        Some(
-            v_flex()
-                .gap_1()
-                .p_2()
-                .border_t_1()
-                .border_color(border)
-                .bg(secondary)
-                .child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(muted)
-                                .child("Transfers"),
-                        )
-                        .child(
+        let summary = if running > 0 {
+            format!("{running} transferring · {pct:.0}%")
+        } else if failed > 0 {
+            format!("{failed} failed")
+        } else {
+            "Transfers".to_string()
+        };
+        let summary_color = if running == 0 && failed > 0 {
+            danger
+        } else {
+            muted
+        };
+
+        let head = h_flex()
+            .id("sftp-transfers-summary")
+            .items_center()
+            .gap(px(6.))
+            .px(px(CONTENT_INSET))
+            .h(px(28.))
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .on_click(cx.listener(|this, _, _w, cx| this.sftp_toggle_tray(cx)))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .child(if expanded { "⌄" } else { "›" }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.5))
+                    .text_color(summary_color)
+                    .child(summary),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        crate::ui::tab_strip::chrome_tile(
                             Button::new("sftp-tray-close")
                                 .icon(IconName::Close)
-                                .ghost()
-                                .xsmall()
-                                .tooltip("Close")
-                                .on_click(
-                                    cx.listener(|this, _, _w, cx| this.sftp_dismiss_tray(cx)),
-                                ),
-                        ),
+                                .xsmall(),
+                            false,
+                            cx,
+                        )
+                        .w(px(18.))
+                        .h(px(18.))
+                        .rounded(px(4.))
+                        .tooltip("Dismiss")
+                        .on_click(cx.listener(|this, _, _w, cx| this.sftp_dismiss_tray(cx))),
+                    ),
+            );
+
+        // The collapsed bar carries the run's progress as a hairline along its own
+        // bottom edge, so "how far along" survives the collapse.
+        let underline = div().h(px(2.)).w_full().bg(border).child(
+            div()
+                .h_full()
+                .w(gpui::relative((pct / 100.0) as f32))
+                .bg(if failed > 0 { danger } else { accent }),
+        );
+
+        let body = expanded.then(|| {
+            let inner: Div = if jobs.is_empty() {
+                v_flex().child(
+                    div()
+                        .px(px(CONTENT_INSET))
+                        .py(px(3.))
+                        .text_size(px(11.5))
+                        .text_color(muted)
+                        .child("No transfers yet."),
                 )
-                .child(body),
+            } else {
+                let mut list = v_flex().px(px(CONTENT_INSET)).pb(px(6.)).gap(px(6.));
+                for job in jobs {
+                    list = list.child(self.render_sftp_job(job, cx));
+                }
+                list
+            };
+            div()
+                .id("sftp-transfers-list")
+                // Never more than a third of the column: the footer reports on the
+                // panel, it doesn't become it.
+                .max_h(px(200.))
+                .overflow_y_scroll()
+                .child(inner)
+        });
+
+        Some(
+            v_flex()
+                .flex_none()
+                .border_t_1()
+                .border_color(border)
+                .bg(sidebar)
+                .child(head)
+                .when(running > 0 && !expanded, |this| this.child(underline))
+                .children(body)
+                .into_any_element(),
         )
     }
 

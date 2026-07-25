@@ -73,8 +73,13 @@ actions!(
         ShowRightPanelFiles,
         OpenSettings,
         RestartDaemon,
-        // Toggle the SFTP file panel for the focused native-SSH pane (WS5).
+        // Show the detail panel's Files tab, which browses the focused pane's
+        // remote filesystem over SFTP when that pane is native SSH (WS5).
         ToggleSftp,
+        // Open the detail panel's Info tab on the focused native-SSH pane with
+        // the add-forward form expanded (WS4). The band itself is always on that
+        // tab; this is the way in that doesn't require the panel to be open.
+        ShowSshForwards,
         // Toggle the code panel: a full-body overlay of [file tree | editor]
         // covering the terminal (settings-overlay style).
         ToggleCodePanel,

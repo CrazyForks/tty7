@@ -203,9 +203,12 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         // Like Terminal.app / iTerm2 / Ghostty ⌘K: wipe the screen + scrollback.
         ("ClearScrollback", "secondary-k"),
         ("OpenSettings", "secondary-,"),
-        // No default chord — reachable from the command palette ("SFTP Panel") and
-        // bindable in Settings like any other action.
+        // No default chord — reachable from the command palette ("SSH: Remote
+        // Files") and bindable in Settings like any other action.
         ("ToggleSftp", ""),
+        // No default chord either — the palette ("SSH: Port Forwarding") and the
+        // Info tab's own `+` are the primary ways in.
+        ("ShowSshForwards", ""),
         // The code panel (file tree + editor overlay), on VS Code's explorer
         // chord. ⌘⇧E is free (no existing binding or preset uses it).
         ("ToggleCodePanel", "secondary-shift-e"),
@@ -510,6 +513,7 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
         "ClearScrollback" => KeyBinding::new(keystroke, ClearScrollback, Some("Terminal")),
         "OpenSettings" => KeyBinding::new(keystroke, OpenSettings, None),
         "ToggleSftp" => KeyBinding::new(keystroke, ToggleSftp, None),
+        "ShowSshForwards" => KeyBinding::new(keystroke, ShowSshForwards, None),
         "ToggleCodePanel" => KeyBinding::new(keystroke, ToggleCodePanel, None),
         "EditorSave" => KeyBinding::new(keystroke, EditorSave, None),
         "OpenSshProfiles" => KeyBinding::new(keystroke, OpenSshProfiles, None),
