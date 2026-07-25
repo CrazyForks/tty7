@@ -605,7 +605,8 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 /// ESC is stripped first (in both branches, unlike the paste path): clipboard
 /// text carrying its own `ESC[201~` could otherwise close the paste early and
 /// have the rest run as typed input, and a raw ESC reaching zle unbracketed is
-/// an editor command, not text.
+/// an editor command, not text. CR is normalized away in the same pass, so a
+/// CRLF clipboard is one line break either way rather than a stray blank Enter.
 ///
 /// An empty buffer skips the markers: zsh's `bracketed-paste-magic` (which
 /// oh-my-zsh turns on) errors on a paste with nothing between them.
@@ -614,9 +615,19 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 /// [`crate::core::agent_prompt::submit_bytes`], which is this shape minus the
 /// unbracketed fallback (an agent TUI always enables the mode).
 fn submit_bytes(line: &str, bracketed: bool) -> Vec<u8> {
-    let clean: String = line.chars().filter(|&c| c != '\x1b').collect();
-    // The non-bracketed fallback rides `paste_bytes`' newline normalization, so
-    // a CRLF clipboard yields one CR per line rather than a stray extra Enter.
+    // A CRLF clipboard pastes into the editor verbatim, so the `\r` has to go
+    // before either branch sees it. Unbracketed it would be a second Enter
+    // (`\r\n` → `\r\r`, a blank line submitted mid-command); bracketed it would
+    // ride inside the markers and land on whatever the far side happens to do
+    // with a CR in a paste — zsh turns it into a newline, so the block gains a
+    // blank line, and a shell that doesn't leaves a literal `^M` in the command.
+    // One `\n` per line is the shape both branches are written for.
+    let clean: String = line
+        .replace("\r\n", "\n")
+        .chars()
+        .filter(|&c| c != '\x1b')
+        .map(|c| if c == '\r' { '\n' } else { c })
+        .collect();
     let mut bytes = paste_bytes(&clean, bracketed && !clean.is_empty());
     bytes.push(b'\r');
     bytes
@@ -6270,6 +6281,24 @@ mod tests {
         // A CRLF clipboard yields one CR per line, not a stray extra Enter
         // (`\r\n` used to become `\r\r` — a blank line submitted mid-command).
         assert_eq!(submit_bytes("a\r\nb", false), b"a\rb\r".to_vec());
+    }
+
+    #[test]
+    fn submit_bytes_normalizes_line_breaks_inside_the_paste() {
+        // The CR of a CRLF clipboard must not ride inside the markers either:
+        // zsh turns a pasted CR into a newline (so the block would gain a blank
+        // line) and a shell that doesn't leaves a literal `^M` in the command.
+        assert_eq!(
+            submit_bytes("a\r\nb", true),
+            b"\x1b[200~a\nb\x1b[201~\r".to_vec()
+        );
+        // A lone CR is a line break too — dropping it would glue the lines
+        // together into one command.
+        assert_eq!(
+            submit_bytes("a\rb", true),
+            b"\x1b[200~a\nb\x1b[201~\r".to_vec()
+        );
+        assert_eq!(submit_bytes("a\rb", false), b"a\rb\r".to_vec());
     }
 
     #[test]
