@@ -108,8 +108,8 @@ pub struct Config {
     /// Where a newly opened tab lands relative to the active one.
     #[serde(default, deserialize_with = "de_lenient")]
     pub new_tab_position: NewTabPosition,
-    /// Where the tab bar is rendered: a horizontal strip in the title bar
-    /// (`top`, the default) or a vertical list down the left side (`left`).
+    /// Where the tab bar is rendered: a vertical list down the left side
+    /// (`left`, the default) or a horizontal strip in the title bar (`top`).
     #[serde(default, deserialize_with = "de_lenient")]
     pub tab_bar_position: TabBarPosition,
     /// Width (px) of the vertical tab sidebar (only meaningful when
@@ -421,10 +421,10 @@ pub enum NewTabPosition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TabBarPosition {
-    /// A horizontal strip of chips in the title bar (the current behavior).
-    #[default]
+    /// A horizontal strip of chips in the title bar.
     Top,
     /// A vertical list down the left side of the window (a tab sidebar).
+    #[default]
     Left,
 }
 
@@ -536,9 +536,9 @@ impl Default for Config {
             cursor_blink: true,
             scrollback_limit: 10_000,
             new_tab_position: NewTabPosition::AfterCurrent,
-            // Horizontal title-bar strip, matching the long-standing layout;
-            // `left` opts into the vertical sidebar.
-            tab_bar_position: TabBarPosition::Top,
+            // Vertical sidebar down the left side; `top` opts back into the
+            // horizontal title-bar strip.
+            tab_bar_position: TabBarPosition::Left,
             sidebar_width: default_sidebar_width(),
             sidebar_collapsed: false,
             right_panel_visible: false,
@@ -1100,16 +1100,17 @@ mod tests {
         assert_eq!(cfg.font_size, 20.0);
         assert_eq!(cfg.new_tab_position, NewTabPosition::AfterCurrent);
         assert_eq!(cfg.notify_on_command_finish, NotifyMode::Unfocused);
-        assert_eq!(cfg.tab_bar_position, TabBarPosition::Top);
+        assert_eq!(cfg.tab_bar_position, TabBarPosition::Left);
 
-        // Valid kebab-case values round-trip.
+        // Valid kebab-case values round-trip. `top` is the non-default here, so
+        // the assert still proves the field parsed rather than fell back.
         let cfg: Config = serde_json::from_str(
-            r#"{"new_tab_position": "end", "notify_on_command_finish": "always", "tab_bar_position": "left"}"#,
+            r#"{"new_tab_position": "end", "notify_on_command_finish": "always", "tab_bar_position": "top"}"#,
         )
         .unwrap();
         assert_eq!(cfg.new_tab_position, NewTabPosition::End);
         assert_eq!(cfg.notify_on_command_finish, NotifyMode::Always);
-        assert_eq!(cfg.tab_bar_position, TabBarPosition::Left);
+        assert_eq!(cfg.tab_bar_position, TabBarPosition::Top);
     }
 
     #[test]
