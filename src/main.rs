@@ -392,14 +392,26 @@ fn main() {
             // Reopen the workspaces that had a window at the last quit, each in
             // its own window and at its own remembered geometry (`ui::windows`
             // owns that logic now, since "New Workspace" and the workspace picker
-            // need the identical path). Quitting with every window closed —
-            // or a first run — opens a single window on a fresh workspace.
-            let reopen: Vec<_> = crate::core::session::WorkspaceStore::all(cx)
-                .open_workspaces()
-                .map(|w| w.id)
-                .collect();
+            // need the identical path). Quitting with every window closed — or a
+            // first run — opens a single window on a fresh workspace.
+            let (reopen, any_saved) = {
+                let store = crate::core::session::WorkspaceStore::all(cx);
+                let reopen: Vec<_> = store.open_workspaces().map(|w| w.id).collect();
+                (reopen, !store.workspaces.is_empty())
+            };
+            // With nothing to reopen, what that one window should hold depends on
+            // whether there is anything to come back to: workspaces the user
+            // detached are listed by the home page's picker, so leave it empty
+            // for them. A genuine first run has no picker to show and no reason
+            // to greet the user with a blank page — it opens a terminal, exactly
+            // as every pre-multi-window build did.
+            let fresh = if any_saved {
+                crate::ui::windows::FreshStart::HomePage
+            } else {
+                crate::ui::windows::FreshStart::Shell
+            };
             if reopen.is_empty() {
-                crate::ui::windows::open(cx, None);
+                crate::ui::windows::open_with(cx, None, fresh);
             } else {
                 for id in reopen {
                     crate::ui::windows::open(cx, Some(id));

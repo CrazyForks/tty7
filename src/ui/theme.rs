@@ -90,20 +90,9 @@ fn window_menu_items(cx: &App) -> Vec<MenuItem> {
     let order = crate::ui::windows::menu_order(cx);
     let store = crate::core::session::WorkspaceStore::all(cx);
 
-    let slot_action = |i: usize| -> Option<Box<dyn gpui::Action>> {
-        Some(match i {
-            0 => Box::new(SelectWorkspace1) as Box<dyn gpui::Action>,
-            1 => Box::new(SelectWorkspace2),
-            2 => Box::new(SelectWorkspace3),
-            3 => Box::new(SelectWorkspace4),
-            4 => Box::new(SelectWorkspace5),
-            5 => Box::new(SelectWorkspace6),
-            6 => Box::new(SelectWorkspace7),
-            7 => Box::new(SelectWorkspace8),
-            8 => Box::new(SelectWorkspace9),
-            _ => return None,
-        })
-    };
+    // The same slot→action mapping the title-bar chip's menu uses, so slot *n*
+    // dispatches identically wherever it was clicked.
+    let slot_action = crate::ui::tab_strip::select_workspace_action;
 
     let mut items = Vec::new();
     let mut separated = false;

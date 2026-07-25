@@ -382,7 +382,7 @@ fn workspace_menu_row(row: WorkspaceMenuRow, cx: &App) -> impl IntoElement + use
 /// The `SelectWorkspace{1..9}` action for a Window-menu slot, or `None` past
 /// the ninth. Shared by the title-bar chip and `ui::theme`'s Window menu so
 /// both index `ui::windows::menu_order` identically.
-fn select_workspace_action(index: usize) -> Option<Box<dyn gpui::Action>> {
+pub(crate) fn select_workspace_action(index: usize) -> Option<Box<dyn gpui::Action>> {
     Some(match index {
         0 => Box::new(SelectWorkspace1) as Box<dyn gpui::Action>,
         1 => Box::new(SelectWorkspace2),

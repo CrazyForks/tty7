@@ -294,10 +294,6 @@ impl Command {
         ]
     }
 
-    /// The theme-picker sub-list: one entry per built-in preset, in the presets'
-    /// display order. Confirming one emits `SetTheme(i)`, which applies that
-    /// preset. The active theme is marked with a check so the list doubles as a
-    /// "which theme am I on?" indicator.
     /// The workspace sub-list: every workspace tty7 knows about, most recently
     /// active first. Open ones are labelled as such — picking one focuses its
     /// window rather than opening a second one onto the same panes.
@@ -332,6 +328,10 @@ impl Command {
             .collect()
     }
 
+    /// The theme-picker sub-list: one entry per built-in preset, in the presets'
+    /// display order. Confirming one emits `SetTheme(i)`, which applies that
+    /// preset. The active theme is marked with a check so the list doubles as a
+    /// "which theme am I on?" indicator.
     pub fn theme_commands(cx: &App) -> Vec<Command> {
         let active = crate::ui::theme::effective_preset_id(cx);
         crate::ui::presets::all(cx)

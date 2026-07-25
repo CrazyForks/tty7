@@ -180,8 +180,8 @@ pub struct Config {
     /// Whether the user has already been told, once, that closing a window puts
     /// its workspace away rather than ending it. ⌘W is muscle memory and the
     /// result is off-screen, so the first time it happens deserves one line
-    /// pointing at the Window menu — and never again. Set to `true` by that
-    /// hint; there is no UI to reset it (nor a reason to).
+    /// pointing at the title bar's workspace menu — and never again. Set to
+    /// `true` by that hint; there is no UI to reset it (nor a reason to).
     #[serde(default)]
     pub workspace_detach_hint_seen: bool,
     /// How the terminal bell (BEL / `^G`) is signalled. Defaults to a brief

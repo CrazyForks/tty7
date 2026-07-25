@@ -596,17 +596,28 @@ impl Tty7App {
     /// that is no longer on file.
     pub fn for_workspace(
         id: Option<WorkspaceId>,
+        fresh: crate::ui::windows::FreshStart,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         // Claiming marks the workspace open and hands back its saved tabs, so
         // the store (not this window) stays the single writer of session.json.
         let restore = cx.global::<Config>().restore_session;
+        let known = id.is_some_and(|id| WorkspaceStore::all(cx).get(id).is_some());
         let (workspace, saved) = WorkspaceStore::claim(cx, id);
-        // Restore the tab/split layout + each pane's cwd, unless the user turned
-        // restore off — then start fresh. `None` takes the first-run path in
-        // `with_session`, spawning a single default terminal.
-        let session = restore.then_some(saved);
+        // A workspace that was already on file restores its tab/split layout and
+        // each pane's cwd, unless the user turned restore off — then it starts
+        // fresh. A *brand-new* one has no tabs to restore, so what it comes up
+        // with is the caller's call: `None` here takes the first-run path in
+        // `with_session`, spawning a single default terminal, which is what
+        // `New Workspace` and a first run both want. Handing an empty session
+        // through instead lands on the home page, for the launch that exists to
+        // show the workspace picker.
+        let session = match (known, fresh) {
+            (true, _) => restore.then_some(saved),
+            (false, crate::ui::windows::FreshStart::Shell) => None,
+            (false, crate::ui::windows::FreshStart::HomePage) => Some(Session::default()),
+        };
         let app = Self::with_session(Some(workspace), session, window, cx);
         // Persist right away. The leaves just spawned (or reattached) now carry
         // daemon pane ids, and nothing else writes them until the next
@@ -993,9 +1004,22 @@ impl Tty7App {
             let answer = window.prompt(
                 PromptLevel::Info,
                 "Close Window?",
+                // What this promises has to match what the next launch does.
+                // Closing the last window *detaches* its workspace rather than
+                // ending it: the panes keep running in the daemon, but tty7
+                // comes back on the home page with the workspace waiting in the
+                // picker — it no longer reopens it unasked, so promising it
+                // would be restored would be a promise the app doesn't keep.
+                //
+                // Points at the title bar's workspace menu, not the macOS
+                // Window menu: there is no menu bar on Windows or Linux, and
+                // the corner chip is the one place that lists workspaces on
+                // every platform.
                 Some(
-                    "Your sessions keep running in the background and will be \
-                     restored the next time you open tty7.",
+                    "Your sessions keep running in the background. This \
+                     workspace will be waiting on the home page, and in the \
+                     workspace menu in the title bar, the next time you open \
+                     tty7.",
                 ),
                 &["Cancel", "Close"],
                 cx,
