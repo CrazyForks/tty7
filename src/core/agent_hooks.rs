@@ -4,10 +4,10 @@
 //! The rich agent-status channel ([`crate::core::cli_agent`]) needs the agent
 //! itself to say what it's doing. Each supported agent exposes that
 //! differently — Claude Code and Codex take a declarative hooks map, Copilot
-//! auto-loads JSON hook files from a directory, OpenCode loads JS plugins, Pi
-//! loads TS extensions — but every integration bottoms out in the same tiny
-//! emitter: `tty7 agent-hook <agent> <event>` reads the hook's JSON payload
-//! from stdin and writes one sentinel OSC 777 sequence to the controlling
+//! and Grok auto-load JSON hook files from a directory, OpenCode loads JS
+//! plugins, Pi loads TS extensions — but every integration bottoms out in the
+//! same tiny emitter: `tty7 agent-hook <agent> <event>` reads the hook's JSON
+//! payload from stdin and writes one sentinel OSC 777 sequence to the controlling
 //! terminal, where tty7's daemon-side sniffer picks it up and folds it into
 //! the pane's session state.
 //!
@@ -23,6 +23,12 @@ use crate::core::cli_agent::AGENT_EVENT_SENTINEL;
 /// The env var tty7 sets in every spawned shell; the hook emitter refuses to
 /// write escape sequences into terminals that aren't tty7.
 pub const TTY7_ENV_MARKER: &str = "TTY7";
+
+/// Env var Grok Build's hook runner injects into every hook process it spawns.
+/// Its presence identifies *who ran us*, which matters because grok also scans
+/// `~/.claude/settings.json` for hooks (its Claude-compat layer) — see
+/// [`run_agent_hook`].
+const GROK_HOOK_ENV: &str = "GROK_HOOK_EVENT";
 
 /// Cap on how much hook stdin we'll read: real payloads are a few hundred
 /// bytes of JSON; anything huge is not for us.
@@ -46,6 +52,7 @@ pub fn run_agent_hook(agent: &str, event: &str) {
     if std::env::var_os(TTY7_ENV_MARKER).is_none() {
         return;
     }
+    let agent = effective_agent(agent, std::env::var_os(GROK_HOOK_ENV).is_some());
     // Hook payload: the agent writes JSON ({"session_id": …, "message": …, …})
     // and closes stdin. Absent/malformed input still emits the bare event —
     // the state machine works without ids or messages. A tty stdin means the
@@ -82,18 +89,35 @@ fn detach_console() {
 #[cfg(unix)]
 fn detach_console() {}
 
+/// The agent slug an invocation really speaks for. Normally the one the
+/// installed hook passed, but Grok Build reads `~/.claude/settings.json` as
+/// well as its own hooks directory (a deliberate Claude-compat layer), so a
+/// tty7 Claude Code integration also fires inside grok panes. Grok's hook
+/// runner stamps every hook process with [`GROK_HOOK_ENV`], so those events are
+/// relabeled to the agent that actually ran them — otherwise a grok pane
+/// reports "Claude Code", and a user with both integrations installed emits
+/// each turn under two identities instead of one deduplicated stream.
+fn effective_agent(agent: &str, ran_by_grok: bool) -> &str {
+    if ran_by_grok { "grok" } else { agent }
+}
+
 /// The sentinel event one hook invocation maps onto, or `None` to stay silent.
-/// Most hooks pass their event through; the exception is Copilot's single
-/// `notification` hook, which fires for *every* notification type — only
-/// permission/elicitation prompts are the amber "needs you" moment, so those
-/// are escalated to `permission-request` and everything else is dropped
-/// rather than parroted as a block.
+/// Most hooks pass their event through; the exceptions are the single catch-all
+/// `notification` hook Copilot and Grok expose, which fires for *every*
+/// notification type. Only the types that always mean a real block escalate to
+/// `permission-request`; everything else is dropped rather than parroted as one.
+///
+/// The two agents draw that line differently. Copilot's `permission_prompt`
+/// only fires when it is actually asking, so it counts; grok dispatches the
+/// same type *before* its permission system decides — on essentially every tool
+/// call, auto-approved ones included — so only `elicitation_dialog` (grok
+/// asking the user a question) survives there. Grok's completions and errors
+/// (`task_complete`, `agent_error`) are never blocks for either.
 fn effective_event<'a>(agent: &str, event: &'a str, stdin_json: &str) -> Option<&'a str> {
-    if agent == "copilot" && event == "notification" {
-        if stdin_json.contains("permission_prompt") || stdin_json.contains("elicitation_dialog") {
-            return Some("permission-request");
-        }
-        return None;
+    if matches!(agent, "copilot" | "grok") && event == "notification" {
+        let blocks = stdin_json.contains("elicitation_dialog")
+            || (agent == "copilot" && stdin_json.contains("permission_prompt"));
+        return blocks.then_some("permission-request");
     }
     Some(event)
 }
@@ -110,9 +134,19 @@ fn build_hook_sequence(agent: &str, event: &str, stdin_json: &str) -> Vec<u8> {
         "agent": agent,
         "event": event,
     });
-    for key in ["session_id", "message", "cwd"] {
+    // The sentinel body is always snake_case, but the payloads are not: Claude
+    // Code & friends send `session_id`, while Grok Build's envelope is
+    // camelCase throughout (`sessionId`). Read both spellings of each field so
+    // one vendor's convention doesn't cost us the session id that `--resume`
+    // needs.
+    for (key, alias) in [
+        ("session_id", "sessionId"),
+        ("message", "message"),
+        ("cwd", "cwd"),
+    ] {
         if let Some(v) = payload
             .get(key)
+            .or_else(|| payload.get(alias))
             .and_then(|v| v.as_str())
             .filter(|v| !v.is_empty())
         {
@@ -319,15 +353,19 @@ pub enum HookAgent {
     OpenCode,
     /// A tty7-owned TS extension in `~/.pi/agent/extensions/tty7/`.
     Pi,
+    /// A tty7-owned hook file in `~/.grok/hooks/` (Grok Build loads every JSON
+    /// file there, and global hooks need no folder-trust grant).
+    Grok,
 }
 
 impl HookAgent {
-    pub const ALL: [HookAgent; 5] = [
+    pub const ALL: [HookAgent; 6] = [
         HookAgent::Claude,
         HookAgent::Codex,
         HookAgent::Copilot,
         HookAgent::OpenCode,
         HookAgent::Pi,
+        HookAgent::Grok,
     ];
 
     /// The `agent` slug in hook commands and sentinel events — matches
@@ -339,6 +377,7 @@ impl HookAgent {
             HookAgent::Copilot => "copilot",
             HookAgent::OpenCode => "opencode",
             HookAgent::Pi => "pi",
+            HookAgent::Grok => "grok",
         }
     }
 
@@ -350,6 +389,7 @@ impl HookAgent {
             HookAgent::Copilot => "Copilot CLI",
             HookAgent::OpenCode => "OpenCode",
             HookAgent::Pi => "Pi",
+            HookAgent::Grok => "Grok Build",
         }
     }
 
@@ -386,6 +426,12 @@ impl HookAgent {
                     .join("tty7")
                     .join("index.ts"),
             ),
+            HookAgent::Grok => Some(
+                home_dir()?
+                    .join(".grok")
+                    .join("hooks")
+                    .join(OWNED_FILE_STEM_JSON),
+            ),
         }
     }
 
@@ -421,7 +467,7 @@ pub fn hooks_state(agent: HookAgent) -> HooksState {
     match agent {
         HookAgent::Claude => hook_map_state(&path, agent, CLAUDE_HOOK_EVENTS),
         HookAgent::Codex => hook_map_state(&path, agent, CODEX_HOOK_EVENTS),
-        HookAgent::Copilot | HookAgent::OpenCode | HookAgent::Pi => {
+        HookAgent::Copilot | HookAgent::OpenCode | HookAgent::Pi | HookAgent::Grok => {
             let Some(expected) = owned_file_content(agent) else {
                 return HooksState::NotInstalled;
             };
@@ -457,7 +503,7 @@ pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
                 ),
             })
         }
-        HookAgent::Copilot | HookAgent::OpenCode | HookAgent::Pi => {
+        HookAgent::Copilot | HookAgent::OpenCode | HookAgent::Pi | HookAgent::Grok => {
             let content = owned_file_content(agent)
                 .ok_or_else(|| anyhow::anyhow!("cannot resolve tty7's own executable path"))?;
             owned_file_install(&path, &content, &agent.marker())?;
@@ -475,7 +521,7 @@ pub fn uninstall_hooks(agent: HookAgent) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?;
     match agent {
         HookAgent::Claude | HookAgent::Codex => hook_map_uninstall(&path, agent),
-        HookAgent::Copilot | HookAgent::OpenCode | HookAgent::Pi => {
+        HookAgent::Copilot | HookAgent::OpenCode | HookAgent::Pi | HookAgent::Grok => {
             owned_file_uninstall(&path, &agent.marker())
         }
     }
@@ -601,6 +647,39 @@ const CODEX_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt-submit"),
     ("Stop", "stop"),
+];
+
+/// Seconds grok gives one tty7 hook before killing it. Set explicitly for two
+/// reasons: it keeps `Stop` off grok's 600-second gate default (that budget is
+/// for hooks that run test suites; ours writes a few bytes and returns), and it
+/// leaves headroom for the first hook of a session, which pays the cold-start
+/// cost of paging in the tty7 binary. A killed hook only loses that one event —
+/// the session id arrives again on the next `UserPromptSubmit`.
+const GROK_HOOK_TIMEOUT_SECS: u32 = 10;
+
+/// Grok Build's hook events — Claude Code's vocabulary, because grok mirrors it
+/// deliberately (it even reads `~/.claude/settings.json`) — plus the matcher
+/// regex each subscription is narrowed by (grok tests it against the event's
+/// own discriminator: the notification type on `Notification`, the tool name on
+/// tool events, …). Written as an owned file rather than merged into a shared
+/// one; see [`grok_hooks_json`].
+///
+/// `Notification` is the one narrowed subscription. Grok dispatches its
+/// `permission_prompt` notification *before* the permission system decides, so
+/// it fires on essentially every tool call, auto-approved ones included —
+/// escalating that to the amber "needs you" state would flash the pane (and
+/// fire a desktop notification) on every tool a turn runs. `elicitation_dialog`
+/// — grok's ask-the-user question — is the type that always means a real block,
+/// so it is the only one subscribed. The emitter re-checks this (see
+/// [`effective_event`]), which is what covers the same events arriving through
+/// grok's Claude-compat scan, where the matcher isn't ours to set.
+const GROK_HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[
+    ("SessionStart", "session-start", None),
+    ("UserPromptSubmit", "prompt-submit", None),
+    ("Notification", "notification", Some("elicitation_dialog")),
+    ("PostToolUse", "tool-complete", None),
+    ("Stop", "stop", None),
+    ("SessionEnd", "session-end", None),
 ];
 
 fn hook_map_state(path: &Path, agent: HookAgent, events: &[(&str, &str)]) -> HooksState {
@@ -789,6 +868,7 @@ fn owned_file_content(agent: HookAgent) -> Option<String> {
         HookAgent::Copilot => copilot_hooks_json(),
         HookAgent::OpenCode => opencode_plugin_js(),
         HookAgent::Pi => pi_extension_ts(),
+        HookAgent::Grok => grok_hooks_json(),
         HookAgent::Claude | HookAgent::Codex => None,
     }
 }
@@ -873,6 +953,31 @@ fn copilot_hooks_json() -> Option<String> {
         }
     });
     serde_json::to_string_pretty(&root).ok()
+}
+
+/// Grok Build hook file (`~/.grok/hooks/tty7.json`). Grok loads every JSON file
+/// in that directory and global hooks are always trusted (project hooks need a
+/// folder-trust grant; ours don't), so tty7 owns its own file and never touches
+/// the user's. Both the schema and the event names are Claude Code's — grok
+/// mirrors them deliberately — so this is the same wiring as
+/// [`CLAUDE_HOOK_EVENTS`] in owned-file form; see [`GROK_HOOK_EVENTS`] for the
+/// table and why `Notification` carries a matcher.
+fn grok_hooks_json() -> Option<String> {
+    let mut hooks = serde_json::Map::new();
+    for (event, sentinel, matcher) in GROK_HOOK_EVENTS {
+        let mut group = serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": hook_command(HookAgent::Grok, sentinel)?,
+                "timeout": GROK_HOOK_TIMEOUT_SECS,
+            }]
+        });
+        if let Some(matcher) = matcher {
+            group["matcher"] = serde_json::Value::String((*matcher).to_string());
+        }
+        hooks.insert((*event).to_string(), serde_json::json!([group]));
+    }
+    serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).ok()
 }
 
 /// OpenCode plugin (`~/.config/opencode/plugins/tty7.js`). OpenCode has no
@@ -985,6 +1090,31 @@ mod tests {
         let ev = parse_agent_event(&seq[2..seq.len() - 1]).expect("bare event still parses");
         assert_eq!(ev.kind, AgentEventKind::Stop);
         assert_eq!(ev.session_id, None);
+
+        // Grok's envelope is camelCase throughout; the same fields must land in
+        // the snake_case sentinel body, or restore loses the id `--resume` needs.
+        let seq = build_hook_sequence(
+            "grok",
+            "session-start",
+            r#"{"hookEventName":"session_start","sessionId":"g-42","cwd":"/w"}"#,
+        );
+        let ev = parse_agent_event(&seq[2..seq.len() - 1]).expect("daemon parses the grok event");
+        assert_eq!(ev.agent, Some(CLIAgent::Grok));
+        assert_eq!(ev.session_id.as_deref(), Some("g-42"));
+        assert_eq!(ev.cwd.as_deref(), Some(std::path::Path::new("/w")));
+    }
+
+    /// Grok reads `~/.claude/settings.json` too, so a tty7 Claude Code
+    /// integration fires inside grok panes. Those invocations must speak as
+    /// grok — otherwise the pane reports the wrong agent, and having both
+    /// integrations installed emits every turn twice under two identities.
+    #[test]
+    fn grok_run_hooks_are_relabeled_to_grok() {
+        assert_eq!(effective_agent("claude", true), "grok");
+        assert_eq!(effective_agent("grok", true), "grok");
+        // Outside grok's hook runner nothing is rewritten.
+        assert_eq!(effective_agent("claude", false), "claude");
+        assert_eq!(effective_agent("grok", false), "grok");
     }
 
     /// Every event name any installer writes must be one the daemon's parser
@@ -997,6 +1127,7 @@ mod tests {
             .iter()
             .chain(CODEX_HOOK_EVENTS)
             .map(|(_, e)| *e)
+            .chain(GROK_HOOK_EVENTS.iter().map(|(_, e, _)| *e))
             .collect();
         // Owned-file integrations embed their events in generated source.
         events.extend([
@@ -1037,12 +1168,37 @@ mod tests {
             effective_event("copilot", "notification", r#"{"type":"turn_summary"}"#),
             None
         );
+        // Grok's catch-all Notification hook is filtered harder: only its
+        // ask-the-user question is reliably a block. `permission_prompt` fires
+        // ahead of the permission decision — verified against grok 0.2.112,
+        // where an auto-approved `list_dir` emitted one — so escalating it
+        // would flash amber on every tool call.
+        assert_eq!(
+            effective_event(
+                "grok",
+                "notification",
+                r#"{"notificationType":"elicitation_dialog","message":"User question requested"}"#
+            ),
+            Some("permission-request")
+        );
+        for noisy in ["permission_prompt", "task_complete", "agent_error"] {
+            assert_eq!(
+                effective_event(
+                    "grok",
+                    "notification",
+                    &format!(r#"{{"notificationType":"{noisy}"}}"#)
+                ),
+                None,
+                "grok {noisy} is not a block"
+            );
+        }
         // Other agents and events pass through untouched.
         assert_eq!(
             effective_event("claude", "notification", "{}"),
             Some("notification")
         );
         assert_eq!(effective_event("copilot", "stop", "{}"), Some("stop"));
+        assert_eq!(effective_event("grok", "stop", "{}"), Some("stop"));
     }
 
     /// The controlling-tty fallback (`ancestor_tty_device`) is what makes the
@@ -1124,6 +1280,28 @@ mod tests {
         assert!(pi.contains("agent-hook pi"));
         assert!(pi.contains(&exe));
         assert!(pi.contains(r#"process.env["TTY7"]"#));
+
+        let grok = grok_hooks_json().expect("grok content builds");
+        let parsed: serde_json::Value = serde_json::from_str(&grok).expect("valid JSON");
+        for (event, sentinel, matcher) in GROK_HOOK_EVENTS {
+            let group = &parsed["hooks"][*event][0];
+            let cmd = group["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("grok {event} carries a command"));
+            assert!(
+                cmd.ends_with(&format!("agent-hook grok {sentinel}")),
+                "grok {event} runs the emitter with {sentinel}, got {cmd}"
+            );
+            // A narrowed subscription must carry its matcher — without it grok
+            // fires the hook for every notification type, which is the amber
+            // flash this integration exists to avoid.
+            assert_eq!(
+                group.get("matcher").and_then(|m| m.as_str()),
+                *matcher,
+                "grok {event} matcher"
+            );
+        }
+        assert!(grok.contains(&exe));
     }
 
     /// Owned-file lifecycle against a scratch path: install → Installed,

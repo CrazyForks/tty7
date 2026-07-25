@@ -30,7 +30,7 @@ tty7 能识别 pane 里跑着的第三方 coding agent（Claude Code、Codex、G
 Aider、Amp、OpenCode 等约 17 个）并在其外围加功能 —— 绝不包裹或替代 agent 本身。
 
 - **品牌头像** —— 标签 chip / 侧栏行显示每个 pane 跑的是哪个 agent；自定义包装命令可通过 `config.json` 的 `agent_commands` 映射
-- **状态点** —— 工作中（蓝）/ 等你输入（琥珀）/ 完成（绿），由 agent 自己上报的 OSC 事件驱动；在命令面板运行 *Agent: Install Claude Code Hooks* 一键接通 Claude Code
+- **状态点** —— 工作中（蓝）/ 等你输入（琥珀）/ 完成（绿），由 agent 自己上报的 OSC 事件驱动；在 设置 → Agents 一键装好对应 hooks（Claude Code、Codex、Copilot CLI、OpenCode、Pi、Grok Build）
 - **通知** —— agent 卡在等你批准的那一刻弹 "needs your permission…"，每轮结束弹 "finished after Ns"，遵循你的通知策略
 - **一眼看分支** —— 侧栏每行显示该 pane 的 git 分支和工作区改动（`+N −M`），`cd` 或命令跑完时自动刷新
 - **会话恢复** —— 重启后无法重连的 pane 会自动续上 agent 对话，并带上原始启动 flags（`claude --dangerously-skip-permissions --resume …`；`restore_agent_sessions`，默认开启）

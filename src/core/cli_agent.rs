@@ -211,6 +211,9 @@ impl CLIAgent {
             // Copilot CLI: `copilot --resume <sessionId>` (`-r` shorthand) —
             // the one hooks-covered agent that was missing from this table.
             CLIAgent::Copilot => Some(format!("copilot{flags} --resume {session_id}")),
+            // Grok Build: `grok --resume <id-or-title>`; a UUID-shaped value
+            // always takes the id path, which is what its hooks report.
+            CLIAgent::Grok => Some(format!("grok{flags} --resume {session_id}")),
             _ => None,
         }
     }
@@ -268,6 +271,27 @@ impl CLIAgent {
             // `--last` targets "the most recent session" and would contradict
             // the explicit id we inject.
             CLIAgent::Codex => &["--last"],
+            // Beyond the session-targeting flags (`--load` is grok's hidden
+            // alias for `--resume`; `--session-id` names a *new* session and
+            // `--fork-session` would branch off the one we mean to continue),
+            // the worktree pair goes too: `--worktree` with no value mints a
+            // fresh git worktree on every relaunch, and `--worktree-ref`
+            // requires `--worktree`, so leaving it behind would make grok
+            // reject the resume outright.
+            CLIAgent::Grok => &[
+                "--resume",
+                "-r",
+                "--load",
+                "--continue",
+                "-c",
+                "--session-id",
+                "-s",
+                "--fork-session",
+                "--worktree",
+                "-w",
+                "--worktree-ref",
+                "--ref",
+            ],
             _ => &[],
         };
         let mut i = 0;
@@ -1370,6 +1394,34 @@ mod tests {
         assert_eq!(
             CLIAgent::Copilot.resume_command("s-9", None).as_deref(),
             Some("copilot --resume s-9")
+        );
+        // Grok: mode flags survive, and every way of naming another session is
+        // stripped so the injected id is the only target left.
+        assert_eq!(
+            CLIAgent::Grok
+                .resume_command("g-2", Some(&argv(&["grok", "--model", "grok-code"])))
+                .as_deref(),
+            Some("grok --model grok-code --resume g-2")
+        );
+        assert_eq!(
+            CLIAgent::Grok
+                .resume_command(
+                    "g-2",
+                    Some(&argv(&["grok", "--resume", "g-1", "--fork-session"]))
+                )
+                .as_deref(),
+            Some("grok --resume g-2")
+        );
+        // `--worktree` would mint a fresh git worktree on every restore, and
+        // `--worktree-ref` can't survive without it.
+        assert_eq!(
+            CLIAgent::Grok
+                .resume_command(
+                    "g-3",
+                    Some(&argv(&["grok", "-w", "--worktree-ref", "main", "--yolo"]))
+                )
+                .as_deref(),
+            Some("grok --yolo --resume g-3")
         );
     }
 

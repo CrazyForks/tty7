@@ -31,7 +31,7 @@ Codex, Gemini CLI, Aider, Amp, OpenCode, and ~10 more) and adds around them —
 it never wraps or replaces the agent.
 
 - **Brand avatars** — the tab chip / sidebar row shows which agent runs where; custom wrappers map in via `agent_commands` in `config.json`
-- **Status dot** — working (blue) / needs your input (amber) / done (green), driven by agent-reported events over an OSC channel; run *Agent: Install Claude Code Hooks* from the palette to wire Claude Code up
+- **Status dot** — working (blue) / needs your input (amber) / done (green), driven by agent-reported events over an OSC channel; Settings → Agents installs the hooks that feed it (Claude Code, Codex, Copilot CLI, OpenCode, Pi, Grok Build)
 - **Notifications** — "needs your permission…" the moment an agent blocks on you, and "finished after Ns" per turn, honoring your notification policy
 - **Branch at a glance** — each sidebar row shows its pane's git branch and working-tree diff (`+N −M`), refreshed on `cd` and when a command finishes
 - **Session resume** — panes lost to a reboot re-launch their agent conversation on restore, carrying the original launch flags (`claude --dangerously-skip-permissions --resume …`) (`restore_agent_sessions`, on by default)
