@@ -822,7 +822,7 @@ impl Tty7App {
             .items_center()
             .gap_1p5()
             .pl(px(lead))
-            .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
+            .pr(px(crate::ui::app::tile_trailing_inset()))
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
@@ -847,15 +847,17 @@ impl Tty7App {
                 )
             })
             .child(
-                crate::ui::tab_strip::chrome_tile(
-                    Button::new("editor-panel-close")
-                        .icon(Icon::new(IconName::Close).size(px(15.))),
+                crate::ui::tab_strip::chrome_tile_sized(
+                    // This header is the title bar's own height and sits flush
+                    // with it, so its one control is a full chrome tile — not the
+                    // half-size one it used to be, which read as a different
+                    // class of button on the same line.
+                    Button::new("editor-panel-close").icon(Icon::new(IconName::Close)),
+                    crate::ui::app::TILE_SIZE,
+                    crate::ui::app::TILE_GLYPH_LINE,
                     false,
                     cx,
                 )
-                .xsmall()
-                .w(px(30.))
-                .h(px(30.))
                 .rounded_lg()
                 .tooltip("Back to Terminal (Esc)")
                 .on_click(cx.listener(|this, _, window, cx| {

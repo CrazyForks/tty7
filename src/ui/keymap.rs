@@ -114,7 +114,15 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
     // and Linux without binding to the Win/Super key, which the OS reserves.
     vec![
         ("NewTab", "secondary-t"),
+        ("NewWorkspace", "secondary-shift-n"),
         ("CloseActiveTab", "secondary-w"),
+        // No default chord on purpose: this is the one action that kills running
+        // sessions, and it must not sit one slip away from ⌘W. Reachable from
+        // the Shell menu and the palette; bindable in Settings for anyone who
+        // wants it.
+        ("StopWorkspace", ""),
+        ("DeleteWorkspace", ""),
+        ("RenameWorkspace", ""),
         ("SplitRight", "secondary-d"),
         ("SplitDown", "secondary-shift-d"),
         ("FocusNextPane", "secondary-]"),
@@ -455,6 +463,10 @@ fn keystroke_is_valid(s: &str) -> bool {
 fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
     Some(match action {
         "NewTab" => KeyBinding::new(keystroke, NewTab, None),
+        "NewWorkspace" => KeyBinding::new(keystroke, NewWorkspace, None),
+        "StopWorkspace" => KeyBinding::new(keystroke, StopWorkspace, None),
+        "DeleteWorkspace" => KeyBinding::new(keystroke, DeleteWorkspace, None),
+        "RenameWorkspace" => KeyBinding::new(keystroke, RenameWorkspace, None),
         "CloseActiveTab" => KeyBinding::new(keystroke, CloseActiveTab, None),
         "SplitRight" => KeyBinding::new(keystroke, SplitRight, None),
         "SplitDown" => KeyBinding::new(keystroke, SplitDown, None),

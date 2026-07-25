@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Multiple windows, one workspace each** — `New Workspace` (⌘⇧N) opens a
+  second window with its own tabs, splits, and chrome state. A workspace is
+  the persistent thing: closing its window puts it away with its panes still
+  running in the daemon, and the Window menu, the command palette, and the
+  home page's picker all bring it back. `Stop Workspace` ends one for real
+  (no default chord — it kills sessions), `Delete Workspace` also forgets the
+  layout, and a workspace can be renamed from the title-bar chip.
+- **Window menu with the workspace list** — every workspace, live or stopped,
+  with a monogram badge, a corner dot for liveness, and ⌘1–9 for the first
+  nine in menu order.
+
+### Changed
+
+- **Sidebar and right-panel visibility are per-window** — toggling one
+  window's chrome leaves the others alone. The config value is now what a
+  *newly opened* window starts with; panel width stays shared.
+
+- **Daemon wire protocol is now v2** — WSL panes carry a remote-context kind
+  that a v1 client can't decode, so it would drop the pane's connection
+  instead of ignoring the unknown value. The version handshake now sees that
+  skew and offers to restart the daemon, rather than letting a downgraded
+  build lose panes silently.
+
 ## [26.7.2] - 2026-07-21
 
 ### Added

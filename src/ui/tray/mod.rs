@@ -36,8 +36,7 @@ use sni::Backend;
 
 use crate::core::cli_agent::AgentStatus;
 use crate::core::config::{Config, NotifyMode};
-use crate::ui::app::Tty7App;
-use gpui::Context;
+use gpui::App;
 
 /// How often the poll loop re-snapshots the app. Agent status itself is
 /// polled into the views on a 300 ms timer; 1 s here keeps the tray a hair
@@ -68,6 +67,16 @@ pub(crate) enum TrayAction {
     /// Quit *and* shut the daemon down, ending every running session.
     /// Confirmed with a prompt before anything happens.
     QuitStopSessions,
+}
+
+/// Sort key for the agent list: the pane that needs the user tops the menu.
+pub(crate) fn urgency(status: AgentStatus) -> u8 {
+    match status {
+        AgentStatus::Waiting => 3,
+        AgentStatus::Working => 2,
+        AgentStatus::Done => 1,
+        AgentStatus::Idle => 0,
+    }
 }
 
 /// One agent pane, as shown in the tray menu.
@@ -318,27 +327,90 @@ mod tests {
     }
 }
 
+/// Everything the tray renders, gathered across *every* open window. One icon
+/// represents the whole app, so an agent waiting in a background window has to
+/// show up here — otherwise the tray would silently only ever describe
+/// whichever window happened to open first.
+fn app_snapshot(cx: &mut App) -> TraySnapshot {
+    let windows = crate::ui::windows::WindowRegistry::open_windows(cx);
+    let mut agents = Vec::new();
+    for (_, weak) in windows {
+        let Some(app) = weak.upgrade() else { continue };
+        agents.extend(app.read(cx).agent_rows(cx));
+    }
+    // Sorted once over the merged list, so the most urgent pane tops the menu
+    // regardless of which window it lives in.
+    agents.sort_by_key(|a| std::cmp::Reverse(urgency(a.status)));
+    TraySnapshot {
+        agents,
+        notify_mode: cx.global::<Config>().notify_on_command_finish,
+    }
+}
+
+/// Route a menu click to the window that should handle it.
+///
+/// `RevealPane` carries a leaf's entity id, which belongs to exactly one
+/// window — sending it anywhere else would silently do nothing. Everything
+/// else (Settings, quit, the notify toggle) acts on the app or just needs
+/// *some* window, so it goes to the most recently focused one.
+fn dispatch(action: TrayAction, cx: &mut App) {
+    use crate::ui::windows::WindowRegistry;
+
+    let target = match action {
+        TrayAction::RevealPane { leaf_id } => WindowRegistry::open_windows(cx)
+            .into_iter()
+            .find(|(_, weak)| {
+                weak.upgrade()
+                    .is_some_and(|app| app.read(cx).owns_leaf(leaf_id))
+            })
+            .map(|(workspace, _)| workspace),
+        _ => None,
+    }
+    .or_else(|| WindowRegistry::most_recent(cx));
+
+    // No window at all (every one closed while the menu was open): nothing to
+    // act on. Quit is the exception — it must work even then.
+    let Some(workspace) = target else {
+        if matches!(action, TrayAction::Quit) {
+            cx.quit();
+        }
+        return;
+    };
+    let (Some(handle), Some(weak)) = (
+        WindowRegistry::window_for(cx, workspace),
+        WindowRegistry::app_for(cx, workspace),
+    ) else {
+        return;
+    };
+    let _ = handle.update(cx, |_, window, cx| {
+        if let Some(app) = weak.upgrade() {
+            app.update(cx, |app, cx| app.handle_tray_action(action, window, cx));
+        }
+    });
+}
+
 /// Wire the tray up: one task pumps menu clicks into the app, another polls
-/// the app into the tray. Called once from `Tty7App::with_session`; both
-/// tasks end (dropping the tray icon) when the app entity drops.
+/// the app into the tray. Called once, for the first window (`ui::app`); both
+/// tasks live for the app's lifetime, not any one window's.
 ///
 /// `show_tray_icon` is re-read every tick, so the Settings toggle and a
 /// `config.json` hot-reload both take effect within a second — the backend
 /// is dropped (icon removed) when off and re-created when back on.
-pub(crate) fn init(cx: &mut Context<Tty7App>) {
+pub(crate) fn init(cx: &mut App) {
     let (tx, rx) = smol::channel::unbounded::<TrayAction>();
 
     // Menu clicks → the app. The platform handler feeds `tx` from wherever
     // the OS delivers menu events; this task is the only place they touch
     // gpui state, with a real window + context in hand.
-    cx.spawn(async move |this, cx| {
+    //
+    // App-scoped rather than tied to one window's entity: the tray is a single
+    // icon for the whole app and has to outlive any individual window. Each
+    // click picks its own target window (see [`dispatch`]).
+    // The loop ends when every `TrayAction` sender is dropped — i.e. when the
+    // backend goes away. On app shutdown the detached task itself is dropped.
+    cx.spawn(async move |cx| {
         while let Ok(action) = rx.recv().await {
-            let alive = this.update_in(cx, |app, window, cx| {
-                app.handle_tray_action(action, window, cx)
-            });
-            if alive.is_err() {
-                break;
-            }
+            cx.update(|cx| dispatch(action, cx));
         }
     })
     .detach();
@@ -346,7 +418,7 @@ pub(crate) fn init(cx: &mut Context<Tty7App>) {
     // App → tray poll loop. Owns the backend; dropping it removes the icon.
     // The backend types are !Send on macOS (NSStatusItem), which is fine on
     // the foreground executor — exactly where tray-icon requires them.
-    cx.spawn(async move |this, cx| {
+    cx.spawn(async move |cx| {
         let mut backend: Option<Backend> = None;
         // Last snapshot actually pushed; `None` forces a push after
         // (re)creation so a fresh icon never shows a stale menu.
@@ -363,11 +435,8 @@ pub(crate) fn init(cx: &mut Context<Tty7App>) {
         let mut cooldown = 0u32;
         loop {
             cx.background_executor().timer(POLL).await;
-            let Ok((enabled, snap)) = this.update(cx, |app, cx| {
-                (cx.global::<Config>().show_tray_icon, app.tray_snapshot(cx))
-            }) else {
-                break; // app gone — backend drops with the task
-            };
+            let (enabled, snap) =
+                cx.update(|cx| (cx.global::<Config>().show_tray_icon, app_snapshot(cx)));
             if !enabled {
                 backend = None;
                 shown = None;

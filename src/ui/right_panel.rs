@@ -26,7 +26,10 @@ use std::rc::Rc;
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::PaneProcs;
 use crate::terminal::git_diff::{self, DiffSnapshot};
-use crate::ui::app::{CONTENT_INSET, Tty7App};
+use crate::ui::app::{
+    CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App, tile_trailing_inset,
+    tile_trailing_inset_sm,
+};
 
 /// Bounds for the panel's width, mirroring the rail's: a floor so the tree never
 /// becomes an ellipsis parade, and a ceiling as a fraction of the window so a
@@ -76,8 +79,8 @@ const PROCS_POLL: std::time::Duration = std::time::Duration::from_millis(2000);
 impl Tty7App {
     /// Whether the right panel is docked open. The title bar's tab row, the body
     /// column and the code overlay's right inset all derive from this.
-    pub(crate) fn right_panel_open(&self, cx: &gpui::App) -> bool {
-        cx.global::<Config>().right_panel_visible && !self.tabs.is_empty()
+    pub(crate) fn right_panel_open(&self, _cx: &gpui::App) -> bool {
+        self.right_panel_visible && !self.tabs.is_empty()
     }
 
     /// The panel's live width, re-clamped to the window the same way the rail's
@@ -92,19 +95,25 @@ impl Tty7App {
         self.right_panel_width.get().clamp(MIN_WIDTH, max)
     }
 
-    /// `ToggleRightPanel` (⌘J).
+    /// `ToggleRightPanel` (⌘J). Flips this window's panel; the config write is
+    /// only what the *next* window will start with — see the field's doc comment.
     pub(crate) fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
-        let next = !cx.global::<Config>().right_panel_visible;
+        let next = !self.right_panel_visible;
+        self.right_panel_visible = next;
         self.update_config(cx, |cfg| cfg.right_panel_visible = next);
+        cx.notify();
     }
 
     /// Select a tab. Opens the panel if it was closed, so the title bar's tab
     /// tiles double as "show me this" rather than being inert while hidden.
     pub(crate) fn set_right_panel_tab(&mut self, tab: RightPanelTab, cx: &mut Context<Self>) {
+        self.right_panel_tab = tab;
+        self.right_panel_visible = true;
         self.update_config(cx, |cfg| {
             cfg.right_panel_tab = tab;
             cfg.right_panel_visible = true;
         });
+        cx.notify();
     }
 
     /// The docked column, or `None` while the panel is closed.
@@ -117,7 +126,7 @@ impl Tty7App {
             return None;
         }
         let width = self.right_panel_px(window, cx);
-        let tab = cx.global::<Config>().right_panel_tab;
+        let tab = self.right_panel_tab;
 
         let body = match tab {
             RightPanelTab::Info => self.render_panel_info(window, cx),
@@ -184,7 +193,7 @@ impl Tty7App {
                         .on_double_click(|_, window, _| window.titlebar_double_click())
                         .items_center()
                         .gap(px(2.))
-                        .pl(px(CONTENT_INSET - crate::ui::app::TILE_PAD))
+                        .pl(px(tile_trailing_inset()))
                         .children(self.right_panel_tabs(cx))
                         .child(div().flex_1())
                         // The panel is what reaches the window's right edge while
@@ -314,9 +323,11 @@ impl Tty7App {
             .justify_between()
             .pl(px(CONTENT_INSET))
             // Trailing tiles align on the glyph like every other control in the
-            // window; a label-only header just takes the plain inset.
+            // window; a label-only header just takes the plain inset. `_SM`
+            // because what hangs here is a body-scale tile, whose glyph sits a
+            // different distance inside its box than the chrome's does.
             .pr(px(if trailing.is_some() {
-                CONTENT_INSET - crate::ui::app::TILE_PAD
+                tile_trailing_inset_sm()
             } else {
                 CONTENT_INSET
             }))
@@ -350,14 +361,13 @@ impl Tty7App {
     /// so a manual refresh is a button that does what already happened.
     fn files_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         let show_hidden = self.file_tree.show_hidden;
-        crate::ui::tab_strip::chrome_tile(
-            Button::new("panel-tree-hidden").icon(Icon::new(IconName::Eye).size(px(13.))),
+        crate::ui::tab_strip::chrome_tile_sized(
+            Button::new("panel-tree-hidden").icon(Icon::new(IconName::Eye)),
+            TILE_SIZE_SM,
+            TILE_GLYPH_SM,
             show_hidden,
             cx,
         )
-        .xsmall()
-        .w(px(24.))
-        .h(px(24.))
         .rounded_md()
         .tooltip(if show_hidden {
             "Hide dotfiles"
@@ -538,18 +548,16 @@ impl Tty7App {
         };
         h_flex()
             .gap(px(2.))
-            .px(px(CONTENT_INSET - crate::ui::app::TILE_PAD))
+            .px(px(tile_trailing_inset_sm()))
             .pt(px(6.))
             .child(
-                crate::ui::tab_strip::chrome_tile(
-                    Button::new("panel-info-reveal")
-                        .icon(Icon::new(IconName::FolderOpen).size(px(13.))),
+                crate::ui::tab_strip::chrome_tile_sized(
+                    Button::new("panel-info-reveal").icon(Icon::new(IconName::FolderOpen)),
+                    TILE_SIZE_SM,
+                    TILE_GLYPH_SM,
                     false,
                     cx,
                 )
-                .xsmall()
-                .w(px(24.))
-                .h(px(24.))
                 .rounded_md()
                 .tooltip(reveal_label)
                 .on_click({
@@ -558,15 +566,13 @@ impl Tty7App {
                 }),
             )
             .child(
-                crate::ui::tab_strip::chrome_tile(
-                    Button::new("panel-info-copy-path")
-                        .icon(Icon::new(IconName::Copy).size(px(13.))),
+                crate::ui::tab_strip::chrome_tile_sized(
+                    Button::new("panel-info-copy-path").icon(Icon::new(IconName::Copy)),
+                    TILE_SIZE_SM,
+                    TILE_GLYPH_SM,
                     false,
                     cx,
                 )
-                .xsmall()
-                .w(px(24.))
-                .h(px(24.))
                 .rounded_md()
                 .tooltip("Copy Path")
                 .on_click(move |_, _window, cx| {
@@ -736,9 +742,10 @@ impl Tty7App {
                     }
                     app.right_panel.procs = Some(procs);
                     cx.notify();
-                    let cfg = cx.global::<Config>();
+                    // This window's own panel state, not the config's: another
+                    // window closing its panel must not stop our poll.
                     let wanted =
-                        cfg.right_panel_visible && cfg.right_panel_tab == RightPanelTab::Info;
+                        app.right_panel_visible && app.right_panel_tab == RightPanelTab::Info;
                     if !wanted {
                         // Loop ends here; release the guard so reopening restarts it.
                         app.right_panel.procs_loading = false;
@@ -756,8 +763,7 @@ impl Tty7App {
                 if app.right_panel.procs_gen != generation {
                     return;
                 }
-                let cfg = cx.global::<Config>();
-                let wanted = cfg.right_panel_visible && cfg.right_panel_tab == RightPanelTab::Info;
+                let wanted = app.right_panel_visible && app.right_panel_tab == RightPanelTab::Info;
                 if wanted {
                     app.spawn_procs_query(pane_id, generation, cx);
                 } else {

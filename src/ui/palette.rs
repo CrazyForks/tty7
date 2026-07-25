@@ -29,6 +29,20 @@ use crate::core::ssh_profile::parse_quick_connect;
 #[derive(Clone, PartialEq, Eq)]
 pub enum CommandKind {
     NewTab,
+    NewWorkspace,
+    /// Submenu opener: swap the palette to the list of known workspaces.
+    /// Handled inside `PaletteView`; never reaches the host.
+    OpenWorkspacePicker,
+    /// Show `id`'s workspace. In a window that already has one open elsewhere
+    /// this focuses that window; otherwise the current window swaps over to it
+    /// and its previous workspace detaches into the picker.
+    SwitchToWorkspace(crate::core::session::WorkspaceId),
+    /// Stop this window's workspace: kill its sessions and close the window,
+    /// keeping the layout so it can be started again. The counterpart to
+    /// closing a window, which only detaches.
+    StopWorkspace,
+    /// Stop it *and* discard the layout. The only irreversible one.
+    DeleteWorkspace,
     SplitRight,
     SplitDown,
     ClosePane,
@@ -116,6 +130,10 @@ impl CommandKind {
         use CommandKind::*;
         Some(match self {
             NewTab => "NewTab",
+            NewWorkspace => "NewWorkspace",
+            OpenWorkspacePicker | SwitchToWorkspace(_) => return None,
+            StopWorkspace => "StopWorkspace",
+            DeleteWorkspace => "DeleteWorkspace",
             SplitRight => "SplitRight",
             SplitDown => "SplitDown",
             ClosePane => "CloseActiveTab",
@@ -209,6 +227,10 @@ impl Command {
         use CommandKind::*;
         vec![
             Command::new("New Tab", NewTab),
+            Command::new("New Workspace", NewWorkspace),
+            Command::new("Switch Workspace…", OpenWorkspacePicker),
+            Command::new("Stop Workspace…", StopWorkspace),
+            Command::new("Delete Workspace…", DeleteWorkspace),
             Command::new("Split Right", SplitRight),
             Command::new("Split Down", SplitDown),
             Command::new("Close Pane/Tab", ClosePane),
@@ -270,6 +292,40 @@ impl Command {
     /// display order. Confirming one emits `SetTheme(i)`, which applies that
     /// preset. The active theme is marked with a check so the list doubles as a
     /// "which theme am I on?" indicator.
+    /// The workspace sub-list: every workspace tty7 knows about, most recently
+    /// active first. Open ones are labelled as such — picking one focuses its
+    /// window rather than opening a second one onto the same panes.
+    pub fn workspace_commands(cx: &App) -> Vec<Command> {
+        use crate::core::session::WorkspaceStore;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut all: Vec<_> = WorkspaceStore::all(cx).workspaces.iter().collect();
+        all.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        all.into_iter()
+            .map(|w| {
+                let state = if w.open {
+                    "open".to_string()
+                } else {
+                    crate::ui::home::relative_time(now, w.last_active)
+                };
+                let path = w
+                    .dominant_repo()
+                    .or_else(|| w.first_cwd())
+                    .map(|p| crate::ui::home::display_path(&p))
+                    .unwrap_or_default();
+                let subtitle = if path.is_empty() {
+                    state
+                } else {
+                    format!("{path} · {state}")
+                };
+                Command::new(w.display_name(), CommandKind::SwitchToWorkspace(w.id))
+                    .with_subtitle(subtitle)
+            })
+            .collect()
+    }
+
     pub fn theme_commands(cx: &App) -> Vec<Command> {
         let active = crate::ui::theme::effective_preset_id(cx);
         crate::ui::presets::all(cx)
@@ -554,6 +610,7 @@ enum PaletteMenu {
     Root,
     Theme,
     SshConnect,
+    Workspace,
 }
 
 /// The command palette as a self-contained view. It owns the `ListState`
@@ -641,7 +698,7 @@ impl PaletteView {
         match self.menu {
             PaletteMenu::SshConnect => "user@host [-p 2222 -J jump]",
             PaletteMenu::Root => "Search or type user@host to connect…",
-            PaletteMenu::Theme => "Search…",
+            PaletteMenu::Theme | PaletteMenu::Workspace => "Search…",
         }
     }
 
@@ -678,6 +735,11 @@ impl PaletteView {
                     Some(CommandKind::OpenSshConnectInput) => {
                         self.menu = PaletteMenu::SshConnect;
                         self.show_ssh_connect(window, cx);
+                    }
+                    Some(CommandKind::OpenWorkspacePicker) => {
+                        self.menu = PaletteMenu::Workspace;
+                        let workspaces = Command::workspace_commands(cx);
+                        self.show(workspaces, window, cx);
                     }
                     Some(CommandKind::OpenSshConnect(input)) if input.trim().is_empty() => {}
                     Some(kind) => cx.emit(PaletteEvent::Confirm(kind)),
