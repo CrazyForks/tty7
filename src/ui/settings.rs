@@ -796,7 +796,15 @@ impl Tty7App {
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(Icon::new(IconName::Search).small().text_color(header_muted))
+                            // Stock magnifier, not tty7's: this page's glyphs run at
+                            // 16px, where the detail panel's redraw reads thin and
+                            // its handle stubby. See `assets::STOCK_PREFIX`.
+                            .child(
+                                Icon::empty()
+                                    .path("stock/icons/search.svg")
+                                    .small()
+                                    .text_color(header_muted),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -1695,7 +1703,11 @@ impl Tty7App {
                             })
                             .child(
                                 Button::new(("ssh-prof-menu", row_idx))
-                                    .icon(IconName::Ellipsis)
+                                    // Stock `⋯`, not tty7's: the redraw's filled
+                                    // `r=2` dots are weighted for the title bar's
+                                    // 18px tiles and smear into three blobs at the
+                                    // 16px `small()` uses. See `assets::STOCK_PREFIX`.
+                                    .icon(Icon::empty().path("stock/icons/ellipsis.svg"))
                                     .ghost()
                                     .small()
                                     .dropdown_menu_with_anchor(
@@ -3618,7 +3630,13 @@ impl Tty7App {
             div().w(px(268.)).child(
                 Input::new(&search)
                     .small()
-                    .prefix(Icon::new(IconName::Search).small().text_color(muted_fg)),
+                    // Stock magnifier — same reason as the page header's.
+                    .prefix(
+                        Icon::empty()
+                            .path("stock/icons/search.svg")
+                            .small()
+                            .text_color(muted_fg),
+                    ),
             ),
         );
 

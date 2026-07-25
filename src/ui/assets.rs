@@ -16,8 +16,23 @@ use gpui::{AssetSource, Result, SharedString};
 /// tty7's asset source. Registered once in `main` via `with_assets`.
 pub struct Assets;
 
+/// Prefix that opts a single call site *out* of the overrides in [`agent_icon`]
+/// and takes gpui-component's own glyph instead: `stock/icons/search.svg`.
+///
+/// Needed because the overrides are keyed on the asset path, which makes them
+/// app-wide (see [`agent_icon`]). Most of them are wanted everywhere, but the
+/// detail panel's set is drawn for 18px tiles sitting beside solid dock glyphs,
+/// and a few of those shapes are too heavy at the 16px the Settings page uses —
+/// its `⋯` in particular, whose filled `r=2` dots smear into three blobs there.
+/// Rather than fork the whole set under a second name, those call sites ask for
+/// stock by path.
+const STOCK_PREFIX: &str = "stock/";
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(downstream) = path.strip_prefix(STOCK_PREFIX) {
+            return gpui_component_assets::Assets.load(downstream);
+        }
         if let Some(bytes) = agent_icon(path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
@@ -43,7 +58,8 @@ impl AssetSource for Assets {
 /// tty7's and gpui-component's own — resolves through the arm below. Adding a
 /// name that upstream also ships redraws it everywhere; check the call sites
 /// before doing so, and prefer a name upstream *doesn't* use (`circle-info`)
-/// when only one place should change.
+/// when only one place should change. A call site that wants the downstream
+/// glyph despite an override here asks for it by [`STOCK_PREFIX`].
 fn agent_icon(path: &str) -> Option<&'static [u8]> {
     let bytes: &'static [u8] = match path {
         // Flush `>_` prompt glyph for the plain-shell tab avatar (Lucide's
@@ -132,4 +148,40 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         _ => return None,
     };
     Some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Settings page reaches for stock glyphs by path; if that stopped
+    /// bypassing the overrides it would silently pick up the detail panel's
+    /// heavier redraws again, which is the regression this prefix exists to undo.
+    #[test]
+    fn stock_prefix_bypasses_the_overrides() {
+        for name in ["search", "ellipsis"] {
+            let overridden = Assets
+                .load(&format!("icons/{name}.svg"))
+                .unwrap()
+                .expect("tty7 override present");
+            let stock = Assets
+                .load(&format!("{STOCK_PREFIX}icons/{name}.svg"))
+                .unwrap()
+                .expect("downstream glyph present");
+            assert_ne!(
+                overridden, stock,
+                "`{name}` should resolve to different art with and without `{STOCK_PREFIX}`"
+            );
+        }
+    }
+
+    /// A `stock/` path for a glyph tty7 never overrode still has to resolve —
+    /// the prefix is a bypass, not a separate asset set.
+    #[test]
+    fn stock_prefix_works_for_unoverridden_glyphs() {
+        assert_eq!(
+            Assets.load("stock/icons/check.svg").unwrap(),
+            Assets.load("icons/check.svg").unwrap(),
+        );
+    }
 }
