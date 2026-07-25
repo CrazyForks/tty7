@@ -770,7 +770,8 @@ impl Tty7App {
                         // collapse tile and the title bar's own "+", and ghost's
                         // hover is a heavier, differently-derived grey.
                         crate::ui::tab_strip::chrome_tile(
-                            Button::new("sidebar-add").icon(Icon::new(IconName::Plus).size(px(18.))),
+                            Button::new("sidebar-add")
+                                .icon(Icon::new(IconName::Plus).size(px(18.))),
                             false,
                             cx,
                         )
