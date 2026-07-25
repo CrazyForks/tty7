@@ -109,13 +109,65 @@ jobs:
         shell: pwsh
         run: '& ./.github/scripts/bundle-windows.ps1 "${{ matrix.target }}" "${{ matrix.arch }}"'
 
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+      # Hand the artifacts to the assemble job rather than uploading them to the
+      # release here. Four parallel jobs each publishing their own slice would
+      # make the release "latest" the moment the *first* platform finished — the
+      # in-app update check (src/core/update.rs) reads /releases/latest, so users
+      # would be prompted to download a release that was still missing most of
+      # its assets. Same glob list as before: the bundle scripts leave
+      # intermediates in dist/ (tty7.app, entitlements.plist, the Windows staging
+      # dir) that must not reach the release assets.
+      - uses: actions/upload-artifact@v7
         with:
-          files: |
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
             tty7/dist/*.dmg
             tty7/dist/*.tar.gz
             tty7/dist/*.zip
             tty7/dist/*-setup.exe
             tty7/dist/*.AppImage
+          if-no-files-found: error
+
+  # Single assembly step, after all four platforms succeed. The release object is
+  # created as a **draft** and left that way: a draft is invisible to both
+  # /releases/latest and the releases page, so nothing can prompt a user to
+  # download a version whose asset set is incomplete or whose notes are still
+  # empty. Publishing is the release skill's job — it verifies the six assets and
+  # writes the body first, then flips the draft. See .claude/skills/release/SKILL.md.
+  draft-release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Reuse an existing release rather than failing: re-triggering a tag
+      # (force-push after a fixed platform) must top up the same draft. If the
+      # release was already published, --clobber just replaces its assets and it
+      # stays published.
+      #
+      # Existence is probed with `release list`, not `release view`: GitHub's
+      # get-release-by-tag endpoint does not return drafts, so a view-based check
+      # could miss the very draft a previous run left behind and create a second
+      # one (GitHub happily allows duplicate drafts on one tag).
+      - name: Assemble the draft release
+        run: |
+          set -euo pipefail
+          # Captured into a variable, not piped into `grep -q`: -q exits on the
+          # first match, and the resulting SIGPIPE would make `pipefail` report
+          # the pipeline as failed — i.e. "found" would read as "not found".
+          # `release list` includes drafts (cf. its --exclude-drafts flag).
+          EXISTING=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName -q '.[].tagName')
+          if grep -Fxq "$GITHUB_REF_NAME" <<<"$EXISTING"; then
+            echo "release $GITHUB_REF_NAME already exists; reusing it"
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --draft --title "$GITHUB_REF_NAME" --notes ""
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
