@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **tmux keeps UTF-8 output when tty7 is launched from Finder/Dock** — macOS
+  GUI launches can omit every locale variable, which makes tmux deliberately
+  replace each Unicode display cell with `_`. New shells now receive the
+  macOS `UTF-8` character locale only when no inherited or configured locale
+  exists; explicit locale choices remain untouched.
+
 ## [26.7.3] - 2026-07-25
 
 ### Added

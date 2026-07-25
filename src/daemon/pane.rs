@@ -309,6 +309,28 @@ fn initial_working_directory(cwd: Option<PathBuf>) -> Option<PathBuf> {
         .find(|d| d.is_dir())
 }
 
+/// Whether the effective child environment leaves every locale selector empty.
+///
+/// `extra_env` has the same precedence it gets at spawn: a configured value,
+/// including an explicitly empty one, overrides the daemon's inherited value.
+/// tmux checks these variables in this exact order to decide whether its client
+/// supports UTF-8; when all three are empty it deliberately renders each Unicode
+/// cell as `_`.
+#[cfg(any(target_os = "macos", test))]
+fn locale_environment_is_empty(
+    extra_env: &std::collections::HashMap<String, String>,
+    mut inherited: impl FnMut(&str) -> Option<String>,
+) -> bool {
+    ["LC_ALL", "LC_CTYPE", "LANG"].iter().all(|key| {
+        extra_env
+            .get(*key)
+            .cloned()
+            .or_else(|| inherited(key))
+            .as_deref()
+            .map_or(true, str::is_empty)
+    })
+}
+
 fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<PathBuf>) {
     if let Some(dir) = initial_cwd {
         cmd.cwd(dir);
@@ -324,13 +346,26 @@ fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<Pat
         crate::core::agent_hooks::TTY7_ENV_MARKER,
         env!("CARGO_PKG_VERSION"),
     );
-    // User-configured environment variables, injected last so they can override
-    // the inherited environment (but not TERM/COLORTERM above, which reflect our
-    // emulator's real capabilities).
-    for (k, v) in crate::core::config::extra_env() {
+
+    // User-configured environment variables override inherited values (but not
+    // TERM/COLORTERM above, which reflect our emulator's real capabilities).
+    let extra_env = crate::core::config::extra_env();
+    for (k, v) in &extra_env {
         if k != "TERM" && k != "COLORTERM" {
             cmd.env(k, v);
         }
+    }
+
+    // LaunchServices commonly starts a macOS app with no locale variables at
+    // all. Direct children can still print UTF-8, but tmux interprets that empty
+    // environment as a non-UTF-8 terminal and substitutes one `_` per display
+    // cell. Seed only LC_CTYPE (the macOS `UTF-8` locale alias) so character
+    // handling is correct without changing message/date/number localization.
+    // Respect any non-empty inherited or user-configured locale, including an
+    // explicit `C`; configured empty values are absence, so repair them too.
+    #[cfg(target_os = "macos")]
+    if locale_environment_is_empty(&extra_env, |key| std::env::var(key).ok()) {
+        cmd.env("LC_CTYPE", "UTF-8");
     }
 }
 
@@ -3536,6 +3571,32 @@ mod tests {
 
         assert!(dead_rx.try_recv().is_ok(), "unattached death → on_dead");
         assert!(dead_rx.try_recv().is_err(), "on_dead must fire only once");
+    }
+
+    /// The macOS UTF-8 fallback applies only when the child would otherwise have
+    /// no locale at all. An inherited or config-provided value is authoritative;
+    /// an explicit empty config value masks the inherited one just as it does at
+    /// spawn, allowing the fallback to repair the resulting empty environment.
+    #[test]
+    fn locale_fallback_respects_the_effective_child_environment() {
+        let inherited = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let is_empty = |extra: &[(&str, &str)], parent: &[(&str, &str)]| {
+            let extra = inherited(extra);
+            let parent = inherited(parent);
+            locale_environment_is_empty(&extra, |key| parent.get(key).cloned())
+        };
+
+        assert!(is_empty(&[], &[]));
+        assert!(is_empty(&[("LC_CTYPE", "")], &[]));
+        assert!(is_empty(&[("LANG", "")], &[("LANG", "en_US.UTF-8")]));
+        assert!(!is_empty(&[], &[("LANG", "en_US.UTF-8")]));
+        assert!(!is_empty(&[], &[("LC_ALL", "C")]));
+        assert!(!is_empty(&[("LC_CTYPE", "UTF-8")], &[]));
     }
 
     /// Every spawned shell carries the `TTY7` marker, so the `tty7 agent-hook`
