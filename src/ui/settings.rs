@@ -687,7 +687,7 @@ impl Tty7App {
         // active it also carries a trailing `(N)` count of that section's matching
         // settings — the full section nav stays put and is annotated with
         // per-section hit counts, rather than collapsing into a flat result list.
-        let nav_item = |label: &'static str, target: SettingsSection, icon: IconName| {
+        let nav_item = |label: &'static str, target: SettingsSection, icon: Icon| {
             let view = cx.entity();
             let count = if query.is_empty() {
                 0
@@ -695,7 +695,7 @@ impl Tty7App {
                 section_match_count(target, &query)
             };
             let item = SidebarMenuItem::new(label)
-                .icon(Icon::new(icon))
+                .icon(icon)
                 .active(section == target)
                 .on_click(move |_, _window, cx| {
                     view.update(cx, |this, cx| this.select_settings_section(target, cx));
@@ -718,7 +718,7 @@ impl Tty7App {
             .child(nav_item(
                 "Appearance",
                 SettingsSection::Appearance,
-                IconName::Palette,
+                Icon::new(IconName::Palette),
             ))
             // Sliders for Terminal (it's the tuning page), the `>_`
             // prompt glyph for Shell (it configures the prompt's
@@ -726,28 +726,43 @@ impl Tty7App {
             .child(nav_item(
                 "Terminal",
                 SettingsSection::Terminal,
-                IconName::Settings2,
+                Icon::new(IconName::Settings2),
             ))
             .child(nav_item(
                 "Shell",
                 SettingsSection::Shell,
-                IconName::SquareTerminal,
+                Icon::new(IconName::SquareTerminal),
             ))
-            .child(nav_item("SSH", SettingsSection::Ssh, IconName::Globe))
-            .child(nav_item("Agents", SettingsSection::Agents, IconName::Bot))
+            .child(nav_item(
+                "SSH",
+                SettingsSection::Ssh,
+                Icon::new(IconName::Globe),
+            ))
+            .child(nav_item(
+                "Agents",
+                SettingsSection::Agents,
+                Icon::new(IconName::Bot),
+            ))
             .child(nav_item(
                 "Window & Tabs",
                 SettingsSection::WindowTabs,
-                IconName::WindowRestore,
+                Icon::new(IconName::WindowRestore),
             ))
             // The icon set ships no keyboard glyph; CaseSensitive ("Aa")
             // is the closest key-ish cue available.
             .child(nav_item(
                 "Keybindings",
                 SettingsSection::Keybindings,
-                IconName::CaseSensitive,
+                Icon::new(IconName::CaseSensitive),
             ))
-            .child(nav_item("About", SettingsSection::About, IconName::Info));
+            // Not `IconName::Info`: `icons/info.svg` is overridden app-wide with
+            // the detail panel's "panel with two lines" glyph, which reads as a
+            // document, not as *About*. This row keeps the circled `i`.
+            .child(nav_item(
+                "About",
+                SettingsSection::About,
+                Icon::empty().path("icons/circle-info.svg"),
+            ));
 
         let sidebar = Sidebar::new("settings-sidebar")
             .collapsible(SidebarCollapsible::None)
@@ -784,7 +799,15 @@ impl Tty7App {
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(Icon::new(IconName::Search).small().text_color(header_muted))
+                            // Stock magnifier, not tty7's: this page's glyphs run at
+                            // 16px, where the detail panel's redraw reads thin and
+                            // its handle stubby. See `assets::STOCK_PREFIX`.
+                            .child(
+                                Icon::empty()
+                                    .path("stock/icons/search.svg")
+                                    .small()
+                                    .text_color(header_muted),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -1695,7 +1718,11 @@ impl Tty7App {
                             })
                             .child(
                                 Button::new(("ssh-prof-menu", row_idx))
-                                    .icon(IconName::Ellipsis)
+                                    // Stock `⋯`, not tty7's: the redraw's filled
+                                    // `r=2` dots are weighted for the title bar's
+                                    // 18px tiles and smear into three blobs at the
+                                    // 16px `small()` uses. See `assets::STOCK_PREFIX`.
+                                    .icon(Icon::empty().path("stock/icons/ellipsis.svg"))
                                     .ghost()
                                     .small()
                                     .dropdown_menu_with_anchor(
@@ -3618,7 +3645,13 @@ impl Tty7App {
             div().w(px(268.)).child(
                 Input::new(&search)
                     .small()
-                    .prefix(Icon::new(IconName::Search).small().text_color(muted_fg)),
+                    // Stock magnifier — same reason as the page header's.
+                    .prefix(
+                        Icon::empty()
+                            .path("stock/icons/search.svg")
+                            .small()
+                            .text_color(muted_fg),
+                    ),
             ),
         );
 

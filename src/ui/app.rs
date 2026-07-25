@@ -386,9 +386,13 @@ pub(crate) struct WorkspaceRename {
 }
 
 pub(crate) struct LoopbackForwardPanelState {
-    pub(crate) open_pane_id: Option<u64>,
+    /// The pane whose add/edit form is expanded under the Info tab's Forwards
+    /// band, or `None` while the band is just its list. Per-pane rather than a
+    /// bare flag so switching panes with a form open doesn't offer the new pane
+    /// a form half-filled with the old one's values.
+    pub(crate) form_pane_id: Option<u64>,
     /// The unified forwards list (Local/Remote/Dynamic, including auto localhost
-    /// forwards) for the open native-SSH pane (WS4).
+    /// forwards) for the pane the Info tab is showing (WS4).
     pub(crate) managed: Vec<crate::daemon::protocol::ManagedForward>,
     /// Add-forward form state (native-SSH panes only).
     pub(crate) mf_kind: crate::daemon::protocol::SshForwardKind,
@@ -855,7 +859,7 @@ impl Tty7App {
             home_focus: cx.focus_handle(),
             detected_shells: Vec::new(),
             loopback_panel: LoopbackForwardPanelState {
-                open_pane_id: None,
+                form_pane_id: None,
                 managed: Vec::new(),
                 mf_kind: crate::daemon::protocol::SshForwardKind::Local,
                 mf_bind_host,
@@ -2161,6 +2165,10 @@ impl Tty7App {
             let _ = crate::terminal::RemoteTerminal::remove_forward(pane_id, old_id);
         }
         self.loopback_panel.managed = crate::terminal::RemoteTerminal::add_forward(pane_id, rule);
+        // The new row *is* the confirmation, so the form folds away rather than
+        // sitting there re-inviting an add nobody asked for. (Only on the success
+        // path — every validation failure above returns early with it still open.)
+        self.loopback_panel.form_pane_id = None;
         // Reset the value-carrying fields; keep bind host default.
         for input in [
             &self.loopback_panel.mf_bind_port,
@@ -2183,6 +2191,9 @@ impl Tty7App {
     ) {
         self.loopback_panel.mf_kind = forward.kind;
         self.loopback_panel.mf_editing = Some(forward.id);
+        // Clicking a row is the only way in, and the form is where the values
+        // land — so expand it on the row's own pane.
+        self.loopback_panel.form_pane_id = Some(forward.pane_id);
         let target_port = if forward.target_port == 0 {
             String::new()
         } else {
@@ -2243,20 +2254,50 @@ impl Tty7App {
         cx.notify();
     }
 
-    pub(crate) fn toggle_loopback_forward_panel(&mut self, pane_id: u64, cx: &mut Context<Self>) {
-        let should_open = self.loopback_panel.open_pane_id != Some(pane_id);
-        if should_open {
-            self.loopback_panel.open_pane_id = Some(pane_id);
-            self.refresh_managed_forwards(pane_id, cx);
-        } else {
-            self.loopback_panel.open_pane_id = None;
+    /// `ShowSshForwards` / the palette's "SSH: Port Forwarding": land on the
+    /// pane's forwards wherever you were. The band lives on the Info tab, so this
+    /// opens the panel there and expands the add form — the one entry point that
+    /// works with the panel closed, which is why it exists at all.
+    ///
+    /// A no-op on anything but a connected native-SSH pane: without a connection
+    /// there is nothing to forward over, and opening an empty form on a local
+    /// shell would only be a puzzle.
+    pub(crate) fn show_ssh_forwards(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pane_id, _)) = self.active_connected_native_ssh_pane(window, cx) else {
+            return;
+        };
+        self.set_right_panel_tab(crate::core::config::RightPanelTab::Info, cx);
+        if self.loopback_panel.form_pane_id != Some(pane_id) {
+            self.toggle_managed_forward_form(pane_id, window, cx);
         }
-        cx.notify();
     }
 
-    pub(crate) fn close_loopback_forward_panel(&mut self, cx: &mut Context<Self>) {
-        self.loopback_panel.open_pane_id = None;
-        cx.notify();
+    /// The Forwards band's `+`: expand the add form for `pane_id`, or collapse it
+    /// if it's already this pane's. Collapsing goes through the same reset as
+    /// Cancel, so a form abandoned mid-edit can't come back still in edit mode.
+    pub(crate) fn toggle_managed_forward_form(
+        &mut self,
+        pane_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.loopback_panel.form_pane_id == Some(pane_id) {
+            self.close_managed_forward_form(window, cx);
+            return;
+        }
+        self.loopback_panel.form_pane_id = Some(pane_id);
+        self.cancel_managed_forward_edit(window, cx);
+        self.refresh_managed_forwards(pane_id, cx);
+    }
+
+    /// Collapse the add/edit form, clearing it back to the add defaults.
+    pub(crate) fn close_managed_forward_form(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.loopback_panel.form_pane_id = None;
+        self.cancel_managed_forward_edit(window, cx);
     }
 
     /// Route a typed "SSH: Add Connection…" line to the native engine (PRD §3.1/
@@ -3561,6 +3602,7 @@ impl Tty7App {
             OpenSettings => self.toggle_settings(window, cx),
             RestartDaemon => self.restart_daemon(window, cx),
             ToggleSftp => self.toggle_sftp(window, cx),
+            ShowSshForwards => self.show_ssh_forwards(window, cx),
             ToggleCodePanel => self.toggle_code_panel(window, cx),
             RestartSshSession => self.restart_ssh_session(window, cx),
             SetTheme(i) => {
@@ -4880,21 +4922,6 @@ impl Render for Tty7App {
         let rail = vertical && !self.sidebar_collapsed;
         let strip = self.tab_strip(!vertical, window, cx);
         let sidebar = rail.then(|| self.tab_sidebar(window, cx));
-        // Gate the pane action buttons (tunnel / SFTP) + their panels to a
-        // connected native-SSH pane; a foreground `ssh` or a still-connecting
-        // session shows only the top-left status strip, no action buttons.
-        let active_ssh_pane = self.active_connected_native_ssh_pane(window, cx);
-        // The Cmd+F find bar pins to the same top-right slot as these action
-        // buttons and, being deep inside the pane tree, paints *under* them
-        // (gpui stacks by child order, and this overlay is a later sibling of
-        // `body`). Give the find bar that slot: while it's open on the focused
-        // pane, suppress the tunnel/SFTP icons so they don't bleed through.
-        let search_open = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.pane.focused_or_first(window, cx))
-            .map(|leaf| leaf.read(cx).search.is_some())
-            .unwrap_or(false);
         // Native-SSH status strip / reconnect notice for the focused pane (E1/E4).
         let ssh_status = self
             .tabs
@@ -4945,22 +4972,12 @@ impl Render for Tty7App {
             .relative()
             .overflow_hidden()
             .child(body)
-            // Pane-contextual tunnel / SFTP action buttons, pinned top-right of
-            // the terminal area when the active pane is a connected native SSH
-            // session (the tunnel button also drives the forwards panel).
-            .when_some(active_ssh_pane, |this, (pane_id, remote)| {
-                // Hide the top-right tunnel/SFTP icons while the find bar owns
-                // that slot; the bottom-docked SFTP panel is unaffected.
-                this.when(!search_open, |this| {
-                    this.child(self.render_loopback_forward_overlay(pane_id, &remote, cx))
-                })
-                // Pane-contextual SFTP panel (WS5), docked right when open for
-                // this (native-SSH) pane.
-                .when_some(
-                    self.render_sftp_overlay(pane_id, &remote, window, cx),
-                    |this, panel| this.child(panel),
-                )
-            })
+            // Nothing of the SSH tooling floats over the terminal any more: port
+            // forwarding is a band on the detail panel's Info tab, the remote file
+            // browser is its Files tab, and transfers are the panel's footer. That
+            // also gives the ⌘F find bar the top-right slot back — it used to have
+            // to fight the tunnel/SFTP icons for it.
+            //
             // In-pane native-SSH auth / host-key sheet (WS3), shown over the pane
             // that raised the prompt.
             .when_some(self.render_ssh_prompt_overlay(window, cx), |this, el| {
@@ -5309,6 +5326,9 @@ impl Render for Tty7App {
                 cx.listener(|this, _: &RestartDaemon, window, cx| this.restart_daemon(window, cx)),
             )
             .on_action(cx.listener(|this, _: &ToggleSftp, window, cx| this.toggle_sftp(window, cx)))
+            .on_action(cx.listener(|this, _: &ShowSshForwards, window, cx| {
+                this.show_ssh_forwards(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleCodePanel, window, cx| {
                 this.toggle_code_panel(window, cx)
             }))

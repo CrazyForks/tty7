@@ -25,7 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sidebar and right-panel visibility are per-window** — toggling one
   window's chrome leaves the others alone. The config value is now what a
   *newly opened* window starts with; panel width stays shared.
-
 - **Daemon wire protocol is now v2** — WSL panes carry a remote-context kind
   that a v1 client can't decode, so it would drop the pane's connection
   instead of ignoring the unknown value. The version handshake now sees that

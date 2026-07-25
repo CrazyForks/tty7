@@ -2,17 +2,20 @@
 //!
 //! Settings owns persistent preferences; this module owns the live forwarding
 //! dashboard that only makes sense beside a concrete SSH pane.
+//!
+//! The dashboard is a **band in the detail panel's Info tab**, not a popover over
+//! the terminal: a pane's forwards are one of its facts, so they belong beside its
+//! cwd, processes and ports rather than in a floating panel of their own. The
+//! rendering helpers here are called from `right_panel`'s Info body.
 
-use gpui::{AnyElement, Context, Div, Entity, FontWeight, div, prelude::*, px};
-use gpui_component::Selectable as _;
-use gpui_component::badge::Badge;
+use gpui::{AnyElement, Context, Div, Entity, FontWeight, Stateful, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
-use gpui_component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
-use crate::daemon::protocol::{ForwardStatus, ManagedForward, RemoteContext, SshForwardKind};
+use crate::daemon::protocol::{ForwardStatus, ManagedForward, SshForwardKind};
 use crate::terminal::view::TerminalView;
-use crate::ui::app::Tty7App;
+use crate::ui::app::{CONTENT_INSET, Tty7App};
 
 impl Tty7App {
     /// The in-pane native-SSH notice (PRD FR-E4): a dead pane shows a
@@ -154,148 +157,39 @@ impl Tty7App {
         )
     }
 
-    /// Pane-contextual action buttons for a connected native-SSH pane, pinned
-    /// top-right of the terminal body: a **tunnel** icon that toggles the port
-    /// forwarding panel and an **SFTP** icon that toggles the file browser. The
-    /// panels themselves are unchanged; these are just discoverable entry points
-    /// beside the top-left ` SSH ` status strip (status vs. actions). The tunnel
-    /// icon carries a small count badge when one or more forwards are active.
+    /// The Info tab's **Forwards** band: what this pane routes across its
+    /// connection, sitting under Ports, which says what it listens on locally.
+    /// `None` for anything but a connected native-SSH pane — the band doesn't
+    /// exist rather than showing an empty section on every local shell.
     ///
-    /// The caller gates this to a connected native pane (see `app.rs` render), so
-    /// the buttons never appear for a plain foreground `ssh` or a still-connecting
-    /// session.
-    pub(crate) fn render_loopback_forward_overlay(
+    /// The rows are the daemon's list, re-fetched on the Info tab's own poll (see
+    /// `right_panel::sync_procs`), so a forward that dies out from under us turns
+    /// red here without anyone clicking anything.
+    pub(crate) fn forwards_section(
         &self,
-        pane_id: u64,
-        remote: &RemoteContext,
+        pane_id: Option<u64>,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let foreground = cx.theme().foreground;
-        let active_count = self
-            .loopback_panel
-            .managed
-            .iter()
-            .filter(|m| m.pane_id == pane_id)
-            .count();
-        let panel_open = self.loopback_panel.open_pane_id == Some(pane_id);
-        let sftp_open = self.sftp_panel.open_pane_id == Some(pane_id);
+    ) -> Option<AnyElement> {
+        let pane_id = pane_id?;
+        let open = self.loopback_panel.form_pane_id == Some(pane_id);
+        // The `+` toggles the add form open. It's the band's only control, so it
+        // takes the header's trailing slot rather than a row of its own.
+        let add = crate::ui::tab_strip::chrome_tile(
+            Button::new(("ssh-forward-add-toggle", pane_id))
+                .icon(Icon::empty().path("icons/plus.svg").size(px(13.))),
+            open,
+            cx,
+        )
+        .xsmall()
+        .w(px(24.))
+        .h(px(24.))
+        .rounded_md()
+        .tooltip(if open { "Cancel" } else { "Add forward" })
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.toggle_managed_forward_form(pane_id, window, cx)
+        }))
+        .into_any_element();
 
-        // Tunnel (port forwarding). ExternalLink is the closest network/arrows
-        // glyph the icon set ships — it reads as "traffic forwarded out".
-        let tunnel_button = Button::new(("ssh-forward-icon", pane_id))
-            .icon(IconName::ExternalLink)
-            .ghost()
-            .small()
-            .selected(panel_open)
-            .tooltip("Port forwarding")
-            .on_click(cx.listener(move |this, _, _window, cx| {
-                this.toggle_loopback_forward_panel(pane_id, cx)
-            }));
-        // A tiny count badge when ≥1 forward is active; the bare icon otherwise.
-        let tunnel: AnyElement = if active_count > 0 {
-            Badge::new()
-                .count(active_count)
-                .child(tunnel_button)
-                .into_any_element()
-        } else {
-            tunnel_button.into_any_element()
-        };
-
-        // SFTP (file browser). Folder is the natural glyph.
-        let sftp_button = Button::new(("ssh-sftp-icon", pane_id))
-            .icon(IconName::Folder)
-            .ghost()
-            .small()
-            .selected(sftp_open)
-            .tooltip("SFTP")
-            .on_click(cx.listener(move |this, _, window, cx| this.toggle_sftp(window, cx)));
-
-        div()
-            .absolute()
-            .top_2()
-            .right_4()
-            .flex()
-            .flex_col()
-            .items_end()
-            .gap_2()
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(tunnel)
-                    .child(sftp_button),
-            )
-            .when(panel_open, |this| {
-                this.child(self.render_loopback_forward_panel(pane_id, remote, cx))
-            })
-            .text_color(foreground)
-            .into_any_element()
-    }
-
-    /// The port-forwarding panel: a single unified forwards list plus one L/R/D add
-    /// form (Tabby-like). Auto forwards created by Cmd-clicking a `localhost:PORT`
-    /// link (FR-F4) arrive as plain Local rows in this same list.
-    fn render_loopback_forward_panel(
-        &self,
-        pane_id: u64,
-        remote: &RemoteContext,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let popover = cx.theme().popover;
-        let border = cx.theme().border;
-        let foreground = cx.theme().foreground;
-        let muted_foreground = cx.theme().muted_foreground;
-        let close = Button::new(("ssh-forward-panel-close", pane_id))
-            .icon(IconName::Close)
-            .ghost()
-            .small()
-            .tooltip("Close")
-            .on_click(cx.listener(|this, _, _w, cx| this.close_loopback_forward_panel(cx)));
-
-        v_flex()
-            .w(px(460.))
-            .max_h(px(560.))
-            .gap_3()
-            .p_3()
-            .overflow_hidden()
-            .bg(popover)
-            .border_1()
-            .border_color(border)
-            .rounded_lg()
-            .shadow_lg()
-            .child(
-                h_flex()
-                    .items_start()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(foreground)
-                                    .child("SSH forwards"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted_foreground)
-                                    .child(remote.target.clone()),
-                            ),
-                    )
-                    .child(close),
-            )
-            .child(self.render_managed_forwards_section(pane_id, cx))
-    }
-
-    /// The single port-forwarding section for a native-SSH pane: an add form with a
-    /// Local/Remote/Dynamic kind selector and the live forward rows (including the
-    /// auto localhost-link forwards, which read as Local rows).
-    fn render_managed_forwards_section(&self, pane_id: u64, cx: &mut Context<Self>) -> Div {
-        let foreground = cx.theme().foreground;
-        let muted_foreground = cx.theme().muted_foreground;
         let managed: Vec<ManagedForward> = self
             .loopback_panel
             .managed
@@ -304,35 +198,163 @@ impl Tty7App {
             .cloned()
             .collect();
 
-        let body = if managed.is_empty() {
-            v_flex().child(
-                div()
-                    .text_sm()
-                    .text_color(muted_foreground)
-                    .child("No forwards yet."),
-            )
-        } else {
-            let mut list = v_flex().gap_2();
-            for forward in &managed {
-                list = list.child(self.render_managed_forward_row(forward, cx));
-            }
-            list
-        };
+        let mono = cx.theme().mono_font_family.clone();
+        // Rows inset themselves rather than the list, so the hover capsule bleeds
+        // into the same 12px gutter the Changes rows use.
+        let mut list = v_flex().px(px(CONTENT_INSET - 4.)).py(px(2.)).gap(px(1.));
+        for forward in &managed {
+            list = list.child(self.forward_row(forward, &mono, cx));
+        }
 
-        v_flex()
-            .gap_2()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(foreground)
-                    .child("Port forwarding"),
-            )
-            .child(self.render_managed_forward_form(pane_id, cx))
-            .child(body)
+        Some(
+            v_flex()
+                .child(self.panel_subtitle("Forwards", true, Some(add), cx))
+                // The empty line is suppressed while the form is open: the form
+                // *is* the answer to "nothing here yet".
+                .when(managed.is_empty() && !open, |this| {
+                    this.child(
+                        div()
+                            .px(px(CONTENT_INSET))
+                            .py(px(2.))
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("None."),
+                    )
+                })
+                .when(!managed.is_empty(), |this| this.child(list))
+                .when(open, |this| this.child(self.forward_form(pane_id, cx)))
+                .into_any_element(),
+        )
     }
 
-    fn render_managed_forward_form(&self, pane_id: u64, cx: &mut Context<Self>) -> Div {
+    /// One forward, in the Info list's language: a mono kind letter, the bound
+    /// port as the same chip a listening port gets, and the destination trailing
+    /// it. Click to load it into the form (edit = re-establish); the `×` revealed
+    /// on hover tears it down. A description, where one was typed, takes a second
+    /// muted line — the only thing on the row that isn't derivable from the rule.
+    fn forward_row(
+        &self,
+        forward: &ManagedForward,
+        mono: &gpui::SharedString,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let letter = match forward.kind {
+            SshForwardKind::Local => "L",
+            SshForwardKind::Remote => "R",
+            SshForwardKind::Dynamic => "D",
+        };
+        let errored = matches!(forward.status, ForwardStatus::Error(_));
+        // A bind host worth naming is one that isn't the loopback default —
+        // `0.0.0.0` means "reachable from the network", which the row must not
+        // hide behind a bare port number.
+        let bind = if matches!(forward.bind_host.as_str(), "127.0.0.1" | "localhost" | "") {
+            forward.bind_port.to_string()
+        } else {
+            format!("{}:{}", forward.bind_host, forward.bind_port)
+        };
+        // The tail carries the error where there is one: an error is what you
+        // need to read, and the destination is still on the row you clicked from.
+        let tail = match &forward.status {
+            ForwardStatus::Error(msg) => msg.clone(),
+            ForwardStatus::Listening => match forward.kind {
+                SshForwardKind::Dynamic => "SOCKS".to_string(),
+                _ => format!("→ {}:{}", forward.target_host, forward.target_port),
+            },
+        };
+        let pane_id = forward.pane_id;
+        let forward_id = forward.id;
+        let forward_for_edit = forward.clone();
+        let group = gpui::SharedString::from(format!("panel-forward-{forward_id}"));
+
+        h_flex()
+            .id(("panel-forward", forward_id as usize))
+            .group(group.clone())
+            .items_center()
+            .gap(px(8.))
+            .px(px(4.))
+            .py(px(3.))
+            .rounded(px(5.))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.sidebar_accent.opacity(0.55)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.edit_managed_forward(forward_for_edit.clone(), window, cx)
+            }))
+            .child(crate::ui::right_panel::git_badge(
+                letter,
+                if errored { theme.danger } else { muted },
+                mono,
+            ))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(1.))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(crate::ui::right_panel::info_chip(
+                                &bind,
+                                theme.accent,
+                                theme.foreground,
+                                mono,
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .font_family(mono.clone())
+                                    .text_color(if errored { theme.danger } else { muted })
+                                    .child(tail),
+                            ),
+                    )
+                    .when_some(forward.description.clone(), |this, desc| {
+                        this.child(
+                            div()
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(muted)
+                                .child(desc),
+                        )
+                    }),
+            )
+            .child(
+                // Revealed on row hover — the same progressive disclosure the
+                // sidebar's rows use, so a list of forwards stays a list.
+                div()
+                    .flex_shrink_0()
+                    .opacity(0.)
+                    .group_hover(group, |s| s.opacity(1.))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        crate::ui::tab_strip::chrome_tile(
+                            Button::new(("panel-forward-del", forward_id as usize))
+                                .icon(IconName::Close)
+                                .xsmall(),
+                            false,
+                            cx,
+                        )
+                        .w(px(18.))
+                        .h(px(18.))
+                        .rounded(px(4.))
+                        .tooltip("Remove")
+                        .on_click(cx.listener(
+                            move |this, _, _window, cx| {
+                                this.remove_managed_forward(pane_id, forward_id, cx)
+                            },
+                        )),
+                    ),
+            )
+    }
+
+    /// The add/edit form, inline under the band. The 460px three-column layout the
+    /// old popover used doesn't survive a 260px column, so the fields stack: kind,
+    /// then one line each for bind and target, each `host : port`.
+    fn forward_form(&self, pane_id: u64, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let kind = self.loopback_panel.mf_kind;
@@ -342,28 +364,35 @@ impl Tty7App {
             SshForwardKind::Remote => 1,
             SshForwardKind::Dynamic => 2,
         };
-        // Dynamic (SOCKS) forwards have no fixed target — grey the target inputs.
+        // Dynamic (SOCKS) forwards have no fixed target — grey the target line.
         let needs_target = kind != SshForwardKind::Dynamic;
 
-        let bind_host = div()
-            .w(px(150.))
-            .child(Input::new(&self.loopback_panel.mf_bind_host).small());
-        let bind_port = div()
-            .w(px(80.))
-            .child(Input::new(&self.loopback_panel.mf_bind_port).small());
-        let target_host = div()
-            .w(px(150.))
-            .child(Input::new(&self.loopback_panel.mf_target_host).small());
-        let target_port = div()
-            .w(px(80.))
-            .child(Input::new(&self.loopback_panel.mf_target_port).small());
-        let description = div()
-            .w_full()
-            .child(Input::new(&self.loopback_panel.mf_description).small());
+        // `host : port` on one line, the port sized to four digits and the host
+        // taking what's left.
+        let pair = |label: &'static str,
+                    host: &Entity<gpui_component::input::InputState>,
+                    port: &Entity<gpui_component::input::InputState>| {
+            h_flex()
+                .items_center()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(30.))
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child(label),
+                )
+                .child(div().flex_1().min_w_0().child(Input::new(host).xsmall()))
+                .child(div().text_size(px(11.)).text_color(muted).child(":"))
+                .child(div().w(px(52.)).child(Input::new(port).xsmall()))
+        };
 
         v_flex()
-            .gap_2()
-            .py_1()
+            .px(px(CONTENT_INSET))
+            .pt(px(6.))
+            .pb(px(2.))
+            .gap(px(5.))
             .child(self.segmented(
                 "ssh-managed-forward-kind",
                 &["Local", "Remote", "Dynamic"],
@@ -378,133 +407,44 @@ impl Tty7App {
                     this.set_managed_forward_kind(kind, cx);
                 },
             ))
+            .child(pair(
+                "bind",
+                &self.loopback_panel.mf_bind_host,
+                &self.loopback_panel.mf_bind_port,
+            ))
             .child(
-                h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(div().w(px(48.)).text_xs().text_color(muted).child("bind"))
-                    .child(bind_host)
-                    .child(div().text_sm().text_color(muted).child(":"))
-                    .child(bind_port),
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_1()
+                div()
                     .opacity(if needs_target { 1.0 } else { 0.4 })
-                    .child(
-                        div()
-                            .w(px(48.))
-                            .text_xs()
-                            .text_color(muted)
-                            .child(if needs_target { "target" } else { "SOCKS" }),
-                    )
-                    .child(target_host)
-                    .child(div().text_sm().text_color(muted).child(":"))
-                    .child(target_port),
+                    .child(pair(
+                        if needs_target { "to" } else { "SOCKS" },
+                        &self.loopback_panel.mf_target_host,
+                        &self.loopback_panel.mf_target_port,
+                    )),
             )
+            .child(Input::new(&self.loopback_panel.mf_description).xsmall())
             .child(
                 h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(description)
-                    .when(editing, |row| {
-                        row.child(
-                            Button::new(("ssh-managed-forward-cancel", pane_id))
-                                .label("Cancel")
-                                .small()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.cancel_managed_forward_edit(window, cx)
-                                })),
-                        )
-                    })
+                    .justify_end()
+                    .gap(px(4.))
+                    .pt(px(1.))
+                    .child(
+                        Button::new(("ssh-managed-forward-cancel", pane_id))
+                            .label("Cancel")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_managed_forward_form(window, cx)
+                            })),
+                    )
                     .child(
                         Button::new(("ssh-managed-forward-add", pane_id))
                             .label(if editing { "Save" } else { "Add" })
-                            .small()
                             .primary()
+                            .xsmall()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.add_managed_forward(pane_id, window, cx)
                             })),
                     ),
-            )
-    }
-
-    fn render_managed_forward_row(&self, forward: &ManagedForward, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        let (badge, badge_color) = match forward.kind {
-            SshForwardKind::Local => ("L", theme.info),
-            SshForwardKind::Remote => ("R", theme.warning),
-            SshForwardKind::Dynamic => ("D", theme.success),
-        };
-        let bind = format!("{}:{}", forward.bind_host, forward.bind_port);
-        let flow = if forward.kind == SshForwardKind::Dynamic {
-            format!("{bind}  (SOCKS)")
-        } else {
-            format!("{bind} -> {}:{}", forward.target_host, forward.target_port)
-        };
-        let (status_text, status_color) = match &forward.status {
-            ForwardStatus::Listening => ("listening".to_string(), theme.success),
-            ForwardStatus::Error(msg) => (format!("error: {msg}"), theme.danger),
-        };
-        let pane_id = forward.pane_id;
-        let forward_id = forward.id;
-        let forward_for_edit = forward.clone();
-
-        h_flex()
-            .items_center()
-            .gap_3()
-            .px_3()
-            .py_2()
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(20.))
-                    .h(px(20.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .bg(badge_color.opacity(0.15))
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(badge_color)
-                    .child(badge),
-            )
-            .child(
-                v_flex()
-                    .gap_0p5()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().text_sm().text_color(theme.foreground).child(flow))
-                    .when_some(forward.description.clone(), |el, desc| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(desc),
-                        )
-                    })
-                    .child(div().text_xs().text_color(status_color).child(status_text)),
-            )
-            .child(
-                Button::new(("ssh-managed-forward-edit", forward_id as usize))
-                    .label("Edit")
-                    .small()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.edit_managed_forward(forward_for_edit.clone(), window, cx)
-                    })),
-            )
-            .child(
-                Button::new(("ssh-managed-forward-del", forward_id as usize))
-                    .label("Delete")
-                    .small()
-                    .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.remove_managed_forward(pane_id, forward_id, cx)
-                    })),
             )
     }
 }

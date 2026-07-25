@@ -347,7 +347,7 @@ pub struct SftpEntry {
 }
 
 /// A metadata / namespace operation on the remote filesystem. Recursive delete
-/// (`RemoveDir`) recurses daemon-side. `Stat`/`Readlink` return data in the
+/// (`RemoveDir`) recurses daemon-side. `Stat`/`Readlink`/`Realpath` return data in the
 /// [`SftpOpResult`]; the rest just succeed or fail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -381,6 +381,16 @@ pub enum SftpOp {
     },
     /// Read a symlink's target path (returned as [`SftpOpResult::Link`]).
     Readlink {
+        path: String,
+    },
+    /// Resolve `path` against the SFTP session's own working directory and return
+    /// it absolute (SFTP's REALPATH), as [`SftpOpResult::Link`].
+    ///
+    /// Exists for one job: `Realpath { path: "." }` is how the browser learns the
+    /// login directory. A remote shell only reports its cwd if tty7's shell
+    /// integration is installed over there, which on a host you just connected to
+    /// it usually isn't — and `/` is a poor place to open a file browser.
+    Realpath {
         path: String,
     },
 }
@@ -1569,6 +1579,10 @@ mod tests {
                 op: SftpOp::Readlink {
                     path: "/link".into(),
                 },
+            },
+            ClientMsg::SftpOp {
+                pane_id: 4,
+                op: SftpOp::Realpath { path: ".".into() },
             },
             ClientMsg::SftpTransferStart(SftpTransferSpec {
                 pane_id: 4,
