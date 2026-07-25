@@ -66,6 +66,12 @@ pub(crate) struct RightPanelState {
     /// generation no longer matches drops its result and stops rescheduling, so the
     /// freshly started loop for the new pane is the only one left running.
     pub(crate) procs_gen: u64,
+    /// Whether the current pane also wants its SSH forwards re-listed on the
+    /// procs tick. Kept here rather than only captured by the running loop
+    /// because it can flip *without* a pane switch — a native-SSH pane you are
+    /// already watching finishes connecting — and the loop reads this on each
+    /// reschedule so it picks the change up on the next tick.
+    pub(crate) procs_forwards: bool,
 }
 
 /// How often the Info tab re-queries processes and ports while it's open. Fast
@@ -113,7 +119,26 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.right_panel_open(cx) {
+        let panel_open = self.right_panel_open(cx);
+        // The remote browser follows the detail pane on *every* paint, not only
+        // while Files is on screen. Opening it is the Files tab's job (no point
+        // listing a directory nobody asked to see), but retiring it can't be:
+        // the transfers footer below is pane-scoped and rides under all four
+        // tabs, so a pane switch made from Info has to drop the old pane's
+        // browser too — otherwise the footer would report a transfer belonging
+        // to a pane you're no longer looking at.
+        //
+        // This runs *before* the closed-panel bail, and treats a closed panel as
+        // "not looking at that pane": the browser owns a 500ms transfer poll that
+        // only ends when the browser does, so leaving it open behind a closed
+        // panel would keep a daemon round-trip (and a full re-render) running
+        // twice a second for a column nobody can see.
+        if let Some(open) = self.sftp_panel.open_pane_id
+            && (!panel_open || self.remote_files_pane(window, cx).map(|(id, _)| id) != Some(open))
+        {
+            self.sftp_close_browser(cx);
+        }
+        if !panel_open {
             return None;
         }
         let width = self.right_panel_px(window, cx);
@@ -192,6 +217,10 @@ impl Tty7App {
                         .child(self.window_chrome(window, cx))
                 })
                 .child(body)
+                // The transfers footer is a sibling of the body, not part of any
+                // tab: an SFTP transfer belongs to the pane, so reading Info or
+                // Changes must not make a running upload vanish.
+                .children(self.sftp_transfers_footer(cx))
                 .child(handle)
                 .into_any_element(),
         )
@@ -300,7 +329,7 @@ impl Tty7App {
     /// label, plus an optional live count trailing it (files, commands, changed
     /// files) so the header states scale at a glance, and an optional control on
     /// the right. The count is the quiet mono tally the sidebar group headers use.
-    fn panel_title(
+    pub(crate) fn panel_title(
         &self,
         text: &str,
         count: Option<String>,
@@ -371,10 +400,16 @@ impl Tty7App {
         .into_any_element()
     }
 
-    /// The Files tab's filter box — the same borderless magnifier + input the tab
-    /// rail uses, so the two panels search the same way. Sits under the header
-    /// rather than in it: it's a full-width control, not a trailing tile.
-    fn files_search(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// A tab's filter box — the same borderless magnifier + input the tab rail
+    /// uses, so everything in the window searches the same way. Sits under the
+    /// header rather than in it: it's a full-width control, not a trailing tile.
+    /// Takes the input so the local tree and the remote browser can each keep
+    /// their own query while sharing the one appearance.
+    pub(crate) fn panel_search(
+        &self,
+        input: &gpui::Entity<gpui_component::input::InputState>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         h_flex()
             .flex_none()
             .items_center()
@@ -390,7 +425,7 @@ impl Tty7App {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(&self.file_search).appearance(false).xsmall()),
+                    .child(Input::new(input).appearance(false).xsmall()),
             )
             .into_any_element()
     }
@@ -436,6 +471,10 @@ impl Tty7App {
         // hang off the cwd, and the two lists get their own sub-headers below.
         let mut cwd_for_actions: Option<PathBuf> = None;
         let mut pane_id: Option<u64> = None;
+        // Set only for a *connected native* SSH pane — the one kind that can carry
+        // forwards. A foreground `ssh` typed into a local shell has no connection
+        // to forward over, and a still-connecting one has nothing to list yet.
+        let mut forwards_pane: Option<u64> = None;
 
         if let Some(tab) = self.tabs.get(self.active) {
             if let Some(leaf) = tab.detail_pane(window, cx) {
@@ -457,6 +496,16 @@ impl Tty7App {
                 if let Some(ssh) = view.ssh_spec() {
                     rows.push(("ssh", ssh.host.clone()));
                 }
+                if view
+                    .remote_context()
+                    .is_some_and(|c| c.kind == crate::daemon::protocol::RemoteKind::NativeSsh)
+                    && matches!(
+                        view.ssh_phase(),
+                        Some(crate::daemon::protocol::SshPhase::Connected)
+                    )
+                {
+                    forwards_pane = Some(view.pane_id);
+                }
             }
             if let Some(git) = tab.git_status(Some(window), cx) {
                 rows.push(("branch", git.branch.clone()));
@@ -477,8 +526,9 @@ impl Tty7App {
         }
 
         // Keep the process/port query pointed at the pane on screen, and keep it
-        // ticking while this tab is the one being looked at.
-        self.sync_procs(pane_id, cx);
+        // ticking while this tab is the one being looked at. The same tick carries
+        // the pane's forwards when it has any to carry.
+        self.sync_procs(pane_id, forwards_pane.is_some(), cx);
 
         let mono = cx.theme().mono_font_family.clone();
         let mut list = v_flex().px(px(CONTENT_INSET)).py(px(2.)).gap(px(3.));
@@ -515,13 +565,17 @@ impl Tty7App {
             // Three labelled bands — Session / Processes / Ports — instead of one
             // flat column, so the pane's facts, what it's running, and what it's
             // listening on read as distinct groups.
-            .child(self.panel_subtitle("Session", false, cx))
+            .child(self.panel_subtitle("Session", false, None, cx))
             .child(list)
             .when_some(cwd_for_actions, |this, cwd| {
                 this.child(self.cwd_actions(cwd, cx))
             })
             .children(self.procs_section(pane_id, cx))
             .children(self.ports_section(pane_id, cx))
+            // Ports says what this pane listens on locally; Forwards says what it
+            // routes across the connection. Same family of fact, so it reads as
+            // the band after it rather than a feature bolted on.
+            .children(self.forwards_section(forwards_pane, cx))
             .into_any_element();
         self.panel_scroll(inner, title)
     }
@@ -581,19 +635,49 @@ impl Tty7App {
     /// A small-caps band label inside a tab's body, for the sub-lists that hang
     /// off the Info tab. Lighter than [`panel_title`], which is the tab's own
     /// header. `divider` draws a hairline above it, so the second and third bands
-    /// separate from the one before; the first band passes `false`.
-    fn panel_subtitle(&self, text: &str, divider: bool, cx: &mut Context<Self>) -> AnyElement {
-        div()
+    /// separate from the one before; the first band passes `false`. `trailing`
+    /// carries a band's own control where it has one — the same slot
+    /// [`panel_title`](Self::panel_title) gives a tab, so a band's `+` sits on its
+    /// label's line instead of earning a row.
+    pub(crate) fn panel_subtitle(
+        &self,
+        text: &str,
+        divider: bool,
+        trailing: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
             .when(divider, |d| {
                 d.mt(px(6.)).border_t_1().border_color(cx.theme().border)
             })
-            .px(px(CONTENT_INSET))
-            .pt(px(if divider { 12. } else { 10. }))
-            .pb(px(4.))
-            .text_size(px(10.5))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(cx.theme().muted_foreground)
-            .child(text.to_uppercase())
+            .items_center()
+            .justify_between()
+            .pl(px(CONTENT_INSET))
+            // A trailing tile aligns on its glyph, not its hit box — same
+            // correction the tab header makes.
+            .pr(px(if trailing.is_some() {
+                CONTENT_INSET - crate::ui::app::TILE_PAD
+            } else {
+                CONTENT_INSET
+            }))
+            // A tile is 24px tall against a ~15px label, so the band's own top
+            // padding would push its glyph off the label's line; give the padding
+            // back as a shorter lead when one is present.
+            .pt(px(match (divider, trailing.is_some()) {
+                (true, false) => 12.,
+                (true, true) => 8.,
+                (false, false) => 10.,
+                (false, true) => 6.,
+            }))
+            .pb(px(if trailing.is_some() { 0. } else { 4. }))
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().muted_foreground)
+                    .child(text.to_uppercase()),
+            )
+            .when_some(trailing, |this, t| this.child(t))
             .into_any_element()
     }
 
@@ -639,7 +723,7 @@ impl Tty7App {
         }
         Some(
             v_flex()
-                .child(self.panel_subtitle("Processes", true, cx))
+                .child(self.panel_subtitle("Processes", true, None, cx))
                 .child(list)
                 .into_any_element(),
         )
@@ -679,7 +763,7 @@ impl Tty7App {
         }
         Some(
             v_flex()
-                .child(self.panel_subtitle("Ports", true, cx))
+                .child(self.panel_subtitle("Ports", true, None, cx))
                 .child(list)
                 .into_any_element(),
         )
@@ -697,13 +781,30 @@ impl Tty7App {
     /// Point the process query at `pane_id` and make sure the poll is running.
     /// Called from the Info tab's render, so the loop starts when the tab is
     /// looked at and dies when it isn't — see [`spawn_procs_query`].
-    fn sync_procs(&mut self, pane_id: Option<u64>, cx: &mut Context<Self>) {
+    ///
+    /// `forwards` asks the same tick to re-list the pane's SSH forwards. It rides
+    /// this loop rather than owning one because it wants the identical lifetime
+    /// (Info on screen, this pane) and because a forward can change state without
+    /// the UI touching it — a remote bind that loses its listener goes to `Error`
+    /// on the daemon, and only a re-list finds out. Off for a non-SSH pane, so a
+    /// local shell doesn't pay for a round-trip that can only answer "none".
+    ///
+    /// It's recorded on the state as well as passed down because it can flip
+    /// while the loop is already running — a pane you're watching on Info
+    /// finishes connecting, and neither the pane id nor the generation changes,
+    /// so nothing would otherwise tell the loop to start asking.
+    fn sync_procs(&mut self, pane_id: Option<u64>, forwards: bool, cx: &mut Context<Self>) {
         let Some(pane_id) = pane_id else { return };
+        self.right_panel.procs_forwards = forwards;
         if self.right_panel.procs_pane != Some(pane_id) {
             self.right_panel.procs_pane = Some(pane_id);
             // Drop the previous pane's answer rather than showing it under the new
             // pane's heading until the first tick lands.
             self.right_panel.procs = None;
+            // Same for the forwards: the list is one pane's, and the rows filter by
+            // pane id anyway, so leaving the old pane's in place would only flash
+            // them under the new pane's band until the tick lands.
+            self.loopback_panel.managed.clear();
             // Retire the old pane's loop and free the guard so the new pane's loop
             // can start below; the retired tick bows out on the generation check.
             self.right_panel.procs_gen += 1;
@@ -712,20 +813,36 @@ impl Tty7App {
         if !self.right_panel.procs_loading {
             self.right_panel.procs_loading = true;
             let generation = self.right_panel.procs_gen;
-            self.spawn_procs_query(pane_id, generation, cx);
+            self.spawn_procs_query(pane_id, generation, forwards, cx);
         }
     }
 
     /// One query, then reschedule — the poll loop. It reschedules only while the
     /// panel is open on Info, so the loop is self-terminating: close the panel or
     /// switch tabs and the next completion simply doesn't queue another.
-    fn spawn_procs_query(&mut self, pane_id: u64, generation: u64, cx: &mut Context<Self>) {
+    fn spawn_procs_query(
+        &mut self,
+        pane_id: u64,
+        generation: u64,
+        forwards: bool,
+        cx: &mut Context<Self>,
+    ) {
         // `procs_loading` is set by the caller (`sync_procs`) and deliberately
         // stays set across the whole cycle, including the timer wait below.
         cx.spawn(async move |this, cx| {
-            let procs = cx
+            // Both round-trips on the one background hop, so the tick costs one
+            // scheduling slot rather than two.
+            let (procs, managed) = cx
                 .background_executor()
-                .spawn(async move { crate::terminal::RemoteTerminal::query_procs(pane_id) })
+                .spawn(async move {
+                    let procs = crate::terminal::RemoteTerminal::query_procs(pane_id);
+                    let managed = if forwards {
+                        crate::terminal::RemoteTerminal::list_forwards(pane_id)
+                    } else {
+                        Vec::new()
+                    };
+                    (procs, managed)
+                })
                 .await;
             let keep_polling = this
                 .update(cx, |app, cx| {
@@ -735,6 +852,9 @@ impl Tty7App {
                         return false;
                     }
                     app.right_panel.procs = Some(procs);
+                    if forwards {
+                        app.loopback_panel.managed = managed;
+                    }
                     cx.notify();
                     let cfg = cx.global::<Config>();
                     let wanted =
@@ -759,7 +879,11 @@ impl Tty7App {
                 let cfg = cx.global::<Config>();
                 let wanted = cfg.right_panel_visible && cfg.right_panel_tab == RightPanelTab::Info;
                 if wanted {
-                    app.spawn_procs_query(pane_id, generation, cx);
+                    // Re-read rather than carrying the flag forward: the pane may
+                    // have finished connecting since this cycle started, which is
+                    // the one way it changes without a pane switch to retire us.
+                    let forwards = app.right_panel.procs_forwards;
+                    app.spawn_procs_query(pane_id, generation, forwards, cx);
                 } else {
                     app.right_panel.procs_loading = false;
                 }
@@ -1098,10 +1222,22 @@ impl Tty7App {
     /// The project tree, reusing the code panel's rows verbatim — same expand
     /// state, same click-to-open, so the panel and the editor overlay are two
     /// views of one tree rather than two trees.
+    /// The Files tab follows the pane: a local pane gets its repository tree, a
+    /// connected native-SSH pane gets that machine's filesystem over SFTP. One tab,
+    /// because "the files this pane is working in" is one idea — where they
+    /// physically live is a property of the pane, not a second feature.
     fn render_panel_files(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let remote = self.remote_files_pane(window, cx);
+        let host = remote.as_ref().map(|(_, host)| host.clone());
+        // Point the browser at this pane, or tear it down when the tab has moved
+        // back to a local one. Returns whether to render the remote mode.
+        if self.sftp_sync_pane(remote.map(|(id, _)| id), window, cx) {
+            return self.render_panel_sftp(host.unwrap_or_default(), window, cx);
+        }
+
         let controls = self.files_controls(cx);
         let title = self.panel_title("Files", None, Some(controls), cx);
-        let search = self.files_search(cx);
+        let search = self.panel_search(&self.file_search.clone(), cx);
         let rows = self.render_file_tree_rows(window, cx);
         v_flex()
             .flex_1()
@@ -1111,12 +1247,33 @@ impl Tty7App {
             .child(rows)
             .into_any_element()
     }
+
+    /// The detail pane and its host name when it's a *connected native* SSH pane —
+    /// the gate for the Files tab's remote mode. A foreground `ssh` typed into a
+    /// local shell has no connection to browse, and a still-connecting one has
+    /// nothing to list, so both keep the local tree.
+    fn remote_files_pane(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(u64, String)> {
+        use crate::daemon::protocol::{RemoteKind, SshPhase};
+        let leaf = self.tabs.get(self.active)?.detail_pane(window, cx)?;
+        let view = leaf.read(cx);
+        let remote = view.remote_context()?;
+        if remote.kind != RemoteKind::NativeSsh
+            || !matches!(view.ssh_phase(), Some(SshPhase::Connected))
+        {
+            return None;
+        }
+        Some((view.pane_id, remote.target))
+    }
 }
 
 /// A small status letter (`M`/`U`/…) for a change row. The *kind* is told by the
 /// glyph in the mono face, not by colour, so the list stays monochrome; callers
 /// pass a muted tone and reserve real hue for the `+N −M` counts beside it.
-fn git_badge(letter: &str, color: gpui::Hsla, mono: &gpui::SharedString) -> AnyElement {
+pub(crate) fn git_badge(letter: &str, color: gpui::Hsla, mono: &gpui::SharedString) -> AnyElement {
     div()
         .flex_none()
         .w(px(14.))
@@ -1131,7 +1288,12 @@ fn git_badge(letter: &str, color: gpui::Hsla, mono: &gpui::SharedString) -> AnyE
 
 /// A pid / port pill: a mono number on the soft-grey capsule the rest of the
 /// chrome uses, so a numeric datum reads as a tag rather than loose text.
-fn info_chip(text: &str, bg: gpui::Hsla, fg: gpui::Hsla, mono: &gpui::SharedString) -> AnyElement {
+pub(crate) fn info_chip(
+    text: &str,
+    bg: gpui::Hsla,
+    fg: gpui::Hsla,
+    mono: &gpui::SharedString,
+) -> AnyElement {
     div()
         .flex_none()
         .px(px(5.))

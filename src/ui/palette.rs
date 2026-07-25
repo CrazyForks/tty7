@@ -60,8 +60,12 @@ pub enum CommandKind {
     ReopenClosedTab,
     OpenSettings,
     RestartDaemon,
-    /// Toggle the SFTP file panel for the focused native-SSH pane (WS5).
+    /// Show the focused native-SSH pane's remote filesystem — the detail
+    /// panel's Files tab, which browses over SFTP for a remote pane (WS5).
     ToggleSftp,
+    /// Show the focused native-SSH pane's forwards in the detail panel's Info
+    /// tab, add form open (WS4).
+    ShowSshForwards,
     /// Toggle the code panel (file tree + editor overlay over the terminal).
     ToggleCodePanel,
     /// Reconnect a dead native-SSH pane in place (WS6, FR-E4).
@@ -153,6 +157,7 @@ impl CommandKind {
             OpenSettings => "OpenSettings",
             RestartDaemon => "RestartDaemon",
             ToggleSftp => "ToggleSftp",
+            ShowSshForwards => "ShowSshForwards",
             ToggleCodePanel => "ToggleCodePanel",
             RestartSshSession => "RestartSshSession",
             SendSelectionToAgent
@@ -253,7 +258,8 @@ impl Command {
             Command::new("SSH: Add Connection…", OpenSshConnectInput),
             Command::new("SSH: Manage Profiles…", OpenSshProfiles),
             Command::new("Reconnect SSH Session", RestartSshSession),
-            Command::new("SFTP Panel", ToggleSftp),
+            Command::new("SSH: Remote Files", ToggleSftp),
+            Command::new("SSH: Port Forwarding", ShowSshForwards),
             Command::new("Code Panel", ToggleCodePanel),
             Command::new("Change Theme…", OpenThemePicker),
             Command::new("Open Settings", OpenSettings),

@@ -136,6 +136,12 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         // about *About*. No upstream `IconName` maps here, so it's referenced by
         // path (see `settings.rs`).
         "icons/circle-info.svg" => include_bytes!("../../assets/icons/circle-info.svg"),
+        // The Files tab's remote (SFTP) mode needs a refresh it doesn't need
+        // locally: the local tree runs a recursive filesystem watcher and
+        // invalidates itself, a remote listing has nothing watching it. Drawn to
+        // the circle rule above (2.7→21.3) so it sits level with the `eye` beside
+        // it rather than lucide's r=9 `rotate-cw`, which reads a step small.
+        "icons/refresh.svg" => include_bytes!("../../assets/icons/refresh.svg"),
         "icons/agents/claude.svg" => include_bytes!("../../assets/icons/agents/claude.svg"),
         "icons/agents/codex.svg" => include_bytes!("../../assets/icons/agents/codex.svg"),
         "icons/agents/gemini.svg" => include_bytes!("../../assets/icons/agents/gemini.svg"),
