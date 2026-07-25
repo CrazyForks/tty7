@@ -11,11 +11,9 @@ mod terminal;
 mod ui;
 
 use crate::core::config::Config;
-use crate::ui::app::Tty7App;
 use crate::ui::assets::Assets;
 use crate::ui::keymap;
 use gpui::*;
-use gpui_component::{Root, TitleBar};
 
 /// Register the bundled Hack monospace faces with gpui's text system so the
 /// default `font_family` ("Hack") renders identically on every machine, with no
@@ -360,6 +358,14 @@ fn main() {
             set_dock_icon_for_bare_binary();
             // Load user config once and stash it as a global for views to read.
             cx.set_global(Config::load());
+            // Read `session.json` (migrating a pre-multi-window file) before any
+            // window is built: windows claim their workspace from this store
+            // rather than each parsing the file themselves. It also dedupes
+            // pane claims here, once, instead of per window.
+            crate::core::session::WorkspaceStore::init(cx);
+            // The window registry has to exist before the first window opens —
+            // `ui::windows::open` registers into it.
+            crate::ui::windows::WindowRegistry::init(cx);
             // Build the theme registry (built-ins + user theme files) before the
             // first window paints its theme.
             crate::ui::presets::load_registry(cx);
@@ -383,70 +389,34 @@ fn main() {
                 .detach();
             keymap::init(cx);
 
-            cx.spawn(async move |cx| {
-                // Open where the user left off: `window.json` holds the geometry from
-                // the last quit (written by the quit hook in `ui::app`), applied only
-                // while `remember_window_size` is on. A remembered window that no
-                // longer touches any display (monitor unplugged, resolution change)
-                // keeps its size but re-centers; with nothing remembered, open at a
-                // roomy default, centred on the primary display (`centered` needs
-                // `&App`, which the async cx hands out via `update`).
-                let remembered = cx
-                    .update(|cx| cx.global::<Config>().remember_window_size)
-                    .then(crate::core::window_state::WindowState::load)
-                    .flatten();
-                let bounds = cx.update(|cx| match remembered {
-                    Some(state) => {
-                        let bounds = state.bounds();
-                        if cx.displays().iter().any(|d| d.bounds().intersects(&bounds)) {
-                            bounds
-                        } else {
-                            Bounds::centered(None, bounds.size, cx)
-                        }
-                    }
-                    None => Bounds::centered(None, size(px(1440.), px(900.)), cx),
-                });
-                // Launch state from config: a normal window, or maximized /
-                // fullscreen. Each variant still carries the bounds above as the
-                // size to restore to when the user un-maximizes / exits fullscreen.
-                let startup_mode = cx.update(|cx| cx.global::<Config>().startup_mode);
-                let window_bounds = match startup_mode {
-                    crate::core::config::StartupMode::Normal => WindowBounds::Windowed(bounds),
-                    crate::core::config::StartupMode::Maximized => WindowBounds::Maximized(bounds),
-                    crate::core::config::StartupMode::Fullscreen => {
-                        WindowBounds::Fullscreen(bounds)
-                    }
-                };
-                let window_background = cx.update(|cx| crate::ui::theme::background_appearance(cx));
-                let options = WindowOptions {
-                    window_bounds: Some(window_bounds),
-                    // Start from the component defaults but nudge the traffic lights
-                    // down so they stay vertically centred in our taller (40px) title
-                    // bar — see `TitleBar::new().h(..)` in `app.rs`. `apply_theme`
-                    // re-pins the same position after appearance changes.
-                    titlebar: Some(TitlebarOptions {
-                        traffic_light_position: Some(crate::ui::theme::traffic_light_position()),
-                        ..TitleBar::title_bar_options()
-                    }),
-                    // Non-opaque from creation: macOS 26 ignores a runtime flip to
-                    // transparent, so the opacity slider only works on a window
-                    // born this way (see `theme::background_appearance`).
-                    window_background,
-                    ..Default::default()
-                };
-
-                cx.open_window(options, |window, cx| {
-                    let app = cx.new(|cx| Tty7App::new(window, cx));
-                    // Root's own background is fully transparent: `Tty7App`'s root
-                    // div is the single owner of the window background (solid /
-                    // gradient / image, with the theme's alpha). A second paint
-                    // here would compound the alpha and read darker than the
-                    // configured opacity.
-                    cx.new(|cx| Root::new(app, window, cx).bg(gpui::transparent_black()))
-                })
-                .expect("failed to open window");
-            })
-            .detach();
+            // Reopen the workspaces that had a window at the last quit, each in
+            // its own window and at its own remembered geometry (`ui::windows`
+            // owns that logic now, since "New Workspace" and the workspace picker
+            // need the identical path). Quitting with every window closed — or a
+            // first run — opens a single window on a fresh workspace.
+            let (reopen, any_saved) = {
+                let store = crate::core::session::WorkspaceStore::all(cx);
+                let reopen: Vec<_> = store.open_workspaces().map(|w| w.id).collect();
+                (reopen, !store.workspaces.is_empty())
+            };
+            // With nothing to reopen, what that one window should hold depends on
+            // whether there is anything to come back to: workspaces the user
+            // detached are listed by the home page's picker, so leave it empty
+            // for them. A genuine first run has no picker to show and no reason
+            // to greet the user with a blank page — it opens a terminal, exactly
+            // as every pre-multi-window build did.
+            let fresh = if any_saved {
+                crate::ui::windows::FreshStart::HomePage
+            } else {
+                crate::ui::windows::FreshStart::Shell
+            };
+            if reopen.is_empty() {
+                crate::ui::windows::open_with(cx, None, fresh);
+            } else {
+                for id in reopen {
+                    crate::ui::windows::open(cx, Some(id));
+                }
+            }
         });
 }
 

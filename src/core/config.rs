@@ -117,23 +117,32 @@ pub struct Config {
     /// the live layout re-clamps it to `[180, window_width/2]`.
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
-    /// Whether the vertical tab sidebar is collapsed out of the layout (only
+    /// Whether the vertical tab sidebar starts collapsed out of the layout (only
     /// meaningful when `tab_bar_position` is `left`). Distinct from
     /// `tab_bar_position`: collapsing hides the rail *without* falling back to
     /// the horizontal title-bar strip, so the terminal gets the full width and
     /// re-expanding restores the same rail. Toggled by `ToggleLeftPanel`.
+    ///
+    /// Like `right_panel_visible` and `right_panel_tab` below, this is the value
+    /// a *newly opened window* starts with, not the live state of any window on
+    /// screen — that lives on [`Tty7App`](crate::ui::app::Tty7App), so toggling
+    /// one window's chrome leaves every other window alone. Each toggle writes
+    /// back here, so a new window inherits the last choice made anywhere.
     #[serde(default)]
     pub sidebar_collapsed: bool,
-    /// Whether the right detail panel (session info / changes / files) is
-    /// docked open. Toggled by `ToggleRightPanel`.
+    /// Whether the right detail panel (session info / changes / files) starts
+    /// docked open. Toggled by `ToggleRightPanel`. Per-window at runtime — see
+    /// `sidebar_collapsed`.
     #[serde(default)]
     pub right_panel_visible: bool,
     /// Width (px) of the right detail panel. Re-clamped by the live layout the
-    /// same way `sidebar_width` is.
+    /// same way `sidebar_width` is. Unlike the two flags around it this stays
+    /// shared: a width is a preference, not a view state, and every window
+    /// tracking the config is what makes a drag in one hold in the next.
     #[serde(default = "default_right_panel_width")]
     pub right_panel_width: f32,
-    /// Which tab the right detail panel last had selected, so reopening it lands
-    /// where it was left.
+    /// Which tab the right detail panel starts on, so reopening it lands where
+    /// it was left. Per-window at runtime — see `sidebar_collapsed`.
     #[serde(default, deserialize_with = "de_lenient")]
     pub right_panel_tab: RightPanelTab,
     /// How the vertical tab sidebar arranges its rows (only meaningful when
@@ -168,6 +177,13 @@ pub struct Config {
     /// second, so toggling it (Settings or a `config.json` edit) applies live.
     #[serde(default = "default_true")]
     pub show_tray_icon: bool,
+    /// Whether the user has already been told, once, that closing a window puts
+    /// its workspace away rather than ending it. ⌘W is muscle memory and the
+    /// result is off-screen, so the first time it happens deserves one line
+    /// pointing at the title bar's workspace menu — and never again. Set to
+    /// `true` by that hint; there is no UI to reset it (nor a reason to).
+    #[serde(default)]
+    pub workspace_detach_hint_seen: bool,
     /// How the terminal bell (BEL / `^G`) is signalled. Defaults to a brief
     /// visual flash (the current behavior).
     #[serde(default, deserialize_with = "de_lenient")]
@@ -530,6 +546,7 @@ impl Default for Config {
             notify_threshold_secs: default_notify_threshold_secs(),
             restore_session: true,
             show_tray_icon: true,
+            workspace_detach_hint_seen: false,
             // Visual flash preserves the pre-config behavior (the bell always
             // flashed); opting into None/Audible is a deliberate change.
             bell: BellMode::Visual,

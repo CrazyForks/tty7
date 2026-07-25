@@ -11,16 +11,21 @@ use gpui_component::select::{SearchableVec, SelectEvent, SelectState};
 use gpui_component::slider::{SliderEvent, SliderState};
 use gpui_component::{ActiveTheme as _, IndexPath, TitleBar, WindowExt as _};
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::core::actions::*;
 use crate::core::config::{
-    Config, CursorStyle as ConfigCursorStyle, NewTabPosition, ShellConfig, TabBarPosition,
+    Config, CursorStyle as ConfigCursorStyle, NewTabPosition, RightPanelTab, ShellConfig,
+    TabBarPosition,
 };
-use crate::core::session::{Session, SessionAxis, SessionPane, SessionTab};
+use crate::core::session::{
+    Session, SessionAxis, SessionPane, SessionTab, WorkspaceId, WorkspaceStore,
+};
 use crate::core::shells::DetectedShell;
 use crate::core::ssh_config;
+use crate::core::window_state::WindowState;
 use crate::daemon::protocol::{RemoteContext, ShellSpec, ssh_option_takes_value};
 use crate::terminal::view::{ChildExited, TerminalView};
 use crate::ui::palette::{Command, CommandKind, PaletteEvent, PaletteView};
@@ -81,20 +86,70 @@ const RECORD_COMMIT_DELAY_MS: u64 = 650;
 /// they all line up (and reach the very top of the window).
 pub(crate) const TITLE_BAR_HEIGHT: f32 = 40.;
 
-/// The chrome tile rhythm: a 30px hit box around a 15px glyph, so the glyph sits
-/// [`TILE_PAD`] inside the box on every edge. Alignment is a property of what you
-/// can *see*, so anything lining a tile up with text or with the window edge
-/// subtracts `TILE_PAD` from the inset it wants — otherwise the invisible hit box
-/// lands on the line and the glyph reads 7.5px short of it.
-pub(crate) const TILE_SIZE: f32 = 30.;
-pub(crate) const TILE_GLYPH: f32 = 15.;
+/// The chrome tile rhythm: a square hit box centred on a glyph, in two sizes —
+/// the chrome's controls (title bar, rail, panel tabs, code header), and the
+/// smaller ones that sit *inside* a panel's body, which have to read as
+/// subordinate to the header above them.
+///
+/// The glyph sizes are nominal — the viewBox, not the mark. What they were
+/// picked to land is ~10.8pt of actual *ink*, measured off a screenshot against
+/// the macOS traffic lights (12pt across) in the same frame. That is a hair under
+/// VS Code / Windsurf, which measure 12pt the same way, and well over the 8.4pt
+/// these tiles drew before [`crate::ui::tab_strip::BUTTON_ICON_SCALE`] — the size
+/// they had been pinned to regardless of what any call site asked for.
+pub(crate) const TILE_SIZE: f32 = 32.;
+pub(crate) const TILE_GLYPH: f32 = 13.;
+pub(crate) const TILE_SIZE_SM: f32 = 24.;
+pub(crate) const TILE_GLYPH_SM: f32 = 11.;
+
+/// Line-art glyphs need a bigger nominal size than framed ones to draw the same
+/// ink: in lucide's 24-unit box `plus` spans 5→19 where `panel-left` spans 3→21,
+/// so at one shared size the "+" reads a fifth smaller than the tile beside it.
+/// Sized off the measured ratios (58% against 72%), not the viewBox arithmetic.
+/// (No `_SM` counterpart: every body-scale tile currently carries a framed mark.)
+pub(crate) const TILE_GLYPH_LINE: f32 = 16.;
+
+/// Distance from a tile's edge to the glyph inside it — what anything lining a
+/// tile up with text or with the window edge subtracts from the inset it wants,
+/// so the *glyph* lands on the line rather than the invisible hit box around it.
+///
+/// Deliberately the nominal gap, not the distance to the glyph's ink. Counting
+/// the transparent margin lucide leaves inside the mark is more accurate about
+/// where the ink is, and useless: it makes `TILE_PAD` bigger than
+/// [`CONTENT_INSET`], which drove [`tile_trailing_inset`] to under a pixel and
+/// left the hover capsule looking sheared off against the window edge. The
+/// capsule is a thing you can see; it can't be pushed off screen to put the
+/// glyph a truer 2px to the right.
 pub(crate) const TILE_PAD: f32 = (TILE_SIZE - TILE_GLYPH) / 2.;
+pub(crate) const TILE_PAD_SM: f32 = (TILE_SIZE_SM - TILE_GLYPH_SM) / 2.;
 
 /// The one content inset the whole window aligns to: the rail's text and icons,
 /// the title bar's chrome glyphs, and the side panels all start (or end) here, so
 /// every vertical edge in the chrome falls on one of two lines rather than the
 /// five slightly different ones each surface used to pick for itself.
 pub(crate) const CONTENT_INSET: f32 = 12.;
+
+/// Smallest gap between a tile's hit box — the capsule its hover and selected
+/// states paint — and the window edge it sits against.
+///
+/// A floor, because the two rules that set that gap disagree once a tile is big
+/// relative to [`CONTENT_INSET`]: aligning the glyph wants the box pushed out by
+/// [`TILE_PAD`], and at `TILE_SIZE` 32 against an inset of 12 that leaves the
+/// capsule flush with the edge, reading as clipped rather than aligned. Where
+/// they conflict the visible thing wins.
+const TILE_EDGE_GAP: f32 = 5.;
+
+/// Trailing inset for a group of tiles that ends on the window's right edge: the
+/// glyph on [`CONTENT_INSET`] where there is room for it, never closer to the
+/// edge than [`TILE_EDGE_GAP`].
+pub(crate) fn tile_trailing_inset() -> f32 {
+    (CONTENT_INSET - TILE_PAD).max(TILE_EDGE_GAP)
+}
+
+/// The same floor for the body-scale tiles inside a panel.
+pub(crate) fn tile_trailing_inset_sm() -> f32 {
+    (CONTENT_INSET - TILE_PAD_SM).max(TILE_EDGE_GAP)
+}
 
 /// What gpui-component's `TitleBar` already insets its content by, to clear the
 /// window controls: 80px on macOS (traffic lights on the left), 12px elsewhere
@@ -105,8 +160,8 @@ pub(crate) const TITLE_BAR_LEAD: f32 = if cfg!(target_os = "macos") { 80. } else
 /// Left offset for the tile group that sits beside the window controls.
 ///
 /// On macOS the thing that can collide with the traffic lights is the tile's
-/// *hit box* — it paints a background on hover and when selected, 7.5px wider
-/// than the glyph on each side — so this aligns the box, not the glyph, and the
+/// *hit box* — it paints a background on hover and when selected, [`TILE_PAD`]
+/// wider than the glyph on each side — so this aligns the box, not the glyph, and the
 /// bar's own 80px lead is already exactly the clearance macOS defines for that.
 /// Hence zero: pulling back into the reserve to "hug" the lights only made the
 /// hover capsule touch them. Off macOS the controls are on the right, nothing is
@@ -116,7 +171,7 @@ pub(crate) fn title_bar_hug_offset() -> f32 {
     if cfg!(target_os = "macos") {
         0.
     } else {
-        CONTENT_INSET - TILE_PAD - TITLE_BAR_LEAD
+        tile_trailing_inset() - TITLE_BAR_LEAD
     }
 }
 
@@ -322,6 +377,14 @@ pub(crate) struct Renaming {
     _subs: Vec<Subscription>,
 }
 
+/// In-flight inline rename of the current workspace (the title-bar chip turns
+/// into a text field). Mirrors [`Renaming`], but keyed to nothing — there is
+/// only ever one current workspace per window.
+pub(crate) struct WorkspaceRename {
+    pub(crate) input: Entity<InputState>,
+    _subs: Vec<Subscription>,
+}
+
 pub(crate) struct LoopbackForwardPanelState {
     /// The pane whose add/edit form is expanded under the Info tab's Forwards
     /// band, or `None` while the band is just its list. Per-pane rather than a
@@ -451,6 +514,19 @@ pub struct Tty7App {
     /// exactly the reason `sidebar_width` is — see there.
     pub(crate) right_panel_width: Rc<Cell<f32>>,
     pub(crate) right_panel_dragging: Rc<Cell<bool>>,
+    /// Which chrome this *window* is showing: is the detail panel docked open,
+    /// which of its tabs is selected, and is the tab rail collapsed.
+    ///
+    /// Window-level rather than `Config`, which is a global: with one window the
+    /// two were indistinguishable, but with several, reading the config meant
+    /// opening the detail panel in one window opened it in every other one too.
+    /// A window is a *view* — what it has on screen is its own. The config
+    /// fields of the same names survive as what a newly opened window starts
+    /// with, written back on each toggle so a new window (and the next launch)
+    /// inherits the last thing the user actually chose.
+    pub(crate) right_panel_visible: bool,
+    pub(crate) right_panel_tab: RightPanelTab,
+    pub(crate) sidebar_collapsed: bool,
     /// Scroll handle for the sidebar's row list, so activating a tab scrolls its
     /// row into view.
     pub(crate) sidebar_scroll: gpui::ScrollHandle,
@@ -484,6 +560,25 @@ pub struct Tty7App {
     /// current by a bounds observer so the quit hook can persist it to
     /// `window.json` — at quit time no `&Window` is in reach to ask directly.
     window_bounds: Bounds<Pixels>,
+    /// Which persistent workspace this window is showing. The window is the
+    /// transient view; the workspace is the identity that survives closing it
+    /// and shows up in the home-page picker. Every `save_session` writes back
+    /// under this id, so two windows never overwrite each other's tabs.
+    pub(crate) workspace: WorkspaceId,
+    /// Cached "which daemon panes are alive", with the instant it was taken.
+    /// The picker needs it per row, but answering costs a control connection to
+    /// the daemon — far too much to pay on every frame — and the answer only
+    /// changes when a shell exits. A short TTL keeps it honest without making
+    /// rendering do IO.
+    pub(crate) alive_cache: RefCell<Option<(std::time::Instant, HashSet<u64>)>>,
+    /// `Some` while the title-bar workspace chip is being renamed inline.
+    /// Separate from `renaming` (tabs) because the two live in different
+    /// widgets and can't be in flight at once anyway.
+    pub(crate) workspace_rename: Option<WorkspaceRename>,
+    /// Last title pushed to the OS window, so the common case (nothing
+    /// changed) skips the platform call. `RefCell` because the sync runs from
+    /// `focus_active`, which only takes `&self`.
+    window_title: std::cell::RefCell<String>,
 }
 
 /// Which close action a live-SSH close-confirmation is gating (PRD FR-E3).
@@ -496,16 +591,39 @@ pub(crate) enum SshCloseKind {
 }
 
 impl Tty7App {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // Restore the previous session (tab/split layout + each pane's cwd),
-        // unless the user turned restore off — then start fresh. `None` takes the
-        // first-run path in `with_session`, spawning a single default terminal.
-        let session = if cx.global::<Config>().restore_session {
-            Session::load()
-        } else {
-            None
+    /// A window on `id`'s workspace — reopening one from the picker — or on a
+    /// fresh workspace when `id` is `None` (New Workspace) or names a workspace
+    /// that is no longer on file.
+    pub fn for_workspace(
+        id: Option<WorkspaceId>,
+        fresh: crate::ui::windows::FreshStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Claiming marks the workspace open and hands back its saved tabs, so
+        // the store (not this window) stays the single writer of session.json.
+        let restore = cx.global::<Config>().restore_session;
+        let known = id.is_some_and(|id| WorkspaceStore::all(cx).get(id).is_some());
+        let (workspace, saved) = WorkspaceStore::claim(cx, id);
+        // A workspace that was already on file restores its tab/split layout and
+        // each pane's cwd, unless the user turned restore off — then it starts
+        // fresh. A *brand-new* one has no tabs to restore, so what it comes up
+        // with is the caller's call: `None` here takes the first-run path in
+        // `with_session`, spawning a single default terminal, which is what
+        // `New Workspace` and a first run both want. Handing an empty session
+        // through instead lands on the home page, for the launch that exists to
+        // show the workspace picker.
+        let session = match (known, fresh) {
+            (true, _) => restore.then_some(saved),
+            (false, crate::ui::windows::FreshStart::Shell) => None,
+            (false, crate::ui::windows::FreshStart::HomePage) => Some(Session::default()),
         };
-        let app = Self::with_session(session, window, cx);
+        let app = Self::with_session(Some(workspace), session, window, cx);
+        // Persist right away. The leaves just spawned (or reattached) now carry
+        // daemon pane ids, and nothing else writes them until the next
+        // *structural* change — so a crash before the user happens to open a
+        // tab would strand every one of those panes in the daemon.
+        app.save_session(cx);
         // If startup reused a daemon that speaks a different wire protocol
         // (an app upgrade while the old service kept running), the sessions
         // just restored above are living on that old dialect. Surface the
@@ -568,10 +686,14 @@ impl Tty7App {
     /// so every subscription and window hook runs exactly as in production
     /// without touching `~/.config` or a daemon.
     pub(crate) fn with_session(
+        workspace: Option<WorkspaceId>,
         session: Option<Session>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Tests build a window without going through the store; give them a
+        // detached identity rather than requiring the global to be installed.
+        let workspace = workspace.unwrap_or_default();
         // Font size from config (borrow ends before the mutable theme apply).
         let (
             font_size,
@@ -606,6 +728,11 @@ impl Tty7App {
         let mf_description = cx.new(|cx| InputState::new(window, cx).placeholder("description"));
         let sidebar_width = cx.global::<Config>().sidebar_width;
         let right_panel_width = cx.global::<Config>().right_panel_width;
+        // The config's copies are this window's *starting* chrome; from here on
+        // the window owns them (see the fields' doc comment).
+        let right_panel_visible = cx.global::<Config>().right_panel_visible;
+        let right_panel_tab = cx.global::<Config>().right_panel_tab;
+        let sidebar_collapsed = cx.global::<Config>().sidebar_collapsed;
         // Live-apply hot-reloaded config: the watcher in `main.rs` swaps the
         // `Config` global on every `config.json` change, which fires this. The
         // window-aware variant so the reload can re-run `apply_theme` with the
@@ -655,6 +782,10 @@ impl Tty7App {
             // the sidebar's `+N −N` would keep showing pre-alt-tab numbers
             // until the user happened to run a command in the pane.
             if window.is_window_active() {
+                // Whichever window the user last brought forward is the one to
+                // focus on the next launch — `claim` only ever records the
+                // *last opened* workspace, which is a different thing.
+                WorkspaceStore::focus(cx, this.workspace);
                 this.refresh_git_status_all(cx);
             }
         });
@@ -757,6 +888,9 @@ impl Tty7App {
             sidebar_dragging: Rc::new(Cell::new(false)),
             right_panel_width: Rc::new(Cell::new(right_panel_width)),
             right_panel_dragging: Rc::new(Cell::new(false)),
+            right_panel_visible,
+            right_panel_tab,
+            sidebar_collapsed,
             sidebar_scroll: gpui::ScrollHandle::new(),
             reorder: Rc::new(RefCell::new(None)),
             sidebar_search,
@@ -767,11 +901,21 @@ impl Tty7App {
             ssh_prompt: crate::ui::ssh_prompt::SshPromptState::new(cx),
             ssh_close_confirm: None,
             window_bounds: window.window_bounds().get_bounds(),
+            workspace,
+            alive_cache: RefCell::new(None),
+            workspace_rename: None,
+            window_title: std::cell::RefCell::new(String::new()),
         };
-        // Bring the system tray up (icon + agent menu + poll loop). Skipped in
-        // tests: the headless harness has no native status bar to register
-        // with, and the poll task would just spin against the mocked clock.
-        if !cfg!(test) {
+        // Bring the system tray up (icon + agent menu + poll loop) — but only
+        // for the *first* window: the tray is one app-wide icon, and letting
+        // every window register its own would stack N icons in the status bar.
+        // `register` happens after `open_window` returns, so during the first
+        // window's construction the registry is still empty.
+        //
+        // Skipped in tests: the headless harness has no native status bar to
+        // register with, and the poll task would just spin against the mocked
+        // clock.
+        if !cfg!(test) && crate::ui::windows::WindowRegistry::count(cx) == 0 {
             crate::ui::tray::init(cx);
         }
         // Discover this machine's shells for the "+" dropdown off the UI thread
@@ -818,53 +962,81 @@ impl Tty7App {
         })
         .detach();
 
-        // Confirm before the red traffic light closes the window. Closing quits
-        // the app, but the panes are *detached, not killed* — they keep running in
-        // the daemon and re-attach on the next launch — so the prompt reassures
-        // rather than warns. We veto the immediate close (return `false`), show the
-        // prompt, and quit only if the user picks "Close". A one-shot flag lets
-        // that post-confirm quit through should we be asked again, instead of
-        // looping the prompt.
+        // Closing a window *detaches* its workspace: the panes keep running in
+        // the daemon, and the workspace drops into the home-page picker to be
+        // reopened later. So closing one of several windows is cheap and needs
+        // no confirmation — the user can see the others and get this one back.
+        //
+        // The last window is different: closing it also quits the app (a
+        // windowless process left in the Dock no longer responds to being
+        // clicked — #147), so that one keeps the reassuring prompt. We veto the
+        // immediate close (return `false`), show it, and quit only if the user
+        // picks "Close"; a one-shot flag lets that post-confirm close through
+        // instead of looping the prompt.
         let close_confirmed = std::rc::Rc::new(std::cell::Cell::new(false));
         let weak_app = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             if close_confirmed.get() {
                 return true;
             }
-            // From the home page (zero tabs) there are no running sessions to
-            // reassure about — prompting would be pure friction. Close directly,
-            // but still quit with the window: closing our only window without
-            // quitting leaves a windowless process sitting in the Dock that no
-            // longer responds to being clicked (#147). Deferred onto the next
-            // tick so the close itself completes first, same as the confirmed
-            // path below.
-            if weak_app
+            let last_window = crate::ui::windows::WindowRegistry::count(cx) <= 1;
+            let empty = weak_app
                 .upgrade()
-                .is_some_and(|app| app.read(cx).tabs.is_empty())
-            {
-                cx.spawn(async move |cx| {
-                    let _ = cx.update(|cx| cx.quit());
-                })
-                .detach();
+                .is_some_and(|app| app.read(cx).tabs.is_empty());
+
+            // Any window but the last, or an empty one with nothing to
+            // reassure about: detach and go. Prompting here would be friction.
+            if !last_window || empty {
+                if let Some(app) = weak_app.upgrade() {
+                    app.update(cx, |app, cx| app.detach_workspace(cx));
+                }
+                if last_window {
+                    // Deferred onto the next tick so the close itself completes
+                    // first, same as the confirmed path below.
+                    cx.spawn(async move |cx| {
+                        let _ = cx.update(|cx| cx.quit());
+                    })
+                    .detach();
+                }
                 return true;
             }
+
             let answer = window.prompt(
                 PromptLevel::Info,
                 "Close Window?",
+                // What this promises has to match what the next launch does.
+                // Closing the last window *detaches* its workspace rather than
+                // ending it: the panes keep running in the daemon, but tty7
+                // comes back on the home page with the workspace waiting in the
+                // picker — it no longer reopens it unasked, so promising it
+                // would be restored would be a promise the app doesn't keep.
+                //
+                // Points at the title bar's workspace menu, not the macOS
+                // Window menu: there is no menu bar on Windows or Linux, and
+                // the corner chip is the one place that lists workspaces on
+                // every platform.
                 Some(
-                    "Your sessions keep running in the background and will be \
-                     restored the next time you open tty7.",
+                    "Your sessions keep running in the background. This \
+                     workspace will be waiting on the home page, and in the \
+                     workspace menu in the title bar, the next time you open \
+                     tty7.",
                 ),
                 &["Cancel", "Close"],
                 cx,
             );
             let close_confirmed = close_confirmed.clone();
+            let weak_app = weak_app.clone();
             cx.spawn(async move |cx| {
                 // Index 1 == "Close"; index 0 (Cancel) and a dismissed prompt
                 // both leave the window open.
                 if let Ok(1) = answer.await {
                     close_confirmed.set(true);
-                    cx.update(|cx| cx.quit());
+                    let _ = cx.update(|cx| {
+                        if let Some(app) = weak_app.upgrade() {
+                            app.update(cx, |app, cx| app.detach_workspace(cx));
+                        }
+                        cx.quit();
+                    });
                 }
             })
             .detach();
@@ -878,7 +1050,7 @@ impl Tty7App {
     /// Snapshot the current tabs/active index into a `Session` and persist it.
     /// Called after every structural change; the write is a small synchronous
     /// JSON dump and any error is swallowed inside `Session::save`.
-    pub(crate) fn save_session(&self, cx: &App) {
+    pub(crate) fn save_session(&self, cx: &mut App) {
         let tabs: Vec<SessionTab> = self
             .tabs
             .iter()
@@ -886,13 +1058,178 @@ impl Tty7App {
             .collect();
         // Zero tabs is a real state (the home page) and is persisted as such, so
         // the next launch comes back to it instead of a fresh shell.
-        if tabs.is_empty() {
-            Session::default().save();
+        let active = if tabs.is_empty() {
+            0
+        } else {
+            self.active.min(tabs.len() - 1)
+        };
+        let session = Session { active, tabs };
+        // The store merges this into the other windows' workspaces and owns the
+        // write; the geometry rides along so reopening lands where we are now.
+        WorkspaceStore::record(
+            cx,
+            self.workspace,
+            session,
+            Some(WindowState::from_bounds(self.window_bounds)),
+        );
+    }
+
+    /// This window is going away: capture its final state (a plain `cd` may
+    /// have moved a pane's cwd with no structural change to trigger a save),
+    /// mark the workspace closed so the home-page picker lists it, and drop it
+    /// from the registry so "is this the last window?" stays accurate.
+    ///
+    /// A *detach*, not a teardown — the daemon panes keep running and reattach
+    /// when the workspace is reopened.
+    pub(crate) fn detach_workspace(&self, cx: &mut App) {
+        self.save_session(cx);
+        // An empty workspace has nothing to come back to, so it is dropped
+        // outright instead of accumulating as a blank row in the picker —
+        // every `New Workspace` the user closes without using would leave one.
+        let name = if self.tabs.is_empty() {
+            WorkspaceStore::remove(cx, self.workspace);
+            String::new()
+        } else {
+            WorkspaceStore::close_window(cx, self.workspace);
+            // Read after the update so the name reflects what was just stored.
+            WorkspaceStore::all(cx)
+                .get(self.workspace)
+                .map(|w| w.display_name())
+                .unwrap_or_default()
+        };
+        crate::ui::windows::WindowRegistry::unregister(cx, self.workspace);
+        // The workspace just moved from "on screen" to "detached" — the Window
+        // menu is the only place that says so.
+        crate::ui::windows::refresh_menu(cx);
+        // ...and the first time that happens, say it out loud once. Only for a
+        // workspace with something in it: putting away an empty window teaches
+        // nothing (and it was dropped outright above).
+        if !name.is_empty() {
+            crate::ui::windows::hint_detached(cx, &name);
+        }
+    }
+
+    /// Stop a workspace — kill its sessions and close its window — confirming
+    /// first when something is still running. Its layout stays on file, so it
+    /// can be started again later.
+    ///
+    /// Deliberately not called "close": the red traffic light closes a window
+    /// and only detaches, while this ends the shells. Two actions that sit near
+    /// each other need two different verbs, or the menu reads as if they were
+    /// variations on one thing.
+    pub(crate) fn stop_workspace(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::ui::windows::confirm_and_stop(cx, window, id);
+        cx.notify();
+    }
+
+    /// Delete a workspace: stop it *and* discard the saved layout.
+    pub(crate) fn delete_workspace(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::ui::windows::confirm_and_delete(cx, window, id);
+        cx.notify();
+    }
+
+    /// Show the workspace in the Window menu's slot `index`. A stale slot (the
+    /// menu was built before a workspace was stopped) is a no-op rather than an
+    /// error — the menu is rebuilt right after any such change anyway.
+    pub(crate) fn select_workspace_slot(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((id, _open)) = crate::ui::windows::menu_order(cx).get(index).copied() else {
+            return;
+        };
+        self.reveal_workspace(id, window, cx);
+    }
+
+    /// Show `id`'s workspace.
+    ///
+    /// One workspace is shown by exactly one window, so this either focuses the
+    /// window it already has or opens a new one for it — never swaps it into
+    /// *this* window, which would leave the workspace already here without one.
+    ///
+    /// The single exception is a window that is empty (the home page): reusing
+    /// it beats opening a second window and stranding a blank frame, and there
+    /// is no workspace to displace.
+    pub(crate) fn reveal_workspace(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = crate::ui::windows::WindowRegistry::window_for(cx, id) {
+            let _ = handle.update(cx, |_, other, _| other.activate_window());
             return;
         }
-        let active = self.active.min(tabs.len() - 1);
-        let session = Session { active, tabs };
-        session.save();
+        if self.tabs.is_empty() {
+            self.switch_workspace(id, window, cx);
+        } else {
+            crate::ui::windows::open(cx, Some(id));
+        }
+    }
+
+    /// Swap this window over to `id`'s workspace in place, rebuilding its tabs.
+    ///
+    /// This is what the home-page picker does: the window running it is empty
+    /// (the picker only shows on the home page), so opening a *second* window
+    /// would strand this blank one. The outgoing workspace is dropped rather
+    /// than detached for the same reason.
+    pub(crate) fn switch_workspace(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.workspace;
+        if previous == id {
+            return;
+        }
+        if self.tabs.is_empty() {
+            WorkspaceStore::remove(cx, previous);
+        } else {
+            self.save_session(cx);
+            WorkspaceStore::close_window(cx, previous);
+        }
+
+        let (claimed, session) = WorkspaceStore::claim(cx, Some(id));
+        crate::ui::windows::WindowRegistry::rebind(cx, previous, claimed);
+        self.adopt_workspace(claimed, session, window, cx);
+    }
+
+    /// Take over an *already claimed* workspace: rebuild this window's tabs
+    /// from `session` and retitle it. Split from [`Self::switch_workspace`]
+    /// because `ui::windows::close_workspace` gets here having already
+    /// destroyed the outgoing workspace — there is nothing left to detach.
+    pub(crate) fn adopt_workspace(
+        &mut self,
+        id: WorkspaceId,
+        session: Session,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace = id;
+        let font_size = self.font_size;
+        let (tabs, active) = tabs_from_session(Some(session), font_size, window, cx);
+        self.tabs = tabs;
+        self.active = active;
+        self.maximized = None;
+        // Same reason as `for_workspace`: capture the reattached/spawned pane
+        // ids now rather than waiting for a structural change.
+        self.save_session(cx);
+        crate::ui::windows::refresh_menu(cx);
+        self.focus_active(window, cx);
+        cx.notify();
     }
 
     /// Reopen the most recently closed tab (Cmd+Shift+T). Rebuilds its pane
@@ -931,18 +1268,25 @@ impl Tty7App {
 
     // ── System tray (`ui::tray`) ────────────────────────────────────────────
 
-    /// Snapshot every agent pane for the tray menu: brand name, status, and a
-    /// "where" line (cwd directory name + git branch). Most urgent first, so
-    /// the pane that needs the user tops the menu. Called by the tray's poll
-    /// loop once a second; the walk is a handful of entity reads.
-    pub(crate) fn tray_snapshot(&self, cx: &App) -> crate::ui::tray::TraySnapshot {
+    /// Whether this window hosts the pane with `leaf_id`. The tray's reveal
+    /// carries a gpui entity id, which is unique app-wide, so this is how a
+    /// click finds the one window that can act on it.
+    pub(crate) fn owns_leaf(&self, leaf_id: u64) -> bool {
+        self.tabs.iter().any(|t| {
+            t.pane
+                .leaves()
+                .iter()
+                .any(|l| l.entity_id().as_u64() == leaf_id)
+        })
+    }
+
+    /// This window's agent panes, unsorted: brand name, status, and a "where"
+    /// line (cwd directory name + git branch). Unsorted because the tray is a
+    /// single icon for the whole app — it concatenates every window's rows and
+    /// sorts once, most urgent first, so the pane that needs the user tops the
+    /// menu.
+    pub(crate) fn agent_rows(&self, cx: &App) -> Vec<crate::ui::tray::AgentRow> {
         use crate::core::cli_agent::AgentStatus;
-        let urgency = |s: AgentStatus| match s {
-            AgentStatus::Waiting => 3,
-            AgentStatus::Working => 2,
-            AgentStatus::Done => 1,
-            AgentStatus::Idle => 0,
-        };
         let mut agents = Vec::new();
         for tab in &self.tabs {
             for leaf in tab.pane.leaves() {
@@ -971,11 +1315,7 @@ impl Tty7App {
                 });
             }
         }
-        agents.sort_by_key(|a| std::cmp::Reverse(urgency(a.status)));
-        crate::ui::tray::TraySnapshot {
-            agents,
-            notify_mode: cx.global::<Config>().notify_on_command_finish,
-        }
+        agents
     }
 
     /// Apply a tray menu click. Runs on the foreground executor with the
@@ -1161,8 +1501,12 @@ impl Tty7App {
                 match &restarted {
                     Ok(()) => {
                         let font_size = this.font_size;
-                        let (tabs, active) =
-                            tabs_from_session(Session::load(), font_size, window, cx);
+                        // This window's own workspace only — the other windows
+                        // rebuild themselves from theirs.
+                        let saved = WorkspaceStore::all(cx)
+                            .get(this.workspace)
+                            .map(|w| w.session.clone());
+                        let (tabs, active) = tabs_from_session(saved, font_size, window, cx);
                         this.tabs = tabs;
                         this.active = active;
                     }
@@ -2094,15 +2438,18 @@ impl Tty7App {
     /// the choice. In `Top` mode there is no rail to collapse, so this switches to
     /// `Left` and shows it — the shortcut always means "give me the sidebar".
     pub(crate) fn toggle_left_panel(&mut self, cx: &mut Context<Self>) {
-        let cfg = cx.global::<Config>();
-        let (pos, collapsed) = match cfg.tab_bar_position {
+        let (pos, collapsed) = match cx.global::<Config>().tab_bar_position {
             TabBarPosition::Top => (TabBarPosition::Left, false),
-            TabBarPosition::Left => (TabBarPosition::Left, !cfg.sidebar_collapsed),
+            // This window's own collapse state — collapsing one window's rail
+            // must not collapse every other window's. See `sidebar_collapsed`.
+            TabBarPosition::Left => (TabBarPosition::Left, !self.sidebar_collapsed),
         };
+        self.sidebar_collapsed = collapsed;
         self.update_config(cx, |cfg| {
             cfg.tab_bar_position = pos;
             cfg.sidebar_collapsed = collapsed;
         });
+        cx.notify();
     }
 
     /// Whether the left rail is actually on screen: `Left` mode, not collapsed,
@@ -2110,7 +2457,7 @@ impl Tty7App {
     /// strip and the collapse button all derive from this one predicate.
     pub(crate) fn left_panel_open(&self, cx: &gpui::App) -> bool {
         matches!(cx.global::<Config>().tab_bar_position, TabBarPosition::Left)
-            && !cx.global::<Config>().sidebar_collapsed
+            && !self.sidebar_collapsed
             && !self.tabs.is_empty()
     }
 
@@ -2218,7 +2565,30 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.remember_window_size = on);
     }
 
+    /// Name the OS window after its workspace, so ⌘` and Mission Control can
+    /// tell several tty7 windows apart. Reads the *saved* workspace, which
+    /// every structural change writes just before focus lands here — a title
+    /// one beat behind is invisible, and it keeps this off the render path.
+    ///
+    /// An empty workspace has no subject yet, so it falls back to the app name
+    /// rather than showing "Untitled".
+    pub(crate) fn sync_window_title(&self, window: &mut Window, cx: &App) {
+        let title = WorkspaceStore::all(cx)
+            .get(self.workspace)
+            .filter(|w| !w.session.tabs.is_empty())
+            .map(|w| w.display_name())
+            .unwrap_or_else(|| "tty7".to_string());
+        if *self.window_title.borrow() == title {
+            return;
+        }
+        window.set_window_title(&title);
+        *self.window_title.borrow_mut() = title;
+    }
+
     pub(crate) fn focus_active(&self, window: &mut Window, cx: &mut App) {
+        // Focus moves after every structural change, which is exactly when the
+        // window's subject may have changed too.
+        self.sync_window_title(window, cx);
         // While the settings overlay is open it owns focus (so Esc-to-close and
         // keybinding capture keep working); tab operations behind it don't steal
         // it. `close_settings` refocuses the active terminal on the way out.
@@ -3018,6 +3388,59 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// The set of daemon panes currently alive, cached for [`ALIVE_TTL`].
+    pub(crate) fn alive_panes_cached(&self) -> HashSet<u64> {
+        const ALIVE_TTL: std::time::Duration = std::time::Duration::from_millis(2000);
+        let mut slot = self.alive_cache.borrow_mut();
+        if let Some((taken, panes)) = slot.as_ref()
+            && taken.elapsed() < ALIVE_TTL
+        {
+            return panes.clone();
+        }
+        let panes = alive_panes();
+        *slot = Some((std::time::Instant::now(), panes.clone()));
+        panes
+    }
+
+    /// Turn the title-bar workspace chip into a text field, seeded with the
+    /// current name. Committing on Enter or blur mirrors the tab rename.
+    pub(crate) fn start_workspace_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = WorkspaceStore::all(cx)
+            .get(self.workspace)
+            .map(|w| w.display_name())
+            .unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        let subs = vec![cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    this.commit_workspace_rename(window, cx)
+                }
+                _ => {}
+            },
+        )];
+        self.workspace_rename = Some(WorkspaceRename { input, _subs: subs });
+        cx.notify();
+    }
+
+    /// Commit the workspace rename. An empty value clears the custom name, so
+    /// the chip falls back to the derived repo name — the same "clear to
+    /// revert" contract the tab rename has.
+    pub(crate) fn commit_workspace_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rename) = self.workspace_rename.take() else {
+            return;
+        };
+        let value = rename.input.read(cx).value().trim().to_string();
+        let id = self.workspace;
+        WorkspaceStore::rename(cx, id, (!value.is_empty()).then_some(value));
+        crate::ui::windows::refresh_menu(cx);
+        self.sync_window_title(window, cx);
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
     /// Commit the in-progress rename: a non-empty value becomes the tab's custom
     /// name; an empty value clears it (reverting to the title-derived label).
     /// Taking `renaming` first makes the focus change below re-entrancy-safe (the
@@ -3031,6 +3454,7 @@ impl Tty7App {
             tab.name = if value.is_empty() { None } else { Some(value) };
         }
         self.save_session(cx);
+        crate::ui::windows::refresh_menu(cx);
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -3145,6 +3569,13 @@ impl Tty7App {
         use CommandKind::*;
         match kind {
             NewTab => self.new_tab(window, cx),
+            NewWorkspace => crate::ui::windows::open(cx, None),
+            // The opener never reaches here (the palette swaps its own list),
+            // but the match must stay exhaustive.
+            OpenWorkspacePicker => {}
+            SwitchToWorkspace(id) => self.reveal_workspace(id, window, cx),
+            StopWorkspace => self.stop_workspace(self.workspace, window, cx),
+            DeleteWorkspace => self.delete_workspace(self.workspace, window, cx),
             SplitRight => self.split(Axis::Horizontal, window, cx),
             SplitDown => self.split(Axis::Vertical, window, cx),
             ClosePane => self.close_pane(window, cx),
@@ -4512,7 +4943,7 @@ impl Render for Tty7App {
         // the layout below has no left column, so the title strip takes over the
         // rail's jobs: it reserves the traffic lights and carries the sidebar's
         // own controls (new tab + expand) at its left edge.
-        let rail = vertical && !cx.global::<Config>().sidebar_collapsed;
+        let rail = vertical && !self.sidebar_collapsed;
         let strip = self.tab_strip(!vertical, window, cx);
         let sidebar = rail.then(|| self.tab_sidebar(window, cx));
         // Native-SSH status strip / reconnect notice for the focused pane (E1/E4).
@@ -4722,6 +5153,50 @@ impl Render for Tty7App {
             .text_color(cx.theme().foreground)
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| this.new_tab(window, cx)))
+            .on_action(cx.listener(|this, _: &SelectWorkspace1, window, cx| {
+                this.select_workspace_slot(0, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectWorkspace2, window, cx| {
+                this.select_workspace_slot(1, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectWorkspace3, window, cx| {
+                this.select_workspace_slot(2, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectWorkspace4, window, cx| {
+                this.select_workspace_slot(3, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectWorkspace5, window, cx| {
+                this.select_workspace_slot(4, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectWorkspace6, window, cx| {
+                this.select_workspace_slot(5, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectWorkspace7, window, cx| {
+                this.select_workspace_slot(6, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectWorkspace8, window, cx| {
+                this.select_workspace_slot(7, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectWorkspace9, window, cx| {
+                this.select_workspace_slot(8, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RenameWorkspace, window, cx| {
+                this.start_workspace_rename(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &StopWorkspace, window, cx| {
+                let id = this.workspace;
+                this.stop_workspace(id, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DeleteWorkspace, window, cx| {
+                let id = this.workspace;
+                this.delete_workspace(id, window, cx);
+            }))
+            .on_action(cx.listener(|_this, _: &NewWorkspace, _window, cx| {
+                // A fresh workspace, not a copy of this one: the daemon gives
+                // each pane a single subscriber, so a second window onto the
+                // same panes would steal this window's output.
+                crate::ui::windows::open(cx, None);
+            }))
             .on_action(cx.listener(|this, _: &CloseActiveTab, window, cx| {
                 // With focus in the editor panel, ⌘W closes the active file
                 // tab instead of the terminal pane/tab.
@@ -4990,7 +5465,7 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
 /// Set of daemon pane ids currently alive, used by `session_to_pane` to decide
 /// per leaf whether to re-`attach` or `spawn`. Computed once per restore from the
 /// daemon's `List`; empty (→ all-fresh) when the daemon is unreachable.
-fn alive_panes() -> std::collections::HashSet<u64> {
+pub(crate) fn alive_panes() -> std::collections::HashSet<u64> {
     crate::terminal::RemoteTerminal::list_panes()
         .into_iter()
         .filter(|p| p.alive)
@@ -5001,7 +5476,7 @@ fn alive_panes() -> std::collections::HashSet<u64> {
 /// Rebuild the tab list from a persisted `Session`, re-attaching to still-live
 /// daemon panes where possible and spawning fresh shells otherwise. An absent or
 /// empty session yields no tabs (the home page). Shared by first-launch restore
-/// (`Tty7App::new`) and the daemon-restart rebuild (`restart_daemon`), so the two
+/// (`Tty7App::for_workspace`) and the daemon-restart rebuild (`restart_daemon`), so the two
 /// stay in lockstep.
 fn tabs_from_session(
     session: Option<Session>,
@@ -5461,7 +5936,8 @@ mod keybinding_gpui_tests {
         // layer isn't one. `Root::view()` hands the typed app entity back so the
         // tests still drive `Tty7App` directly.
         let window = cx.add_window(|window, cx| {
-            let app = cx.new(|cx| Tty7App::with_session(Some(Session::default()), window, cx));
+            let app =
+                cx.new(|cx| Tty7App::with_session(None, Some(Session::default()), window, cx));
             gpui_component::Root::new(app, window, cx)
         });
         window

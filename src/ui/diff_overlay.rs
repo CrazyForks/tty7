@@ -331,8 +331,8 @@ impl Tty7App {
             .flex_shrink_0()
             .h(px(crate::ui::app::TITLE_BAR_HEIGHT))
             .pl(px(lead))
-            // Trailing tile aligns on its glyph, like every other corner control.
-            .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
+            // Trailing tile aligns on its glyph's ink, like every corner control.
+            .pr(px(crate::ui::app::tile_trailing_inset()))
             .gap_2()
             .items_center()
             .border_b_1()
@@ -438,12 +438,17 @@ impl Tty7App {
             )
             .child(div().flex_1())
             .child(
-                crate::ui::tab_strip::chrome_tile(
-                    Button::new("diff-overlay-close").icon(IconName::Close),
+                crate::ui::tab_strip::chrome_tile_sized(
+                    // Explicit tile, not `.small()`: this bar stands in for the
+                    // title bar while the overlay is up, so its close control is
+                    // the same tile the title bar's controls are.
+                    Button::new("diff-overlay-close").icon(Icon::new(IconName::Close)),
+                    crate::ui::app::TILE_SIZE,
+                    crate::ui::app::TILE_GLYPH_LINE,
                     false,
                     cx,
                 )
-                .small()
+                .rounded_lg()
                 .tooltip("Close Diff (Esc)")
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.close_diff_overlay(window, cx);

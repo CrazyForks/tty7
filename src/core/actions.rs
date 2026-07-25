@@ -9,6 +9,34 @@ actions!(
     tty7,
     [
         NewTab,
+        // Create a workspace and the window that shows it. One workspace is
+        // shown by exactly one window and vice versa — there is deliberately no
+        // "new window on the same workspace", which would need two clients on
+        // one set of daemon panes (the daemon allows only one).
+        NewWorkspace,
+        // Stop the current workspace: kill its sessions and close its window,
+        // keeping its layout on file so it can be started again. The deliberate
+        // opposite of a window close, which only detaches — hence the verb.
+        StopWorkspace,
+        // Stop it *and* forget the layout. The only irreversible one.
+        DeleteWorkspace,
+        // Rename the current workspace in place, from the title-bar chip.
+        // Until now `Workspace.name` could only ever be the derived repo name —
+        // there was no way for the user to set one.
+        RenameWorkspace,
+        // Show the Nth workspace in the Window menu's order (see
+        // `ui::windows::menu_order`). Unit actions rather than one
+        // parameterized action, matching `ActivateTab1..9` — it keeps them
+        // nameable in config/Settings like every other binding.
+        SelectWorkspace1,
+        SelectWorkspace2,
+        SelectWorkspace3,
+        SelectWorkspace4,
+        SelectWorkspace5,
+        SelectWorkspace6,
+        SelectWorkspace7,
+        SelectWorkspace8,
+        SelectWorkspace9,
         CloseActiveTab,
         SplitRight,
         SplitDown,

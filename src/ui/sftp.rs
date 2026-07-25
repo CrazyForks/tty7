@@ -257,12 +257,12 @@ impl Tty7App {
     /// shell, or a plain PTY) has nothing to list; the Files tab shows its local
     /// tree instead, which is the right answer rather than an error.
     pub(crate) fn toggle_sftp(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        use crate::core::config::{Config, RightPanelTab};
-        // The config, not `right_panel_open`: this toggles the same preference
-        // `toggle_right_panel` does, so the two agree on what "open" means even
-        // with no tabs to render into.
-        let cfg = cx.global::<Config>();
-        if cfg.right_panel_visible && cfg.right_panel_tab == RightPanelTab::Files {
+        use crate::core::config::RightPanelTab;
+        // This window's own panel state, not `right_panel_open`: this toggles
+        // exactly what `toggle_right_panel` does, so the two agree on what
+        // "open" means even with no tabs to render into. (And not the config
+        // either — that is only what a *new* window starts with.)
+        if self.right_panel_visible && self.right_panel_tab == RightPanelTab::Files {
             self.toggle_right_panel(cx);
             return;
         }
@@ -1815,7 +1815,8 @@ mod gpui_tests {
         // Wrapped in a `Root` like `main.rs` does — gpui-component widgets in the
         // panel reach for it on the window.
         let window = cx.add_window(|window, cx| {
-            let app = cx.new(|cx| Tty7App::with_session(Some(Session::default()), window, cx));
+            let app =
+                cx.new(|cx| Tty7App::with_session(None, Some(Session::default()), window, cx));
             gpui_component::Root::new(app, window, cx)
         });
         cx.background_executor.run_until_parked();
@@ -1831,10 +1832,13 @@ mod gpui_tests {
         (app, vcx)
     }
 
-    fn panel(vcx: &mut VisualTestContext) -> (bool, RightPanelTab) {
+    /// The *window's* panel state, not the config's: the config is only what a
+    /// newly opened window starts with, so asserting on it would pass even if
+    /// this window's panel never moved.
+    fn panel(app: &Entity<Tty7App>, vcx: &mut VisualTestContext) -> (bool, RightPanelTab) {
         vcx.update(|_, cx| {
-            let cfg = cx.global::<Config>();
-            (cfg.right_panel_visible, cfg.right_panel_tab)
+            let app = app.read(cx);
+            (app.right_panel_visible, app.right_panel_tab)
         })
     }
 
@@ -1847,18 +1851,18 @@ mod gpui_tests {
 
         // From closed: opens the panel on Files.
         app.update_in(&mut vcx, |app, window, cx| {
-            app.update_config(cx, |cfg| cfg.right_panel_visible = false);
+            app.right_panel_visible = false;
             app.toggle_sftp(window, cx);
         });
-        assert_eq!(panel(&mut vcx), (true, RightPanelTab::Files));
+        assert_eq!(panel(&app, &mut vcx), (true, RightPanelTab::Files));
 
         // Already there: puts it away rather than re-selecting the same tab.
         app.update_in(&mut vcx, |app, window, cx| app.toggle_sftp(window, cx));
-        assert!(!panel(&mut vcx).0, "second press should close");
+        assert!(!panel(&app, &mut vcx).0, "second press should close");
 
         // And back again.
         app.update_in(&mut vcx, |app, window, cx| app.toggle_sftp(window, cx));
-        assert_eq!(panel(&mut vcx), (true, RightPanelTab::Files));
+        assert_eq!(panel(&app, &mut vcx), (true, RightPanelTab::Files));
     }
 
     /// Open on another tab, `ToggleSftp` is still "take me there" — it switches to
@@ -1870,6 +1874,6 @@ mod gpui_tests {
             app.set_right_panel_tab(RightPanelTab::Info, cx);
             app.toggle_sftp(window, cx);
         });
-        assert_eq!(panel(&mut vcx), (true, RightPanelTab::Files));
+        assert_eq!(panel(&app, &mut vcx), (true, RightPanelTab::Files));
     }
 }

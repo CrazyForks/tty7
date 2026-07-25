@@ -14,10 +14,12 @@ use gpui::{
     Animation, AnimationExt as _, App, Context, KeyDownEvent, Keystroke, MouseButton,
     MouseDownEvent, div, prelude::*, px,
 };
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::kbd::Kbd;
-use gpui_component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
 
-use crate::core::session::{SessionPane, SessionTab};
+use crate::core::session::{SessionPane, SessionTab, WorkspaceId, WorkspaceStore};
 use crate::ui::app::Tty7App;
 
 /// The "tty7" logotype in half-block characters. Rendered line-by-line in the
@@ -78,6 +80,72 @@ fn clamp_label(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Most closed workspaces to offer on the home page. The picker is a "get back
+/// to what you were doing" affordance, not a session manager — a long tail of
+/// months-old workspaces would bury the recent ones and turn the page into a
+/// wall. The rest stay in `session.json` and reachable from the command palette.
+const MAX_PICKER_ROWS: usize = 6;
+
+/// Longest workspace path shown before the front is elided.
+pub(crate) const PICKER_PATH_MAX: usize = 34;
+
+/// One closed workspace, flattened for rendering. Owned (not a `&Workspace`)
+/// so collecting it releases the borrow on the global store before the row
+/// closures capture `cx`.
+struct PickerRow {
+    id: WorkspaceId,
+    name: String,
+    path: String,
+    panes: usize,
+    when: String,
+    /// Whether any of its panes are still running in the daemon. A stopped
+    /// workspace still lists its panes — they are the *saved* layout, not live
+    /// shells — so the count alone can't say which of the two this is.
+    live: bool,
+}
+
+/// Human-readable age of a workspace's last activity. Coarse on purpose — the
+/// user is picking between "the one from lunchtime" and "the one from last
+/// week", not reading a log.
+pub(crate) fn relative_time(now: u64, then: u64) -> String {
+    // A future timestamp (clock change, edited file) reads as current rather
+    // than rendering a negative age.
+    if then == 0 || then >= now {
+        return "just now".to_string();
+    }
+    let secs = now - then;
+    match secs {
+        s if s < 60 => "just now".to_string(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 7200 => "1 hour ago".to_string(),
+        s if s < 86_400 => format!("{} hours ago", s / 3600),
+        s if s < 172_800 => "yesterday".to_string(),
+        s if s < 604_800 => format!("{} days ago", s / 86_400),
+        _ => "over a week ago".to_string(),
+    }
+}
+
+/// A workspace's directory, shortened for the picker's dim subtitle: `$HOME`
+/// collapses to `~`, and a still-too-long path keeps its tail (the part that
+/// identifies the project) with an elided front.
+pub(crate) fn display_path(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    let shortened = match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && text.starts_with(&home) => {
+            format!("~{}", &text[home.len()..])
+        }
+        _ => text.to_string(),
+    };
+    if shortened.chars().count() <= PICKER_PATH_MAX {
+        return shortened;
+    }
+    let tail: String = shortened
+        .chars()
+        .skip(shortened.chars().count() - PICKER_PATH_MAX)
+        .collect();
+    format!("…{tail}")
 }
 
 /// The display string ("⌘T") for an action's effective (default or
@@ -145,6 +213,13 @@ impl Tty7App {
             );
         }
 
+        // Workspaces the user closed earlier. Closing a window detaches its
+        // workspace rather than ending it — the panes keep running in the
+        // daemon — so this list is how they come back. It sits directly under
+        // the logo, above the shortcut watermark: getting back to real work
+        // outranks learning a keybinding.
+        let picker = self.render_workspace_picker(cx);
+
         v_flex()
             .id("home-page")
             .track_focus(&self.home_focus)
@@ -164,6 +239,7 @@ impl Tty7App {
                 }
             }))
             .child(logo)
+            .children(picker)
             .child(list)
             // Ease the page in rather than popping it — closing the last tab
             // should feel like arriving somewhere, not like a glitch.
@@ -172,6 +248,218 @@ impl Tty7App {
                 Animation::new(Duration::from_millis(150)),
                 |page, delta| page.opacity(delta),
             )
+    }
+
+    /// The closed-workspace picker, or `None` when there is nothing to reopen
+    /// (first run, or every workspace is already on screen) — an empty panel
+    /// would just be clutter on a page whose point is calm.
+    fn render_workspace_picker(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Collect owned rows first: this releases the borrow on the workspace
+        // store before the per-row click handlers capture `cx`.
+        let alive = self.alive_panes_cached();
+        let rows: Vec<PickerRow> = WorkspaceStore::all(cx)
+            .closed_workspaces()
+            .into_iter()
+            .take(MAX_PICKER_ROWS)
+            .map(|w| PickerRow {
+                live: w.pane_ids().iter().any(|id| alive.contains(id)),
+                id: w.id,
+                name: clamp_label(&w.display_name()),
+                path: w
+                    .dominant_repo()
+                    .or_else(|| w.first_cwd())
+                    .map(|p| display_path(&p))
+                    .unwrap_or_default(),
+                panes: w.pane_count(),
+                when: relative_time(now, w.last_active),
+            })
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+
+        // Copied out rather than held as a `&Theme`: the rows below hand `cx`
+        // straight to the shared avatar builder, and a live borrow of the theme
+        // would be in its way.
+        let (muted, foreground, popover, border) = {
+            let theme = cx.theme();
+            (
+                theme.muted_foreground,
+                theme.foreground,
+                theme.popover,
+                theme.border,
+            )
+        };
+        // The established popup language: a solid 10px-radius panel with inset
+        // soft-grey pill highlights — no translucency, no saturated accent.
+        let hover_fill = cx.theme().accent.opacity(0.6);
+
+        let mut panel = v_flex()
+            .w(px(360.))
+            .p(px(6.))
+            .gap(px(2.))
+            .rounded(px(10.))
+            .bg(popover)
+            .border_1()
+            .border_color(border)
+            // The page behind us spawns a terminal on *any* left click (the
+            // empty window's whole job). Without this, a click meant for a row
+            // bubbles out to that handler, which swaps the home page away
+            // before the row's own `on_click` — mouse *up* — ever fires. The
+            // picker would look like it did nothing but open a stray terminal.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+        for row in rows {
+            let id = row.id;
+            let live = row.live;
+            // The context menu builds outside `cx.listener`, so it reaches the
+            // app the way the tab context menu does — through a weak handle.
+            let menu_app = cx.entity().downgrade();
+            let menu_app2 = menu_app.clone();
+            panel = panel.child(
+                h_flex()
+                    .id(("workspace-row", id.element_key() as usize))
+                    // Named group so the row's ✕ can reveal itself on hover of
+                    // the whole row, not just of the glyph's own few pixels.
+                    .group("workspace-row")
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px(px(10.))
+                    .py(px(7.))
+                    .rounded(px(6.))
+                    .hover(|row| row.bg(hover_fill))
+                    .cursor_pointer()
+                    // The picker only renders on the home page, so this window
+                    // is empty: swap it over in place rather than opening a
+                    // second window and stranding this blank one. If the
+                    // workspace somehow already has a window, focus that.
+                    // ⌘-click opens in a *new* window, plain click swaps this
+                    // one over — the same gesture browsers and Finder use, so
+                    // the user never has to decide "which container" before
+                    // picking what they want to see.
+                    .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                        if ev.modifiers().platform {
+                            crate::ui::windows::open(cx, Some(id));
+                        } else {
+                            this.reveal_workspace(id, window, cx);
+                        }
+                    }))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .overflow_hidden()
+                            // The same monogram badge the title-bar chip and
+                            // the workspace menu use, with liveness riding its
+                            // corner: a dot means the shells are still running
+                            // in the daemon and reopening reattaches to them.
+                            // No dot means the layout is all that is left and
+                            // reopening spawns fresh — the app's existing
+                            // convention that a resting thing is just its mark.
+                            .child(crate::ui::tab_strip::workspace_avatar(
+                                // Never "current": this page only renders with
+                                // zero tabs, so every row in it is a workspace
+                                // you are *not* looking at.
+                                &row.name, row.live, false, 26., cx,
+                            ))
+                            .child(
+                                v_flex()
+                                    .gap(px(1.))
+                                    .overflow_hidden()
+                                    .child(div().text_sm().text_color(foreground).child(row.name))
+                                    .child(div().text_xs().text_color(muted).child(row.path)),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(
+                                v_flex()
+                                    .items_end()
+                                    .gap(px(1.))
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(if row.panes == 1 {
+                                        "1 pane".to_string()
+                                    } else {
+                                        format!("{} panes", row.panes)
+                                    })
+                                    .child(row.when),
+                            )
+                            // One hover action, not a cluster: the sidebar row
+                            // — the busiest row in the app — reveals exactly
+                            // one and keeps the rest on its right-click menu.
+                            // Deleting is the irreversible one, which is
+                            // precisely why it hides until aimed at rather than
+                            // sitting out in the open; stopping is a click away
+                            // on the same row's context menu.
+                            .child(
+                                div()
+                                    .invisible()
+                                    .group_hover("workspace-row", |x| x.visible())
+                                    // Without this the press also reaches the
+                                    // row underneath and opens the very
+                                    // workspace being thrown away.
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        Button::new((
+                                            "workspace-delete",
+                                            id.element_key() as usize,
+                                        ))
+                                        .icon(IconName::Close)
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.delete_workspace(id, window, cx);
+                                            }),
+                                        ),
+                                    ),
+                            ),
+                    )
+                    // The rest of the row's actions. A right-click menu is what
+                    // every other list in this app uses for its second-tier
+                    // actions (see the tab rows), and it works here because the
+                    // picker is a page — inside the title-bar workspace menu it
+                    // can't be done, since a popup dismisses on any mouse-down
+                    // outside its own bounds and would tear itself down before
+                    // the nested menu's click ever landed.
+                    .context_menu(move |menu, _window, _cx| {
+                        let app = menu_app.clone();
+                        menu.item(
+                            PopupMenuItem::new("Stop Workspace")
+                                // Nothing to stop on a workspace whose shells
+                                // are already gone.
+                                .disabled(!live)
+                                .on_click(move |_, window, cx| {
+                                    let _ = app
+                                        .update(cx, |this, cx| this.stop_workspace(id, window, cx));
+                                }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Delete Workspace…").on_click({
+                                let app = menu_app2.clone();
+                                move |_, window, cx| {
+                                    let _ = app.update(cx, |this, cx| {
+                                        this.delete_workspace(id, window, cx)
+                                    });
+                                }
+                            }),
+                        )
+                    }),
+            );
+        }
+        Some(panel)
     }
 }
 
@@ -261,6 +549,55 @@ mod tests {
         let label = closed_tab_label(&tab).unwrap();
         assert_eq!(label.chars().count(), CLOSED_LABEL_MAX + 1);
         assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn relative_time_reads_coarsely_across_the_ranges() {
+        let now = 10_000_000u64;
+        assert_eq!(relative_time(now, now), "just now");
+        assert_eq!(relative_time(now, now - 30), "just now");
+        assert_eq!(relative_time(now, now - 120), "2 min ago");
+        assert_eq!(relative_time(now, now - 3600), "1 hour ago");
+        assert_eq!(relative_time(now, now - 4 * 3600), "4 hours ago");
+        assert_eq!(relative_time(now, now - 90_000), "yesterday");
+        assert_eq!(relative_time(now, now - 3 * 86_400), "3 days ago");
+        assert_eq!(relative_time(now, now - 30 * 86_400), "over a week ago");
+    }
+
+    #[test]
+    fn relative_time_never_renders_a_negative_age() {
+        let now = 1_000_000u64;
+        // A never-stamped workspace, and one whose clock ran ahead (a system
+        // time change, or a hand-edited session file).
+        assert_eq!(relative_time(now, 0), "just now");
+        assert_eq!(relative_time(now, now + 5_000), "just now");
+    }
+
+    #[test]
+    fn display_path_collapses_home_and_elides_from_the_front() {
+        // SAFETY: single-threaded test; HOME is restored right after.
+        let saved = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", "/Users/tester") };
+
+        assert_eq!(
+            display_path(std::path::Path::new("/Users/tester/repo/tty7")),
+            "~/repo/tty7"
+        );
+        // Outside home, the path is left alone.
+        assert_eq!(display_path(std::path::Path::new("/opt/work")), "/opt/work");
+
+        // A long path keeps its *tail* — the part that names the project.
+        let long = display_path(std::path::Path::new(
+            "/Users/tester/very/deeply/nested/projects/area/thing",
+        ));
+        assert!(long.starts_with('…'), "{long} should be front-elided");
+        assert!(long.ends_with("thing"), "{long} must keep the tail");
+        assert_eq!(long.chars().count(), PICKER_PATH_MAX + 1);
+
+        match saved {
+            Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 
     #[test]
