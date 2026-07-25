@@ -5055,8 +5055,8 @@ impl Render for Tty7App {
             pair.into_iter().filter_map(|(_, el)| el).collect()
         };
 
-        // The two layouts. Horizontal (default): a column of [title bar / body].
-        // Vertical: the rail is a full-height *left column* that reaches the very
+        // The two layouts. Horizontal: a column of [title bar / body].
+        // Vertical (default): the rail is a full-height *left column* that reaches the very
         // top of the window — the traffic lights sit on its surface — with the
         // title strip and terminal stacked in the right column. That way the rail
         // surface has no seam with the title bar and reads as one continuous
