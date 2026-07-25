@@ -165,12 +165,24 @@ impl Render for DragTab {
 /// use. (Overriding just the hover from outside doesn't work: `Button` applies
 /// its own `.hover()` during render, after any the caller set.)
 pub(crate) fn chrome_tile_variant(cx: &gpui::App) -> ButtonCustomVariant {
+    chrome_tile_variant_for(false, cx)
+}
+
+/// The tile's paint, with the glyph weight that matches its state.
+///
+/// At rest the glyphs sit at `sidebar_foreground` — the same step the tab
+/// rail's inactive rows use. Full `foreground` (#111 on white) was a hard,
+/// near-black row of ink against the near-white bar around it: the darkest
+/// treatment in the window sitting on its lightest surface. A lit toggle still
+/// gets full strength, so "on" reads as both a filled capsule *and* darker ink.
+pub(crate) fn chrome_tile_variant_for(selected: bool, cx: &gpui::App) -> ButtonCustomVariant {
     ButtonCustomVariant::new(cx)
         .color(cx.theme().transparent)
-        // Full `foreground`, not the softer `secondary_foreground`: the chrome
-        // glyphs read as deliberate controls rather than faint hints — the
-        // "commercial-app" weight, paired with the filled dock icons below.
-        .foreground(cx.theme().foreground)
+        .foreground(if selected {
+            cx.theme().foreground
+        } else {
+            cx.theme().sidebar_foreground
+        })
         // The sidebar's own selected-row fill (a 12% mix, ≈#E2E2E2 on white) at
         // full strength: every icon tile in the chrome answers the pointer with
         // the exact grey the rows do. It used to be that grey at 55% opacity,
@@ -211,7 +223,7 @@ pub(crate) fn chrome_tile_sized(
     cx: &gpui::App,
 ) -> Button {
     button
-        .custom(chrome_tile_variant(cx))
+        .custom(chrome_tile_variant_for(selected, cx))
         .selected(selected)
         .with_size(px(glyph / BUTTON_ICON_SCALE))
         .w(px(tile))
