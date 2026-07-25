@@ -309,25 +309,20 @@ fn initial_working_directory(cwd: Option<PathBuf>) -> Option<PathBuf> {
         .find(|d| d.is_dir())
 }
 
-/// Whether the effective child environment leaves every locale selector empty.
+/// Whether a GUI-launched child needs tty7 to supply a character locale.
 ///
-/// `extra_env` has the same precedence it gets at spawn: a configured value,
-/// including an explicitly empty one, overrides the daemon's inherited value.
 /// tmux checks these variables in this exact order to decide whether its client
-/// supports UTF-8; when all three are empty it deliberately renders each Unicode
-/// cell as `_`.
+/// supports UTF-8; when all three are absent or empty it deliberately renders
+/// each Unicode cell as `_`. Any configured locale key is authoritative, even
+/// when its value is empty, so the generic `env` override remains capable of
+/// opting out of this fallback.
 #[cfg(any(target_os = "macos", test))]
-fn locale_environment_is_empty(
+fn locale_fallback_is_needed(
     extra_env: &std::collections::HashMap<String, String>,
     mut inherited: impl FnMut(&str) -> Option<String>,
 ) -> bool {
     ["LC_ALL", "LC_CTYPE", "LANG"].iter().all(|key| {
-        extra_env
-            .get(*key)
-            .cloned()
-            .or_else(|| inherited(key))
-            .as_deref()
-            .map_or(true, str::is_empty)
+        !extra_env.contains_key(*key) && inherited(key).as_deref().map_or(true, str::is_empty)
     })
 }
 
@@ -361,10 +356,10 @@ fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<Pat
     // environment as a non-UTF-8 terminal and substitutes one `_` per display
     // cell. Seed only LC_CTYPE (the macOS `UTF-8` locale alias) so character
     // handling is correct without changing message/date/number localization.
-    // Respect any non-empty inherited or user-configured locale, including an
-    // explicit `C`; configured empty values are absence, so repair them too.
+    // Respect any inherited non-empty locale and every user-configured locale
+    // key, including `C` or an empty value used to opt out of the fallback.
     #[cfg(target_os = "macos")]
-    if locale_environment_is_empty(&extra_env, |key| std::env::var(key).ok()) {
+    if locale_fallback_is_needed(&extra_env, |key| std::env::var(key).ok()) {
         cmd.env("LC_CTYPE", "UTF-8");
     }
 }
@@ -3573,30 +3568,33 @@ mod tests {
         assert!(dead_rx.try_recv().is_err(), "on_dead must fire only once");
     }
 
-    /// The macOS UTF-8 fallback applies only when the child would otherwise have
-    /// no locale at all. An inherited or config-provided value is authoritative;
-    /// an explicit empty config value masks the inherited one just as it does at
-    /// spawn, allowing the fallback to repair the resulting empty environment.
+    /// The macOS UTF-8 fallback applies only when the inherited environment has
+    /// no locale and the user has not taken control through the generic `env`
+    /// map. Key presence is authoritative there, including an empty value.
     #[test]
-    fn locale_fallback_respects_the_effective_child_environment() {
-        let inherited = |pairs: &[(&str, &str)]| {
+    fn locale_fallback_respects_inherited_and_configured_environments() {
+        let environment = |pairs: &[(&str, &str)]| {
             pairs
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect::<std::collections::HashMap<_, _>>()
         };
-        let is_empty = |extra: &[(&str, &str)], parent: &[(&str, &str)]| {
-            let extra = inherited(extra);
-            let parent = inherited(parent);
-            locale_environment_is_empty(&extra, |key| parent.get(key).cloned())
+        let fallback_is_needed = |extra: &[(&str, &str)], parent: &[(&str, &str)]| {
+            let extra = environment(extra);
+            let parent = environment(parent);
+            locale_fallback_is_needed(&extra, |key| parent.get(key).cloned())
         };
 
-        assert!(is_empty(&[], &[]));
-        assert!(is_empty(&[("LC_CTYPE", "")], &[]));
-        assert!(is_empty(&[("LANG", "")], &[("LANG", "en_US.UTF-8")]));
-        assert!(!is_empty(&[], &[("LANG", "en_US.UTF-8")]));
-        assert!(!is_empty(&[], &[("LC_ALL", "C")]));
-        assert!(!is_empty(&[("LC_CTYPE", "UTF-8")], &[]));
+        assert!(fallback_is_needed(&[], &[]));
+        assert!(fallback_is_needed(&[], &[("LANG", "")]));
+        assert!(!fallback_is_needed(&[], &[("LANG", "en_US.UTF-8")]));
+        assert!(!fallback_is_needed(&[], &[("LC_ALL", "C")]));
+        assert!(!fallback_is_needed(&[("LC_CTYPE", "UTF-8")], &[]));
+        assert!(!fallback_is_needed(&[("LC_CTYPE", "")], &[]));
+        assert!(!fallback_is_needed(
+            &[("LANG", "")],
+            &[("LANG", "en_US.UTF-8")]
+        ));
     }
 
     /// Every spawned shell carries the `TTY7` marker, so the `tty7 agent-hook`
