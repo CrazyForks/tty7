@@ -37,7 +37,10 @@ use crate::core::keychain::CredentialRef;
 use crate::core::ssh_profile::{
     Algorithms, AuthMode, ForwardKind, ForwardRule, HostPort, SshProfile, to_connect_string,
 };
-use crate::ui::app::{FONT_SIZE_STEP, LINE_HEIGHT_STEP, ThemeEdit, Tty7App};
+use crate::ui::app::{
+    FONT_SIZE_STEP, LINE_HEIGHT_STEP, TILE_GLYPH_LINE, TILE_SIZE, TITLE_BAR_HEIGHT, ThemeEdit,
+    Tty7App,
+};
 use crate::ui::presets;
 
 /// Which section of the settings panel is currently selected in the sidebar.
@@ -925,23 +928,35 @@ impl Tty7App {
             // and carries its own ✕, so keeping this one would stack two ✕ there.
             .when(!show_theme_panel, |r| {
                 r.child(
-                    // Sized like the title bar's "⋯" (30px, 15px glyph,
-                    // `rounded_lg`), because it stands in the same corner: a
-                    // `small` icon button is 24px, which reads undersized next
-                    // to the 34px window-control tiles this spot belongs to.
-                    // `top` centres it in the title bar's band — (40 − 30) / 2.
-                    div().absolute().top(px(5.)).right(px(10.)).occlude().child(
-                        Button::new("settings-close")
-                            .icon(Icon::new(IconName::Close).size(px(15.)))
-                            .ghost()
-                            .xsmall()
-                            .w(px(30.))
-                            .h(px(30.))
-                            .rounded_lg()
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.close_settings(window, cx)),
-                            ),
-                    ),
+                    // A full chrome tile, because it stands in the same corner as
+                    // the title bar's own: a `small` icon button is 24px, which
+                    // reads undersized next to the 34px window-control tiles this
+                    // spot belongs to. `right` is the window-control zone's own
+                    // margin rather than the content inset — what this has to
+                    // clear here is the controls, not a text column. `top`
+                    // centres it in the title bar's band.
+                    div()
+                        .absolute()
+                        .top(px((TITLE_BAR_HEIGHT - TILE_SIZE) / 2.))
+                        .right(px(10.))
+                        .occlude()
+                        .child(
+                            Button::new("settings-close")
+                                .icon(Icon::new(IconName::Close))
+                                .ghost()
+                                // Sizing the button, not the icon: `Button::render`
+                                // overwrites whatever size the icon was handed.
+                                // See `BUTTON_ICON_SCALE`.
+                                .with_size(px(
+                                    TILE_GLYPH_LINE / crate::ui::tab_strip::BUTTON_ICON_SCALE
+                                ))
+                                .w(px(TILE_SIZE))
+                                .h(px(TILE_SIZE))
+                                .rounded_lg()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_settings(window, cx)
+                                })),
+                        ),
                 )
             });
 

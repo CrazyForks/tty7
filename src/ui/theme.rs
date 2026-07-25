@@ -40,6 +40,7 @@ pub(crate) fn set_menus(cx: &mut App) {
         ]),
         Menu::new("Shell").items([
             MenuItem::action("New Tab", NewTab),
+            MenuItem::action("New Workspace", NewWorkspace),
             MenuItem::action("Split Right", SplitRight),
             MenuItem::action("Split Down", SplitDown),
             MenuItem::separator(),
@@ -50,7 +51,16 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::action("Reopen Closed Tab", ReopenClosedTab),
             MenuItem::separator(),
             MenuItem::action("Close Pane / Tab", CloseActiveTab),
+            // Last, and separated: the only two items here that touch running
+            // sessions. Everything above them — including closing the window —
+            // leaves the shells alive in the daemon, so these sit apart rather
+            // than a mis-click away from "Close Pane / Tab". Stop keeps the
+            // layout; Delete is the only thing that discards it.
+            MenuItem::separator(),
+            MenuItem::action("Stop Workspace…", StopWorkspace),
+            MenuItem::action("Delete Workspace…", DeleteWorkspace),
         ]),
+        Menu::new("Window").items(window_menu_items(cx)),
         Menu::new("View").items([
             MenuItem::action("Increase Font Size", IncreaseFontSize),
             MenuItem::action("Decrease Font Size", DecreaseFontSize),
@@ -59,6 +69,71 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::action("Toggle Full Screen", ToggleFullscreen),
         ]),
     ]);
+}
+
+/// The Window menu's contents: every workspace tty7 knows about, on screen or
+/// not.
+///
+/// This is what makes ⌘W honest. Closing a window only *detaches* its
+/// workspace — the shells keep running in the daemon — but a detached
+/// workspace the user can't see may as well have been deleted. The Window menu
+/// is where a Mac user already looks for "what do I have open", so putting the
+/// detached ones right below the open ones costs no learning at all.
+///
+/// Slot order comes from [`crate::ui::windows::menu_order`], shared with the
+/// `SelectWorkspace1..9` handlers so slot *n* means the same thing in both.
+fn window_menu_items(cx: &App) -> Vec<MenuItem> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let order = crate::ui::windows::menu_order(cx);
+    let store = crate::core::session::WorkspaceStore::all(cx);
+
+    // The same slot→action mapping the title-bar chip's menu uses, so slot *n*
+    // dispatches identically wherever it was clicked.
+    let slot_action = crate::ui::tab_strip::select_workspace_action;
+
+    let mut items = Vec::new();
+    let mut separated = false;
+    for (i, (id, open)) in order.iter().enumerate() {
+        let Some(workspace) = store.get(*id) else {
+            continue;
+        };
+        let Some(action) = slot_action(i) else { break };
+        // One rule between the two groups: what's on screen, then what's put
+        // away. Only drawn once, and never as a leading rule.
+        if !open && !separated {
+            separated = true;
+            if !items.is_empty() {
+                items.push(MenuItem::Separator);
+            }
+        }
+        let label = if *open {
+            workspace.display_name()
+        } else {
+            // The age is the useful discriminator among detached ones — several
+            // may share a repo name.
+            format!(
+                "{}  —  {}",
+                workspace.display_name(),
+                crate::ui::home::relative_time(now, workspace.last_active)
+            )
+        };
+        items.push(MenuItem::Action {
+            name: label.into(),
+            action,
+            os_action: None,
+            checked: false,
+            disabled: false,
+        });
+    }
+    if items.is_empty() {
+        // Never hand back an empty menu — an unclickable "Window" title reads
+        // as broken. The one workspace that must exist is the current one.
+        items.push(MenuItem::action("New Workspace", NewWorkspace));
+    }
+    items
 }
 
 /// The actual window-background paint for the active theme: a flat color or a

@@ -43,7 +43,20 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// byte, a changed payload shape, altered framing. Purely additive changes —
 /// a brand-new kind, a new `#[serde(default)]` field — don't need a bump;
 /// the existing unknown-kind / missing-field behavior already covers them.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// A **new variant of an existing enum** is not additive, despite looking it:
+/// the enums here carry no `#[serde(other)]` fallback, so an old peer fails
+/// the whole `from_json` and its reader treats that as a desync — it drops the
+/// connection rather than ignoring the field. That is what earned v2.
+///
+/// ## History
+///
+/// - **v2** — [`RemoteKind::Wsl`]. A v1 client decoding a WSL pane's
+///   `RemoteContext` errors out and loses the pane, which only bites on a
+///   downgrade (a v2 GUI spawns the pane, a v1 GUI later attaches to it), but
+///   loses it silently. The handshake now catches that skew and asks.
+/// - **v1** — the dialect at the time versioning landed.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Reply to `ClientMsg::Version`: the protocol dialect the daemon speaks, plus
 /// its crate version for logs/diagnostics. Only `protocol` drives decisions.

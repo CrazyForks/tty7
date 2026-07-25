@@ -114,7 +114,15 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
     // and Linux without binding to the Win/Super key, which the OS reserves.
     vec![
         ("NewTab", "secondary-t"),
+        ("NewWorkspace", "secondary-shift-n"),
         ("CloseActiveTab", "secondary-w"),
+        // No default chord on purpose: this is the one action that kills running
+        // sessions, and it must not sit one slip away from ⌘W. Reachable from
+        // the Shell menu and the palette; bindable in Settings for anyone who
+        // wants it.
+        ("StopWorkspace", ""),
+        ("DeleteWorkspace", ""),
+        ("RenameWorkspace", ""),
         ("SplitRight", "secondary-d"),
         ("SplitDown", "secondary-shift-d"),
         ("FocusNextPane", "secondary-]"),
@@ -145,6 +153,19 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         ("ActivateTab7", "secondary-7"),
         ("ActivateTab8", "secondary-8"),
         ("ActivateTab9", "secondary-9"),
+        // Workspace slots in the Window menu's order. No default chord: ⌘1–9 is
+        // already the tab row's, and a workspace switch is a rarer move than a
+        // tab switch. Clickable in the Window menu and the title-bar chip, and
+        // bindable here for anyone who wants the chord.
+        ("SelectWorkspace1", ""),
+        ("SelectWorkspace2", ""),
+        ("SelectWorkspace3", ""),
+        ("SelectWorkspace4", ""),
+        ("SelectWorkspace5", ""),
+        ("SelectWorkspace6", ""),
+        ("SelectWorkspace7", ""),
+        ("SelectWorkspace8", ""),
+        ("SelectWorkspace9", ""),
         ("IncreaseFontSize", "secondary-="),
         ("DecreaseFontSize", "secondary--"),
         ("ResetFontSize", "secondary-0"),
@@ -458,6 +479,10 @@ fn keystroke_is_valid(s: &str) -> bool {
 fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
     Some(match action {
         "NewTab" => KeyBinding::new(keystroke, NewTab, None),
+        "NewWorkspace" => KeyBinding::new(keystroke, NewWorkspace, None),
+        "StopWorkspace" => KeyBinding::new(keystroke, StopWorkspace, None),
+        "DeleteWorkspace" => KeyBinding::new(keystroke, DeleteWorkspace, None),
+        "RenameWorkspace" => KeyBinding::new(keystroke, RenameWorkspace, None),
         "CloseActiveTab" => KeyBinding::new(keystroke, CloseActiveTab, None),
         "SplitRight" => KeyBinding::new(keystroke, SplitRight, None),
         "SplitDown" => KeyBinding::new(keystroke, SplitDown, None),
@@ -484,6 +509,15 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
         "ActivateTab7" => KeyBinding::new(keystroke, ActivateTab7, None),
         "ActivateTab8" => KeyBinding::new(keystroke, ActivateTab8, None),
         "ActivateTab9" => KeyBinding::new(keystroke, ActivateTab9, None),
+        "SelectWorkspace1" => KeyBinding::new(keystroke, SelectWorkspace1, None),
+        "SelectWorkspace2" => KeyBinding::new(keystroke, SelectWorkspace2, None),
+        "SelectWorkspace3" => KeyBinding::new(keystroke, SelectWorkspace3, None),
+        "SelectWorkspace4" => KeyBinding::new(keystroke, SelectWorkspace4, None),
+        "SelectWorkspace5" => KeyBinding::new(keystroke, SelectWorkspace5, None),
+        "SelectWorkspace6" => KeyBinding::new(keystroke, SelectWorkspace6, None),
+        "SelectWorkspace7" => KeyBinding::new(keystroke, SelectWorkspace7, None),
+        "SelectWorkspace8" => KeyBinding::new(keystroke, SelectWorkspace8, None),
+        "SelectWorkspace9" => KeyBinding::new(keystroke, SelectWorkspace9, None),
         "IncreaseFontSize" => KeyBinding::new(keystroke, IncreaseFontSize, None),
         "DecreaseFontSize" => KeyBinding::new(keystroke, DecreaseFontSize, None),
         "ResetFontSize" => KeyBinding::new(keystroke, ResetFontSize, None),

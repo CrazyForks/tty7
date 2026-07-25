@@ -6,7 +6,7 @@
 //! Releasing the modifier, adding another modifier, pressing any real key
 //! (a chord like ⌘C), or the window changing active status all hide them
 //! immediately — the chord dismissal lives in the keystroke interceptor
-//! registered in `Tty7App::new` (it fires even for keys the terminal
+//! registered in `Tty7App::with_session` (it fires even for keys the terminal
 //! consumes), and the activation dismissal in the observer beside it (a
 //! window that deactivates mid-hold never receives the release).
 //!
@@ -96,7 +96,7 @@ impl Tty7App {
     }
 
     /// Hide the badges and invalidate any pending reveal. Called on every real
-    /// keypress (the interceptor in `Tty7App::new`) so a chord like ⌘C never
+    /// keypress (the interceptor in `Tty7App::with_session`) so a chord like ⌘C never
     /// shows them, and on every window-activation flip (the observer next to
     /// it) because deactivating mid-hold — ⌘-Tab, Spotlight, a click into
     /// another app — sends the modifier release to whatever app is key by
@@ -150,8 +150,9 @@ mod gpui_tests {
         // Inject the zero-tab session (the persisted home-page state) so the
         // app builds without spawning a terminal — and without reading the
         // on-disk `session.json`.
-        let window =
-            cx.add_window(|window, cx| Tty7App::with_session(Some(Session::default()), window, cx));
+        let window = cx.add_window(|window, cx| {
+            Tty7App::with_session(None, Some(Session::default()), window, cx)
+        });
         // `add_window` alone doesn't make this the platform's active window,
         // and `deactivate_window` below is a no-op on a non-active one — so
         // activate it for real, like the OS does when the app opens.

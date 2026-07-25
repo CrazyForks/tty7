@@ -16,10 +16,14 @@ use gpui_component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::core::actions::{OpenSettings, TogglePalette};
+use crate::core::actions::{
+    NewWorkspace, OpenSettings, RenameWorkspace, SelectWorkspace1, SelectWorkspace2,
+    SelectWorkspace3, SelectWorkspace4, SelectWorkspace5, SelectWorkspace6, SelectWorkspace7,
+    SelectWorkspace8, SelectWorkspace9, StopWorkspace, TogglePalette,
+};
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::ShellSpec;
-use crate::ui::app::{Tab, Tty7App};
+use crate::ui::app::{TILE_GLYPH, TILE_GLYPH_LINE, TILE_SIZE, Tab, Tty7App, tile_trailing_inset};
 use crate::ui::hints::tab_badge_label;
 use crate::ui::reorder::{self, Reorder, Surface};
 
@@ -173,16 +177,408 @@ pub(crate) fn chrome_tile_variant(cx: &gpui::App) -> ButtonCustomVariant {
         // which on a light background is a ≈#EE tint nobody can see — and until
         // the fork learned to read `hover` at all, nothing was painted anyway.
         .hover(cx.theme().sidebar_accent)
-        // Selected (a lit toggle) and pressed sit one step darker than hover, so
-        // an open panel still reads as on while the pointer is over its button.
-        .active(cx.theme().list_active)
+        // Selected and pressed paint the *same* grey, not a darker step. The
+        // chrome has one fill and one only: with two, a lit toggle and a hovered
+        // menu button sat side by side in the same corner wearing different
+        // greys, which reads as two styles rather than two states. What says a
+        // tile is on is that it is filled at all — the tiles around it are bare.
+        .active(cx.theme().sidebar_accent)
 }
 
+/// What `Button::render` multiplies its own size by before handing it to the
+/// icon. The number matters here because the icon size a caller sets *doesn't*:
+/// `render` ends with `.with_size(icon_size)` on whatever `Icon` it was given,
+/// overwriting it unconditionally. So `Icon::size(px(18.))` on a `.xsmall()`
+/// button silently rendered at `Size::XSmall` — 12px — and every chrome glyph in
+/// the window had been that size regardless of what its call site asked for.
+/// Sizing the *button* is the only channel that reaches the glyph.
+pub(crate) const BUTTON_ICON_SCALE: f32 = 0.75;
+
+/// A chrome tile at the standard size: [`TILE_SIZE`] box, [`TILE_GLYPH`] glyph.
 pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> Button {
-    button.custom(chrome_tile_variant(cx)).selected(selected)
+    chrome_tile_sized(button, TILE_SIZE, TILE_GLYPH, selected, cx)
+}
+
+/// The same tile with its geometry named — for the line-art glyphs, which need a
+/// larger nominal size to draw the same ink, and for the body-scale tiles inside
+/// a panel. Callers set their own rounding; everything else is decided here so
+/// no call site can drift from the rhythm again.
+pub(crate) fn chrome_tile_sized(
+    button: Button,
+    tile: f32,
+    glyph: f32,
+    selected: bool,
+    cx: &gpui::App,
+) -> Button {
+    button
+        .custom(chrome_tile_variant(cx))
+        .selected(selected)
+        .with_size(px(glyph / BUTTON_ICON_SCALE))
+        .w(px(tile))
+        .h(px(tile))
+}
+
+/// One workspace row in the title-bar menu, flattened for rendering.
+#[derive(Clone)]
+struct WorkspaceMenuRow {
+    id: crate::core::session::WorkspaceId,
+    name: String,
+    /// Currently shown by a window.
+    open: bool,
+    /// Shown by *this* window.
+    is_current: bool,
+    /// Has panes still running in the daemon.
+    live: bool,
+}
+
+/// Diameter of the monogram badge on a workspace row. Smaller than the
+/// title-bar chip's (which sits among 32px tiles) and a shade under the
+/// sidebar's 24px, so a menu row stays at menu height.
+const MENU_AVATAR_PX: f32 = 20.0;
+
+/// The colour of a live workspace's corner dot. The same green
+/// [`AgentStatus::Done`](crate::core::cli_agent::AgentStatus::dot_rgb) uses —
+/// deliberately *not* the brand mint, which belongs to the logo and would be
+/// the only saturated pixel in a chrome that has none.
+pub(crate) const LIVE_DOT: u32 = 0x22C55E;
+
+/// The monogram badge for a workspace, built in the same shape as a tab
+/// avatar: a neutral disc carrying the first letter, with liveness riding the
+/// corner as a small dot.
+///
+/// The dot is the sidebar's [`status_dot`](Tty7App::status_dot), ringed in the
+/// surface it sits on — one corner-dot language for every avatar in the app.
+/// Drawn bare it was the same disc, but a bare disc at this diameter is all
+/// colour and no edge, and it landed on the menu as the loudest thing in it;
+/// the ring spends half the dot's width on separation instead.
+///
+/// A stopped workspace draws *no* dot, matching `AgentStatus::Idle`: a resting
+/// thing is just its mark. An "off" indicator would be a second shape invented
+/// for one list, and this app already decided that absence says it.
+///
+/// "This is the one you are looking at" is drawn by *subtraction*: the current
+/// badge renders at full strength and every other one fades to the same 0.55
+/// an unfocused pane uses. A leading checkmark would be truer to menu
+/// convention, but it makes the popup reserve a whole gutter that seven of
+/// eight rows leave empty and every label indent past; and marking the current
+/// row by *adding* something — an inverted disc, a ring — puts the heaviest
+/// pixels in the menu on the one row that needs no introduction.
+pub(crate) fn workspace_avatar(
+    name: &str,
+    live: bool,
+    current: bool,
+    size: f32,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let initial: String = name
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "~".to_string());
+    div()
+        .relative()
+        .flex_shrink_0()
+        .size(px(size))
+        .child(
+            div()
+                .size(px(size))
+                .rounded_full()
+                // `secondary`, not `muted`: a menu's fill is `popover`, and those
+                // two differ by half a percent — the disc came out invisible,
+                // leaving a bare letter with a dot floating beside it.
+                .bg(cx.theme().secondary)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px((size * 0.46).round()))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(cx.theme().foreground.opacity(0.65))
+                .child(initial)
+                // The same 0.55 an unfocused pane fades to, and for the same
+                // reason given there: a background-tinted scrim would be
+                // white-on-white in a light theme.
+                //
+                // The disc fades, the dot does not — element opacity multiplies
+                // through the whole subtree, so a faded dot takes its separator
+                // ring down with it and the green underneath prints straight
+                // through it as a halo. Liveness is status either way; it has no
+                // reason to say which row you're standing on.
+                .when(!current, |disc| disc.opacity(0.55)),
+        )
+        .when(live, |badge| {
+            // Ringed in `popover`, not `background`: a menu row's fill is the
+            // popover colour, and the two differ enough that a background-ringed
+            // dot draws a pale halo instead of an edge.
+            badge.child(Tty7App::status_dot(LIVE_DOT, 0, size, cx.theme().popover))
+        })
+}
+
+/// Render one workspace row: the monogram badge (carrying liveness on its
+/// corner), the name, and — on hover — a single close.
+///
+/// One button, not three. The sidebar row is the most action-rich row in the
+/// app and it reveals exactly one on hover, with everything else on the
+/// right-click menu; a menu row has no reason to be busier than that. Stopping
+/// and renaming live in the menu's bottom group, where every other
+/// current-workspace command already is.
+fn workspace_menu_row(row: WorkspaceMenuRow, cx: &App) -> impl IntoElement + use<> {
+    let id = row.id;
+    // The row's own hover fill, so the button sits on an opaque patch and the
+    // name slides under it through the gradient rather than colliding with it.
+    let backing = cx.theme().accent;
+    let mut fade_from = backing;
+    fade_from.a = 0.;
+    h_flex()
+        .id(("workspace-menu-row", id.element_key() as usize))
+        .group("workspace-menu-row")
+        .relative()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(workspace_avatar(
+            &row.name,
+            row.live,
+            row.is_current,
+            MENU_AVATAR_PX,
+            cx,
+        ))
+        // The name stays at full strength on every row: this is a list you read
+        // to pick from, and dimming seven of eight names to mark the one you're
+        // already on taxes the reading to make a point the badge already makes.
+        .child(div().flex_1().min_w_0().truncate().child(row.name))
+        .child(
+            h_flex()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right(px(0.))
+                .items_center()
+                .opacity(0.)
+                .group_hover("workspace-menu-row", |s| s.opacity(1.))
+                .child(div().w(px(14.)).h(px(20.)).bg(linear_gradient(
+                    90.,
+                    linear_color_stop(fade_from, 0.),
+                    linear_color_stop(backing, 1.),
+                )))
+                .child(
+                    div()
+                        .bg(backing)
+                        // Swallow the press so the click doesn't also fire the
+                        // row's own "show this workspace" underneath it.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            Button::new(("workspace-menu-delete", id.element_key() as usize))
+                                .icon(IconName::Close)
+                                .ghost()
+                                .xsmall()
+                                .on_click(move |_, window, cx| {
+                                    crate::ui::windows::confirm_and_delete(cx, window, id);
+                                }),
+                        ),
+                ),
+        )
+}
+
+/// The `SelectWorkspace{1..9}` action for a Window-menu slot, or `None` past
+/// the ninth. Shared by the title-bar chip and `ui::theme`'s Window menu so
+/// both index `ui::windows::menu_order` identically.
+pub(crate) fn select_workspace_action(index: usize) -> Option<Box<dyn gpui::Action>> {
+    Some(match index {
+        0 => Box::new(SelectWorkspace1) as Box<dyn gpui::Action>,
+        1 => Box::new(SelectWorkspace2),
+        2 => Box::new(SelectWorkspace3),
+        3 => Box::new(SelectWorkspace4),
+        4 => Box::new(SelectWorkspace5),
+        5 => Box::new(SelectWorkspace6),
+        6 => Box::new(SelectWorkspace7),
+        7 => Box::new(SelectWorkspace8),
+        8 => Box::new(SelectWorkspace9),
+        _ => return None,
+    })
 }
 
 impl Tty7App {
+    /// Diameter of the workspace avatar, matching the 32px chrome tiles beside
+    /// it so the corner reads as one row of controls.
+    const AVATAR_PX: f32 = 26.0;
+
+    /// The title-bar workspace control: a monogram of the current workspace
+    /// plus a chevron, opening the one menu that owns everything
+    /// workspace-scoped — and the app-level entries the "⋯" used to hold.
+    ///
+    /// This exists because the rest of it was too well hidden. Switching lived
+    /// in the command palette, reopening lived on the home page, ending lived
+    /// behind a hover, and renaming had no UI at all — each individually
+    /// defensible, together undiscoverable. Nothing in the window even *said*
+    /// which workspace it was, which starts to matter the moment there are two.
+    ///
+    /// A monogram rather than the full name: a fixed-width control can't be
+    /// pushed off the corner by a long repo name, and it sits level with the
+    /// icon tiles instead of introducing a third shape. The full name is in the
+    /// tooltip and checked in the menu.
+    ///
+    /// While a rename is in flight the control becomes the text field, so the
+    /// name is edited where it is displayed.
+    pub(crate) fn workspace_chip(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        if let Some(rename) = self.workspace_rename.as_ref() {
+            // The tile itself becomes the field — same height, same radius, and
+            // the hover fill standing in for "this control is being edited".
+            // A bordered input would drop a form control into a strip that has
+            // none, and `Input`'s default pill fights every other shape here;
+            // `appearance(false)` is what the tab rename uses for the same
+            // reason.
+            return h_flex()
+                .id("workspace-rename")
+                .flex_shrink_0()
+                .items_center()
+                .h(px(32.))
+                .w(px(150.))
+                .px(px(8.))
+                .rounded_lg()
+                .bg(cx.theme().sidebar_accent)
+                // Swallow mouse-downs (including the double-click that selects a
+                // word) so they never reach the enclosing TitleBar and zoom the
+                // window — the tab rename learned this the hard way.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(Input::new(&rename.input).appearance(false).xsmall())
+                .into_any_element();
+        }
+
+        let current = crate::core::session::WorkspaceStore::all(cx)
+            .get(self.workspace)
+            .map(|w| w.display_name())
+            .unwrap_or_else(|| "tty7".to_string());
+        // First character, uppercased — the whole point is a glyph that is
+        // recognisably *this* workspace at a glance across windows.
+        let monogram: String = current
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "~".to_string());
+
+        // Same `action_context` trick as the old "⋯": `.menu(label, Action)`
+        // dispatches the real action, so a click and its shortcut travel one
+        // path and the row renders the shortcut hint for free.
+        let action_ctx = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.pane.focused_or_first(window, cx))
+            .map(|leaf| leaf.read(cx).focus_handle.clone())
+            .unwrap_or_else(|| self.home_focus.clone());
+        // The only thing the rows need from `self`. Everything else — the
+        // order, the names, which shells are still running — is read inside the
+        // menu builder below, at the moment the menu opens.
+        let current_id = self.workspace;
+
+        div()
+            .occlude()
+            .flex_shrink_0()
+            .child(
+                Button::new("titlebar-workspace")
+                    .custom(chrome_tile_variant(cx))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(3.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(Self::AVATAR_PX))
+                                    .rounded_full()
+                                    .bg(cx.theme().secondary)
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(monogram),
+                            )
+                            // A chevron, unlike the toggles beside it: those do
+                            // one thing on click, this opens a menu, and the
+                            // glyph is what says so.
+                            .child(Icon::new(IconName::ChevronDown).size(px(11.))),
+                    )
+                    .xsmall()
+                    .h(px(32.))
+                    .rounded_lg()
+                    .tooltip(SharedString::from(current))
+                    .dropdown_menu_with_anchor(
+                        gpui::Anchor::TopRight,
+                        move |mut menu, _window, cx| {
+                            menu = menu.min_w(px(260.)).action_context(action_ctx.clone());
+                            // Built here, not at title-bar render time. The rows
+                            // carry a liveness snapshot, and a snapshot taken when
+                            // the chip last drew is whatever happened to be true
+                            // then — a shell that exited since would still show its
+                            // dot, because nothing re-renders the title bar when a
+                            // pane dies in another window. Reading it on open costs
+                            // one daemon round-trip per menu, which is exactly when
+                            // it is worth paying for.
+                            let alive = crate::ui::app::alive_panes();
+                            let rows: Vec<WorkspaceMenuRow> = crate::ui::windows::menu_order(cx)
+                                .into_iter()
+                                .map(|(id, open)| {
+                                    let ws = crate::core::session::WorkspaceStore::all(cx).get(id);
+                                    WorkspaceMenuRow {
+                                        id,
+                                        name: ws.map(|w| w.display_name()).unwrap_or_default(),
+                                        open,
+                                        is_current: id == current_id,
+                                        live: ws
+                                            .map(|w| w.pane_ids().iter().any(|p| alive.contains(p)))
+                                            .unwrap_or(false),
+                                    }
+                                })
+                                .collect();
+                            let mut separated = false;
+                            for (i, row) in rows.iter().enumerate() {
+                                let Some(action) = select_workspace_action(i) else {
+                                    break;
+                                };
+                                // One rule between what is on screen and what is put
+                                // away, drawn once and never leading.
+                                if !row.open && !separated {
+                                    separated = true;
+                                    if i > 0 {
+                                        menu = menu.separator();
+                                    }
+                                }
+                                let row = row.clone();
+                                // Deliberately *not* `menu_element_with_check`: a
+                                // single checked item makes `PopupMenu` reserve a
+                                // left icon gutter on every row in the menu, and
+                                // seven of eight of them have nothing to put in it.
+                                // The current workspace is marked on its avatar
+                                // instead — same information, no column.
+                                menu = menu.menu_element(action, move |_window, cx| {
+                                    workspace_menu_row(row.clone(), cx)
+                                });
+                            }
+                            menu.separator()
+                                .menu("New Workspace", Box::new(NewWorkspace))
+                                // The two actions a row's single close doesn't
+                                // carry. They act on *this* window's workspace,
+                                // like every other entry below the rows — and
+                                // rename has to: the field it opens is the chip in
+                                // this title bar, so it can only ever edit the name
+                                // shown there.
+                                .menu("Rename Workspace…", Box::new(RenameWorkspace))
+                                .menu("Stop Workspace…", Box::new(StopWorkspace))
+                                // The app-level entries the "⋯" used to carry.
+                                // Folded in here so the corner has one menu rather
+                                // than two adjacent ones.
+                                .separator()
+                                .menu("Command Palette", Box::new(TogglePalette))
+                                .menu("Settings…", Box::new(OpenSettings))
+                        },
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The window's right-corner chrome: the detail-panel toggle and the overflow
     /// "⋯". Built here rather than inline because it has two hosts — the title
     /// strip while the panel is closed, and the panel's own top zone while it's
@@ -195,25 +591,20 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let panel_open = self.right_panel_open(cx);
-        // `.menu(label, Action)` dispatches the real action, so a click and the
-        // shortcut travel one path and the row auto-renders the shortcut hint; it
-        // needs an `action_context` inside the app's element tree to land on the
-        // root `on_action` handlers, so we hand it the focused pane (falling back
-        // to the home page's handle when no tab is open).
-        let action_ctx = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.pane.focused_or_first(window, cx))
-            .map(|leaf| leaf.read(cx).focus_handle.clone())
-            .unwrap_or_else(|| self.home_focus.clone());
         h_flex()
             .flex_shrink_0()
             .items_center()
             .gap(px(2.))
+            // The workspace control leads the corner chrome: it is the only
+            // thing in the window that says *which* workspace this is, which
+            // starts to matter the moment there are two. It also absorbed the
+            // old "⋯" menu, so the corner has one menu instead of two adjacent
+            // ones, and nothing workspace-scoped is left behind a modifier
+            // gesture or a palette entry the user has to already know about.
             // The "⋯" glyph ends on the window's content inset like every other
             // right edge in the chrome — hence `inset - TILE_PAD`, which puts the
-            // *glyph* there instead of its 30px hit box.
-            .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
+            // *glyph's ink* there instead of its hit box.
+            .pr(px(tile_trailing_inset()))
             // On Windows/Linux the window controls (─ ▢ ✕) sit on the right, right
             // where the "⋯" lands, so its inset has to match *their* rhythm rather
             // than add breathing room: the 34px control tiles put consecutive glyph
@@ -227,13 +618,10 @@ impl Tty7App {
                 div().occlude().flex_shrink_0().child(
                     chrome_tile(
                         Button::new("titlebar-right-panel")
-                            .icon(Icon::empty().path("icons/panel-right.svg").size(px(18.))),
+                            .icon(Icon::empty().path("icons/panel-right.svg")),
                         panel_open,
                         cx,
                     )
-                    .xsmall()
-                    .w(px(32.))
-                    .h(px(32.))
                     .rounded_lg()
                     .tooltip("Detail Panel")
                     .on_click(cx.listener(|this, _, _window, cx| {
@@ -241,35 +629,13 @@ impl Tty7App {
                     })),
                 ),
             )
-            .child(
-                div().occlude().flex_shrink_0().child(
-                    chrome_tile(
-                        Button::new("titlebar-menu")
-                            .icon(Icon::new(IconName::Ellipsis).size(px(18.))),
-                        false,
-                        cx,
-                    )
-                    .xsmall()
-                    .w(px(32.))
-                    .h(px(32.))
-                    .rounded_lg()
-                    .dropdown_menu_with_anchor(
-                        gpui::Anchor::TopRight,
-                        move |menu, _window, _cx| {
-                            menu.min_w(px(220.))
-                                .action_context(action_ctx.clone())
-                                .menu("Command Palette", Box::new(TogglePalette))
-                                .menu("Settings…", Box::new(OpenSettings))
-                        },
-                    ),
-                ),
-            )
+            .child(self.workspace_chip(window, cx))
     }
 
     /// The detail panel's tab tiles — icon-only, one per view. Lives here beside
     /// the rest of the chrome tiles so all of them share one styling helper.
     pub(crate) fn right_panel_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let active_tab = cx.global::<Config>().right_panel_tab;
+        let active_tab = self.right_panel_tab;
         [
             (
                 RightPanelTab::Info,
@@ -302,13 +668,10 @@ impl Tty7App {
                 .flex_shrink_0()
                 .child(
                     chrome_tile(
-                        Button::new(("right-panel-tab", tab as usize)).icon(icon.size(px(18.))),
+                        Button::new(("right-panel-tab", tab as usize)).icon(icon),
                         active_tab == tab,
                         cx,
                     )
-                    .xsmall()
-                    .w(px(32.))
-                    .h(px(32.))
                     .rounded_lg()
                     .tooltip(label)
                     .on_click(cx.listener(move |this, _, _window, cx| {
@@ -327,10 +690,12 @@ impl Tty7App {
     /// haven't looked at: when nonzero, the dot swells into a count badge —
     /// the same disc grown just enough to speak its number — so read↔unread
     /// stays one element opening its mouth, not a second indicator appearing.
-    /// `size` is the avatar edge.
-    fn status_dot(rgb: u32, unread: usize, size: f32, cx: &App) -> gpui::AnyElement {
+    /// `size` is the avatar edge, `ring` the colour of the surface the badge
+    /// sits on — the separator is drawn in it, so a dot on a popover row rings
+    /// in the popover's fill rather than the window background's.
+    fn status_dot(rgb: u32, unread: usize, size: f32, ring: gpui::Hsla) -> gpui::AnyElement {
         let d = (size * 0.42).max(7.);
-        let bg = cx.theme().background;
+        let bg = ring;
         if unread > 0 {
             // The count badge: sized to seat a digit legibly, centred on the
             // read dot's centre (same corner point) so the swell reads as the
@@ -407,7 +772,7 @@ impl Tty7App {
                 // panes, without ever hiding the done state.
                 let dot = status
                     .and_then(|s| s.dot_rgb())
-                    .map(|rgb| Self::status_dot(rgb, unread, size, cx));
+                    .map(|rgb| Self::status_dot(rgb, unread, size, cx.theme().background));
                 base.relative()
                     .rounded_full()
                     .bg(gpui::rgb(agent.accent_rgb()))
@@ -437,7 +802,9 @@ impl Tty7App {
                 // SSH connection phase as a corner status dot — the same
                 // element as an agent's, not a border ring around the badge
                 // (a ring read as a second, differently-shaped avatar style).
-                .when_some(ssh, |b, rgb| b.child(Self::status_dot(rgb, 0, size, cx)))
+                .when_some(ssh, |b, rgb| {
+                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background))
+                })
                 .into_any_element(),
         }
     }
@@ -1082,24 +1449,24 @@ impl Tty7App {
         // spot; ⌘T still opens a default tab in one), followed by every shell
         // discovered on this machine (`detected_shells`, probed at startup).
         // Built on gpui-component's `DropdownMenu`, which is only implemented
-        // for `Button` — hence a ghost Button restyled to the title bar's 30px
-        // tile rhythm (30px box, 15px glyph, soft corners) rather than the
-        // hand-rolled tile the "+" used to be.
+        // for `Button` — hence a ghost Button restyled to the title bar's tile
+        // rhythm (`TILE_SIZE` box, soft corners) rather than the hand-rolled
+        // tile the "+" used to be. `TILE_GLYPH_LINE`, not `TILE_GLYPH`: lucide's
+        // "+" draws inside a smaller share of its viewBox than the framed marks
+        // beside it, and would otherwise read a fifth small.
         let add_button =
             // Same Windows titlebar note as the chips above: `occlude()` gives
             // the trigger a BlockMouse hitbox so the TitleBar's HTCAPTION drag
             // area doesn't swallow the click.
             div().occlude().flex_shrink_0().child(
                 self.attach_new_tab_menu(
-                    chrome_tile(
-                        Button::new("tab-add")
-                            .icon(Icon::new(IconName::Plus).size(px(18.))),
+                    chrome_tile_sized(
+                        Button::new("tab-add").icon(Icon::new(IconName::Plus)),
+                        TILE_SIZE,
+                        TILE_GLYPH_LINE,
                         false,
                         cx,
                     )
-                        .xsmall()
-                        .w(px(32.))
-                        .h(px(32.))
                         .rounded_lg(),
                     cx,
                 ),
@@ -1121,15 +1488,14 @@ impl Tty7App {
                 .child(
                     div().occlude().flex_shrink_0().child(
                         self.attach_new_tab_menu(
-                            chrome_tile(
+                            chrome_tile_sized(
                                 Button::new("titlebar-add-collapsed")
-                                    .icon(Icon::new(IconName::Plus).size(px(18.))),
+                                    .icon(Icon::new(IconName::Plus)),
+                                TILE_SIZE,
+                                TILE_GLYPH_LINE,
                                 false,
                                 cx,
                             )
-                            .xsmall()
-                            .w(px(32.))
-                            .h(px(32.))
                             .rounded_lg(),
                             cx,
                         ),
@@ -1139,13 +1505,10 @@ impl Tty7App {
                     div().occlude().flex_shrink_0().child(
                         chrome_tile(
                             Button::new("titlebar-expand-sidebar")
-                                .icon(Icon::empty().path("icons/panel-left.svg").size(px(18.))),
+                                .icon(Icon::empty().path("icons/panel-left.svg")),
                             false,
                             cx,
                         )
-                        .xsmall()
-                        .w(px(32.))
-                        .h(px(32.))
                         .rounded_lg()
                         .tooltip("Show Sidebar")
                         .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),

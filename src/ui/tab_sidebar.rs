@@ -753,8 +753,8 @@ impl Tty7App {
             .items_center()
             .justify_end()
             .gap(px(2.))
-            // Glyph, not hit box, on the content edge — see `TILE_PAD`.
-            .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
+            // Glyph's ink, not hit box, on the content edge — see `TILE_PAD`.
+            .pr(px(crate::ui::app::tile_trailing_inset()))
             // Both tiles are wrapped in an `occlude()` div, exactly like the
             // title-strip chrome. This row is a `WindowControlArea::Drag` (set
             // below), which on Windows maps to HTCAPTION — the OS claims the click
@@ -769,15 +769,13 @@ impl Tty7App {
                         // `chrome_tile`, not `ghost()`: this "+" sits beside the
                         // collapse tile and the title bar's own "+", and ghost's
                         // hover is a heavier, differently-derived grey.
-                        crate::ui::tab_strip::chrome_tile(
-                            Button::new("sidebar-add")
-                                .icon(Icon::new(IconName::Plus).size(px(18.))),
+                        crate::ui::tab_strip::chrome_tile_sized(
+                            Button::new("sidebar-add").icon(Icon::new(IconName::Plus)),
+                            crate::ui::app::TILE_SIZE,
+                            crate::ui::app::TILE_GLYPH_LINE,
                             false,
                             cx,
                         )
-                        .xsmall()
-                        .w(px(32.))
-                        .h(px(32.))
                         .rounded_lg(),
                         cx,
                     ),
@@ -787,13 +785,10 @@ impl Tty7App {
                 div().occlude().flex_shrink_0().child(
                     crate::ui::tab_strip::chrome_tile(
                         Button::new("sidebar-collapse")
-                            .icon(Icon::empty().path("icons/panel-left.svg").size(px(18.))),
+                            .icon(Icon::empty().path("icons/panel-left.svg")),
                         false,
                         cx,
                     )
-                    .xsmall()
-                    .w(px(32.))
-                    .h(px(32.))
                     .rounded_lg()
                     .tooltip("Hide Sidebar")
                     .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
