@@ -7,49 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [26.7.3] - 2026-07-25
+
 ### Added
 
 - **Multiple windows, one workspace each** — `New Workspace` (⌘⇧N) opens a
   second window with its own tabs, splits, and chrome state. A workspace is
   the persistent thing: closing its window puts it away with its panes still
   running in the daemon, and the title bar's workspace menu, the command
-  palette, and the home page's picker all bring it back. `Stop Workspace` ends one for real
-  (no default chord — it kills sessions), `Delete Workspace` also forgets the
-  layout, and a workspace can be renamed from the title-bar chip.
+  palette, and the home page's picker all bring it back. `Stop Workspace`
+  ends one for real (no default chord — it kills sessions), `Delete
+  Workspace` also forgets the layout, and a workspace can be renamed from
+  the title-bar chip. (#169)
 - **Workspace switcher, in the two places you'd look** — a title-bar chip
   (monogram + chevron) whose menu lists every workspace with a monogram badge
   and a corner dot for the ones whose shells are still running, and the macOS
   **Window** menu listing the same set: on screen first, then the detached ones
-  with how long ago you left them. Both show the first nine.
+  with how long ago you left them. Both show the first nine. (#169)
+- **Detail panel** — a docked right-hand column that shows what the active
+  pane *is* rather than what it's printing: **Info** (cwd, branch, shell,
+  agent, the process tree and the TCP ports the pane is listening on),
+  **Outline**, **Changes**, and **Files** (a local file tree). Opening a file
+  from it lifts a code editor overlay over the terminal. (#158)
+- **Port forwarding and SFTP live in the detail panel** — a native-SSH pane's
+  forwards are listed, added and removed from the Info tab, and its remote
+  filesystem browses from the Files tab, with transfers reported in a footer
+  that rides under every tab. (#166)
+- **Shell integration in native SSH panes** — OSC 133 prompt marks, exit
+  codes and cwd reporting now reach zsh, bash and fish on the far side, so
+  the inline line editor works in an SSH pane exactly as it does locally.
+  (#152)
+- **Live drag-to-reorder** — tabs rearrange under the cursor the way Chrome
+  and Warp do (the dragged tab stays in the list and the ones it passes slide
+  out of the way) in the strip, the sidebar rows, and whole repo groups.
+  (#151)
+- **The rail's top strip drags the window** — the sidebar's title-bar-height
+  top zone now moves the window on drag and zooms it on double-click, like
+  the title bar it sits level with. (#153)
 - **The ⌃R history menu can be switched off** — Settings → Terminal →
   Keyboard, or `history_search` in `config.json`. With it off, the prompt
   line is handed to the shell and the raw `^R` follows it, so a binding
   of your own (fzf, percol, plain reverse-i-search) answers instead of
-  tty7's menu. (#163)
+  tty7's menu. (#163, #170)
 
 ### Changed
 
 - **Sidebar and right-panel visibility are per-window** — toggling one
   window's chrome leaves the others alone. The config value is now what a
-  *newly opened* window starts with; panel width stays shared.
+  *newly opened* window starts with; panel width stays shared. (#169)
 - **Chrome icons draw at the size they were asked to** — every tile glyph in
   the window (title bar, rail, panel tabs, overlay headers) had been rendering
   at 12px regardless of the size its call site set, because the button widget
   overwrites its icon's size from its own. The tile rhythm is now stated once
   and applied from one helper, so the marks read at their intended weight and
-  the hover capsule keeps a consistent gap from the window edge.
+  the hover capsule keeps a consistent gap from the window edge. (#169)
+- **The panel and chrome glyphs are drawn to one spec** — the detail panel's
+  tab marks and the title bar's own were redrawn so a row of icons stops
+  reading as a row of icons from different sets, and every icon tile shares
+  one soft hover fill. (#161)
+- **Multi-line commands submit as one bracketed paste** — a 30-line block
+  costs one prompt cycle instead of thirty, so it no longer retypes itself
+  down the screen on Enter. (#164)
+- **The file tree lists directories off the render thread** — `read_dir`, the
+  `.gitignore` chain and the search walk left the paint, so a cold cache or a
+  large repo no longer stalls a frame. (#160)
+- **The LSP client is gone** — opening a `.rs` file in the code panel silently
+  spawned rust-analyzer, which indexed the whole workspace for hundreds of
+  megabytes of RAM. A terminal shouldn't do that to you on a click, and the
+  fix is removal rather than a switch for something nobody asked for. (#159)
+- **Sidebar rows float their close button** — the ✕ no longer reserves a
+  permanent trailing column, so labels and branch lines get the full rail
+  width, and it stays clear of a row's `+n −n` counts. (#145)
 - **Daemon wire protocol is now v2** — WSL panes carry a remote-context kind
   that a v1 client can't decode, so it would drop the pane's connection
   instead of ignoring the unknown value. The version handshake now sees that
   skew and offers to restart the daemon, rather than letting a downgraded
-  build lose panes silently.
+  build lose panes silently. (#169)
+- **`Cargo.lock` is checked against `Cargo.toml` in CI** — release builds now
+  run `--locked`, so a drifted lockfile fails the build instead of quietly
+  resolving something else. (#150)
 
 ### Fixed
 
 - **⌃J and ⌃M submit the line again** — accept-line's control codes were
   swallowed at the prompt as unrecognized Ctrl chords, so the keys did
   nothing. They now take the same path Enter does, completion picker and
-  history menu included. (#163)
+  history menu included. (#163, #170)
+- **The sidebar's git counts keep up** — `+N −N` refreshes as an agent's tool
+  calls land (throttled per repo) and when the window regains focus, instead
+  of going stale until you happened to run a command in that pane. (#149)
+- **`ToggleSftp` earns its name** — pressing it while the panel is already on
+  Files closes the panel rather than being a dead press, and the remote
+  browser's 500ms transfer poll now ends itself when the panel closes instead
+  of depending on the render path to retire it. (#167)
+- **Closing the last window from the home page quits** — it used to leave a
+  windowless process in the Dock that no longer responded to being clicked.
+  (#147, #148)
+- **Windows titlebar chrome** — the `⋯` menu sits back on the native
+  window-control rhythm, and the sidebar's collapse / new-tab buttons take
+  their clicks again instead of being swallowed by the drag region. (#162)
+- **Windows: the theme panel's close button did nothing** — and the repo group
+  header showed a plain arrow where every other row shows a pointer. (#155,
+  #156)
+- **Settings keeps its stock glyphs** — the page's own icons stopped being
+  restyled by the chrome tile pass, and its close button is sized to the title
+  bar's rhythm rather than reading undersized beside the window controls.
+  (#157, #165)
 
 ## [26.7.2] - 2026-07-21
 
