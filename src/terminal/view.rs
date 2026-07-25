@@ -583,6 +583,56 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+/// Build the byte sequence that submits the local editor's buffer to the shell.
+///
+/// The line count is what matters here. Replaying every embedded newline as its
+/// own CR makes the shell's line editor run a *full* prompt cycle per line —
+/// preexec, the user's precmd chain (git-status prompts, conda…), a
+/// syntax-highlight pass over the whole buffer, plus our own OSC 133 `D`
+/// follow-up work. A 30-line paste costs 30 of them and visibly crawls down the
+/// screen, as if the command were being retyped. Under bracketed paste the
+/// whole buffer goes in as a single paste and one CR accepts it: one prompt
+/// cycle whatever the line count.
+///
+/// Continuation still works — better, in fact. zle keeps the embedded newlines
+/// in its buffer, so a backslash / open-quote / heredoc command parses as one
+/// unit; the PS2 assembly the per-line replay existed for now happens inside
+/// the buffer instead of on the wire. The visible difference is that the block
+/// executes as one unit and lands in the shell's history as one entry — which
+/// is what pasting multi-line text into any other terminal already does, and
+/// what our own history has always recorded.
+///
+/// ESC is stripped first (in both branches, unlike the paste path): clipboard
+/// text carrying its own `ESC[201~` could otherwise close the paste early and
+/// have the rest run as typed input, and a raw ESC reaching zle unbracketed is
+/// an editor command, not text. CR is normalized away in the same pass, so a
+/// CRLF clipboard is one line break either way rather than a stray blank Enter.
+///
+/// An empty buffer skips the markers: zsh's `bracketed-paste-magic` (which
+/// oh-my-zsh turns on) errors on a paste with nothing between them.
+///
+/// The agent-prompt path already delivers multi-line text this way — see
+/// [`crate::core::agent_prompt::submit_bytes`], which is this shape minus the
+/// unbracketed fallback (an agent TUI always enables the mode).
+fn submit_bytes(line: &str, bracketed: bool) -> Vec<u8> {
+    // A CRLF clipboard pastes into the editor verbatim, so the `\r` has to go
+    // before either branch sees it. Unbracketed it would be a second Enter
+    // (`\r\n` → `\r\r`, a blank line submitted mid-command); bracketed it would
+    // ride inside the markers and land on whatever the far side happens to do
+    // with a CR in a paste — zsh turns it into a newline, so the block gains a
+    // blank line, and a shell that doesn't leaves a literal `^M` in the command.
+    // One `\n` per line is the shape both branches are written for.
+    let clean: String = line
+        .replace("\r\n", "\n")
+        .chars()
+        .filter(|&c| c != '\x1b')
+        .map(|c| if c == '\r' { '\n' } else { c })
+        .collect();
+    let mut bytes = paste_bytes(&clean, bracketed && !clean.is_empty());
+    bytes.push(b'\r');
+    bytes
+}
+
 /// Strip trailing spaces/tabs from every line, preserving the line structure
 /// (and any final newline). Used by copy when `clipboard_trim_trailing_spaces`
 /// is on so selections don't carry cell-padding whitespace.
@@ -3266,12 +3316,16 @@ impl TerminalView {
         // "ls" strays + "pwd\r" runs `lspwd`. Wipe first: FIFO puts the ^U
         // ahead of the line bytes.
         self.wipe_pending_typeahead();
-        // Replay each embedded newline as an Enter so the shell's own line editor
-        // assembles the multi-line command — backslash / open-quote continuation
-        // with its PS2 prompts — exactly as if it had been typed line by line.
-        let mut bytes = line.replace('\n', "\r").into_bytes();
-        bytes.push(b'\r');
-        self.terminal.write(bytes);
+        // One paste + one CR when the shell takes bracketed paste, so a
+        // multi-line command costs one prompt cycle instead of one per line
+        // (see `submit_bytes`); per-line CRs otherwise.
+        let bracketed = self
+            .terminal
+            .term
+            .lock()
+            .mode()
+            .contains(TermMode::BRACKETED_PASTE);
+        self.terminal.write(submit_bytes(&line, bracketed));
         self.cmd.clear();
         self.cursor_visible = true;
         let mut term = self.terminal.term.lock();
@@ -5763,8 +5817,8 @@ mod tests {
         SelectEndCopy, WheelRoute, clipboard_paste_text, display_width, drag_scroll_step,
         encode_mouse, expand_file_command_template, fallback_chain, fig_icon_emoji, fig_icon_glyph,
         focus_report_bytes, input_overflow_shift, input_overlay_rows, menu_layout, paste_bytes,
-        select_end_copy, shell_escape_path, smooth_scroll_step, trim_trailing_spaces, wheel_route,
-        wrapped_click_index,
+        select_end_copy, shell_escape_path, smooth_scroll_step, submit_bytes, trim_trailing_spaces,
+        wheel_route, wrapped_click_index,
     };
     use alacritty_terminal::term::TermMode;
     use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths, Modifiers};
@@ -6196,6 +6250,72 @@ mod tests {
             paste_bytes("a\nb", true),
             b"\x1b[200~a\nb\x1b[201~".to_vec()
         );
+    }
+
+    #[test]
+    fn submit_bytes_sends_a_multi_line_command_as_one_bracketed_paste() {
+        // The regression this exists for: replaying each newline as its own CR
+        // made zle run a full prompt cycle per line (preexec + the user's
+        // precmd chain + a highlight pass), so a pasted block crawled down the
+        // screen. One paste, one CR — one cycle, whatever the line count.
+        assert_eq!(
+            submit_bytes("echo a\necho b\necho c", true),
+            b"\x1b[200~echo a\necho b\necho c\x1b[201~\r".to_vec()
+        );
+        // Exactly one CR reaches the shell: the accept, not one per line.
+        let out = submit_bytes("a\nb\nc\nd", true);
+        assert_eq!(out.iter().filter(|&&b| b == b'\r').count(), 1);
+        // Single-line commands take the same shape — no special case.
+        assert_eq!(
+            submit_bytes("ls -la", true),
+            b"\x1b[200~ls -la\x1b[201~\r".to_vec()
+        );
+    }
+
+    #[test]
+    fn submit_bytes_falls_back_to_per_line_cr_without_bracketed_paste() {
+        // A shell that never enabled bracketed paste can only assemble a
+        // multi-line command the old way: one Enter per line, letting its
+        // editor do the PS2 continuation.
+        assert_eq!(submit_bytes("a\nb", false), b"a\rb\r".to_vec());
+        // A CRLF clipboard yields one CR per line, not a stray extra Enter
+        // (`\r\n` used to become `\r\r` — a blank line submitted mid-command).
+        assert_eq!(submit_bytes("a\r\nb", false), b"a\rb\r".to_vec());
+    }
+
+    #[test]
+    fn submit_bytes_normalizes_line_breaks_inside_the_paste() {
+        // The CR of a CRLF clipboard must not ride inside the markers either:
+        // zsh turns a pasted CR into a newline (so the block would gain a blank
+        // line) and a shell that doesn't leaves a literal `^M` in the command.
+        assert_eq!(
+            submit_bytes("a\r\nb", true),
+            b"\x1b[200~a\nb\x1b[201~\r".to_vec()
+        );
+        // A lone CR is a line break too — dropping it would glue the lines
+        // together into one command.
+        assert_eq!(
+            submit_bytes("a\rb", true),
+            b"\x1b[200~a\nb\x1b[201~\r".to_vec()
+        );
+        assert_eq!(submit_bytes("a\rb", false), b"a\rb\r".to_vec());
+    }
+
+    #[test]
+    fn submit_bytes_strips_esc_and_skips_markers_on_an_empty_line() {
+        // Clipboard text carrying its own `ESC[201~` would otherwise close the
+        // paste early and have the rest run as typed input.
+        let out = submit_bytes("foo\x1b[201~\nrm -rf ~", true);
+        let end = b"\x1b[201~";
+        assert_eq!(out.windows(end.len()).filter(|w| *w == end).count(), 1);
+        assert_eq!(out, b"\x1b[200~foo[201~\nrm -rf ~\x1b[201~\r".to_vec());
+        // ESC is stripped on the unbracketed path too — raw ESC reaching zle is
+        // an editor command, not text.
+        assert_eq!(submit_bytes("a\x1bb", false), b"ab\r".to_vec());
+
+        // An empty line is a bare Enter: zsh's `bracketed-paste-magic` errors
+        // on a paste with nothing between the markers.
+        assert_eq!(submit_bytes("", true), b"\r".to_vec());
     }
 
     #[test]
