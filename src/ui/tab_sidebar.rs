@@ -755,36 +755,48 @@ impl Tty7App {
             .gap(px(2.))
             // Glyph, not hit box, on the content edge — see `TILE_PAD`.
             .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
+            // Both tiles are wrapped in an `occlude()` div, exactly like the
+            // title-strip chrome. This row is a `WindowControlArea::Drag` (set
+            // below), which on Windows maps to HTCAPTION — the OS claims the click
+            // as a window-drag before gpui ever hit-tests, so a bare button never
+            // fires its `on_click`. `occlude()` gives each a BlockMouse hitbox so
+            // hit-testing stops on the button. (No-op on macOS, where titlebar
+            // dragging doesn't gate child hit-testing — which is why this worked
+            // there and silently did nothing on Windows.)
             .child(
-                self.attach_new_tab_menu(
-                    // `chrome_tile`, not `ghost()`: this "+" sits beside the
-                    // collapse tile and the title bar's own "+", and ghost's
-                    // hover is a heavier, differently-derived grey.
+                div().occlude().flex_shrink_0().child(
+                    self.attach_new_tab_menu(
+                        // `chrome_tile`, not `ghost()`: this "+" sits beside the
+                        // collapse tile and the title bar's own "+", and ghost's
+                        // hover is a heavier, differently-derived grey.
+                        crate::ui::tab_strip::chrome_tile(
+                            Button::new("sidebar-add").icon(Icon::new(IconName::Plus).size(px(18.))),
+                            false,
+                            cx,
+                        )
+                        .xsmall()
+                        .w(px(32.))
+                        .h(px(32.))
+                        .rounded_lg(),
+                        cx,
+                    ),
+                ),
+            )
+            .child(
+                div().occlude().flex_shrink_0().child(
                     crate::ui::tab_strip::chrome_tile(
-                        Button::new("sidebar-add").icon(Icon::new(IconName::Plus).size(px(18.))),
+                        Button::new("sidebar-collapse")
+                            .icon(Icon::empty().path("icons/panel-left.svg").size(px(18.))),
                         false,
                         cx,
                     )
                     .xsmall()
                     .w(px(32.))
                     .h(px(32.))
-                    .rounded_lg(),
-                    cx,
+                    .rounded_lg()
+                    .tooltip("Hide Sidebar")
+                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
                 ),
-            )
-            .child(
-                crate::ui::tab_strip::chrome_tile(
-                    Button::new("sidebar-collapse")
-                        .icon(Icon::empty().path("icons/panel-left.svg").size(px(18.))),
-                    false,
-                    cx,
-                )
-                .xsmall()
-                .w(px(32.))
-                .h(px(32.))
-                .rounded_lg()
-                .tooltip("Hide Sidebar")
-                .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
             );
         // Borderless "Search tabs…" that sits directly on the sunk surface: a
         // leading magnifier + an appearance-less input, no box and no divider
