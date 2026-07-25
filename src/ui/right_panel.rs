@@ -141,7 +141,10 @@ impl Tty7App {
         // "not looking at that pane": the browser owns a 500ms transfer poll that
         // only ends when the browser does, so leaving it open behind a closed
         // panel would keep a daemon round-trip (and a full re-render) running
-        // twice a second for a column nobody can see.
+        // twice a second for a column nobody can see. The poll loop makes the
+        // same check on its own tick (`sftp_start_polling`) so its lifetime
+        // doesn't rest on this function being called every frame; retiring here
+        // as well just gets it done a frame sooner instead of up to 500ms later.
         if let Some(open) = self.sftp_panel.open_pane_id
             && (!panel_open || self.remote_files_pane(window, cx).map(|(id, _)| id) != Some(open))
         {
