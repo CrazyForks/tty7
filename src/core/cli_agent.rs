@@ -338,8 +338,11 @@ impl CLIAgent {
 
     /// Brand accent (0xRRGGBB) for the tab chip's agent dot. Chosen for legibility
     /// on both light and dark themes rather than exact brand black/white. A pure
-    /// black or white dot vanishes against one theme, so monochrome vendors get
-    /// a recognizable mid-tone hue instead; Codex keeps its black field.
+    /// *white* field vanishes against a light theme, so vendors whose mark is a
+    /// grey or gradient monochrome (Cursor) get a recognizable mid-tone hue
+    /// instead. A black field is a different case: it stays darker than even the
+    /// darkest theme background and the white mark on it carries the badge, so
+    /// vendors who actually brand in black (Codex, Grok) keep it.
     pub fn accent_rgb(self) -> u32 {
         match self {
             CLIAgent::Claude => 0xD97757,      // Claude terracotta
@@ -357,7 +360,7 @@ impl CLIAgent {
             CLIAgent::Hermes => 0x8B5CF6,      // violet
             CLIAgent::Vibe => 0xFF7000,        // Mistral orange
             CLIAgent::Antigravity => 0x2563EB, // Google blue (darker than Gemini's)
-            CLIAgent::Grok => 0x64748B,        // xAI is monochrome → slate
+            CLIAgent::Grok => 0x000000,        // xAI brands in black
             CLIAgent::Qwen => 0x7C3AED,        // Qwen purple
         }
     }
@@ -379,6 +382,7 @@ impl CLIAgent {
             CLIAgent::Cursor => "icons/agents/cursor.svg",
             CLIAgent::Goose => "icons/agents/goose.svg",
             CLIAgent::Droid => "icons/agents/droid.svg",
+            CLIAgent::Grok => "icons/agents/grok.svg",
             // No brand mark bundled → generic robot glyph.
             CLIAgent::Aider
             | CLIAgent::Pi
@@ -386,7 +390,6 @@ impl CLIAgent {
             | CLIAgent::Hermes
             | CLIAgent::Vibe
             | CLIAgent::Antigravity
-            | CLIAgent::Grok
             | CLIAgent::Qwen => "icons/bot.svg",
         }
     }
@@ -940,9 +943,12 @@ mod tests {
         }
     }
 
+    /// The two vendors who actually brand in black keep the black field rather
+    /// than the mid-tone substitute monochrome marks otherwise get.
     #[test]
-    fn codex_avatar_uses_its_black_brand_field() {
+    fn black_branded_avatars_keep_their_brand_field() {
         assert_eq!(CLIAgent::Codex.accent_rgb(), 0x000000);
+        assert_eq!(CLIAgent::Grok.accent_rgb(), 0x000000);
     }
 
     #[test]

@@ -151,6 +151,11 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         "icons/agents/cursor.svg" => include_bytes!("../../assets/icons/agents/cursor.svg"),
         "icons/agents/goose.svg" => include_bytes!("../../assets/icons/agents/goose.svg"),
         "icons/agents/droid.svg" => include_bytes!("../../assets/icons/agents/droid.svg"),
+        // The one mark not taken from the vendor directly: xAI publishes its
+        // symbol only as a ~2:1 landscape lockup that turns to mush as a 16px
+        // silhouette, so this is lobehub/lobe-icons' square transcription (MIT),
+        // drawn for exactly this avatar use. Its notice rides in the SVG.
+        "icons/agents/grok.svg" => include_bytes!("../../assets/icons/agents/grok.svg"),
         _ => return None,
     };
     Some(bytes)
@@ -177,6 +182,21 @@ mod tests {
             assert_ne!(
                 overridden, stock,
                 "`{name}` should resolve to different art with and without `{STOCK_PREFIX}`"
+            );
+        }
+    }
+
+    /// Every agent avatar must resolve to real bytes. Adding a brand mark means
+    /// touching two files — the SVG and the arm above — and forgetting the
+    /// second one costs the agent its avatar with nothing to show for it.
+    #[test]
+    fn every_agent_icon_resolves() {
+        for agent in crate::core::cli_agent::CLIAgent::ALL {
+            let path = agent.icon_path();
+            assert!(
+                Assets.load(path).unwrap().is_some(),
+                "{} points at {path}, which nothing serves",
+                agent.display_name()
             );
         }
     }
