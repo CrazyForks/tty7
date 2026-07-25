@@ -215,9 +215,14 @@ impl Tty7App {
             // *glyph* there instead of its 30px hit box.
             .pr(px(crate::ui::app::CONTENT_INSET - crate::ui::app::TILE_PAD))
             // On Windows/Linux the window controls (─ ▢ ✕) sit on the right, right
-            // where the "⋯" lands; give it extra breathing room there so it reads
-            // as a menu affordance, not a fourth window control.
-            .when(!cfg!(target_os = "macos"), |this| this.pr_3())
+            // where the "⋯" lands, so its inset has to match *their* rhythm rather
+            // than add breathing room: the 34px control tiles put consecutive glyph
+            // centres 34px apart, and the "⋯" centre sits `16 + pr + 17` from the
+            // minimise glyph. `pr_1` (4px) lands it at ~37px — reading as part of
+            // the same row, with just enough slack to not be mistaken for a fourth
+            // window control. `pr_3` (12px) put it at ~45px, visibly adrift from the
+            // group (this is where the de3896c chrome redesign reset it — see 9b1c7bf).
+            .when(!cfg!(target_os = "macos"), |this| this.pr_1())
             .child(
                 div().occlude().flex_shrink_0().child(
                     chrome_tile(
