@@ -243,16 +243,30 @@ fn local_download_dir() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 impl Tty7App {
-    /// `ToggleSftp` / the palette's "SFTP Panel": show the remote browser, which
-    /// means putting the detail panel on its Files tab. The tab renders the
-    /// browser by itself once it's looking at a native-SSH pane, so this is only
-    /// ever "take me there" — there is no separate panel to open.
+    /// `ToggleSftp` / the palette's "SSH: Remote Files": show the remote browser,
+    /// which means putting the detail panel on its Files tab. The tab renders the
+    /// browser by itself once it's looking at a native-SSH pane, so there is no
+    /// separate panel to open — showing it is entirely "take me there".
+    ///
+    /// It still earns the `Toggle` in its name: pressing it again while the panel
+    /// is already sitting on Files closes the panel. A key you bound to reach
+    /// something should put it away too, and without this the binding is a dead
+    /// press whenever you're already there.
     ///
     /// A pane with no native connection (a foreground `ssh` typed into a local
     /// shell, or a plain PTY) has nothing to list; the Files tab shows its local
     /// tree instead, which is the right answer rather than an error.
     pub(crate) fn toggle_sftp(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_right_panel_tab(crate::core::config::RightPanelTab::Files, cx);
+        use crate::core::config::{Config, RightPanelTab};
+        // The config, not `right_panel_open`: this toggles the same preference
+        // `toggle_right_panel` does, so the two agree on what "open" means even
+        // with no tabs to render into.
+        let cfg = cx.global::<Config>();
+        if cfg.right_panel_visible && cfg.right_panel_tab == RightPanelTab::Files {
+            self.toggle_right_panel(cx);
+            return;
+        }
+        self.set_right_panel_tab(RightPanelTab::Files, cx);
     }
 
     /// Point the browser at `pane_id`, or tear it down when the Files tab has
@@ -846,12 +860,29 @@ impl Tty7App {
                     .await;
                 // Read the pane still bound to this generation.
                 let pane = this
-                    .update(cx, |this, _| {
+                    .update(cx, |this, cx| {
                         if this.sftp_panel.poll_gen != generation {
-                            None
-                        } else {
-                            this.sftp_panel.open_pane_id
+                            return None;
                         }
+                        // The browser has no window of its own — it's a view
+                        // inside the detail panel — so a closed panel means
+                        // nobody is looking, and this loop is a daemon
+                        // round-trip plus a full re-render twice a second for
+                        // a column that isn't on screen.
+                        //
+                        // The render path retires the browser too, and does it
+                        // a frame sooner. This is the backstop: owning the
+                        // check here means the loop's lifetime doesn't depend
+                        // on `render_right_panel` being called on every frame,
+                        // which is a property of a caller it can't see.
+                        // Retire rather than pause — reopening the panel on
+                        // Files runs the browser's normal open path, which
+                        // starts a fresh loop.
+                        if !this.right_panel_open(cx) {
+                            this.sftp_close_browser(cx);
+                            return None;
+                        }
+                        this.sftp_panel.open_pane_id
                     })
                     .ok()
                     .flatten();
@@ -1764,5 +1795,81 @@ mod tests {
         assert_eq!(mode_string(0o644), "rw-r--r--");
         assert_eq!(mode_string(0o000), "---------");
         assert_eq!(mode_string(0o777), "rwxrwxrwx");
+    }
+}
+
+#[cfg(test)]
+mod gpui_tests {
+    use crate::core::config::{Config, RightPanelTab};
+    use crate::core::session::Session;
+    use crate::ui::app::Tty7App;
+    use gpui::{AppContext, Entity, TestAppContext, VisualTestContext};
+
+    fn harness(cx: &mut TestAppContext) -> (Entity<Tty7App>, VisualTestContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(Config::default());
+            crate::ui::keymap::init(cx);
+        });
+        // Wrapped in a `Root` like `main.rs` does — gpui-component widgets in the
+        // panel reach for it on the window.
+        let window = cx.add_window(|window, cx| {
+            let app = cx.new(|cx| Tty7App::with_session(Some(Session::default()), window, cx));
+            gpui_component::Root::new(app, window, cx)
+        });
+        cx.background_executor.run_until_parked();
+        let app = window
+            .update(cx, |root, _, _| {
+                root.view()
+                    .clone()
+                    .downcast::<Tty7App>()
+                    .unwrap_or_else(|_| panic!("window root wraps a Tty7App"))
+            })
+            .unwrap();
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        (app, vcx)
+    }
+
+    fn panel(vcx: &mut VisualTestContext) -> (bool, RightPanelTab) {
+        vcx.update(|_, cx| {
+            let cfg = cx.global::<Config>();
+            (cfg.right_panel_visible, cfg.right_panel_tab)
+        })
+    }
+
+    /// `ToggleSftp` has to earn its name: it takes you to Files, and pressing it
+    /// again there puts the panel away. It used to only ever open, so a key bound
+    /// to it was a dead press once you'd arrived.
+    #[gpui::test]
+    fn toggle_sftp_opens_files_then_closes_the_panel(cx: &mut TestAppContext) {
+        let (app, mut vcx) = harness(cx);
+
+        // From closed: opens the panel on Files.
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.update_config(cx, |cfg| cfg.right_panel_visible = false);
+            app.toggle_sftp(window, cx);
+        });
+        assert_eq!(panel(&mut vcx), (true, RightPanelTab::Files));
+
+        // Already there: puts it away rather than re-selecting the same tab.
+        app.update_in(&mut vcx, |app, window, cx| app.toggle_sftp(window, cx));
+        assert!(!panel(&mut vcx).0, "second press should close");
+
+        // And back again.
+        app.update_in(&mut vcx, |app, window, cx| app.toggle_sftp(window, cx));
+        assert_eq!(panel(&mut vcx), (true, RightPanelTab::Files));
+    }
+
+    /// Open on another tab, `ToggleSftp` is still "take me there" — it switches to
+    /// Files rather than closing a panel the user is using for something else.
+    #[gpui::test]
+    fn toggle_sftp_switches_tabs_before_it_closes(cx: &mut TestAppContext) {
+        let (app, mut vcx) = harness(cx);
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.set_right_panel_tab(RightPanelTab::Info, cx);
+            app.toggle_sftp(window, cx);
+        });
+        assert_eq!(panel(&mut vcx), (true, RightPanelTab::Files));
     }
 }
