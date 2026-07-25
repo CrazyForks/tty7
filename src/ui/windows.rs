@@ -356,9 +356,12 @@ fn confirm_destructive(
         (1, _) => "1 running session will be ended.".to_string(),
         (n, _) => format!("{n} running sessions will be ended."),
     };
+    // Title Case, like every other prompt title in the app — this one used to
+    // lowercase "workspace" while its siblings read "Close Window?" /
+    // "Quit and Stop Daemon?".
     let answer = window.prompt(
         gpui::PromptLevel::Warning,
-        &format!("{verb} workspace \u{201c}{name}\u{201d}?"),
+        &format!("{verb} Workspace \u{201c}{name}\u{201d}?"),
         Some(&detail),
         &["Cancel", verb],
         cx,

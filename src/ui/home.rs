@@ -44,7 +44,9 @@ const HOME_SHORTCUTS: [(&str, &str); 6] = [
     ("TogglePalette", "Command Palette"),
     ("SplitRight", "Split Right"),
     ("SplitDown", "Split Down"),
-    ("OpenSettings", "Settings"),
+    // "Settings…" everywhere: the menu bar, the tray, the palette and this page
+    // used to offer four different names for the same destination.
+    ("OpenSettings", "Settings…"),
 ];
 
 /// Longest label shown for a recently-closed tab before ellipsizing, matching

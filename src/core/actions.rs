@@ -38,6 +38,16 @@ actions!(
         SelectWorkspace8,
         SelectWorkspace9,
         CloseActiveTab,
+        // Tab operations that until now existed only as tab-context-menu rows,
+        // reachable by right-clicking the *right* chip. As actions they also
+        // reach the menu bar, the palette, and Settings → Keybindings; each acts
+        // on the active tab, which is what "this tab" means with no chip clicked.
+        RenameTab,
+        NewWorktreeTab,
+        CloseOtherTabs,
+        CloseTabsToTheRight,
+        CopyWorkingDirectory,
+        MarkTabUnread,
         SplitRight,
         SplitDown,
         FocusNextPane,
@@ -100,6 +110,32 @@ actions!(
         ShowRightPanelChanges,
         ShowRightPanelFiles,
         OpenSettings,
+        // Open Settings straight to its Keybindings section — the Help menu's
+        // "Keyboard Shortcuts" and the palette's shortcut entry both land here,
+        // rather than making the user open Settings and then find the section.
+        ShowKeyboardShortcuts,
+        // Open Settings on the About section. The macOS App menu's first item
+        // has to exist and has to be called "About tty7"; routing it to the
+        // section that already carries version/links keeps one About, not two.
+        About,
+        // Run the same update check the app does at startup (see `core::update`)
+        // on demand, then report the outcome. Previously only the tray offered
+        // this, which is not where a Mac user looks for it.
+        CheckForUpdates,
+        // Standard macOS App-menu items. gpui exposes the platform calls but
+        // binds nothing by default, so they need real actions to hang off.
+        HideApp,
+        HideOthers,
+        ShowAll,
+        // Standard macOS Window-menu items.
+        MinimizeWindow,
+        ZoomWindow,
+        // Help menu destinations. Each opens a URL in the default browser; kept
+        // as separate actions (rather than one parameterized one) so they can be
+        // bound and searched by name like everything else.
+        OpenDocumentation,
+        OpenDiscord,
+        ReportIssue,
         RestartDaemon,
         // Show the detail panel's Files tab, which browses the focused pane's
         // remote filesystem over SFTP when that pane is native SSH (WS5).

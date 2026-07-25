@@ -569,9 +569,12 @@ impl Tty7App {
                                 .menu("Stop Workspace…", Box::new(StopWorkspace))
                                 // The app-level entries the "⋯" used to carry.
                                 // Folded in here so the corner has one menu rather
-                                // than two adjacent ones.
+                                // than two adjacent ones. Deliberately just these
+                                // two: Help/About live in the menu bar, and
+                                // duplicating them here only makes this menu
+                                // longer without making anything reachable.
                                 .separator()
-                                .menu("Command Palette", Box::new(TogglePalette))
+                                .menu("Command Palette…", Box::new(TogglePalette))
                                 .menu("Settings…", Box::new(OpenSettings))
                         },
                     ),

@@ -303,6 +303,15 @@ pub struct Config {
     #[serde(default)]
     pub ssh_profile_frecency: HashMap<uuid::Uuid, ProfileUsage>,
 
+    /// Per-command usage for the palette's "Recent" group, keyed by the stable
+    /// id in `ui::palette::CommandKind::id`. The static command list is ordered
+    /// by hand, which means the first screenful is whatever the author typed
+    /// first rather than what this user actually runs; this is what lets the
+    /// palette lead with the latter. Only commands with a stable id are tracked
+    /// — a "switch to tab 3" is not a thing to be recently-used.
+    #[serde(default)]
+    pub command_frecency: HashMap<String, ProfileUsage>,
+
     // ── CLI coding agents ────────────────────────────────────────────────────
     /// User-defined agent-detection rules: a command basename → an agent slug
     /// (`{"cc": "claude", "my-codex": "codex"}`), so personal wrappers get
@@ -581,6 +590,7 @@ impl Default for Config {
             verify_host_keys: true,
             ssh_warn_on_close: false,
             ssh_profile_frecency: HashMap::new(),
+            command_frecency: HashMap::new(),
             agent_commands: HashMap::new(),
             restore_agent_sessions: true,
         }
