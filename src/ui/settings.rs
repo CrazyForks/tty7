@@ -2827,6 +2827,7 @@ impl Tty7App {
         let mouse_reporting = cfg.mouse_reporting;
         let smart_select = cfg.smart_select;
         let tab_completion = cfg.tab_completion;
+        let history_search = cfg.history_search;
         let bell = cfg.bell;
         // Map the persisted threshold onto its preset radio index (nearest slot
         // for any off-preset value a hand-edit might leave).
@@ -2927,6 +2928,10 @@ impl Tty7App {
         let tab_completion_switch = Switch::new("term-tab-completion")
             .checked(tab_completion)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_tab_completion(*on, cx)))
+            .into_any_element();
+        let history_search_switch = Switch::new("term-history-search")
+            .checked(history_search)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_history_search(*on, cx)))
             .into_any_element();
         let bell_idx = match bell {
             BellMode::None => 0,
@@ -3041,6 +3046,14 @@ impl Tty7App {
                 "Tab at the prompt opens tty7's completion menu. When off, Tab goes to the \
                  shell's own completion instead.",
                 tab_completion_switch,
+                cx,
+            ))
+            .child(self.settings_row(
+                "History search",
+                "⌃R at the prompt opens tty7's fuzzy history menu. When off, ⌃R goes to the \
+                 shell instead — its own reverse-i-search, or whatever you've bound there \
+                 (fzf, percol).",
+                history_search_switch,
                 cx,
             ))
             .when_some(option_alt_row, |v, row| v.child(row))

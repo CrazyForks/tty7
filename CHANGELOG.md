@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The ⌃R history menu can be switched off** — Settings → Terminal →
+  Keyboard, or `history_search` in `config.json`. With it off, the prompt
+  line is handed to the shell and the raw `^R` follows it, so a binding
+  of your own (fzf, percol, plain reverse-i-search) answers instead of
+  tty7's menu. (#163)
+
+### Fixed
+
+- **⌃J and ⌃M submit the line again** — accept-line's control codes were
+  swallowed at the prompt as unrecognized Ctrl chords, so the keys did
+  nothing. They now take the same path Enter does, completion picker and
+  history menu included. (#163)
+
 ## [26.7.2] - 2026-07-21
 
 ### Added

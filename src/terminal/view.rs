@@ -1532,7 +1532,14 @@ impl TerminalView {
         // PTY — say so once instead of failing silently (#46). The chord still
         // goes to the PTY below, so the shell's own reverse-i-search keeps
         // working as the fallback.
-        if m.control && !m.platform && !m.alt && ks.key == "r" {
+        // Nothing to explain when the user switched the menu off — Ctrl+R
+        // reaching the PTY is then exactly what they asked for.
+        if m.control
+            && !m.platform
+            && !m.alt
+            && ks.key == "r"
+            && cx.global::<Config>().history_search
+        {
             self.note_integration_gap(cx);
         }
 
@@ -1754,6 +1761,16 @@ impl TerminalView {
             return;
         }
 
+        // ⌃J / ⌃M are readline's accept-line — the terminal's own encoding of
+        // Enter (LF / CR), and what most shells' default keymaps bind. Route
+        // them through the same path Enter takes, completion picker included.
+        // Left alone they reach `apply_readline_ctrl`'s no-op arm and the Ctrl
+        // branch below swallows them, so the key does nothing at all (#163).
+        if m.control && !m.platform && !m.alt && matches!(key, "j" | "m") {
+            self.accept_line(cx);
+            return;
+        }
+
         // While a completion menu is open it behaves as a picker:
         // ↑/↓ move the highlight, Enter writes the highlighted candidate into
         // the line (a second Enter submits; Cmd+Enter does both in one stroke),
@@ -1772,16 +1789,7 @@ impl TerminalView {
                     return;
                 }
                 (false, "enter") => {
-                    if self
-                        .completion
-                        .as_ref()
-                        .is_some_and(|s| s.selected().is_some())
-                    {
-                        self.completion_accept(cx);
-                    } else {
-                        self.close_completion();
-                        self.submit_command(cx);
-                    }
+                    self.accept_line(cx);
                     return;
                 }
                 (true, "enter") => {
@@ -1857,6 +1865,13 @@ impl TerminalView {
                 self.close_completion();
                 self.cursor_visible = true;
                 cx.notify();
+                return;
+            }
+            // With the history menu switched off ⌃R belongs to the shell: hand
+            // the line over and let whatever is bound there answer — zle /
+            // readline's own reverse-i-search, or an fzf / percol widget (#163).
+            if key == "r" && !cx.global::<Config>().history_search {
+                self.handoff_line_to_shell(&[0x12], cx);
                 return;
             }
             self.apply_readline_ctrl(key);
@@ -2017,6 +2032,9 @@ impl TerminalView {
     /// Ctrl-R reverse search, Ctrl-C interrupt, and Ctrl-D EOF/forward-delete.
     /// Unrecognized chords are no-ops (the caller swallows every Ctrl combo at
     /// the prompt regardless).
+    ///
+    /// The caller resolves Ctrl-J / Ctrl-M (accept-line) and, when the history
+    /// menu is switched off, Ctrl-R before this point — neither reaches here.
     fn apply_readline_ctrl(&mut self, key: &str) {
         match key {
             "r" => self.start_reverse_search(),
@@ -3259,6 +3277,23 @@ impl TerminalView {
         }
     }
 
+    /// readline's accept-line, as the editor means it: with a completion
+    /// candidate highlighted, take the candidate (a second stroke then runs the
+    /// line); otherwise close any menu and submit. Shared by Enter and its
+    /// control-code aliases ⌃J / ⌃M.
+    fn accept_line(&mut self, cx: &mut Context<Self>) {
+        if self
+            .completion
+            .as_ref()
+            .is_some_and(|s| s.selected().is_some())
+        {
+            self.completion_accept(cx);
+            return;
+        }
+        self.close_completion();
+        self.submit_command(cx);
+    }
+
     /// Ship the edited command line to the PTY — the whole line plus a carriage
     /// return — record it in history, then clear the editor for the next command.
     fn submit_command(&mut self, cx: &mut Context<Self>) {
@@ -3542,14 +3577,16 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Hand the prompt line over to the shell so its native completion
-    /// (compsys, fzf-tab, …) answers the Tab tty7 has nothing for: ship the
-    /// locally edited text to the PTY (no newline), clear the editor, send
-    /// the Tab / Shift-Tab bytes, and suspend the local editor until the
+    /// Hand the prompt line over to the shell so *its* keymap answers a chord
+    /// tty7 declines: ship the locally edited text to the PTY (no newline),
+    /// clear the editor, send `chord`, and suspend the local editor until the
     /// shell's next report. From here the shell's own editor holds the text —
     /// re-engaging ours mid-line would fork the two buffers (its Enter would
     /// submit an empty local line on top of zle's populated one).
-    fn handoff_tab_to_shell(&mut self, shift: bool, cx: &mut Context<Self>) {
+    ///
+    /// A multi-line draft can't make the trip (see below): the chord is
+    /// swallowed and the line stays local.
+    fn handoff_line_to_shell(&mut self, chord: &[u8], cx: &mut Context<Self>) {
         // Fold in any gap input still held, so the shipped line is what the
         // user actually typed.
         if let Some(net) = self.hold.engage() {
@@ -3558,7 +3595,7 @@ impl TerminalView {
         let line = self.cmd.text();
         // An embedded newline would submit on the shell side (zle runs the
         // line on `\r`), so a multi-line draft can't be handed over losslessly
-        // — keep it local and swallow the Tab as before.
+        // — keep it local and swallow the chord as before.
         if line.contains('\n') {
             cx.notify();
             return;
@@ -3568,7 +3605,7 @@ impl TerminalView {
         // we're about to ship; flush it first (FIFO keeps it ahead).
         self.wipe_pending_typeahead();
         // Chars right of the caret: after the shipped text lands, walk zle's
-        // cursor back over them so the shell completes the word the caret was
+        // cursor back over them so the shell acts on the word the caret was
         // on, not the line's tail.
         let tail = line.chars().count().saturating_sub(self.cmd.cursor());
         if !line.is_empty() {
@@ -3579,8 +3616,14 @@ impl TerminalView {
         }
         self.cmd.clear();
         self.editor_handoff = Some(self.terminal.prompt_cycle());
+        self.send_to_pty(chord, cx);
+    }
+
+    /// Hand the line over and let the shell have the Tab, so its native
+    /// completion (compsys, fzf-tab, …) answers what tty7 has nothing for.
+    fn handoff_tab_to_shell(&mut self, shift: bool, cx: &mut Context<Self>) {
         let bytes = self.tab_bytes(shift);
-        self.send_to_pty(&bytes, cx);
+        self.handoff_line_to_shell(&bytes, cx);
     }
 
     /// Tab completion over our own engine (command names in command
@@ -7226,6 +7269,66 @@ mod gpui_tests {
             next_input_until_timeout(&mut daemon),
             Some(b"git status\r".to_vec()),
             "Cmd+Enter ships the selected line to the PTY"
+        );
+    }
+
+    /// Ctrl+J and Ctrl+M are accept-line's control codes, so at the prompt they
+    /// must submit exactly as Enter does (#163) — before the fix they fell into
+    /// `apply_readline_ctrl`'s no-op arm and the key did nothing at all.
+    #[gpui::test]
+    fn ctrl_j_and_ctrl_m_submit_the_line_like_enter(cx: &mut TestAppContext) {
+        // `submit_command` defers a history-file record; pin the config dir to
+        // the shared test scratch so nothing touches the real user history.
+        let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        crate::core::config::set_config_dir(dir);
+
+        let (window, mut daemon) = harness(cx);
+        for (chord, line) in [("ctrl-j", "echo j"), ("ctrl-m", "echo m")] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.cmd.set(line);
+                    view.handle_editor_key(&key(chord), cx);
+                    assert!(view.cmd.is_empty(), "{chord} clears the editor");
+                })
+                .unwrap();
+            assert_eq!(
+                next_input_until_timeout(&mut daemon),
+                Some(format!("{line}\r").into_bytes()),
+                "{chord} ships the line to the PTY"
+            );
+        }
+    }
+
+    /// With `history_search` off, Ctrl+R never opens tty7's menu: the edited
+    /// line is handed to the shell and the raw `^R` follows it, so a user's own
+    /// binding there (fzf, percol, plain reverse-i-search) answers (#163).
+    #[gpui::test]
+    fn history_search_off_sends_ctrl_r_to_the_shell(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        cx.update(|cx| {
+            let mut cfg = cx.global::<Config>().clone();
+            cfg.history_search = false;
+            cx.set_global(cfg);
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.history = ["git status"].into_iter().map(String::from).collect();
+                view.history_frecency = vec![0.0; view.history.len()];
+                view.cmd.set("gi");
+                view.handle_editor_key(&key("ctrl-r"), cx);
+                assert!(
+                    view.reverse_search.is_none(),
+                    "no tty7 menu while opted out"
+                );
+                assert_eq!(view.cmd.text(), "", "the line went to the shell");
+            })
+            .unwrap();
+        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"gi".to_vec()));
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(vec![0x12]),
+            "the raw ^R follows the handed-over line"
         );
     }
 
