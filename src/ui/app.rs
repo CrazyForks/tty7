@@ -2553,6 +2553,10 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.tab_completion = on);
     }
 
+    pub(crate) fn set_history_search(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.history_search = on);
+    }
+
     pub(crate) fn set_startup_mode(
         &mut self,
         mode: crate::core::config::StartupMode,

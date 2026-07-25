@@ -7,7 +7,7 @@
 - **Ghost suggestions** — your history completes the whole line as you type; <kbd>→</kbd> to accept
 - **Explained tab completion** — every flag and subcommand with its description, for ~100 common commands; when tty7 has nothing to offer the Tab falls through to your shell's own completion, and the whole feature can be turned off (Settings → Terminal → Keyboard, or `tab_completion` in `config.json`)
 - **Syntax highlighting** — as you type, nothing to install
-- **Fuzzy history search** — <kbd>⌃ R</kbd> shows what you ran, where, and whether it failed
+- **Fuzzy history search** — <kbd>⌃ R</kbd> shows what you ran, where, and whether it failed; turn it off (Settings → Terminal → Keyboard, or `history_search` in `config.json`) and <kbd>⌃ R</kbd> goes to your shell instead, so an fzf / percol binding keeps working
 - **History from day one** — your existing shell history works as-is and carries across sessions
 - **Line editing** — click to place the caret, mouse selection, word motion, undo
 - **Multi-line editing** — wrapped and multi-line commands edit in place; the grid shifts to keep the caret visible

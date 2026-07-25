@@ -195,6 +195,12 @@ pub struct Config {
     /// fzf-tab, …) answers instead.
     #[serde(default = "default_true")]
     pub tab_completion: bool,
+    /// Ctrl+R at the prompt opens tty7's fuzzy history menu. On by default.
+    /// When off, the prompt line is handed to the shell and Ctrl+R goes to the
+    /// PTY, so whatever is bound there answers instead — readline/zle's own
+    /// reverse-i-search, or a widget like fzf's or percol's (#163).
+    #[serde(default = "default_true")]
+    pub history_search: bool,
 
     // ── Appearance ──────────────────────────────────────────────────────────
     /// The shape drawn for the terminal cursor.
@@ -551,6 +557,7 @@ impl Default for Config {
             // flashed); opting into None/Audible is a deliberate change.
             bell: BellMode::Visual,
             tab_completion: true,
+            history_search: true,
             cursor_style: CursorStyle::Block,
             // Input/mouse defaults preserve today's behavior: Option composes
             // characters as macOS ships it (opt into Option-as-Meta); GPUI
@@ -1183,6 +1190,7 @@ mod tests {
         assert!(cfg.restore_session);
         assert!(cfg.mouse_reporting);
         assert!(cfg.tab_completion);
+        assert!(cfg.history_search);
         assert_eq!(cfg.notify_threshold_secs, 10);
         assert_eq!(cfg.bell, BellMode::Visual);
 
@@ -1192,12 +1200,15 @@ mod tests {
         assert!(cfg.restore_session);
         assert!(cfg.mouse_reporting);
         assert!(cfg.tab_completion);
+        assert!(cfg.history_search);
         assert_eq!(cfg.notify_threshold_secs, 10);
         assert_eq!(cfg.bell, BellMode::Visual);
 
-        // The opt-out round-trips.
+        // The opt-outs round-trip.
         let cfg: Config = serde_json::from_str(r#"{"tab_completion": false}"#).unwrap();
         assert!(!cfg.tab_completion);
+        let cfg: Config = serde_json::from_str(r#"{"history_search": false}"#).unwrap();
+        assert!(!cfg.history_search);
 
         // Valid values round-trip; a bad bell string falls back without failing
         // the whole parse.

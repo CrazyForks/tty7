@@ -160,7 +160,8 @@ impl ReverseSearch {
             Action::Redraw
         } else if (m.control && (key == "g" || key == "c")) || key == "escape" {
             Action::Cancel
-        } else if key == "enter" {
+        } else if key == "enter" || (m.control && (key == "j" || key == "m")) {
+            // ⌃J / ⌃M are accept-line's control codes — Enter by another name.
             let line = self.selected_line(history).map(str::to_string);
             match (m.platform, line) {
                 // Cmd+Enter: run the selected line outright.
@@ -314,6 +315,21 @@ mod tests {
         match rs.handle_key(&key("enter"), &h, &flat(&h)) {
             Action::Accept(None) => {}
             _ => panic!("expected Accept(None) with no match"),
+        }
+    }
+
+    /// ⌃J / ⌃M carry accept-line's control codes, so inside the menu they must
+    /// accept the selection exactly as Enter does (#163).
+    #[test]
+    fn ctrl_j_and_ctrl_m_accept_like_enter() {
+        let h = history();
+        for chord in ["ctrl-j", "ctrl-m"] {
+            let mut rs = ReverseSearch::new(&h, &flat(&h));
+            rs.push_query("cargo", &h, &flat(&h));
+            match rs.handle_key(&key(chord), &h, &flat(&h)) {
+                Action::Accept(Some(line)) => assert_eq!(line, "cargo test"),
+                _ => panic!("{chord} should accept the selected line"),
+            }
         }
     }
 
