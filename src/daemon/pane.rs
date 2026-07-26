@@ -322,8 +322,101 @@ fn locale_fallback_is_needed(
     mut inherited: impl FnMut(&str) -> Option<String>,
 ) -> bool {
     ["LC_ALL", "LC_CTYPE", "LANG"].iter().all(|key| {
-        !extra_env.contains_key(*key) && inherited(key).as_deref().map_or(true, str::is_empty)
+        !extra_env.contains_key(*key) && inherited(key).as_deref().is_none_or(str::is_empty)
     })
+}
+
+/// Where macOS keeps its locale definitions. A name is usable as a locale only
+/// if it has a directory here — the check that keeps us from ever exporting a
+/// locale the C library will fail to load.
+#[cfg(target_os = "macos")]
+const LOCALE_DEFINITION_DIR: &str = "/usr/share/locale";
+
+/// Last-resort character locales, in preference order. `C.UTF-8` says exactly
+/// what we mean — Unicode character handling with no regional bias — and is
+/// built into modern glibc, so it also survives the trip to a Linux host over
+/// ssh. It is a recent addition to macOS though, so `en_US.UTF-8` (present on
+/// every macOS) backs it up.
+#[cfg(any(target_os = "macos", test))]
+const FALLBACK_CHARACTER_LOCALES: [&str; 2] = ["C.UTF-8", "en_US.UTF-8"];
+
+/// The UTF-8 locale to hand a GUI-launched shell, derived from the user's
+/// system locale the way Terminal.app and iTerm2 do it.
+///
+/// Every candidate is checked against the locale definitions actually installed
+/// (`exists`) before it is used. That check is the whole point: a name the C
+/// library cannot load is worse than none at all, because `LC_CTYPE` outranks
+/// the `LANG` a remote host sets for itself, and ssh forwards `LC_*` by default
+/// (`SendEnv LANG LC_*` ships in the stock `ssh_config`). Exporting an
+/// unloadable name would therefore *break* non-ASCII output on every host we
+/// ssh into — the bug this seeds a locale to avoid.
+#[cfg(any(target_os = "macos", test))]
+fn character_locale(identifier: Option<&str>, exists: impl Fn(&str) -> bool) -> Option<String> {
+    identifier
+        .and_then(posix_locale_stem)
+        .map(|stem| format!("{stem}.UTF-8"))
+        .into_iter()
+        .chain(FALLBACK_CHARACTER_LOCALES.iter().map(|s| (*s).to_string()))
+        .find(|candidate| exists(candidate))
+}
+
+/// Reduce a CFLocale/`AppleLocale` identifier to its POSIX `lang_REGION` stem:
+/// `zh_Hans_CN@calendar=gregorian` -> `zh_CN`, `en-US` -> `en_US`.
+///
+/// POSIX locale names carry no script subtag, so `Hans` in the middle is
+/// dropped. A region is required — a bare `zh` cannot name a locale, and
+/// guessing a default region for a language would be inventing a user
+/// preference rather than reading one.
+#[cfg(any(target_os = "macos", test))]
+fn posix_locale_stem(identifier: &str) -> Option<String> {
+    let base = identifier.split('@').next()?;
+    let mut parts = base.split(['_', '-']).filter(|s| !s.is_empty());
+    let language = parts
+        .next()
+        .filter(|l| (2..=3).contains(&l.len()) && l.chars().all(|c| c.is_ascii_alphabetic()))?;
+    // ISO 3166-1 alpha-2 ("CN") or UN M.49 numeric ("419"); anything else in the
+    // trailing position is a script or variant subtag, which POSIX has no slot for.
+    let region = parts.next_back().filter(|r| {
+        (r.len() == 2 && r.chars().all(|c| c.is_ascii_alphabetic()))
+            || (r.len() == 3 && r.chars().all(|c| c.is_ascii_digit()))
+    })?;
+    Some(format!(
+        "{}_{}",
+        language.to_ascii_lowercase(),
+        region.to_ascii_uppercase()
+    ))
+}
+
+/// The current system locale's identifier (e.g. `en_CN`, `zh_Hans_CN`).
+///
+/// Read from CoreFoundation rather than the `defaults` domain so it reflects
+/// the same resolved preference the rest of the system sees.
+#[cfg(target_os = "macos")]
+fn system_locale_identifier() -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::os::raw::c_void;
+
+    type CFLocaleRef = *const c_void;
+    unsafe extern "C" {
+        fn CFLocaleCopyCurrent() -> CFLocaleRef;
+        fn CFLocaleGetIdentifier(locale: CFLocaleRef) -> CFStringRef;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    unsafe {
+        let locale = CFLocaleCopyCurrent();
+        if locale.is_null() {
+            return None;
+        }
+        // `Get` rule: the identifier is owned by the locale, so it is wrapped
+        // without taking ownership and only the locale itself is released.
+        let identifier = CFLocaleGetIdentifier(locale);
+        let out =
+            (!identifier.is_null()).then(|| CFString::wrap_under_get_rule(identifier).to_string());
+        CFRelease(locale);
+        out
+    }
 }
 
 fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<PathBuf>) {
@@ -352,15 +445,21 @@ fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<Pat
     }
 
     // LaunchServices commonly starts a macOS app with no locale variables at
-    // all. Direct children can still print UTF-8, but tmux interprets that empty
-    // environment as a non-UTF-8 terminal and substitutes one `_` per display
-    // cell. Seed only LC_CTYPE (the macOS `UTF-8` locale alias) so character
-    // handling is correct without changing message/date/number localization.
-    // Respect any inherited non-empty locale and every user-configured locale
-    // key, including `C` or an empty value used to opt out of the fallback.
+    // all, so a GUI-launched shell runs in the C locale: `ls` prints one `?` per
+    // non-ASCII byte, and tmux substitutes one `_` per Unicode cell. Seed only
+    // LC_CTYPE — character handling is the broken part, and leaving LANG alone
+    // keeps message/date/number localization as the user set it. Respect any
+    // inherited non-empty locale and every user-configured locale key, including
+    // `C` or an empty value used to opt out of the fallback.
     #[cfg(target_os = "macos")]
-    if locale_fallback_is_needed(&extra_env, |key| std::env::var(key).ok()) {
-        cmd.env("LC_CTYPE", "UTF-8");
+    if locale_fallback_is_needed(&extra_env, |key| std::env::var(key).ok())
+        && let Some(locale) = character_locale(system_locale_identifier().as_deref(), |name| {
+            std::path::Path::new(LOCALE_DEFINITION_DIR)
+                .join(name)
+                .is_dir()
+        })
+    {
+        cmd.env("LC_CTYPE", locale);
     }
 }
 
@@ -3595,6 +3694,81 @@ mod tests {
             &[("LANG", "")],
             &[("LANG", "en_US.UTF-8")]
         ));
+    }
+
+    /// A CFLocale identifier is not a POSIX locale name: it can carry a script
+    /// subtag, keywords, and hyphens, and it may name a region combination the
+    /// machine has no locale for (`en_CN` is a perfectly ordinary macOS setting).
+    #[test]
+    fn posix_locale_stem_drops_script_and_keyword_subtags() {
+        let stem = |id: &str| posix_locale_stem(id);
+
+        assert_eq!(stem("en_US").as_deref(), Some("en_US"));
+        assert_eq!(stem("en-US").as_deref(), Some("en_US"));
+        assert_eq!(stem("zh_Hans_CN").as_deref(), Some("zh_CN"));
+        assert_eq!(
+            stem("zh_Hans_CN@calendar=gregorian").as_deref(),
+            Some("zh_CN")
+        );
+        assert_eq!(stem("es_419").as_deref(), Some("es_419"));
+        assert_eq!(stem("EN_us").as_deref(), Some("en_US"));
+
+        // No region to name a locale with, so there is nothing to derive.
+        assert_eq!(stem("zh"), None);
+        assert_eq!(stem("zh_Hans"), None);
+        assert_eq!(stem(""), None);
+        assert_eq!(stem("@calendar=gregorian"), None);
+    }
+
+    /// The derived locale must exist on the machine before it is exported.
+    /// `LC_CTYPE` outranks the `LANG` a remote host sets for itself and ssh
+    /// forwards `LC_*`, so an unloadable name would break non-ASCII output on
+    /// every host we ssh into — the exact failure this seeding exists to fix.
+    #[test]
+    fn character_locale_only_returns_installed_locales() {
+        let installed = |names: &'static [&'static str]| move |n: &str| names.contains(&n);
+
+        // The system locale is used when the machine actually has it.
+        assert_eq!(
+            character_locale(Some("zh_Hans_CN"), installed(&["zh_CN.UTF-8", "C.UTF-8"])),
+            Some("zh_CN.UTF-8".to_string())
+        );
+        // `en_CN` resolves to no installed locale, so it falls through.
+        assert_eq!(
+            character_locale(Some("en_CN"), installed(&["C.UTF-8", "en_US.UTF-8"])),
+            Some("C.UTF-8".to_string())
+        );
+        // Older macOS predates `C.UTF-8`; `en_US.UTF-8` is there on every macOS.
+        assert_eq!(
+            character_locale(Some("en_CN"), installed(&["en_US.UTF-8"])),
+            Some("en_US.UTF-8".to_string())
+        );
+        // No identifier at all still yields a usable fallback.
+        assert_eq!(
+            character_locale(None, installed(&["C.UTF-8", "en_US.UTF-8"])),
+            Some("C.UTF-8".to_string())
+        );
+        // Nothing installed means nothing exported — never a name that fails to load.
+        assert_eq!(character_locale(Some("zh_Hans_CN"), installed(&[])), None);
+    }
+
+    /// The locale actually derived on this machine must be one the C library can
+    /// load, since an unloadable `LC_CTYPE` is worse than none at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn derived_character_locale_is_installed_on_this_machine() {
+        let exists = |name: &str| {
+            std::path::Path::new(LOCALE_DEFINITION_DIR)
+                .join(name)
+                .is_dir()
+        };
+        let locale = character_locale(system_locale_identifier().as_deref(), exists)
+            .expect("macOS always ships en_US.UTF-8");
+        assert!(exists(&locale), "derived {locale} is not installed");
+        assert!(
+            locale.ends_with(".UTF-8"),
+            "derived {locale} is not a UTF-8 locale"
+        );
     }
 
     /// Every spawned shell carries the `TTY7` marker, so the `tty7 agent-hook`

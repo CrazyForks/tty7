@@ -9,11 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **tmux keeps UTF-8 output when tty7 is launched from Finder/Dock** — macOS
-  GUI launches can omit every locale variable, which makes tmux deliberately
-  replace each Unicode display cell with `_`. New shells now receive the
-  macOS `UTF-8` character locale only when no inherited or configured locale
-  exists; explicit locale choices remain untouched.
+- **Non-ASCII output survives a Finder/Dock launch** — macOS GUI launches can
+  omit every locale variable, leaving the shell in the C locale: `ls` printed
+  one `?` per non-ASCII byte, so a CJK filename came out as `??????`, and tmux
+  replaced each Unicode cell with `_`. New shells now receive a UTF-8 character
+  locale (`LC_CTYPE` only, so message/date/number localization is untouched)
+  derived from the system locale the way Terminal.app does it, and only when no
+  inherited or configured locale exists — explicit locale choices still win.
+  The derived name is checked against the locales actually installed before it
+  is exported, so it stays loadable on remote hosts too, where ssh forwards
+  `LC_*` by default. ([#178](https://github.com/l0ng-ai/tty7/issues/178))
 
 ## [26.7.3] - 2026-07-25
 
