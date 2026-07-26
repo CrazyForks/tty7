@@ -413,6 +413,24 @@ impl CommandGroup {
     }
 }
 
+/// The chrome state the stateful titles ("Hide Left Sidebar", "Show Right
+/// Panel") read, passed in by the window opening the palette.
+///
+/// Deliberately *not* read off `Config`: both of these are per-window state
+/// living on `Tty7App`, and their config copies only record whichever window
+/// toggled them last. Reading the config would label the row by another
+/// window's rail — and clicking it would then do the opposite of what it said.
+#[derive(Clone, Copy)]
+pub struct ChromeState {
+    /// This window's rail collapse flag (`Tty7App::sidebar_collapsed`), not the
+    /// config's. Note this is the *toggle's* state, not whether the rail is on
+    /// screen: on the home page there are no tabs to list, but the command
+    /// still flips this flag, so the title has to describe that.
+    pub rail_collapsed: bool,
+    /// This window's `Tty7App::right_panel_visible`.
+    pub right_panel_visible: bool,
+}
+
 /// A single palette entry: a label plus the action it triggers.
 #[derive(Clone)]
 pub struct Command {
@@ -456,17 +474,20 @@ impl Command {
     /// Titles follow the grammar documented at the top of this module. Several
     /// are *stateful*: a command that flips something reads as the outcome it
     /// will produce right now ("Hide Left Sidebar" when the rail is out), which
-    /// is why this needs `cx`.
+    /// is why this needs `cx` and the calling window's [`ChromeState`].
     ///
     /// The held-key font zoom (⌘+/⌘−) is deliberately absent — stepping it needs
     /// a re-open per press, so it makes a poor palette citizen; only the
     /// one-shot Reset is worth a slot.
-    pub fn base_commands(cx: &App) -> Vec<Command> {
+    pub fn base_commands(cx: &App, chrome: ChromeState) -> Vec<Command> {
         use CommandKind::*;
         let cfg = cx.global::<Config>();
+        // The tab bar's side is a genuine app-wide setting, so it comes off the
+        // config; the rail's collapse flag and the right panel's visibility do
+        // not (see `ChromeState`).
         let tab_bar_left = cfg.tab_bar_position == TabBarPosition::Left;
-        let sidebar_hidden = cfg.sidebar_collapsed || !tab_bar_left;
-        let right_panel_open = cfg.right_panel_visible;
+        let sidebar_hidden = chrome.rail_collapsed || !tab_bar_left;
+        let right_panel_open = chrome.right_panel_visible;
 
         let tabs = [
             Command::new("New Tab", NewTab),

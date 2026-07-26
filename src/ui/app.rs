@@ -28,7 +28,9 @@ use crate::core::ssh_config;
 use crate::core::window_state::WindowState;
 use crate::daemon::protocol::{RemoteContext, ShellSpec, ssh_option_takes_value};
 use crate::terminal::view::{ChildExited, TerminalView};
-use crate::ui::palette::{Command, CommandGroup, CommandKind, PaletteEvent, PaletteView};
+use crate::ui::palette::{
+    ChromeState, Command, CommandGroup, CommandKind, PaletteEvent, PaletteView,
+};
 use crate::ui::pane::{CloseOutcome, Dir, Pane};
 use crate::ui::presets::Fill;
 use crate::ui::settings::{
@@ -3495,7 +3497,15 @@ impl Tty7App {
     /// Build the full command catalog: the static commands plus one
     /// "Switch to Tab: …" entry per open tab (label matches the tab strip).
     fn palette_commands(&self, cx: &App) -> Vec<Command> {
-        let mut commands = Command::base_commands(cx);
+        // This window's own chrome state, not the config's copy of it — see
+        // `ChromeState`.
+        let mut commands = Command::base_commands(
+            cx,
+            ChromeState {
+                rail_collapsed: self.sidebar_collapsed,
+                right_panel_visible: self.right_panel_visible,
+            },
+        );
 
         // Saved SSH profiles, ordered by frecency then name (PRD FR-P3). Each row
         // connects (natively) on Enter and edits on ⌘⏎ / →.
