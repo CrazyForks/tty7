@@ -65,10 +65,19 @@ image = "0.25"
 # to gpui's rev so the shared `http_client`/`zed-reqwest` versions stay aligned.
 reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
 
-# Zed's fork of alacritty_terminal — same rev Zed pins. Used by the *client*
+# Our fork of Zed's alacritty_terminal fork. Used by the *client*
 # (`terminal::remote`) for the VT parser + grid (`Term`/`ansi::Processor`) that
 # renders the mirror. The daemon's PTY itself is driven by `portable-pty` below.
-alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
+#
+# The `tty7` branch is Zed's `fcf32fe` (the rev Zed pins) plus one commit:
+# `push_keyboard_mode` capped its stack by removing from `title_stack` instead of
+# `keyboard_mode_stack` — a copy-paste slip from `push_title` that compiles because
+# both are `Vec`s. With `kitty_keyboard` on (see `terminal_config_from_user`) every
+# overflowing push silently drops a saved title, and once the title stack is empty
+# `Vec::remove(0)` panics — 4097 unpopped `CSI > 1 u` pushes, about 20KB of output,
+# kill the reader thread and freeze the pane. Still present on alacritty master as
+# of 852e971; drop this fork once it lands upstream.
+alacritty_terminal = { git = "https://github.com/l0ng-ai/alacritty", rev = "22b1d74842732f6ea30d8f4eec768b3ac659d0b6" }
 
 # Desktop notifications driven by OSC 9 / OSC 777 escape sequences. Cross-platform;
 # the macOS backend uses the deprecated NSUserNotification (weak — a completion

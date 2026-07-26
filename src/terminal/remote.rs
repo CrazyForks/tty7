@@ -1692,6 +1692,46 @@ mod tests {
         );
     }
 
+    /// Guards the `alacritty_terminal` pin, not our own code. Upstream's
+    /// `push_keyboard_mode` trims its stack by removing from `title_stack` — a
+    /// copy-paste slip from `push_title` — so once the title stack is empty the
+    /// `Vec::remove(0)` panics and takes the reader thread with it. Enabling
+    /// `kitty_keyboard` made that reachable from any foreground program: ~20KB of
+    /// unpopped pushes is enough. Our fork fixes it; a bump back to an unpatched
+    /// rev must fail here rather than in the field.
+    #[test]
+    fn deep_keyboard_mode_pushes_leave_the_reader_alive() {
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+
+        // One past alacritty's KEYBOARD_MODE_STACK_MAX_DEPTH (4096): the push that
+        // overflows is the one that used to panic. The trailing query is the
+        // liveness probe — a dead reader thread simply never answers.
+        let mut payload = b"\x1b[>1u".repeat(4097);
+        payload.extend_from_slice(b"\x1b[?u");
+        DaemonMsg::Output(payload).encode(&mut daemon_side).unwrap();
+        daemon_side.flush().unwrap();
+
+        let mut reply = None;
+        for _ in 0..200 {
+            while let Ok(event) = term.events.try_recv() {
+                if let AlacEvent::PtyWrite(text) = event {
+                    reply = Some(text);
+                }
+            }
+            if reply.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            reply.as_deref(),
+            Some("\x1b[?1u"),
+            "the reader thread must survive a deep mode-push run and still answer queries"
+        );
+    }
+
     #[test]
     fn spawn_retry_only_for_daemon_disconnects() {
         let eof: anyhow::Error =
