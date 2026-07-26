@@ -2,12 +2,14 @@
 //! rather than what it's printing — session facts, its working-tree diff, and
 //! its file tree.
 //!
-//! It splits across two hosts on purpose. The **tab row lives in the title bar**
-//! (built in [`tab_strip`](crate::ui::tab_strip)), so the panel's controls sit on
-//! the same line as the window's own chrome instead of stacking a second 40px bar
-//! under it; the **body** is this module's column inside `body_area`. The two are
-//! kept in register by both measuring from `Config::right_panel_width`, so the
-//! tabs sit exactly over the content they switch.
+//! Its tab row has two homes. On macOS it is the panel's own title-bar-height top
+//! zone, level with the window's chrome, so the column runs unbroken from the top
+//! of the window. Off macOS the title bar has to span the panel (the window
+//! controls live at its right end), so the row drops to the panel's second line —
+//! Cursor-style — while the caption row above is painted in the panel's surface
+//! so the column still reads as one colour.
+//! Either way the tiles themselves are built in
+//! [`tab_strip`](crate::ui::tab_strip), beside the rest of the window's tiles.
 //!
 //! No new source of truth: Info reads the same `TerminalView`/`Tab` accessors the
 //! sidebar row does, Changes probes the same `git_diff` the diff overlay does, and
@@ -182,14 +184,15 @@ impl Tty7App {
                 // bolted under the title bar: its surface runs the full height of
                 // the window, and the tab row sits *on* it rather than on the
                 // terminal's bar above a seam.
-                .child({
-                    // The top zone sits level with the real `TitleBar`, but the
-                    // bar only spans the terminal column — so, exactly like the
-                    // rail's top strip (`tab_sidebar`), make this one act like the
-                    // title bar it aligns with: drag to move, double-click to zoom.
-                    // A press arms a flag and the first *move* starts the window
-                    // move, so a plain click on a tab — and a double-click — still
-                    // lands intact; the tabs and corner chrome take their own.
+                //
+                // macOS only. Off macOS the bar spans the panel — it has to, or the
+                // window controls end up stranded mid-window (see `app::render`) —
+                // and a row of tiles under that caption row was one chrome row too
+                // many: the panel opened with three stacked headers (caption chrome,
+                // tab tiles, section title) before any content. So there the tiles
+                // move into the section header instead (`panel_title`), which is a
+                // row the panel was drawing anyway.
+                .children(cfg!(target_os = "macos").then(|| {
                     let should_move = Rc::new(Cell::new(false));
                     h_flex()
                         .id("right-panel-titlebar-drag")
@@ -204,6 +207,14 @@ impl Tty7App {
                         // down a physical pixel the moment the panel opens.
                         .border_b_1()
                         .border_color(cx.theme().transparent)
+                        // The top zone sits level with the real `TitleBar`, but the
+                        // bar only spans the terminal column — so, exactly like the
+                        // rail's top strip (`tab_sidebar`), make this one act like
+                        // the title bar it aligns with: drag to move, double-click
+                        // to zoom. A press arms a flag and the first *move* starts
+                        // the window move, so a plain click on a tab — and a
+                        // double-click — still lands intact; the tabs and corner
+                        // chrome take their own.
                         .window_control_area(WindowControlArea::Drag)
                         .on_mouse_down(MouseButton::Left, {
                             let should_move = should_move.clone();
@@ -227,7 +238,7 @@ impl Tty7App {
                         // The panel is what reaches the window's right edge while
                         // it's open, so it carries the corner chrome.
                         .child(self.window_chrome(window, cx))
-                })
+                }))
                 .child(body)
                 // The transfers footer is a sibling of the body, not part of any
                 // tab: an SFTP transfer belongs to the pane, so reading Info or
@@ -333,14 +344,20 @@ impl Tty7App {
         (backing, handle)
     }
 
-    /// A section label inside the panel body — the small caps line that names
-    /// what the icon-only tab row can't. `trailing` carries a tab's own controls
-    /// where it has any, so they sit on the label's line rather than earning a
-    /// second header row.
     /// A tab's header: the name in a weightier small-caps than the old faint
     /// label, plus an optional live count trailing it (files, commands, changed
     /// files) so the header states scale at a glance, and an optional control on
     /// the right. The count is the quiet mono tally the sidebar group headers use.
+    /// `trailing` carries a tab's own controls where it has any, so they sit on
+    /// the label's line rather than earning a second header row.
+    ///
+    /// Off macOS this row is also the panel's tab switcher: the four tiles ride
+    /// at its trailing edge, and the row takes the full title-bar height with a
+    /// hairline under it. The panel there hangs below a caption row that already
+    /// carries chrome (see `render_right_panel`), and a tile row of its own on top
+    /// of this one meant three stacked headers before a single line of content —
+    /// so the two that were saying "this is a header" merge into one that also
+    /// says which tab you are on.
     pub(crate) fn panel_title(
         &self,
         text: &str,
@@ -348,23 +365,37 @@ impl Tty7App {
         trailing: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let tabs = (!cfg!(target_os = "macos")).then(|| self.right_panel_tabs(cx));
+        let has_trailing = trailing.is_some();
         h_flex()
             .flex_none()
-            .h(px(32.))
+            // Tall enough to seat the chrome-scale tiles when it carries them;
+            // otherwise the compact label line it has always been.
+            .h(px(if tabs.is_some() {
+                crate::ui::app::TITLE_BAR_HEIGHT
+            } else {
+                32.
+            }))
             .items_center()
-            .justify_between()
             .pl(px(CONTENT_INSET))
             // Trailing tiles align on the glyph like every other control in the
-            // window; a label-only header just takes the plain inset. `_SM`
-            // because what hangs here is a body-scale tile, whose glyph sits a
-            // different distance inside its box than the chrome's does.
-            .pr(px(if trailing.is_some() {
-                tile_trailing_inset_sm()
-            } else {
-                CONTENT_INSET
+            // window; a label-only header just takes the plain inset. `_SM` for a
+            // tab's own control, whose glyph sits a different distance inside its
+            // box than the chrome-scale tab tiles do.
+            .pr(px(match (&tabs, has_trailing) {
+                (Some(_), _) => tile_trailing_inset(),
+                (None, true) => tile_trailing_inset_sm(),
+                (None, false) => CONTENT_INSET,
             }))
+            // The line that separates the header from the tab's content. Only
+            // where the header is the switcher: a label alone doesn't need ruling
+            // off from the band it introduces.
+            .when(tabs.is_some(), |this| {
+                this.border_b_1().border_color(cx.theme().sidebar_border)
+            })
             .child(
                 h_flex()
+                    .flex_shrink_0()
                     .items_baseline()
                     .gap(px(7.))
                     .child(
@@ -384,7 +415,20 @@ impl Tty7App {
                         )
                     }),
             )
+            .child(div().flex_1().min_w_0())
             .when_some(trailing, |this, t| this.child(t))
+            .when_some(tabs, |this, tiles| {
+                this.child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(2.))
+                        // Clear of a tab's own control where there is one; flush
+                        // against the label's spring where there isn't.
+                        .when(has_trailing, |this| this.ml(px(6.)))
+                        .children(tiles),
+                )
+            })
             .into_any_element()
     }
 

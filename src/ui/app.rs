@@ -166,6 +166,12 @@ pub(crate) fn tile_trailing_inset_sm() -> f32 {
 /// here, not at the window edge.
 pub(crate) const TITLE_BAR_LEAD: f32 = if cfg!(target_os = "macos") { 80. } else { 12. };
 
+/// What the bar reserves at its *trailing* edge for the window controls: three
+/// 34px tiles (─ ▢ ✕) off macOS, nothing on macOS (the traffic lights are on the
+/// left, and `TITLE_BAR_LEAD` covers them). Anything in the bar that has to line
+/// up with a column below it measures from the window edge minus this.
+pub(crate) const WINDOW_CONTROLS_W: f32 = if cfg!(target_os = "macos") { 0. } else { 102. };
+
 /// Left offset for the tile group that sits beside the window controls.
 ///
 /// On macOS the thing that can collide with the traffic lights is the tile's
@@ -5165,68 +5171,103 @@ impl Render for Tty7App {
             pair.into_iter().filter_map(|(_, el)| el).collect()
         };
 
-        // The two layouts. Horizontal: a column of [title bar / body].
-        // Vertical (default): the rail is a full-height *left column* that reaches the very
-        // top of the window — the traffic lights sit on its surface — with the
-        // title strip and terminal stacked in the right column. That way the rail
-        // surface has no seam with the title bar and reads as one continuous
-        // panel.
-        // The right detail panel is a full-height column, not a box under the title
-        // bar: it carries its own title-bar-height top zone (tab row + the window's
-        // corner chrome) exactly like the rail does on the left, so its surface
-        // runs unbroken from the very top of the window. Anything less leaves a
-        // horizontal seam where the panel's grey starts under the terminal's bar.
+        // The layout. The rail (vertical mode) is a full-height *left column* that
+        // reaches the very top of the window — the traffic lights sit on its
+        // surface — with the title strip and terminal stacked in the right column.
+        // That way the rail surface has no seam with the title bar and reads as one
+        // continuous panel.
+        //
+        // The right detail panel does the same on macOS: a full-height column
+        // carrying its own title-bar-height top zone (tab row + the window's corner
+        // chrome), so its surface runs unbroken from the very top of the window.
+        //
+        // Off macOS it can't. The window controls (─ ▢ ✕) are laid out by the title
+        // bar itself, at *its* right end, so a full-height panel beside the bar
+        // strands them mid-window with the panel's grey to their right. There the
+        // bar spans the panel too — reaching the real top-right corner, where
+        // Windows and Linux users expect the controls — and the panel hangs below
+        // it, VS Code style. The panel's tab row then sits on the panel (no longer
+        // in the caption row), and the corner chrome stays in the strip.
         let right_panel = self.render_right_panel(window, cx);
-        let main_layout = match sidebar {
-            Some(sidebar) => div()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .flex()
-                .flex_row()
-                .child(sidebar)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        // Anchor for the code overlay: it fills this column
-                        // (title strip + body) — and, since the panel is a sibling
-                        // rather than a child, stops short of the panel for free.
-                        .relative()
-                        .child(title_bar)
-                        .child(body_area)
-                        .children(overlays),
-                )
-                .when_some(right_panel, |this, panel| this.child(panel))
-                .into_any_element(),
-            // Horizontal-tabs mode has no rail, but the panel is still a column
-            // beside the stacked [title bar / body], for the same reason: it has to
-            // own its own top zone to read as one surface.
-            None => div()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .flex()
-                .flex_row()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .relative()
-                        .child(title_bar)
-                        .child(body_area)
-                        // Both overlays cover the whole window face here (their
-                        // content pads down past the traffic lights — see
-                        // `render_code_overlay` and `diff_header`).
-                        .children(overlays),
-                )
-                .when_some(right_panel, |this, panel| this.child(panel))
-                .into_any_element(),
+        let panel_below_title_bar = right_panel.is_some() && !cfg!(target_os = "macos");
+        // Which host the bar goes to: the terminal column's first child, or the
+        // spanning row above [terminal | panel].
+        let (column_title_bar, spanning_title_bar) = if panel_below_title_bar {
+            (None, Some(title_bar))
+        } else {
+            (Some(title_bar), None)
         };
+        // The terminal column, and the anchor for both overlays: they fill it —
+        // and, since the panel is a sibling rather than a child, stop short of the
+        // panel for free. With the bar spanning above, they stop short of it too,
+        // which keeps the native controls clickable while an overlay is open and
+        // lines the overlay's own header row up with the panel's tab row.
+        let terminal_column = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .relative()
+            .when_some(column_title_bar, |this, bar| this.child(bar))
+            .child(body_area)
+            .children(overlays);
+        let panel_row = div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_row()
+            .child(terminal_column)
+            .when_some(right_panel, |this, panel| this.child(panel));
+        let main_layout = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_row()
+            .when_some(sidebar, |this, sidebar| this.child(sidebar))
+            .child(match spanning_title_bar {
+                Some(bar) => div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        // The bar's own band over the panel, painted in the panel's
+                        // surface so the column still reads as one continuous
+                        // sidebar from the very top of the window — the rail's
+                        // trick, kept now that the tab row moved off the caption
+                        // line. Without it the panel's grey started 40px down and
+                        // the corner tore into two colours.
+                        //
+                        // A sibling *under* the transparent bar rather than padding
+                        // inside it: the ─ ▢ ✕ group is the bar's own last child, so
+                        // nothing laid out in the bar can get behind the controls,
+                        // and only a layer below can carry a surface under them.
+                        // Same width and left border as the panel, both read from
+                        // `right_panel_px`, so the edge stays in register through a
+                        // resize drag.
+                        div()
+                            .relative()
+                            .flex_none()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .right_0()
+                                    .w(px(self.right_panel_px(window, cx)))
+                                    .bg(cx.theme().sidebar)
+                                    .border_l_1()
+                                    .border_color(cx.theme().sidebar_border),
+                            )
+                            .child(bar),
+                    )
+                    .child(panel_row)
+                    .into_any_element(),
+                None => panel_row.into_any_element(),
+            })
+            .into_any_element();
 
         // The real window background paint: gradient-aware and opacity-carrying
         // (see `theme::window_background`), plus the theme's optional background

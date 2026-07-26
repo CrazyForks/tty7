@@ -1107,12 +1107,21 @@ impl Tty7App {
         } else {
             (window.viewport_size().width - px(114.)).max(px(140.))
         };
+        // Off macOS the bar spans the detail panel (see `app::render`). The corner
+        // chrome then sits *over the panel's surface*, so it stops hugging the
+        // window controls and aligns with the column it is painted on: a block as
+        // wide as the slice of the panel the bar can reach — panel width less the
+        // control group, less the panel's own left border — with the tiles packed
+        // at its leading edge, on the same inset as everything else in the panel.
+        let chrome_band_w = (!cfg!(target_os = "macos") && self.right_panel_open(cx)).then(|| {
+            (self.right_panel_px(window, cx) - crate::ui::app::WINDOW_CONTROLS_W - 1.).max(0.)
+        });
         // The "+" and the right-edge overflow "⋯" (30px each), their surrounding
         // gaps, and the strip's own left/right padding all live *outside* the
         // clipped chip row — reserve that whole footprint here so the fixed chrome
         // never overflows the strip box (which would eat the "⋯"'s right inset and
         // shove it into the window corner) and cap the chip row at the remainder.
-        let chips_avail = (strip_w - px(100.)).max(px(80.));
+        let chips_avail = (strip_w - px(100.) - px(chrome_band_w.unwrap_or(0.))).max(px(80.));
         // Only the chip row clips; a crowded row shrinks its chips (down to their
         // `min_w`) and truncates their labels rather than pushing the "+" away.
         let mut chips = h_flex()
@@ -1532,11 +1541,14 @@ impl Tty7App {
         });
 
         let panel_open = self.right_panel_open(cx);
-        // The window's right-corner chrome. When the panel is open it lives on the
-        // *panel's* top zone (the panel is what reaches the window's right edge
-        // then) exactly like the rail's controls live on the rail; the strip only
-        // carries it while the panel is closed.
-        let right_chrome = (!panel_open).then(|| self.window_chrome(window, cx));
+        // The window's right-corner chrome. On macOS, when the panel is open it
+        // lives on the *panel's* top zone (the panel is what reaches the window's
+        // right edge then) exactly like the rail's controls live on the rail; the
+        // strip only carries it while the panel is closed. Off macOS the bar spans
+        // the panel (the window controls are at its right end — see `app::render`),
+        // so the strip always reaches the right edge and always carries the chrome.
+        let right_chrome =
+            (!panel_open || !cfg!(target_os = "macos")).then(|| self.window_chrome(window, cx));
 
         // Outer strip: the clipping chip row and the always-visible "+" anchored
         // left, the overflow "⋯" pushed to the right edge by a flexible spacer.
@@ -1567,7 +1579,22 @@ impl Tty7App {
             // leaving just the "⋯" overflow menu on a thin strip.
             .when(show_chips, move |this| this.child(add_button))
             .child(div().flex_1())
-            .when_some(right_chrome, |this, chrome| this.child(chrome))
+            .when_some(right_chrome, |this, chrome| match chrome_band_w {
+                // Over the panel: left-aligned on the panel's content edge, and
+                // wide enough that its own right edge lands where the window
+                // controls start.
+                Some(w) => this.child(
+                    h_flex()
+                        .flex_none()
+                        .w(px(w))
+                        .items_center()
+                        .pl(px(tile_trailing_inset()))
+                        .child(chrome),
+                ),
+                // Over the terminal: pinned to the strip's trailing edge, which is
+                // the window's right edge (or the controls' left edge off macOS).
+                None => this.child(chrome),
+            })
     }
 }
 
