@@ -4,13 +4,17 @@
 //! `ui::presets`) and publishes the terminal-facing palette.
 
 use gpui::{
-    App, Background, Hsla, Menu, MenuItem, Pixels, Point, Window, WindowBackgroundAppearance,
-    linear_color_stop, linear_gradient, point, px, rgb,
+    App, Background, Hsla, Menu, MenuItem, OsAction, Pixels, Point, SystemMenuType, Window,
+    WindowBackgroundAppearance, linear_color_stop, linear_gradient, point, px, rgb,
 };
 use gpui_component::{Theme, ThemeMode};
 
 use crate::core::actions::*;
 use crate::core::config::Config;
+use crate::terminal::view::{
+    ClearScrollback, CopyText, CutText, FindInTerminal, FindNext, FindPrevious, PasteText,
+    RedoEdit, SelectAll, UndoEdit,
+};
 use crate::ui::presets;
 use crate::ui::presets::Fill;
 
@@ -26,47 +30,118 @@ pub(crate) fn traffic_light_position() -> Point<Pixels> {
 }
 
 /// (Re)build the macOS menu bar.
+///
+/// Menu order and contents follow the macOS HIG's standard set — App, File,
+/// Edit, View, Window, Help — because that is where a Mac user's hand goes
+/// before they read a single label. The app used to ship four menus in the
+/// order App / Shell / Window / View with no Edit at all, which put Copy and
+/// Paste nowhere but a right-click and made the whole bar read as improvised.
+///
+/// Two deliberate departures from a stock bar:
+///
+/// * There is no "Shell" menu. Its contents (new/close/split/rename) are File's
+///   job everywhere else, and the name collided with Settings → Shell, which
+///   configures something entirely different — the program a pane launches.
+/// * "Restart Daemon…" lives at the bottom of Help, not near Settings. It is a
+///   break-glass repair, it ends every running shell, and it has no business
+///   one slot away from ⌘,.
 pub(crate) fn set_menus(cx: &mut App) {
     cx.set_menus([
         Menu::new("tty7").items([
+            MenuItem::action("About tty7", About),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
+            MenuItem::separator(),
             MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
+            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action("Hide tty7", HideApp),
+            MenuItem::action("Hide Others", HideOthers),
+            MenuItem::action("Show All", ShowAll),
+            MenuItem::separator(),
+            MenuItem::action("Quit tty7", Quit),
+        ]),
+        Menu::new("File").items([
+            MenuItem::action("New Tab", NewTab),
+            MenuItem::action("New Workspace", NewWorkspace),
+            MenuItem::action("New Worktree Tab", NewWorktreeTab),
+            MenuItem::separator(),
+            MenuItem::action("Split Right", SplitRight),
+            MenuItem::action("Split Down", SplitDown),
+            MenuItem::separator(),
+            MenuItem::action("Rename Tab…", RenameTab),
+            MenuItem::action("Copy Working Directory", CopyWorkingDirectory),
+            MenuItem::separator(),
+            MenuItem::action("Close Pane / Tab", CloseActiveTab),
+            MenuItem::action("Close Other Tabs", CloseOtherTabs),
+            MenuItem::action("Close Tabs to the Right", CloseTabsToTheRight),
+            MenuItem::action("Reopen Closed Tab", ReopenClosedTab),
+            MenuItem::separator(),
+            MenuItem::action("Rename Workspace…", RenameWorkspace),
+            // Separated: the only item above the rule that touches running
+            // sessions is none of them — closing a window or a tab leaves the
+            // shells alive in the daemon. Stop ends them but keeps the layout.
+            MenuItem::action("Stop Workspace…", StopWorkspace),
+            // Alone at the very bottom, behind its own rule: the one
+            // irreversible item in the entire menu bar. It used to sit directly
+            // under Stop, distinguishable only by the verb.
+            MenuItem::separator(),
+            MenuItem::action("Delete Workspace…", DeleteWorkspace),
+        ]),
+        // `os_action` routes these through the standard Cut/Copy/Paste/Select All
+        // selectors, so they behave like every other Mac app's Edit menu (and stay
+        // enabled via the app delegate) while still dispatching our own actions.
+        // They carry no key-equivalent glyph: the chords are handled inline in
+        // `terminal::view::handle_cmd_shortcut` rather than as registered
+        // bindings, because ⌃C has to fall through to SIGINT when nothing is
+        // selected — a registered binding would swallow it.
+        Menu::new("Edit").items([
+            MenuItem::os_action("Undo", UndoEdit, OsAction::Undo),
+            MenuItem::os_action("Redo", RedoEdit, OsAction::Redo),
+            MenuItem::separator(),
+            MenuItem::os_action("Cut", CutText, OsAction::Cut),
+            MenuItem::os_action("Copy", CopyText, OsAction::Copy),
+            MenuItem::os_action("Paste", PasteText, OsAction::Paste),
+            MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action("Find…", FindInTerminal),
+            MenuItem::action("Find Next", FindNext),
+            MenuItem::action("Find Previous", FindPrevious),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Command Palette…", TogglePalette),
+            MenuItem::separator(),
+            MenuItem::action("Increase Font Size", IncreaseFontSize),
+            MenuItem::action("Decrease Font Size", DecreaseFontSize),
+            MenuItem::action("Reset Font Size", ResetFontSize),
+            MenuItem::separator(),
+            // The three docks and the tab rail's placement — the most literally
+            // "view" things in the app, and until now reachable only by chord.
+            MenuItem::action("Left Sidebar", ToggleLeftPanel),
+            MenuItem::action("Right Panel", ToggleRightPanel),
+            MenuItem::action("Code Panel", ToggleCodePanel),
+            MenuItem::action("Tab Bar Position", ToggleTabSidebar),
+            MenuItem::separator(),
+            MenuItem::action("Focus Next Pane", FocusNextPane),
+            MenuItem::action("Focus Previous Pane", FocusPrevPane),
+            MenuItem::action("Zoom Pane", ToggleMaximizePane),
+            MenuItem::separator(),
+            MenuItem::action("Clear Scrollback", ClearScrollback),
+            MenuItem::separator(),
+            MenuItem::action("Enter Full Screen", ToggleFullscreen),
+        ]),
+        Menu::new("Window").items(window_menu_items(cx)),
+        Menu::new("Help").items([
+            MenuItem::action("tty7 Documentation", OpenDocumentation),
+            MenuItem::action("Keyboard Shortcuts", ShowKeyboardShortcuts),
+            MenuItem::separator(),
+            MenuItem::action("Join the Discord", OpenDiscord),
+            MenuItem::action("Report an Issue…", ReportIssue),
             MenuItem::separator(),
             // Force a fresh background daemon (so a newly granted macOS permission
             // such as Full Disk Access takes effect). The trailing "…" signals the
             // confirmation prompt; it ends every running session.
             MenuItem::action("Restart Daemon…", RestartDaemon),
-            MenuItem::separator(),
-            MenuItem::action("Quit tty7", Quit),
-        ]),
-        Menu::new("Shell").items([
-            MenuItem::action("New Tab", NewTab),
-            MenuItem::action("New Workspace", NewWorkspace),
-            MenuItem::action("Split Right", SplitRight),
-            MenuItem::action("Split Down", SplitDown),
-            MenuItem::separator(),
-            MenuItem::action("Focus Next Pane", FocusNextPane),
-            MenuItem::action("Focus Previous Pane", FocusPrevPane),
-            MenuItem::action("Toggle Maximize Pane", ToggleMaximizePane),
-            MenuItem::separator(),
-            MenuItem::action("Reopen Closed Tab", ReopenClosedTab),
-            MenuItem::separator(),
-            MenuItem::action("Close Pane / Tab", CloseActiveTab),
-            // Last, and separated: the only two items here that touch running
-            // sessions. Everything above them — including closing the window —
-            // leaves the shells alive in the daemon, so these sit apart rather
-            // than a mis-click away from "Close Pane / Tab". Stop keeps the
-            // layout; Delete is the only thing that discards it.
-            MenuItem::separator(),
-            MenuItem::action("Stop Workspace…", StopWorkspace),
-            MenuItem::action("Delete Workspace…", DeleteWorkspace),
-        ]),
-        Menu::new("Window").items(window_menu_items(cx)),
-        Menu::new("View").items([
-            MenuItem::action("Increase Font Size", IncreaseFontSize),
-            MenuItem::action("Decrease Font Size", DecreaseFontSize),
-            MenuItem::action("Reset Font Size", ResetFontSize),
-            MenuItem::separator(),
-            MenuItem::action("Toggle Full Screen", ToggleFullscreen),
         ]),
     ]);
 }
@@ -94,7 +169,15 @@ fn window_menu_items(cx: &App) -> Vec<MenuItem> {
     // dispatches identically wherever it was clicked.
     let slot_action = crate::ui::tab_strip::select_workspace_action;
 
-    let mut items = Vec::new();
+    // Minimize / Zoom first: every Mac app's Window menu opens with them, and a
+    // menu that jumps straight into a bespoke list reads as if the standard ones
+    // were forgotten. The workspace roster follows behind a rule.
+    let mut items = vec![
+        MenuItem::action("Minimize", MinimizeWindow),
+        MenuItem::action("Zoom", ZoomWindow),
+        MenuItem::separator(),
+    ];
+    let workspace_start = items.len();
     let mut separated = false;
     for (i, (id, open)) in order.iter().enumerate() {
         let Some(workspace) = store.get(*id) else {
@@ -105,7 +188,10 @@ fn window_menu_items(cx: &App) -> Vec<MenuItem> {
         // away. Only drawn once, and never as a leading rule.
         if !open && !separated {
             separated = true;
-            if !items.is_empty() {
+            // Compared against the roster's own start, not the whole menu: with
+            // Minimize/Zoom above, `items` is never empty and the old check
+            // would have drawn a second rule directly under the first.
+            if items.len() > workspace_start {
                 items.push(MenuItem::Separator);
             }
         }
@@ -128,9 +214,9 @@ fn window_menu_items(cx: &App) -> Vec<MenuItem> {
             disabled: false,
         });
     }
-    if items.is_empty() {
-        // Never hand back an empty menu — an unclickable "Window" title reads
-        // as broken. The one workspace that must exist is the current one.
+    if items.len() == workspace_start {
+        // Never leave the roster empty — a Window menu that lists no windows
+        // reads as broken. The one workspace that must exist is the current one.
         items.push(MenuItem::action("New Workspace", NewWorkspace));
     }
     items

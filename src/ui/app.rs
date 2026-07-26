@@ -28,7 +28,9 @@ use crate::core::ssh_config;
 use crate::core::window_state::WindowState;
 use crate::daemon::protocol::{RemoteContext, ShellSpec, ssh_option_takes_value};
 use crate::terminal::view::{ChildExited, TerminalView};
-use crate::ui::palette::{Command, CommandKind, PaletteEvent, PaletteView};
+use crate::ui::palette::{
+    ChromeState, Command, CommandGroup, CommandKind, PaletteEvent, PaletteView,
+};
 use crate::ui::pane::{CloseOutcome, Dir, Pane};
 use crate::ui::presets::Fill;
 use crate::ui::settings::{
@@ -122,6 +124,13 @@ pub(crate) const TILE_GLYPH_LINE: f32 = 16.;
 /// glyph a truer 2px to the right.
 pub(crate) const TILE_PAD: f32 = (TILE_SIZE - TILE_GLYPH) / 2.;
 pub(crate) const TILE_PAD_SM: f32 = (TILE_SIZE_SM - TILE_GLYPH_SM) / 2.;
+
+/// Help-menu destinations. The README already points people at these; the app
+/// itself offered none of them, so the only in-product way to reach the docs or
+/// the chat was to already know the URL.
+const DOCS_URL: &str = "https://github.com/l0ng-ai/tty7#readme";
+const DISCORD_URL: &str = "https://discord.gg/s3dethqz2V";
+const ISSUES_URL: &str = "https://github.com/l0ng-ai/tty7/issues/new";
 
 /// The one content inset the whole window aligns to: the rail's text and icons,
 /// the title bar's chrome glyphs, and the side panels all start (or end) here, so
@@ -662,16 +671,19 @@ impl Tty7App {
                  running in them is terminated."
                 .to_string(),
         };
+        // Phrased as the question it is, like every other prompt in the app —
+        // this one used to be a bare statement of fact with two verbs under it.
+        // The version details it used to carry in the title are in the body.
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Daemon Is From Another Version",
+            "Restart Daemon?",
             Some(&detail),
-            &["Keep Sessions", "Restart Daemon"],
+            &["Keep Sessions", "Restart"],
             cx,
         );
         cx.spawn(async move |this, cx| {
-            // Index 1 == "Restart Daemon"; "Keep Sessions" or a dismissed
-            // prompt leave the old daemon (and every session) untouched.
+            // Index 1 == "Restart"; "Keep Sessions" or a dismissed prompt leave
+            // the old daemon (and every session) untouched.
             if !matches!(answer.await, Ok(1)) {
                 return;
             }
@@ -1385,11 +1397,10 @@ impl Tty7App {
             }
             TrayAction::CheckForUpdates => {
                 surface_window(window, cx);
-                // Forced: a manual "check now" should work even when the
-                // startup check is disabled. The result lands in the About
-                // panel we open next (via the `UpdateStatus` global).
-                crate::core::update::spawn_check_forced(cx);
-                self.open_settings_section(SettingsSection::About, window, cx);
+                // Same path as the App menu's "Check for Updates…" — the tray
+                // used to carry its own copy of this, and was for a while the
+                // only place in the app offering the check at all.
+                self.check_for_updates_now(window, cx);
             }
             // Same as ⌘Q: sessions keep running in the daemon.
             TrayAction::Quit => cx.quit(),
@@ -3276,6 +3287,24 @@ impl Tty7App {
             .and_then(|leaf| leaf.read(cx).cwd())
     }
 
+    /// Copy the active tab's working directory to the clipboard — the
+    /// `CopyWorkingDirectory` action behind the File menu, the palette, and the
+    /// tab context menu's row of the same name. A no-op when the pane has yet to
+    /// report a cwd, which is also when the context-menu row renders disabled.
+    pub(crate) fn copy_active_cwd(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(cwd) = self.tab_cwd(self.active, window, cx) {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(cwd.display().to_string()));
+        }
+    }
+
+    /// An explicit "check now", from the App menu or the tray. Forced, so it
+    /// works even with the startup check turned off — "I asked" outranks "don't
+    /// ask on my behalf" — and it opens About, where the result lands.
+    pub(crate) fn check_for_updates_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::core::update::spawn_check_forced(cx);
+        self.open_settings_section(SettingsSection::About, window, cx);
+    }
+
     /// [`tab_cwd`](Self::tab_cwd) restricted to a directory on this machine —
     /// for the worktree operations, which shell out to a local `git`. "Copy
     /// Working Directory" deliberately keeps using `tab_cwd`: copying a remote
@@ -3468,7 +3497,15 @@ impl Tty7App {
     /// Build the full command catalog: the static commands plus one
     /// "Switch to Tab: …" entry per open tab (label matches the tab strip).
     fn palette_commands(&self, cx: &App) -> Vec<Command> {
-        let mut commands = Command::base_commands();
+        // This window's own chrome state, not the config's copy of it — see
+        // `ChromeState`.
+        let mut commands = Command::base_commands(
+            cx,
+            ChromeState {
+                rail_collapsed: self.sidebar_collapsed,
+                right_panel_visible: self.right_panel_visible,
+            },
+        );
 
         // Saved SSH profiles, ordered by frecency then name (PRD FR-P3). Each row
         // connects (natively) on Enter and edits on ⌘⏎ / →.
@@ -3500,7 +3537,8 @@ impl Tty7App {
                     format!("SSH: {title}"),
                     CommandKind::ConnectSavedProfile(p.id),
                 )
-                .with_subtitle(subtitle),
+                .with_subtitle(subtitle)
+                .in_group(CommandGroup::Ssh),
             );
         }
 
@@ -3518,10 +3556,13 @@ impl Tty7App {
                 continue;
             }
             let label = self.tab_label(tab, i, None, cx);
-            commands.push(Command::new(
-                format!("Switch to Tab: {label}"),
-                CommandKind::ActivateTab(i),
-            ));
+            commands.push(
+                Command::new(
+                    format!("Switch to Tab: {label}"),
+                    CommandKind::ActivateTab(i),
+                )
+                .in_group(CommandGroup::TabsPanes),
+            );
         }
         commands
     }
@@ -3568,9 +3609,30 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// The focused terminal of the active tab, for palette commands that act on
+    /// the pane rather than the shell. The palette has already closed by the
+    /// time these run, so focus is back where the user left it.
+    fn focused_leaf(&self, window: &Window, cx: &App) -> Option<Entity<TerminalView>> {
+        self.tabs
+            .get(self.active)
+            .and_then(|t| t.pane.focused_or_first(window, cx))
+    }
+
+    /// Record that a palette command was run, for the palette's Recent band.
+    /// Only commands with a stable id are tracked (see `CommandKind::id`).
+    fn bump_command_frecency(&mut self, kind: &CommandKind, cx: &mut Context<Self>) {
+        let Some(id) = kind.id() else { return };
+        self.update_config(cx, |cfg| {
+            let entry = cfg.command_frecency.entry(id.to_string()).or_default();
+            entry.count = entry.count.saturating_add(1);
+            entry.last_used = crate::core::config::unix_now();
+        });
+    }
+
     /// Run a palette command by dispatching to the matching tab/pane operation.
     fn run_command(&mut self, kind: CommandKind, window: &mut Window, cx: &mut Context<Self>) {
         use CommandKind::*;
+        self.bump_command_frecency(&kind, cx);
         match kind {
             NewTab => self.new_tab(window, cx),
             NewWorkspace => crate::ui::windows::open(cx, None),
@@ -3604,30 +3666,72 @@ impl Tty7App {
             ToggleRightPanel => self.toggle_right_panel(cx),
             ShowRightPanel(tab) => self.set_right_panel_tab(tab, cx),
             ResetFontSize => self.reset_font_size(cx),
+            // Pane-scoped commands act on the terminal the closing palette just
+            // handed focus back to.
             FindInTerminal => {
-                // Open the search bar on the pane focus just returned to (the
-                // palette closed before we got here, restoring terminal focus).
-                if let Some(leaf) = self
-                    .tabs
-                    .get(self.active)
-                    .and_then(|t| t.pane.focused_or_first(window, cx))
-                {
+                if let Some(leaf) = self.focused_leaf(window, cx) {
                     leaf.update(cx, |view, cx| view.open_search(window, cx));
                 }
             }
+            FindNext => {
+                if let Some(leaf) = self.focused_leaf(window, cx) {
+                    leaf.update(cx, |view, cx| view.find_step(true, cx));
+                }
+            }
+            FindPrevious => {
+                if let Some(leaf) = self.focused_leaf(window, cx) {
+                    leaf.update(cx, |view, cx| view.find_step(false, cx));
+                }
+            }
             ClearTerminal => {
-                // Same focus story as FindInTerminal: act on the pane the closing
-                // palette just handed focus back to.
-                if let Some(leaf) = self
-                    .tabs
-                    .get(self.active)
-                    .and_then(|t| t.pane.focused_or_first(window, cx))
-                {
+                if let Some(leaf) = self.focused_leaf(window, cx) {
                     leaf.update(cx, |view, cx| view.clear_scrollback(cx));
                 }
             }
+            CopyText => {
+                if let Some(leaf) = self.focused_leaf(window, cx) {
+                    // `false`: a menu/palette copy leaves the highlight up. Only
+                    // the dual-purpose ⌃C chord has to consume the selection.
+                    leaf.update(cx, |view, cx| {
+                        view.copy_contextual(false, cx);
+                    });
+                }
+            }
+            CutText => {
+                if let Some(leaf) = self.focused_leaf(window, cx) {
+                    leaf.update(cx, |view, cx| {
+                        view.cut_contextual(cx);
+                    });
+                }
+            }
+            PasteText => {
+                if let Some(leaf) = self.focused_leaf(window, cx) {
+                    leaf.update(cx, |view, cx| view.paste_from_clipboard(cx));
+                }
+            }
+            SelectAllText => {
+                if let Some(leaf) = self.focused_leaf(window, cx) {
+                    leaf.update(cx, |view, cx| view.select_all_contextual(cx));
+                }
+            }
             ReopenClosedTab => self.reopen_closed_tab(window, cx),
+            RenameTab => self.start_rename(self.active, window, cx),
+            NewWorktreeTab => self.new_worktree_tab(self.active, window, cx),
+            CloseOtherTabs => self.close_other_tabs(self.active, window, cx),
+            CloseTabsToTheRight => self.close_tabs_right_of(self.active, window, cx),
+            CopyWorkingDirectory => self.copy_active_cwd(window, cx),
+            MarkTabUnread => self.mark_tab_unread(self.active, cx),
+            RenameWorkspace => self.start_workspace_rename(window, cx),
             OpenSettings => self.toggle_settings(window, cx),
+            ShowKeyboardShortcuts => {
+                self.open_settings_section(SettingsSection::Keybindings, window, cx)
+            }
+            About => self.open_settings_section(SettingsSection::About, window, cx),
+            CheckForUpdates => self.check_for_updates_now(window, cx),
+            OpenDocumentation => cx.open_url(DOCS_URL),
+            OpenDiscord => cx.open_url(DISCORD_URL),
+            ReportIssue => cx.open_url(ISSUES_URL),
+            Quit => cx.quit(),
             RestartDaemon => self.restart_daemon(window, cx),
             ToggleSftp => self.toggle_sftp(window, cx),
             ShowSshForwards => self.show_ssh_forwards(window, cx),
@@ -5374,6 +5478,51 @@ impl Render for Tty7App {
             .on_action(cx.listener(|this, _: &RestartSshSession, window, cx| {
                 this.restart_ssh_session(window, cx)
             }))
+            // Tab operations that used to be reachable only by right-clicking a
+            // chip. Each targets the active tab, so the menu bar / palette /
+            // keyboard all mean "this tab" without a click to say which.
+            .on_action(cx.listener(|this, _: &RenameTab, window, cx| {
+                this.start_rename(this.active, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewWorktreeTab, window, cx| {
+                this.new_worktree_tab(this.active, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseOtherTabs, window, cx| {
+                this.close_other_tabs(this.active, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseTabsToTheRight, window, cx| {
+                this.close_tabs_right_of(this.active, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyWorkingDirectory, window, cx| {
+                this.copy_active_cwd(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MarkTabUnread, _window, cx| {
+                this.mark_tab_unread(this.active, cx)
+            }))
+            // Settings destinations that deserve their own way in: Help →
+            // Keyboard Shortcuts and the App menu's About both used to require
+            // opening Settings and then hunting for the section.
+            .on_action(cx.listener(|this, _: &ShowKeyboardShortcuts, window, cx| {
+                this.open_settings_section(SettingsSection::Keybindings, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &About, window, cx| {
+                this.open_settings_section(SettingsSection::About, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, window, cx| {
+                this.check_for_updates_now(window, cx)
+            }))
+            // Standard macOS App / Window menu items. gpui exposes the platform
+            // calls but ships no actions for them.
+            .on_action(cx.listener(|_, _: &HideApp, _window, cx| cx.hide()))
+            .on_action(cx.listener(|_, _: &HideOthers, _window, cx| cx.hide_other_apps()))
+            .on_action(cx.listener(|_, _: &ShowAll, _window, cx| cx.unhide_other_apps()))
+            .on_action(cx.listener(|_, _: &MinimizeWindow, window, _cx| window.minimize_window()))
+            .on_action(cx.listener(|_, _: &ZoomWindow, window, _cx| window.zoom_window()))
+            // Help destinations. Opened in the default browser; a failure here is
+            // not worth interrupting the user over, so it is logged, not toasted.
+            .on_action(cx.listener(|_, _: &OpenDocumentation, _window, cx| cx.open_url(DOCS_URL)))
+            .on_action(cx.listener(|_, _: &OpenDiscord, _window, cx| cx.open_url(DISCORD_URL)))
+            .on_action(cx.listener(|_, _: &ReportIssue, _window, cx| cx.open_url(ISSUES_URL)))
             // The theme's background image, composited over the background fill
             // at its own opacity and under all content. Absolute, so it doesn't
             // participate in the flex column; the wrapper clips the Cover

@@ -40,15 +40,24 @@ use crate::daemon::protocol::{RemoteContext, ShellSpec};
 const GRID_PAD_X: f32 = 8.;
 const GRID_PAD_Y: f32 = 4.;
 
-// Terminal-scoped actions dispatched by the right-click context menu. They route
-// to this view via `.on_action` handlers on the terminal surface; tab/split
-// actions in the same menu bubble up to `Tty7App` from the focused terminal.
+// Terminal-scoped actions dispatched by the right-click context menu and the
+// menu bar's Edit menu. They route to this view via `.on_action` handlers on the
+// terminal surface; tab/split actions in the same menu bubble up to `Tty7App`
+// from the focused terminal.
+//
+// Every one of these is the *single* path for its gesture: the ⌘-chord, the
+// context-menu row, and the Edit-menu item all dispatch the same action, so the
+// three can't drift (they did — the context menu's Paste used to skip the
+// image-paste branch that ⌘V had).
 actions!(
     terminal,
     [
         CopyText,
+        CutText,
         PasteText,
         SelectAll,
+        UndoEdit,
+        RedoEdit,
         FindInTerminal,
         FindNext,
         FindPrevious,
@@ -1605,73 +1614,34 @@ impl TerminalView {
     ) -> CmdKey {
         let m = &ks.modifiers;
         match ks.key.as_str() {
+            // Copy / cut / paste route through the same methods the `CopyText` /
+            // `CutText` / `PasteText` actions call, so the chord, the right-click
+            // row and the Edit menu can't drift apart.
             "c" => {
-                // At the prompt, ⌘C copies the editor's selection — but only when
-                // the editor actually has one. With no editor selection we must NOT
-                // swallow the key: the user may have mouse-selected terminal
-                // output/scrollback (which lives in `term.selection`), so fall
-                // through to the terminal-selection branch below.
-                if self.input_active() {
-                    if let Some(text) = self.cmd.selected_text() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text));
-                        // Same dual-purpose rule as the terminal selection
-                        // below: a Ctrl+C copy consumes the editor selection,
-                        // so the next press reaches the editor's ^C (abort
-                        // line) instead of copying forever (#111).
-                        if m.control {
-                            self.cmd.clear_selection();
-                            cx.notify();
-                        }
-                        return CmdKey::Consumed;
-                    }
+                // `clear_on_copy`: Ctrl+C is dual-purpose — copy with a
+                // selection, ^C (SIGINT) without — so the copy must consume the
+                // selection or the next press copies again instead of
+                // interrupting (#111). ⌘C never doubles as SIGINT, so there the
+                // selection stays highlighted (the macOS convention).
+                if self.copy_contextual(m.control, cx) {
+                    CmdKey::Consumed
+                } else {
+                    // Nothing was selected anywhere: don't swallow the key, so
+                    // Ctrl+C still reaches the PTY as ^C.
+                    CmdKey::FallThrough
                 }
-                // Copy the terminal selection, if any; else fall through
-                // (Ctrl+C handles SIGINT).
-                if self.has_selection() {
-                    self.copy_selection(cx);
-                    // Ctrl+C is dual-purpose — copy with a selection, ^C
-                    // (SIGINT) without — so the copy must consume the selection
-                    // or the next press copies again instead of interrupting
-                    // (#111). Cmd+C never doubles as SIGINT, so there the
-                    // selection stays highlighted (the macOS convention).
-                    if m.control {
-                        self.terminal.term.lock().selection = None;
-                        cx.notify();
-                    }
-                    return CmdKey::Consumed;
-                }
-                CmdKey::FallThrough
             }
             "x" => {
-                // Cut: only meaningful in the editor with a selection — copy it
-                // out, then delete it. Elsewhere it's a no-op (swallowed).
-                if self.input_active() {
-                    if let Some(text) = self.cmd.selected_text() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text));
-                        self.cmd.delete_selection();
-                        self.close_completion();
-                        self.cursor_visible = true;
-                        cx.notify();
-                    }
-                    return CmdKey::Consumed;
+                // Cut is editor-only; outside the prompt there is nothing to
+                // remove, so the key falls through rather than dying silently.
+                if self.cut_contextual(cx) {
+                    CmdKey::Consumed
+                } else {
+                    CmdKey::FallThrough
                 }
-                CmdKey::FallThrough
             }
             "v" => {
-                if let Some(item) = cx.read_from_clipboard() {
-                    if let Some(text) = clipboard_paste_text(&item) {
-                        self.paste(text, cx);
-                    } else if !self.input_active() {
-                        if let Some(img) = item.entries().iter().find_map(|e| match e {
-                            ClipboardEntry::Image(img) => Some(img),
-                            _ => None,
-                        }) {
-                            // Clipboard holds an image (e.g. a screenshot) with no text,
-                            // and a foreground TUI (a coding agent) owns the pane.
-                            self.paste_clipboard_image(img, cx);
-                        }
-                    }
-                }
+                self.paste_from_clipboard(cx);
                 CmdKey::Consumed
             }
             // Find (open bar) and ⌘G / ⌘⇧G (next / previous match) are registered
@@ -1688,15 +1658,7 @@ impl TerminalView {
             // The following are editor-only (macOS line editing); they're swallowed
             // elsewhere since they have no terminal meaning.
             "z" => {
-                if self.input_active() {
-                    if m.shift {
-                        self.cmd.redo();
-                    } else {
-                        self.cmd.undo();
-                    }
-                    self.close_completion();
-                    cx.notify();
-                }
+                self.undo_edit(m.shift, cx);
                 CmdKey::Consumed
             }
             "left" => {
@@ -2220,6 +2182,14 @@ impl TerminalView {
         self.terminal.term.lock().selection.is_some()
     }
 
+    /// Is there anything [`copy_contextual`](Self::copy_contextual) would copy —
+    /// in the grid *or* in the prompt editor? What the Copy / Cut menu rows gate
+    /// on: `has_selection` alone is grid-only, so a prompt selection used to
+    /// leave "Copy" greyed out even though ⌘C would have copied it.
+    fn any_selection(&self) -> bool {
+        self.has_selection() || (self.input_active() && self.cmd.selected_text().is_some())
+    }
+
     /// Snapshot the Kitty keyboard-protocol flags the app has enabled, read off the
     /// local `Term`'s mode bits (the reader thread keeps them current by advancing
     /// the emulator over all child output). Consulted by the key encoder so TUIs
@@ -2496,15 +2466,117 @@ impl TerminalView {
         }
     }
 
+    /// Copy whatever is selected, preferring the prompt editor's selection over
+    /// the terminal grid's. Returns whether anything was actually copied — the
+    /// ⌃C path needs to know, because with nothing selected the key has to fall
+    /// through to ^C (SIGINT).
+    ///
+    /// `clear_on_copy` drops the selection after copying. Ctrl+C is dual-purpose
+    /// (copy with a selection, SIGINT without), so it must consume the selection
+    /// or the next press copies forever instead of interrupting (#111); ⌘C and
+    /// the menu items leave the highlight up, the macOS convention.
+    ///
+    /// The single copy path: ⌘C / ⌃C, the right-click "Copy" row, and the Edit
+    /// menu all land here.
+    pub fn copy_contextual(&mut self, clear_on_copy: bool, cx: &mut Context<Self>) -> bool {
+        // At the prompt the editor's selection wins — but only when it has one.
+        // With no editor selection we fall on through: the user may have
+        // mouse-selected terminal output/scrollback, which lives in
+        // `term.selection`, not in the editor.
+        if self.input_active() {
+            if let Some(text) = self.cmd.selected_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                if clear_on_copy {
+                    self.cmd.clear_selection();
+                    cx.notify();
+                }
+                return true;
+            }
+        }
+        if self.has_selection() {
+            self.copy_selection(cx);
+            if clear_on_copy {
+                self.terminal.term.lock().selection = None;
+                cx.notify();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Step to the next (`forward`) or previous search match. A no-op while the
+    /// find bar is closed — there is nothing to step through. Exposed for the
+    /// palette's "Find Next" / "Find Previous", which run from outside the
+    /// terminal module and so can't reach `step_match` directly.
+    pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let direction = if forward {
+            Direction::Right
+        } else {
+            Direction::Left
+        };
+        self.step_match(direction, cx);
+    }
+
+    /// Undo (or, with `redo`, redo) the last prompt edit. Editor-only: the
+    /// terminal grid has no edit history, so outside the prompt this is a no-op
+    /// that still swallows the gesture rather than sending ⌘Z to the PTY.
+    /// Shared by the ⌘Z chord and the Edit menu's Undo / Redo.
+    pub fn undo_edit(&mut self, redo: bool, cx: &mut Context<Self>) {
+        if !self.input_active() {
+            return;
+        }
+        if redo {
+            self.cmd.redo();
+        } else {
+            self.cmd.undo();
+        }
+        self.close_completion();
+        cx.notify();
+    }
+
+    /// Cut the prompt editor's selection: copy it out, then delete it. Only
+    /// meaningful at the prompt — the terminal grid is not editable — so this
+    /// reports whether the gesture was *handled* (i.e. the prompt was active),
+    /// not whether text was actually removed; a cut with nothing selected is
+    /// still a no-op the prompt owns rather than a key the PTY should see.
+    pub fn cut_contextual(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.input_active() {
+            return false;
+        }
+        if let Some(text) = self.cmd.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.cmd.delete_selection();
+            self.close_completion();
+            self.cursor_visible = true;
+            cx.notify();
+        }
+        true
+    }
+
     /// Read the system clipboard and paste it into the PTY (bracketed-paste
-    /// aware). Used by Cmd+V and the right-click "Paste" item.
+    /// aware). The single paste path: ⌘V / ⌃V, the right-click "Paste" row, and
+    /// the Edit menu.
+    ///
+    /// Text wins when the clipboard carries any. Failing that — an image-only
+    /// clipboard (a screenshot) dropped on a pane whose foreground app is a TUI
+    /// coding agent — the image is written to a temp file and its path typed in,
+    /// which is how those agents take attachments.
     pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = cx
-            .read_from_clipboard()
-            .as_ref()
-            .and_then(clipboard_paste_text)
-        {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        if let Some(text) = clipboard_paste_text(&item) {
             self.paste(text, cx);
+            return;
+        }
+        if self.input_active() {
+            return;
+        }
+        if let Some(img) = item.entries().iter().find_map(|e| match e {
+            ClipboardEntry::Image(img) => Some(img),
+            _ => None,
+        }) {
+            self.paste_clipboard_image(img, cx);
         }
     }
 
@@ -5143,9 +5215,10 @@ impl Render for TerminalView {
 
         // Captured for the right-click menu: the focus handle routes dispatched
         // actions to this terminal (and lets tab/split ones bubble to the root),
-        // and the selection state greys out "Copy" when there's nothing selected.
+        // and the selection state greys out "Copy" / "Cut" when there's nothing
+        // selected in either the grid or the prompt editor.
         let menu_focus = self.focus_handle.clone();
-        let has_selection = self.has_selection();
+        let has_selection = self.any_selection();
 
         div()
             .id("terminal-surface")
@@ -5189,9 +5262,18 @@ impl Render for TerminalView {
             }))
             // Context-menu actions handled by this view; tab/split actions in the
             // same menu fall through to `Tty7App`.
-            .on_action(cx.listener(|this, _: &CopyText, _w, cx| this.copy_selection(cx)))
+            // Menu-dispatched copy leaves the selection up (`clear_on_copy:
+            // false`) — only the dual-purpose ⌃C chord has to consume it.
+            .on_action(cx.listener(|this, _: &CopyText, _w, cx| {
+                this.copy_contextual(false, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CutText, _w, cx| {
+                this.cut_contextual(cx);
+            }))
             .on_action(cx.listener(|this, _: &PasteText, _w, cx| this.paste_from_clipboard(cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _w, cx| this.select_all_contextual(cx)))
+            .on_action(cx.listener(|this, _: &UndoEdit, _w, cx| this.undo_edit(false, cx)))
+            .on_action(cx.listener(|this, _: &RedoEdit, _w, cx| this.undo_edit(true, cx)))
             .on_action(
                 cx.listener(|this, _: &FindInTerminal, window, cx| this.open_search(window, cx)),
             )
@@ -5241,7 +5323,7 @@ impl Render for TerminalView {
                 // match the command palette's row height. A fixed min-width keeps
                 // the menu a consistent, intentional size instead of hugging the
                 // longest label (which reads ragged).
-                // Copy/Paste/Select All/Find are dispatched inline (see
+                // Copy/Cut/Paste/Select All are dispatched inline (see
                 // `handle_cmd_shortcut`) with no registered `KeyBinding`, so the menu
                 // can't auto-derive their hints the way it does for the items below.
                 // We render the hint ourselves via `menu_row_with_hint` to keep the
@@ -5253,6 +5335,13 @@ impl Render for TerminalView {
                         Box::new(CopyText),
                         !has_selection,
                         menu_row_with_hint("Copy", Some("secondary-c")),
+                    )
+                    // Cut is prompt-only; it shares Copy's enablement cue rather
+                    // than offering a row that silently does nothing on output.
+                    .menu_element_with_disabled(
+                        Box::new(CutText),
+                        !has_selection,
+                        menu_row_with_hint("Cut", Some("secondary-x")),
                     )
                     .menu_element(
                         Box::new(PasteText),

@@ -461,14 +461,28 @@ impl Tty7App {
             .into_any_element()
     }
 
-    /// A quiet "nothing to show" line, used wherever a tab has no data yet.
-    fn panel_empty(&self, text: &str, cx: &mut Context<Self>) -> AnyElement {
-        div()
+    /// A quiet "nothing to show" line, used wherever a tab has no data yet,
+    /// with an optional second line saying what would fill it.
+    ///
+    /// The hint is the point. An empty state that only reports the absence
+    /// ("No changes.") leaves the user to work out whether the panel is broken,
+    /// still loading, or simply pointed at the wrong thing; one that names the
+    /// condition turns a dead end into an instruction.
+    fn panel_empty(&self, text: &str, hint: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        v_flex()
             .px(px(CONTENT_INSET))
             .py(px(4.))
+            .gap(px(3.))
             .text_size(px(12.))
-            .text_color(cx.theme().muted_foreground)
+            .text_color(muted)
             .child(text.to_string())
+            .children(hint.map(|h| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(muted.opacity(0.75))
+                    .child(h.to_string())
+            }))
             .into_any_element()
     }
 
@@ -535,7 +549,14 @@ impl Tty7App {
         }
 
         if rows.is_empty() {
-            return self.panel_scroll(self.panel_empty("No active session.", cx), title);
+            return self.panel_scroll(
+                self.panel_empty(
+                    "No active session.",
+                    Some("Open a tab to see its shell, directory, and processes here."),
+                    cx,
+                ),
+                title,
+            );
         }
 
         // Keep the process/port query pointed at the pane on screen, and keep it
@@ -916,7 +937,14 @@ impl Tty7App {
             .and_then(|t| t.detail_pane(window, cx))
         else {
             let title = self.panel_title("Outline", None, None, cx);
-            return self.panel_scroll(self.panel_empty("No active session.", cx), title);
+            return self.panel_scroll(
+                self.panel_empty(
+                    "No active session.",
+                    Some("Open a tab to see its shell, directory, and processes here."),
+                    cx,
+                ),
+                title,
+            );
         };
         // Count first (a cheap getter) so the borrow ends before `panel_title`
         // needs `&mut cx`; the list re-borrows the marks below.
@@ -927,7 +955,11 @@ impl Tty7App {
             // `sh`, a nested PTY that eats the marks).
             let title = self.panel_title("Outline", None, None, cx);
             return self.panel_scroll(
-                self.panel_empty("No commands recorded for this pane.", cx),
+                self.panel_empty(
+                    "No commands recorded for this pane.",
+                    Some("Run a command — shell integration marks each one so you can jump back to it."),
+                    cx,
+                ),
                 title,
             );
         }
@@ -1024,7 +1056,14 @@ impl Tty7App {
 
         let Some(cwd) = cwd else {
             let title = self.panel_title("Changes", None, None, cx);
-            return self.panel_scroll(self.panel_empty("No working directory.", cx), title);
+            return self.panel_scroll(
+                self.panel_empty(
+                    "No working directory.",
+                    Some("This pane has not reported one yet."),
+                    cx,
+                ),
+                title,
+            );
         };
         // Probe on first paint for this cwd, and whenever the pane moves to a
         // different repository. Refreshes ride the same git-status observer the
@@ -1055,11 +1094,18 @@ impl Tty7App {
         let mono = cx.theme().mono_font_family.clone();
 
         let inner = match &self.right_panel.diff {
-            None => self.panel_empty("Loading…", cx),
-            Some(None) => self.panel_empty("Not a git work tree.", cx),
-            Some(Some(snap)) if snap.files.is_empty() && snap.untracked.is_empty() => {
-                self.panel_empty("No changes.", cx)
-            }
+            None => self.panel_empty("Loading…", None, cx),
+            Some(None) => self.panel_empty(
+                "Not a git repository.",
+                Some("cd into one and this tab lists its uncommitted changes."),
+                cx,
+            ),
+            Some(Some(snap)) if snap.files.is_empty() && snap.untracked.is_empty() => self
+                .panel_empty(
+                    "No uncommitted changes.",
+                    Some("The working tree is clean."),
+                    cx,
+                ),
             Some(Some(snap)) => {
                 let files: Vec<(String, u32, u32)> = snap
                     .files

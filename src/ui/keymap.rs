@@ -116,6 +116,16 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         ("NewTab", "secondary-t"),
         ("NewWorkspace", "secondary-shift-n"),
         ("CloseActiveTab", "secondary-w"),
+        // Tab operations promoted out of the tab context menu (see
+        // `core::actions`). No default chords: the menu bar, the palette and the
+        // right-click menu all reach them, and none is frequent enough to earn a
+        // reflexive shortcut — but they're bindable here like anything else.
+        ("RenameTab", ""),
+        ("NewWorktreeTab", ""),
+        ("CloseOtherTabs", ""),
+        ("CloseTabsToTheRight", ""),
+        ("CopyWorkingDirectory", ""),
+        ("MarkTabUnread", ""),
         // No default chord on purpose: this is the one action that kills running
         // sessions, and it must not sit one slip away from ⌘W. Reachable from
         // the Shell menu and the palette; bindable in Settings for anyone who
@@ -224,6 +234,53 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         // Like Terminal.app / iTerm2 / Ghostty ⌘K: wipe the screen + scrollback.
         ("ClearScrollback", "secondary-k"),
         ("OpenSettings", "secondary-,"),
+        // Help → Keyboard Shortcuts, on the ⌘/ that editors and browsers use for
+        // "show me the shortcuts". Off macOS `secondary-/` is Ctrl+/, which some
+        // shells bind to undo, so leave it unbound there.
+        (
+            "ShowKeyboardShortcuts",
+            if cfg!(target_os = "macos") {
+                "secondary-/"
+            } else {
+                ""
+            },
+        ),
+        // Menu-bar-only entries: real actions so the palette and Settings can see
+        // them, but nothing here wants a chord by default.
+        ("About", ""),
+        ("CheckForUpdates", ""),
+        ("OpenDocumentation", ""),
+        ("OpenDiscord", ""),
+        ("ReportIssue", ""),
+        // macOS supplies these chords itself for a standard App/Window menu; we
+        // list them so they show up in Settings → Keybindings rather than looking
+        // like undocumented magic, but bind them only where they exist.
+        (
+            "HideApp",
+            if cfg!(target_os = "macos") {
+                "secondary-h"
+            } else {
+                ""
+            },
+        ),
+        (
+            "HideOthers",
+            if cfg!(target_os = "macos") {
+                "secondary-alt-h"
+            } else {
+                ""
+            },
+        ),
+        ("ShowAll", ""),
+        (
+            "MinimizeWindow",
+            if cfg!(target_os = "macos") {
+                "secondary-m"
+            } else {
+                ""
+            },
+        ),
+        ("ZoomWindow", ""),
         // No default chord — reachable from the command palette ("SSH: Remote
         // Files") and bindable in Settings like any other action.
         ("ToggleSftp", ""),
@@ -484,6 +541,12 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
         "DeleteWorkspace" => KeyBinding::new(keystroke, DeleteWorkspace, None),
         "RenameWorkspace" => KeyBinding::new(keystroke, RenameWorkspace, None),
         "CloseActiveTab" => KeyBinding::new(keystroke, CloseActiveTab, None),
+        "RenameTab" => KeyBinding::new(keystroke, RenameTab, None),
+        "NewWorktreeTab" => KeyBinding::new(keystroke, NewWorktreeTab, None),
+        "CloseOtherTabs" => KeyBinding::new(keystroke, CloseOtherTabs, None),
+        "CloseTabsToTheRight" => KeyBinding::new(keystroke, CloseTabsToTheRight, None),
+        "CopyWorkingDirectory" => KeyBinding::new(keystroke, CopyWorkingDirectory, None),
+        "MarkTabUnread" => KeyBinding::new(keystroke, MarkTabUnread, None),
         "SplitRight" => KeyBinding::new(keystroke, SplitRight, None),
         "SplitDown" => KeyBinding::new(keystroke, SplitDown, None),
         "FocusNextPane" => KeyBinding::new(keystroke, FocusNextPane, None),
@@ -546,6 +609,17 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
         "FindPrevious" => KeyBinding::new(keystroke, FindPrevious, Some("Terminal")),
         "ClearScrollback" => KeyBinding::new(keystroke, ClearScrollback, Some("Terminal")),
         "OpenSettings" => KeyBinding::new(keystroke, OpenSettings, None),
+        "ShowKeyboardShortcuts" => KeyBinding::new(keystroke, ShowKeyboardShortcuts, None),
+        "About" => KeyBinding::new(keystroke, About, None),
+        "CheckForUpdates" => KeyBinding::new(keystroke, CheckForUpdates, None),
+        "OpenDocumentation" => KeyBinding::new(keystroke, OpenDocumentation, None),
+        "OpenDiscord" => KeyBinding::new(keystroke, OpenDiscord, None),
+        "ReportIssue" => KeyBinding::new(keystroke, ReportIssue, None),
+        "HideApp" => KeyBinding::new(keystroke, HideApp, None),
+        "HideOthers" => KeyBinding::new(keystroke, HideOthers, None),
+        "ShowAll" => KeyBinding::new(keystroke, ShowAll, None),
+        "MinimizeWindow" => KeyBinding::new(keystroke, MinimizeWindow, None),
+        "ZoomWindow" => KeyBinding::new(keystroke, ZoomWindow, None),
         "ToggleSftp" => KeyBinding::new(keystroke, ToggleSftp, None),
         "ShowSshForwards" => KeyBinding::new(keystroke, ShowSshForwards, None),
         "ToggleCodePanel" => KeyBinding::new(keystroke, ToggleCodePanel, None),

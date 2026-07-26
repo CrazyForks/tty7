@@ -191,10 +191,13 @@ pub(crate) fn menu_spec(snap: &TraySnapshot) -> Vec<SpecItem> {
     };
     items.push(SpecItem::Submenu {
         label: "Notifications".into(),
+        // Weakest to strongest, matching Settings → Window & Tabs → Notify on
+        // command finish, which writes the same setting. The two used to run in
+        // opposite directions with different capitalisation.
         items: vec![
-            notify("notify:always", "Always", NotifyMode::Always),
-            notify("notify:unfocused", "When Unfocused", NotifyMode::Unfocused),
             notify("notify:never", "Never", NotifyMode::Never),
+            notify("notify:unfocused", "When Unfocused", NotifyMode::Unfocused),
+            notify("notify:always", "Always", NotifyMode::Always),
         ],
     });
     items.push(item("settings", "Settings…".into()));
@@ -203,7 +206,7 @@ pub(crate) fn menu_spec(snap: &TraySnapshot) -> Vec<SpecItem> {
     items.push(item("quit", "Quit tty7".into()));
     // Plain quit leaves the daemon (and every session) running; this one
     // stops the daemon too. "Daemon" is already in the product vocabulary —
-    // the app menu ships "Restart Daemon…" — and the confirm prompt spells
+    // the Help menu ships "Restart Daemon…" — and the confirm prompt spells
     // out the consequences.
     items.push(item("quit-stop", "Quit and Stop Daemon…".into()));
     items

@@ -45,13 +45,26 @@ use crate::ui::presets;
 
 /// Which section of the settings panel is currently selected in the sidebar.
 /// Sections are named for the *object* being configured (the appearance, the
-/// terminal, the shell, the window) — never for a property class like
-/// "Behavior", which reads fine but predicts nothing about what's inside.
+/// terminal, the window) — never for a property class like "Behavior", which
+/// reads fine but predicts nothing about what's inside.
+///
+/// Two of these were rearranged because the old split didn't survive contact
+/// with a user asking "which page is that on?":
+///
+/// * **Shell** used to be its own page holding three settings, and nothing
+///   distinguished "the Terminal page" from "the Shell page" from the outside.
+///   Its rows are now Terminal's first group — the program a pane launches is a
+///   property of the terminal, not a peer of it. (It also freed the word
+///   "Shell", which the menu bar was simultaneously using for its File menu.)
+/// * **Input** is new. Completion, history search, the Option/Meta split and
+///   selection/clipboard behaviour were scattered through the bottom of the
+///   Terminal page under four headers; they're the app's most distinctive
+///   surface and they now have a name you can look for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsSection {
     Appearance,
     Terminal,
-    Shell,
+    Input,
     Ssh,
     Agents,
     WindowTabs,
@@ -60,13 +73,27 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
+    /// Every section, in nav order. The single source of truth for "what
+    /// sections exist" — [`best_matching_section`] used to carry its own
+    /// hand-written copy of this list and had silently fallen two behind.
+    pub(crate) const ALL: [SettingsSection; 8] = [
+        SettingsSection::Appearance,
+        SettingsSection::Terminal,
+        SettingsSection::Input,
+        SettingsSection::Ssh,
+        SettingsSection::Agents,
+        SettingsSection::WindowTabs,
+        SettingsSection::Keybindings,
+        SettingsSection::About,
+    ];
+
     /// A `&'static` label for `TTY7_PROFILE` aggregation, so each section's build
     /// cost and rebuild rate report under their own line.
     fn profile_label(self) -> &'static str {
         match self {
             SettingsSection::Appearance => "settings:appearance",
             SettingsSection::Terminal => "settings:terminal",
-            SettingsSection::Shell => "settings:shell",
+            SettingsSection::Input => "settings:input",
             SettingsSection::Ssh => "settings:ssh",
             SettingsSection::Agents => "settings:agents",
             SettingsSection::WindowTabs => "settings:window-tabs",
@@ -93,7 +120,7 @@ struct SearchEntry {
 fn settings_search_entries() -> &'static [SearchEntry] {
     use SettingsSection::*;
     &[
-        // Appearance
+        // ── Appearance ──────────────────────────────────────────────────────
         SearchEntry {
             section: Appearance,
             title: "Theme",
@@ -101,8 +128,23 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Appearance,
-            title: "Font family",
-            keywords: "typeface monospace typography",
+            title: "Sync with system",
+            keywords: "theme dark light auto follow os appearance mode",
+        },
+        SearchEntry {
+            section: Appearance,
+            title: "Custom themes",
+            keywords: "theme duplicate edit colors folder yaml import",
+        },
+        SearchEntry {
+            section: Appearance,
+            title: "Opacity",
+            keywords: "transparency translucent see through window alpha",
+        },
+        SearchEntry {
+            section: Appearance,
+            title: "Blur",
+            keywords: "transparency translucent frosted vibrancy window background",
         },
         SearchEntry {
             section: Appearance,
@@ -113,6 +155,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             section: Appearance,
             title: "Line height",
             keywords: "typography leading spacing",
+        },
+        SearchEntry {
+            section: Appearance,
+            title: "Font family",
+            keywords: "typeface monospace typography",
         },
         SearchEntry {
             section: Appearance,
@@ -144,11 +191,21 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             title: "ANSI colors",
             keywords: "palette 16 terminal colours theme",
         },
-        // Terminal
+        // ── Terminal ────────────────────────────────────────────────────────
         SearchEntry {
             section: Terminal,
-            title: "Option acts as Meta",
-            keywords: "alt keyboard modifier escape macos",
+            title: "Program",
+            keywords: "shell binary zsh bash fish pwsh powershell executable launch",
+        },
+        SearchEntry {
+            section: Terminal,
+            title: "Arguments",
+            keywords: "shell flags login args",
+        },
+        SearchEntry {
+            section: Terminal,
+            title: "Start in",
+            keywords: "cwd working directory start folder path home inherit custom",
         },
         SearchEntry {
             section: Terminal,
@@ -172,51 +229,66 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Terminal,
+            title: "Report mouse to apps",
+            keywords: "mouse reporting vim tmux click scroll shift passthrough",
+        },
+        SearchEntry {
+            section: Terminal,
+            title: "Terminal bell",
+            keywords: "bell audible visual flash sound silence beep ^g",
+        },
+        SearchEntry {
+            section: Terminal,
             title: "Detect URLs",
             keywords: "links hyperlink clickable open",
         },
         SearchEntry {
             section: Terminal,
             title: "Forward SSH loopback links",
-            keywords: "ssh remote port tunnel localhost forward",
+            keywords: "ssh remote port tunnel localhost forward links",
         },
         SearchEntry {
             section: Terminal,
+            title: "Open files with",
+            keywords: "links file editor command external app path line column",
+        },
+        // ── Input ───────────────────────────────────────────────────────────
+        SearchEntry {
+            section: Input,
+            title: "Tab completion",
+            keywords: "complete completion menu suggestions tab prompt",
+        },
+        SearchEntry {
+            section: Input,
+            title: "History search",
+            keywords: "ctrl-r reverse search fuzzy history recall fzf prompt",
+        },
+        SearchEntry {
+            section: Input,
+            title: "Option acts as Meta",
+            keywords: "alt keyboard modifier escape macos option meta",
+        },
+        SearchEntry {
+            section: Input,
             title: "Smart selection",
-            keywords: "double click word url path select semantic",
+            keywords: "double click word url path select semantic bracket email",
         },
         SearchEntry {
-            section: Terminal,
+            section: Input,
             title: "Copy on select",
-            keywords: "clipboard selection yank",
+            keywords: "clipboard selection yank mouse",
         },
         SearchEntry {
-            section: Terminal,
+            section: Input,
             title: "Trim trailing spaces on copy",
-            keywords: "clipboard whitespace",
+            keywords: "clipboard whitespace copy",
         },
+        // ── SSH ─────────────────────────────────────────────────────────────
         SearchEntry {
-            section: Terminal,
-            title: "Notify on command finish",
-            keywords: "notification alert bell done osc",
+            section: Ssh,
+            title: "SSH profiles",
+            keywords: "ssh host connection saved profile import ssh_config manage add edit",
         },
-        // Shell
-        SearchEntry {
-            section: Shell,
-            title: "Program",
-            keywords: "shell binary zsh bash fish executable",
-        },
-        SearchEntry {
-            section: Shell,
-            title: "Arguments",
-            keywords: "shell flags login args",
-        },
-        SearchEntry {
-            section: Shell,
-            title: "Working directory",
-            keywords: "cwd start folder path directory",
-        },
-        // SSH
         SearchEntry {
             section: Ssh,
             title: "Verify host keys",
@@ -227,7 +299,12 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             title: "Warn before closing",
             keywords: "ssh confirm close tab pane live session security",
         },
-        // Agents
+        SearchEntry {
+            section: Ssh,
+            title: "Port forwarding",
+            keywords: "ssh tunnel local remote dynamic socks forward rule",
+        },
+        // ── Agents ──────────────────────────────────────────────────────────
         SearchEntry {
             section: Agents,
             title: "Claude Code hooks",
@@ -253,16 +330,21 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             title: "Pi extension",
             keywords: "agent integration install pi",
         },
-        // Window & Tabs
+        // ── Window & Tabs ───────────────────────────────────────────────────
         SearchEntry {
             section: WindowTabs,
             title: "Startup window",
-            keywords: "restore session launch open",
+            keywords: "launch open maximized fullscreen normal",
         },
         SearchEntry {
             section: WindowTabs,
             title: "Remember window size & position",
             keywords: "window size position bounds geometry launch startup remember",
+        },
+        SearchEntry {
+            section: WindowTabs,
+            title: "Restore last layout",
+            keywords: "restore session previous tabs splits reopen launch startup layout",
         },
         SearchEntry {
             section: WindowTabs,
@@ -272,24 +354,43 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         SearchEntry {
             section: WindowTabs,
             title: "New tab position",
-            keywords: "tabs order end after",
+            keywords: "tabs order end after current",
         },
         SearchEntry {
             section: WindowTabs,
             title: "Tab bar position",
-            keywords: "tabs vertical sidebar left top layout",
+            keywords: "tabs vertical sidebar left top layout rail",
         },
-        // Keybindings
+        SearchEntry {
+            section: WindowTabs,
+            title: "Sidebar grouping",
+            keywords: "tabs group repo repository git scratch header sidebar flat",
+        },
+        SearchEntry {
+            section: WindowTabs,
+            title: "Notify on command finish",
+            keywords: "notification alert done osc desktop banner long command",
+        },
+        SearchEntry {
+            section: WindowTabs,
+            title: "Notify threshold",
+            keywords: "notification alert seconds duration long command delay",
+        },
+        // ── Keybindings / About ─────────────────────────────────────────────
         SearchEntry {
             section: Keybindings,
             title: "Keybindings",
-            keywords: "shortcut hotkey keyboard binding chord tmux preset rebind",
+            keywords: "shortcut hotkey keyboard binding chord tmux preset rebind prefix",
         },
-        // About
         SearchEntry {
             section: About,
             title: "About",
-            keywords: "version license credits build",
+            keywords: "version license credits build update check github",
+        },
+        SearchEntry {
+            section: About,
+            title: "How sessions work",
+            keywords: "session daemon detach persist background close quit stop delete workspace layout survive reboot tmux",
         },
     ]
 }
@@ -312,9 +413,12 @@ pub(crate) fn section_match_count(section: SettingsSection, query: &str) -> usiz
 /// The section a search should jump to: the one with the most matches, ties
 /// broken by nav order (the first section wins). `None` when nothing matches, so
 /// the caller leaves the current selection alone.
+///
+/// Driven by [`SettingsSection::ALL`] rather than a hand-written list: the old
+/// literal here omitted SSH and Agents, so searching "claude" or "known hosts"
+/// annotated the nav with a match count and then refused to go there.
 pub(crate) fn best_matching_section(query: &str) -> Option<SettingsSection> {
-    use SettingsSection::*;
-    [Appearance, Terminal, Shell, WindowTabs, Keybindings, About]
+    SettingsSection::ALL
         .into_iter()
         .map(|s| (s, section_match_count(s, query)))
         .filter(|(_, n)| *n > 0)
@@ -712,7 +816,7 @@ impl Tty7App {
             }
         };
 
-        // The six section links stay put during search — only their `(N)` suffixes
+        // The section links stay put during search — only their `(N)` suffixes
         // change — so the nav never collapses out from under the user.
         let nav_body = SidebarMenu::new()
             .child(nav_item(
@@ -720,18 +824,18 @@ impl Tty7App {
                 SettingsSection::Appearance,
                 Icon::new(IconName::Palette),
             ))
-            // Sliders for Terminal (it's the tuning page), the `>_`
-            // prompt glyph for Shell (it configures the prompt's
-            // program) — the two would otherwise both claim `>_`.
+            // The `>_` prompt glyph for Terminal, which now owns the shell
+            // program; the "Aa" glyph is the closest thing the icon set has to
+            // a keyboard for Input.
             .child(nav_item(
                 "Terminal",
                 SettingsSection::Terminal,
-                Icon::new(IconName::Settings2),
+                Icon::new(IconName::SquareTerminal),
             ))
             .child(nav_item(
-                "Shell",
-                SettingsSection::Shell,
-                Icon::new(IconName::SquareTerminal),
+                "Input",
+                SettingsSection::Input,
+                Icon::new(IconName::Settings2),
             ))
             .child(nav_item(
                 "SSH",
@@ -821,7 +925,7 @@ impl Tty7App {
         let content = match section {
             SettingsSection::Appearance => self.render_settings_appearance(cx),
             SettingsSection::Terminal => self.render_settings_terminal(cx),
-            SettingsSection::Shell => self.render_settings_shell(cx),
+            SettingsSection::Input => self.render_settings_input(cx),
             SettingsSection::Ssh => self.render_settings_ssh(cx),
             SettingsSection::Agents => self.render_settings_agents(cx),
             SettingsSection::WindowTabs => self.render_settings_window_tabs(cx),
@@ -1359,7 +1463,10 @@ impl Tty7App {
             .into_any_element();
 
         v_flex()
-            .child(self.section_header("Window", cx))
+            // Not "Window": Settings → Window & Tabs owns that word for the
+            // window's lifecycle, and two groups called Window on two pages is
+            // how a user ends up on the wrong one.
+            .child(self.section_header("Transparency", cx))
             .child(self.settings_row(
                 "Opacity",
                 "How opaque the window background is, for every theme. Below \
@@ -2713,12 +2820,18 @@ impl Tty7App {
         section.into_any_element()
     }
 
-    /// Shell section: the program tty7 launches in each new terminal, plus its
-    /// launch arguments. Both apply to *newly spawned* panes/tabs — existing
-    /// shells keep running until closed. An empty program falls back to the
-    /// platform default (the login shell on Unix; PowerShell 7 when installed,
-    /// else Windows PowerShell, on Windows).
-    fn render_settings_shell(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The Shell group at the top of the Terminal section: the program tty7
+    /// launches in each new pane, its launch arguments, and where a fresh shell
+    /// starts. All apply to *newly spawned* panes/tabs — existing shells keep
+    /// running until closed. An empty program falls back to the platform default
+    /// (the login shell on Unix; PowerShell 7 when installed, else Windows
+    /// PowerShell, on Windows).
+    ///
+    /// This used to be a section of its own, which left a three-row page and no
+    /// way for a user to guess whether a given knob was filed under "Terminal"
+    /// or under "Shell". The program a pane runs is a property of the terminal,
+    /// so it opens the Terminal page instead.
+    fn render_shell_group(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted_fg = cx.theme().muted_foreground;
         let (program_input, args_input, wd_path_input) = match self.active_settings() {
             Some(s) => (
@@ -2797,8 +2910,6 @@ impl Tty7App {
                 args_control,
                 cx,
             ))
-            .child(self.section_rule(cx))
-            .child(self.section_header("Working directory", cx))
             .child(self.settings_row(
                 "Start in",
                 "What a fresh shell starts in: tty7's launch directory, your home folder, or a fixed path.",
@@ -2823,11 +2934,16 @@ impl Tty7App {
             .into_any_element()
     }
 
-    /// Terminal section: how the terminal surface itself behaves — scrolling,
-    /// mouse, links, clipboard, notifications. Plain switches and segmented
-    /// controls driven straight off the `Config` global (each control's handler
-    /// mutates + saves it). Small groups on purpose: each header names exactly
-    /// what it contains, so it doubles as the landmark you scan for.
+    /// Terminal section: what a pane runs and how the terminal surface itself
+    /// behaves — the shell, scrolling, the mouse, the bell, links. Plain
+    /// switches and segmented controls driven straight off the `Config` global
+    /// (each control's handler mutates + saves it). Small groups on purpose:
+    /// each header names exactly what it contains, so it doubles as the landmark
+    /// you scan for.
+    ///
+    /// Typing, selection and the clipboard used to live down here too, under
+    /// four more headers; they moved to their own Input section, which is both
+    /// findable by name and short enough to read in one screen.
     fn render_settings_terminal(&self, cx: &mut Context<Self>) -> AnyElement {
         let foreground = cx.theme().foreground;
         let cfg = cx.global::<Config>();
@@ -2835,34 +2951,15 @@ impl Tty7App {
         let ssh_loopback_forward = cfg.ssh_loopback_forward;
         let mouse_hide = cfg.mouse_hide_while_typing;
         let focus_follows = cfg.focus_follows_mouse;
-        let option_as_alt = cfg.macos_option_as_alt;
         let scroll_mult = cfg.mouse_scroll_multiplier;
-        let clip_trim = cfg.clipboard_trim_trailing_spaces;
-        let copy_on_select = cfg.copy_on_select;
         let mouse_reporting = cfg.mouse_reporting;
-        let smart_select = cfg.smart_select;
-        let tab_completion = cfg.tab_completion;
-        let history_search = cfg.history_search;
         let bell = cfg.bell;
-        // Map the persisted threshold onto its preset radio index (nearest slot
-        // for any off-preset value a hand-edit might leave).
-        let threshold_idx = match cfg.notify_threshold_secs {
-            n if n <= 5 => 0,
-            n if n <= 10 => 1,
-            n if n <= 30 => 2,
-            _ => 3,
-        };
         // Map the persisted scrollback depth onto its preset radio index (default
         // to 10k's slot for any off-preset value a hand-edit might leave).
         let scrollback_idx = match cfg.scrollback_limit {
             n if n <= 1_000 => 0,
             n if n <= 10_000 => 1,
             _ => 2,
-        };
-        let notify_idx = match cfg.notify_on_command_finish {
-            NotifyMode::Never => 0,
-            NotifyMode::Unfocused => 1,
-            NotifyMode::Always => 2,
         };
         let scroll_slider = match self.active_settings() {
             Some(s) => s.scroll_slider.clone(),
@@ -2899,20 +2996,6 @@ impl Tty7App {
                 this.set_scrollback_limit(lines, cx);
             },
         );
-        let notify_radio = self.segmented(
-            "term-notify",
-            &["Never", "When unfocused", "Always"],
-            notify_idx,
-            cx,
-            |this, ix, _w, cx| {
-                let mode = match ix {
-                    0 => NotifyMode::Never,
-                    1 => NotifyMode::Unfocused,
-                    _ => NotifyMode::Always,
-                };
-                this.set_notify_mode(mode, cx);
-            },
-        );
 
         let focus_switch = Switch::new("term-focus-follows")
             .checked(focus_follows)
@@ -2924,29 +3007,9 @@ impl Tty7App {
                 cx.listener(|this, on: &bool, _w, cx| this.set_mouse_hide_while_typing(*on, cx)),
             )
             .into_any_element();
-        let trim_switch = Switch::new("term-clip-trim")
-            .checked(clip_trim)
-            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_clipboard_trim(*on, cx)))
-            .into_any_element();
-        let copy_on_select_switch = Switch::new("term-copy-on-select")
-            .checked(copy_on_select)
-            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_copy_on_select(*on, cx)))
-            .into_any_element();
         let mouse_report_switch = Switch::new("term-mouse-report")
             .checked(mouse_reporting)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_mouse_reporting(*on, cx)))
-            .into_any_element();
-        let smart_select_switch = Switch::new("term-smart-select")
-            .checked(smart_select)
-            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_smart_select(*on, cx)))
-            .into_any_element();
-        let tab_completion_switch = Switch::new("term-tab-completion")
-            .checked(tab_completion)
-            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_tab_completion(*on, cx)))
-            .into_any_element();
-        let history_search_switch = Switch::new("term-history-search")
-            .checked(history_search)
-            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_history_search(*on, cx)))
             .into_any_element();
         let bell_idx = match bell {
             BellMode::None => 0,
@@ -2967,38 +3030,6 @@ impl Tty7App {
                 this.set_bell_mode(mode, cx);
             },
         );
-        let threshold_radio = self.segmented(
-            "term-notify-threshold",
-            &["5s", "10s", "30s", "1m"],
-            threshold_idx,
-            cx,
-            |this, ix, _w, cx| {
-                let secs = match ix {
-                    0 => 5,
-                    1 => 10,
-                    2 => 30,
-                    _ => 60,
-                };
-                this.set_notify_threshold(secs, cx);
-            },
-        );
-        // macOS only: the Option/special-character split this toggle resolves
-        // doesn't exist on other platforms, where Alt always carries Meta.
-        let option_alt_row = cfg!(target_os = "macos").then(|| {
-            let switch = Switch::new("term-option-as-alt")
-                .checked(option_as_alt)
-                .on_click(
-                    cx.listener(|this, on: &bool, _w, cx| this.set_macos_option_as_alt(*on, cx)),
-                )
-                .into_any_element();
-            self.settings_row(
-                "Option (⌥) acts as Meta",
-                "⌥+key sends the escape chord shells expect (⌥B = back one word) \
-                 instead of typing a special character (∫).",
-                switch,
-                cx,
-            )
-        });
         // Slider + a live readout of the current multiplier beside it.
         let scroll_control = h_flex()
             .items_center()
@@ -3015,6 +3046,8 @@ impl Tty7App {
             .into_any_element();
 
         v_flex()
+            .child(self.render_shell_group(cx))
+            .child(self.section_rule(cx))
             .child(self.section_header("Scrolling", cx))
             .child(self.settings_row(
                 "Scrollback",
@@ -3048,30 +3081,14 @@ impl Tty7App {
                 mouse_report_switch,
                 cx,
             ))
-            .child(self.settings_row(
-                "Smart selection",
-                "Double-click selects the whole URL, file path, email, or bracket pair under the cursor.",
-                smart_select_switch,
-                cx,
-            ))
             .child(self.section_rule(cx))
-            .child(self.section_header("Keyboard", cx))
+            .child(self.section_header("Bell", cx))
             .child(self.settings_row(
-                "Tab completion",
-                "Tab at the prompt opens tty7's completion menu. When off, Tab goes to the \
-                 shell's own completion instead.",
-                tab_completion_switch,
+                "Terminal bell",
+                "How a bell (^G) is signalled: silenced, a brief flash, or the system sound.",
+                bell_control,
                 cx,
             ))
-            .child(self.settings_row(
-                "History search",
-                "⌃R at the prompt opens tty7's fuzzy history menu. When off, ⌃R goes to the \
-                 shell instead — its own reverse-i-search, or whatever you've bound there \
-                 (fzf, percol).",
-                history_search_switch,
-                cx,
-            ))
-            .when_some(option_alt_row, |v, row| v.child(row))
             .child(self.section_rule(cx))
             .child(self.section_header("Links", cx))
             .child(self.settings_row(
@@ -3094,8 +3111,94 @@ impl Tty7App {
                 link_file_command_control,
                 cx,
             ))
+            .into_any_element()
+    }
+
+    /// Input section: everything about putting text *in* and taking text *out* —
+    /// the completion and history menus at the prompt, the Option/Meta split,
+    /// and how selection reaches the clipboard.
+    ///
+    /// A section of its own because these are the settings that distinguish tty7
+    /// from a plain terminal, and they were previously the last four groups of a
+    /// seven-group Terminal page — findable only by scrolling past everything
+    /// else, and not findable by search at all (completion and history search
+    /// had no index entries).
+    fn render_settings_input(&self, cx: &mut Context<Self>) -> AnyElement {
+        let cfg = cx.global::<Config>();
+        let option_as_alt = cfg.macos_option_as_alt;
+        let tab_completion = cfg.tab_completion;
+        let history_search = cfg.history_search;
+        let smart_select = cfg.smart_select;
+        let copy_on_select = cfg.copy_on_select;
+        let clip_trim = cfg.clipboard_trim_trailing_spaces;
+
+        let tab_completion_switch = Switch::new("term-tab-completion")
+            .checked(tab_completion)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_tab_completion(*on, cx)))
+            .into_any_element();
+        let history_search_switch = Switch::new("term-history-search")
+            .checked(history_search)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_history_search(*on, cx)))
+            .into_any_element();
+        let smart_select_switch = Switch::new("term-smart-select")
+            .checked(smart_select)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_smart_select(*on, cx)))
+            .into_any_element();
+        let copy_on_select_switch = Switch::new("term-copy-on-select")
+            .checked(copy_on_select)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_copy_on_select(*on, cx)))
+            .into_any_element();
+        let trim_switch = Switch::new("term-clip-trim")
+            .checked(clip_trim)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_clipboard_trim(*on, cx)))
+            .into_any_element();
+        // macOS only: the Option/special-character split this toggle resolves
+        // doesn't exist on other platforms, where Alt always carries Meta.
+        let option_alt_row = cfg!(target_os = "macos").then(|| {
+            let switch = Switch::new("term-option-as-alt")
+                .checked(option_as_alt)
+                .on_click(
+                    cx.listener(|this, on: &bool, _w, cx| this.set_macos_option_as_alt(*on, cx)),
+                )
+                .into_any_element();
+            self.settings_row(
+                "Option (⌥) acts as Meta",
+                "⌥+key sends the escape chord shells expect (⌥B = back one word) \
+                 instead of typing a special character (∫).",
+                switch,
+                cx,
+            )
+        });
+
+        v_flex()
+            .child(self.section_intro(
+                "Prompt",
+                "tty7's own menus at the shell prompt. Turn one off to hand the key back to the shell.",
+                cx,
+            ))
+            .child(self.settings_row(
+                "Tab completion",
+                "Tab at the prompt opens tty7's completion menu. When off, Tab goes to the \
+                 shell's own completion instead.",
+                tab_completion_switch,
+                cx,
+            ))
+            .child(self.settings_row(
+                "History search",
+                "⌃R at the prompt opens tty7's fuzzy history menu. When off, ⌃R goes to the \
+                 shell instead — its own reverse-i-search, or whatever you've bound there \
+                 (fzf, percol).",
+                history_search_switch,
+                cx,
+            ))
             .child(self.section_rule(cx))
-            .child(self.section_header("Clipboard", cx))
+            .child(self.section_header("Selection & clipboard", cx))
+            .child(self.settings_row(
+                "Smart selection",
+                "Double-click selects the whole URL, file path, email, or bracket pair under the cursor.",
+                smart_select_switch,
+                cx,
+            ))
             .child(self.settings_row(
                 "Copy on select",
                 "Selecting text with the mouse copies it to the clipboard right away, no ⌘C needed.",
@@ -3108,28 +3211,11 @@ impl Tty7App {
                 trim_switch,
                 cx,
             ))
-            .child(self.section_rule(cx))
-            .child(self.section_header("Bell", cx))
-            .child(self.settings_row(
-                "Terminal bell",
-                "How a bell (^G) is signalled: silenced, a brief flash, or the system sound.",
-                bell_control,
-                cx,
-            ))
-            .child(self.section_rule(cx))
-            .child(self.section_header("Notifications", cx))
-            .child(self.settings_row(
-                "Notify on command finish",
-                "Desktop alert after a long foreground command completes.",
-                notify_radio,
-                cx,
-            ))
-            .child(self.settings_row(
-                "Notify threshold",
-                "How long a command must run to qualify as \"long\".",
-                threshold_radio,
-                cx,
-            ))
+            .when_some(option_alt_row, |v, row| {
+                v.child(self.section_rule(cx))
+                    .child(self.section_header("Keyboard", cx))
+                    .child(row)
+            })
             .into_any_element()
     }
 
@@ -3253,6 +3339,53 @@ impl Tty7App {
             crate::core::config::SidebarGrouping::Repo => 0,
             crate::core::config::SidebarGrouping::None => 1,
         };
+        // Notifications are app-level, not terminal-level: the tray menu already
+        // exposed the same `NotifyMode` at the top of its own menu while the
+        // setting itself sat at the bottom of the Terminal page.
+        let notify_idx = match cfg.notify_on_command_finish {
+            NotifyMode::Never => 0,
+            NotifyMode::Unfocused => 1,
+            NotifyMode::Always => 2,
+        };
+        // Map the persisted threshold onto its preset radio index (nearest slot
+        // for any off-preset value a hand-edit might leave).
+        let threshold_idx = match cfg.notify_threshold_secs {
+            n if n <= 5 => 0,
+            n if n <= 10 => 1,
+            n if n <= 30 => 2,
+            _ => 3,
+        };
+        let notify_radio = self.segmented(
+            "wt-notify",
+            // Same order and casing as the tray's Notifications submenu, which
+            // writes this very setting — the two used to disagree on both.
+            &["Never", "When Unfocused", "Always"],
+            notify_idx,
+            cx,
+            |this, ix, _w, cx| {
+                let mode = match ix {
+                    0 => NotifyMode::Never,
+                    1 => NotifyMode::Unfocused,
+                    _ => NotifyMode::Always,
+                };
+                this.set_notify_mode(mode, cx);
+            },
+        );
+        let threshold_radio = self.segmented(
+            "wt-notify-threshold",
+            &["5s", "10s", "30s", "1m"],
+            threshold_idx,
+            cx,
+            |this, ix, _w, cx| {
+                let secs = match ix {
+                    0 => 5,
+                    1 => 10,
+                    2 => 30,
+                    _ => 60,
+                };
+                this.set_notify_threshold(secs, cx);
+            },
+        );
 
         let restore_switch = Switch::new("wt-restore-session")
             .checked(restore_session)
@@ -3337,8 +3470,12 @@ impl Tty7App {
                 remember_window_switch,
                 cx,
             ))
+            // "Session" already means "a shell running in the background" all
+            // over this app; using it here for "the saved arrangement of tabs"
+            // made the one word mean two things on the same page. The thing
+            // being restored is the layout.
             .child(self.settings_row(
-                "Restore previous session",
+                "Restore last layout",
                 "Reopen the last window's tabs, splits, and directories on launch. Off starts with a single fresh terminal.",
                 restore_switch,
                 cx,
@@ -3369,6 +3506,20 @@ impl Tty7App {
                 "Group sidebar tabs under a header per git repository, with non-repo tabs \
                  in a Scratch section. Only applies to the left sidebar.",
                 sidebar_grouping_radio,
+                cx,
+            ))
+            .child(self.section_rule(cx))
+            .child(self.section_header("Notifications", cx))
+            .child(self.settings_row(
+                "Notify on command finish",
+                "Desktop alert after a long foreground command completes.",
+                notify_radio,
+                cx,
+            ))
+            .child(self.settings_row(
+                "Notify threshold",
+                "How long a command must run to qualify as \"long\".",
+                threshold_radio,
                 cx,
             ))
             .into_any_element()
@@ -4000,6 +4151,75 @@ impl Tty7App {
             .into_any_element()
     }
 
+    /// "How sessions work": the four-line explanation of the app's own model —
+    /// what closing a window does, what Stop does, what Delete does, what Quit
+    /// does.
+    ///
+    /// This is tty7's central idea and the thing that most surprises a user
+    /// arriving from another terminal, and until now it was explained *only*
+    /// inside the confirmation dialogs — that is, at the moment the user is
+    /// already committing to an action, and never before. Stating it once, in
+    /// the one page that describes what the app is, means the dialogs confirm a
+    /// model the user has already met instead of teaching it under pressure.
+    ///
+    /// Deliberately a plain definition list rather than settings rows: nothing
+    /// here is configurable, and giving it switch-shaped chrome would suggest
+    /// otherwise.
+    fn render_session_model(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (foreground, muted_fg) = (theme.foreground, theme.muted_foreground);
+
+        let entry = |term: &'static str, meaning: &'static str| {
+            v_flex()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(foreground)
+                        .child(term),
+                )
+                .child(div().text_xs().text_color(muted_fg).child(meaning))
+        };
+
+        v_flex()
+            .mt_6()
+            .gap_2()
+            .child(self.section_rule(cx))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(foreground)
+                    .child("How sessions work"),
+            )
+            .child(div().text_xs().text_color(muted_fg).child(
+                "Your shells run in a background daemon, not in this window. That is what lets them outlive a quit or a reboot — and it means \"close\" and \"end\" are different things here.",
+            ))
+            .child(
+                v_flex()
+                    .mt_2()
+                    .gap_3()
+                    .child(entry(
+                        "Closing a window (⌘W on the last tab)",
+                        "Detaches the workspace. Every shell keeps running; the workspace waits on the home page and in the title-bar menu.",
+                    ))
+                    .child(entry(
+                        "Quitting tty7 (⌘Q)",
+                        "Same deal, for every window. Nothing running is interrupted.",
+                    ))
+                    .child(entry(
+                        "Stop Workspace",
+                        "Ends that workspace's shells but keeps its layout, so you can start it again with fresh ones.",
+                    ))
+                    .child(entry(
+                        "Delete Workspace",
+                        "Ends the shells and forgets the layout. The only step here you can't undo.",
+                    )),
+            )
+            .into_any_element()
+    }
+
     /// About section: app identity and stack.
     fn render_settings_about(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
@@ -4068,6 +4288,7 @@ impl Tty7App {
                             .child("Pure Rust · GPU rendering on Zed's gpui · VT core from Alacritty"),
                     ),
             )
+            .child(self.render_session_model(cx))
             // Updates: the startup check drops a newer version here if it found
             // one. We never self-update — "Download" just opens the Releases
             // page; the toggle turns the check off (see `core::update`).
@@ -4164,6 +4385,94 @@ impl Tty7App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every section must carry at least one index entry, or the search box can
+    /// annotate the nav with a count it can never jump to — and, worse, a whole
+    /// page of settings becomes unreachable by search.
+    #[test]
+    fn every_section_has_search_entries() {
+        for section in SettingsSection::ALL {
+            let n = settings_search_entries()
+                .iter()
+                .filter(|e| e.section == section)
+                .count();
+            assert!(
+                n > 0,
+                "section {:?} has no search entries",
+                section.profile_label()
+            );
+        }
+    }
+
+    /// `best_matching_section` must be able to reach every section — it used to
+    /// be driven by a hand-written list that had fallen behind by two.
+    #[test]
+    fn best_matching_section_can_reach_every_section() {
+        for section in SettingsSection::ALL {
+            let entry = settings_search_entries()
+                .iter()
+                .find(|e| e.section == section)
+                .expect("checked by every_section_has_search_entries");
+            let query = entry.title.to_lowercase();
+            let landed = best_matching_section(&query);
+            assert!(
+                landed.is_some(),
+                "query {query:?} matched nothing at all (section {:?})",
+                section.profile_label()
+            );
+        }
+    }
+
+    /// Settings that had no index entry at all before this pass — searching for
+    /// any of them returned an empty result on a page that plainly had the knob.
+    #[test]
+    fn previously_unsearchable_settings_are_findable() {
+        use SettingsSection::*;
+        let cases: &[(&str, SettingsSection)] = &[
+            ("opacity", Appearance),
+            ("blur", Appearance),
+            ("completion", Input),
+            ("ctrl-r", Input),
+            ("grouping", WindowTabs),
+            ("threshold", WindowTabs),
+            ("report mouse", Terminal),
+            ("open files with", Terminal),
+            ("bell", Terminal),
+            ("known_hosts", Ssh),
+            ("claude", Agents),
+        ];
+        for (query, expected) in cases {
+            assert_eq!(
+                best_matching_section(query).map(|s| s.profile_label()),
+                Some(expected.profile_label()),
+                "query {query:?} should land on {:?}",
+                expected.profile_label()
+            );
+        }
+    }
+
+    /// The index names rows, so a title that no longer matches the rendered row
+    /// sends the user to the right page and then leaves them hunting. This
+    /// pins the ones that had drifted (the index said "Working directory"; the
+    /// row says "Start in").
+    #[test]
+    fn index_titles_match_rendered_row_labels() {
+        for title in [
+            "Start in",
+            "Restore last layout",
+            "Terminal bell",
+            "Report mouse to apps",
+            "Open files with",
+            "Sidebar grouping",
+            "Tab completion",
+            "History search",
+        ] {
+            assert!(
+                settings_search_entries().iter().any(|e| e.title == title),
+                "no index entry titled {title:?}"
+            );
+        }
+    }
 
     #[test]
     fn humanize_action_splits_on_capitals() {

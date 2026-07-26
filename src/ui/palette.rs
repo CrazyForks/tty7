@@ -8,10 +8,34 @@
 //! [`PaletteView`] wraps that list with the overlay chrome (scrim + card) and
 //! emits a [`PaletteEvent`] on confirm/dismiss; command *execution* lives in
 //! `app.rs`, where it can touch `Tty7App`'s tab/pane operations.
+//!
+//! ## The naming grammar
+//!
+//! Every title in [`Command::base_commands`] follows one shape, because a
+//! palette is read by scanning and a list written in three different styles
+//! can't be scanned. The rules, in order of precedence:
+//!
+//! 1. **`Verb Object`** — "New Tab", "Split Right", "Clear Scrollback". The
+//!    verb comes first because that is what the user is searching for.
+//! 2. **`Namespace: Verb Object`** when the command belongs to an enumerable
+//!    subsystem — `SSH:`, `Agent:`, `Right Panel:`. If one command in a group
+//!    carries the prefix, *all* of them do; a single bare sibling (this list
+//!    used to have "Reconnect SSH Session" sitting beside four `SSH:` rows) is
+//!    what makes a namespace look accidental.
+//! 3. **A trailing `…`** means "this asks for something else before it acts" —
+//!    another list, a text field, a confirmation. Not "this opens a panel".
+//! 4. **No `Toggle`.** A toggle names the mechanism; the user wants the result.
+//!    Titles read "Hide Left Sidebar" or "Show Left Sidebar" depending on where
+//!    the sidebar currently is, which also removes the guesswork about what a
+//!    toggle would do from the current state.
+//! 5. **Two commands that could be confused must not merely differ by a word.**
+//!    "Toggle Tab Sidebar" and "Toggle Left Sidebar" were, respectively, moving
+//!    the tab bar and collapsing the rail; they now read "Tab Bar: Move to Left
+//!    Sidebar" and "Hide Left Sidebar".
 
 use gpui::{
-    App, Context, Entity, EventEmitter, MouseButton, MouseDownEvent, Subscription, Task, Window,
-    div, prelude::*, px,
+    App, Context, Entity, EventEmitter, MouseButton, MouseDownEvent, SharedString, Subscription,
+    Task, Window, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, IndexPath, h_flex,
@@ -21,6 +45,7 @@ use gpui_component::{
 
 use uuid::Uuid;
 
+use crate::core::config::{Config, RightPanelTab, TabBarPosition};
 use crate::core::ssh_profile::parse_quick_connect;
 
 /// What a command actually does. Most variants map to an existing `Tty7App`
@@ -37,6 +62,8 @@ pub enum CommandKind {
     /// this focuses that window; otherwise the current window swaps over to it
     /// and its previous workspace detaches into the picker.
     SwitchToWorkspace(crate::core::session::WorkspaceId),
+    /// Rename this window's workspace in place, from the title-bar chip.
+    RenameWorkspace,
     /// Stop this window's workspace: kill its sessions and close the window,
     /// keeping the layout so it can be started again. The counterpart to
     /// closing a window, which only detaches.
@@ -46,6 +73,14 @@ pub enum CommandKind {
     SplitRight,
     SplitDown,
     ClosePane,
+    // Tab operations that used to live only in the tab context menu, so the
+    // palette could not reach what a right-click could.
+    RenameTab,
+    NewWorktreeTab,
+    CloseOtherTabs,
+    CloseTabsToTheRight,
+    CopyWorkingDirectory,
+    MarkTabUnread,
     ResetFontSize,
     NextPane,
     PrevPane,
@@ -68,11 +103,28 @@ pub enum CommandKind {
     ToggleRightPanel,
     /// Switch the right panel to a specific tab, opening it if it was closed —
     /// so the palette can land you on Changes without a toggle-then-click.
-    ShowRightPanel(crate::core::config::RightPanelTab),
+    ShowRightPanel(RightPanelTab),
     ClearTerminal,
     FindInTerminal,
+    FindNext,
+    FindPrevious,
+    // The clipboard trio + Select All. Dispatched to the focused terminal, the
+    // same actions the Edit menu and the right-click menu use.
+    CopyText,
+    CutText,
+    PasteText,
+    SelectAllText,
     ReopenClosedTab,
     OpenSettings,
+    /// Settings, opened straight on its Keybindings section.
+    ShowKeyboardShortcuts,
+    /// Settings, opened straight on its About section.
+    About,
+    CheckForUpdates,
+    OpenDocumentation,
+    OpenDiscord,
+    ReportIssue,
+    Quit,
     RestartDaemon,
     /// Show the focused native-SSH pane's remote filesystem — the detail
     /// panel's Files tab, which browses over SFTP for a remote pane (WS5).
@@ -124,23 +176,130 @@ impl CommandKind {
             _ => None,
         }
     }
-}
 
-impl CommandKind {
-    /// The action whose keystroke should be shown beside this command in the
-    /// palette, if any. Commands with no global binding (Change Theme and its
-    /// sub-entries, Find, tab switching) return `None` and render without a hint.
-    fn binding_action(&self) -> Option<&'static str> {
+    /// A stable key for [`Config::command_frecency`], or `None` for commands
+    /// that aren't a repeatable "thing you run" — a specific tab index, a theme
+    /// slot, a typed host. Recording those would fill the Recent group with
+    /// entries that mean something different next launch.
+    pub fn id(&self) -> Option<&'static str> {
         use CommandKind::*;
         Some(match self {
+            NewTab => "new-tab",
+            NewWorkspace => "new-workspace",
+            OpenWorkspacePicker => "switch-workspace",
+            RenameWorkspace => "rename-workspace",
+            StopWorkspace => "stop-workspace",
+            DeleteWorkspace => "delete-workspace",
+            SplitRight => "split-right",
+            SplitDown => "split-down",
+            ClosePane => "close-pane",
+            RenameTab => "rename-tab",
+            NewWorktreeTab => "new-worktree-tab",
+            CloseOtherTabs => "close-other-tabs",
+            CloseTabsToTheRight => "close-tabs-right",
+            CopyWorkingDirectory => "copy-cwd",
+            MarkTabUnread => "mark-tab-unread",
+            ResetFontSize => "reset-font-size",
+            NextPane => "next-pane",
+            PrevPane => "prev-pane",
+            FocusPaneLeft => "focus-pane-left",
+            FocusPaneRight => "focus-pane-right",
+            FocusPaneUp => "focus-pane-up",
+            FocusPaneDown => "focus-pane-down",
+            ResizePaneLeft => "resize-pane-left",
+            ResizePaneRight => "resize-pane-right",
+            ResizePaneUp => "resize-pane-up",
+            ResizePaneDown => "resize-pane-down",
+            SwapPaneNext => "swap-pane-next",
+            SwapPanePrev => "swap-pane-prev",
+            NextTab => "next-tab",
+            PrevTab => "prev-tab",
+            ToggleMaximizePane => "zoom-pane",
+            ToggleFullscreen => "full-screen",
+            ToggleTabSidebar => "tab-bar-position",
+            ToggleLeftPanel => "left-sidebar",
+            ToggleRightPanel => "right-panel",
+            ShowRightPanel(RightPanelTab::Info) => "right-panel-info",
+            ShowRightPanel(RightPanelTab::Outline) => "right-panel-outline",
+            ShowRightPanel(RightPanelTab::Changes) => "right-panel-changes",
+            ShowRightPanel(RightPanelTab::Files) => "right-panel-files",
+            ClearTerminal => "clear-scrollback",
+            FindInTerminal => "find",
+            FindNext => "find-next",
+            FindPrevious => "find-previous",
+            CopyText => "copy",
+            CutText => "cut",
+            PasteText => "paste",
+            SelectAllText => "select-all",
+            ReopenClosedTab => "reopen-closed-tab",
+            OpenSettings => "settings",
+            ShowKeyboardShortcuts => "keyboard-shortcuts",
+            About => "about",
+            CheckForUpdates => "check-for-updates",
+            OpenDocumentation => "documentation",
+            OpenDiscord => "discord",
+            ReportIssue => "report-issue",
+            Quit => "quit",
+            RestartDaemon => "restart-daemon",
+            ToggleSftp => "ssh-remote-files",
+            ShowSshForwards => "ssh-port-forwarding",
+            ToggleCodePanel => "code-panel",
+            RestartSshSession => "ssh-reconnect",
+            SendSelectionToAgent => "agent-send-selection",
+            SendGitDiffToAgent => "agent-send-diff",
+            OpenThemePicker => "change-theme",
+            OpenSshConnectInput => "ssh-add-connection",
+            OpenSshProfiles => "ssh-manage-profiles",
+            // Instance-specific: a tab index, a theme slot, a profile id, a
+            // typed host. Not stable across sessions, so not tracked.
+            SwitchToWorkspace(_)
+            | OpenSshConnect(_)
+            | SetTheme(_)
+            | ActivateTab(_)
+            | ConnectSavedProfile(_)
+            | EditSavedProfile(_)
+            | QuickConnect(_)
+            | SaveQuickConnect(_) => return None,
+        })
+    }
+
+    /// The keystroke shown beside this command, as a config keyspec.
+    ///
+    /// Most commands resolve through the live keymap, so a user remap shows up
+    /// here automatically. The clipboard trio and Select All are the exception:
+    /// they're handled inline in `terminal::view::handle_cmd_shortcut` rather
+    /// than as registered bindings (⌃C has to fall through to SIGINT with
+    /// nothing selected, which a registered binding would swallow), so their
+    /// chords are stated literally — the same thing the right-click menu does.
+    fn key_spec(&self, cx: &App) -> Option<String> {
+        use CommandKind::*;
+        // Inline-handled chords, macOS-only: off macOS these live on Ctrl and
+        // Ctrl+A / Ctrl+F keep their readline meaning, so advertising them
+        // would be a lie.
+        let inline =
+            |spec: &str| -> Option<String> { cfg!(target_os = "macos").then(|| spec.to_string()) };
+        match self {
+            CopyText => return inline("secondary-c"),
+            CutText => return inline("secondary-x"),
+            PasteText => return inline("secondary-v"),
+            SelectAllText => return inline("secondary-a"),
+            _ => {}
+        }
+        let action = match self {
             NewTab => "NewTab",
             NewWorkspace => "NewWorkspace",
-            OpenWorkspacePicker | SwitchToWorkspace(_) => return None,
+            RenameWorkspace => "RenameWorkspace",
             StopWorkspace => "StopWorkspace",
             DeleteWorkspace => "DeleteWorkspace",
             SplitRight => "SplitRight",
             SplitDown => "SplitDown",
             ClosePane => "CloseActiveTab",
+            RenameTab => "RenameTab",
+            NewWorktreeTab => "NewWorktreeTab",
+            CloseOtherTabs => "CloseOtherTabs",
+            CloseTabsToTheRight => "CloseTabsToTheRight",
+            CopyWorkingDirectory => "CopyWorkingDirectory",
+            MarkTabUnread => "MarkTabUnread",
             ResetFontSize => "ResetFontSize",
             NextPane => "FocusNextPane",
             PrevPane => "FocusPrevPane",
@@ -161,26 +320,44 @@ impl CommandKind {
             ToggleTabSidebar => "ToggleTabSidebar",
             ToggleLeftPanel => "ToggleLeftPanel",
             ToggleRightPanel => "ToggleRightPanel",
-            ShowRightPanel(tab) => {
-                use crate::core::config::RightPanelTab as T;
-                match tab {
-                    T::Info => "ShowRightPanelInfo",
-                    T::Outline => "ShowRightPanelOutline",
-                    T::Changes => "ShowRightPanelChanges",
-                    T::Files => "ShowRightPanelFiles",
-                }
-            }
+            ShowRightPanel(tab) => match tab {
+                RightPanelTab::Info => "ShowRightPanelInfo",
+                RightPanelTab::Outline => "ShowRightPanelOutline",
+                RightPanelTab::Changes => "ShowRightPanelChanges",
+                RightPanelTab::Files => "ShowRightPanelFiles",
+            },
             ClearTerminal => "ClearScrollback",
+            // Previously grouped with the hint-less commands even though it has
+            // shipped a default ⌘F for as long as the binding has existed — so
+            // the one command whose shortcut users most want to learn was the
+            // one the palette refused to teach.
+            FindInTerminal => "FindInTerminal",
+            FindNext => "FindNext",
+            FindPrevious => "FindPrevious",
             ReopenClosedTab => "ReopenClosedTab",
             OpenSettings => "OpenSettings",
+            ShowKeyboardShortcuts => "ShowKeyboardShortcuts",
+            About => "About",
+            CheckForUpdates => "CheckForUpdates",
+            OpenDocumentation => "OpenDocumentation",
+            OpenDiscord => "OpenDiscord",
+            ReportIssue => "ReportIssue",
+            Quit => "Quit",
             RestartDaemon => "RestartDaemon",
             ToggleSftp => "ToggleSftp",
             ShowSshForwards => "ShowSshForwards",
             ToggleCodePanel => "ToggleCodePanel",
             RestartSshSession => "RestartSshSession",
-            SendSelectionToAgent
+            OpenSshProfiles => "OpenSshProfiles",
+            // No global binding, by design or by nature.
+            CopyText
+            | CutText
+            | PasteText
+            | SelectAllText
+            | SendSelectionToAgent
             | SendGitDiffToAgent
-            | FindInTerminal
+            | OpenWorkspacePicker
+            | SwitchToWorkspace(_)
             | OpenThemePicker
             | OpenSshConnectInput
             | OpenSshConnect(_)
@@ -189,10 +366,69 @@ impl CommandKind {
             | ConnectSavedProfile(_)
             | EditSavedProfile(_)
             | QuickConnect(_)
-            | SaveQuickConnect(_)
-            | OpenSshProfiles => return None,
-        })
+            | SaveQuickConnect(_) => return None,
+        };
+        crate::ui::keymap::effective_key(action, cx)
     }
+}
+
+/// The band a command is filed under in the unfiltered palette. Groups exist so
+/// the resting list reads as a map of the app rather than 60 undifferentiated
+/// rows; while a search is running they're dropped and the results rank purely
+/// by match quality.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommandGroup {
+    TabsPanes,
+    Workspaces,
+    View,
+    Terminal,
+    Ssh,
+    Agents,
+    Application,
+}
+
+impl CommandGroup {
+    /// Display order of the groups, which is roughly "how often you reach for
+    /// this": the tab/pane verbs first, the app-level chores last.
+    const ORDER: [CommandGroup; 7] = [
+        CommandGroup::TabsPanes,
+        CommandGroup::Workspaces,
+        CommandGroup::View,
+        CommandGroup::Terminal,
+        CommandGroup::Ssh,
+        CommandGroup::Agents,
+        CommandGroup::Application,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            CommandGroup::TabsPanes => "Tabs & Panes",
+            CommandGroup::Workspaces => "Workspaces",
+            CommandGroup::View => "View",
+            CommandGroup::Terminal => "Terminal",
+            CommandGroup::Ssh => "SSH",
+            CommandGroup::Agents => "Agents",
+            CommandGroup::Application => "Application",
+        }
+    }
+}
+
+/// The chrome state the stateful titles ("Hide Left Sidebar", "Show Right
+/// Panel") read, passed in by the window opening the palette.
+///
+/// Deliberately *not* read off `Config`: both of these are per-window state
+/// living on `Tty7App`, and their config copies only record whichever window
+/// toggled them last. Reading the config would label the row by another
+/// window's rail — and clicking it would then do the opposite of what it said.
+#[derive(Clone, Copy)]
+pub struct ChromeState {
+    /// This window's rail collapse flag (`Tty7App::sidebar_collapsed`), not the
+    /// config's. Note this is the *toggle's* state, not whether the rail is on
+    /// screen: on the home page there are no tabs to list, but the command
+    /// still flips this flag, so the title has to describe that.
+    pub rail_collapsed: bool,
+    /// This window's `Tty7App::right_panel_visible`.
+    pub right_panel_visible: bool,
 }
 
 /// A single palette entry: a label plus the action it triggers.
@@ -203,6 +439,7 @@ pub struct Command {
     /// profile's `user@host`, or `(~/.ssh/config)` for an alias).
     pub subtitle: Option<String>,
     pub kind: CommandKind,
+    pub group: CommandGroup,
 }
 
 impl Command {
@@ -211,6 +448,9 @@ impl Command {
             title: title.into(),
             subtitle: None,
             kind,
+            // Overwritten by `base_commands`, which files every entry; the
+            // default only matters for the sub-lists, which render ungrouped.
+            group: CommandGroup::Application,
         }
     }
 
@@ -220,25 +460,43 @@ impl Command {
         self
     }
 
+    /// File this command under a group. The dynamic entries the host appends
+    /// (saved SSH profiles, "Switch to Tab: …") have to say where they belong
+    /// or they'd all land in the default band.
+    pub fn in_group(mut self, group: CommandGroup) -> Self {
+        self.group = group;
+        self
+    }
+
     /// The static commands available regardless of how many tabs exist. The
-    /// caller appends the dynamic "Switch to Tab: …" entries (one per tab).
+    /// caller appends the dynamic SSH-profile and "Switch to Tab: …" entries.
     ///
-    /// Trailing "…" flags a command that opens further UI rather than acting
-    /// immediately (a sub-list for Change Theme, a search bar for Find). The
-    /// held-key font zoom (⌘+/⌘−) is deliberately absent — stepping it needs a
-    /// re-open per press, so it makes a poor palette citizen; only the one-shot
-    /// Reset is worth a slot.
-    pub fn base_commands() -> Vec<Command> {
+    /// Titles follow the grammar documented at the top of this module. Several
+    /// are *stateful*: a command that flips something reads as the outcome it
+    /// will produce right now ("Hide Left Sidebar" when the rail is out), which
+    /// is why this needs `cx` and the calling window's [`ChromeState`].
+    ///
+    /// The held-key font zoom (⌘+/⌘−) is deliberately absent — stepping it needs
+    /// a re-open per press, so it makes a poor palette citizen; only the
+    /// one-shot Reset is worth a slot.
+    pub fn base_commands(cx: &App, chrome: ChromeState) -> Vec<Command> {
         use CommandKind::*;
-        vec![
+        let cfg = cx.global::<Config>();
+        // The tab bar's side is a genuine app-wide setting, so it comes off the
+        // config; the rail's collapse flag and the right panel's visibility do
+        // not (see `ChromeState`).
+        let tab_bar_left = cfg.tab_bar_position == TabBarPosition::Left;
+        let sidebar_hidden = chrome.rail_collapsed || !tab_bar_left;
+        let right_panel_open = chrome.right_panel_visible;
+
+        let tabs = [
             Command::new("New Tab", NewTab),
-            Command::new("New Workspace", NewWorkspace),
-            Command::new("Switch Workspace…", OpenWorkspacePicker),
-            Command::new("Stop Workspace…", StopWorkspace),
-            Command::new("Delete Workspace…", DeleteWorkspace),
+            Command::new("New Worktree Tab", NewWorktreeTab)
+                .with_subtitle("isolated checkout on a fresh branch"),
+            Command::new("Rename Tab…", RenameTab),
             Command::new("Split Right", SplitRight),
             Command::new("Split Down", SplitDown),
-            Command::new("Close Pane/Tab", ClosePane),
+            Command::new("Zoom Pane", ToggleMaximizePane),
             Command::new("Next Pane", NextPane),
             Command::new("Previous Pane", PrevPane),
             Command::new("Focus Pane Left", FocusPaneLeft),
@@ -253,45 +511,124 @@ impl Command {
             Command::new("Swap Pane Previous", SwapPanePrev),
             Command::new("Next Tab", NextTab),
             Command::new("Previous Tab", PrevTab),
-            Command::new("Toggle Maximize Pane", ToggleMaximizePane),
-            Command::new("Toggle Fullscreen", ToggleFullscreen),
-            Command::new("Toggle Tab Sidebar", ToggleTabSidebar),
-            Command::new("Toggle Left Sidebar", ToggleLeftPanel),
-            Command::new("Toggle Right Panel", ToggleRightPanel),
+            Command::new("Copy Working Directory", CopyWorkingDirectory),
+            Command::new("Mark Tab as Unread", MarkTabUnread),
+            Command::new("Close Pane / Tab", ClosePane),
+            Command::new("Close Other Tabs", CloseOtherTabs),
+            Command::new("Close Tabs to the Right", CloseTabsToTheRight),
+            Command::new("Reopen Closed Tab", ReopenClosedTab),
+        ];
+
+        let workspaces = [
+            Command::new("New Workspace", NewWorkspace),
+            Command::new("Switch Workspace…", OpenWorkspacePicker),
+            Command::new("Rename Workspace…", RenameWorkspace),
+            Command::new("Stop Workspace…", StopWorkspace)
+                .with_subtitle("ends its sessions, keeps the layout"),
+            Command::new("Delete Workspace…", DeleteWorkspace)
+                .with_subtitle("ends its sessions and forgets the layout"),
+        ];
+
+        let view = [
+            // Stateful titles: what the command will do from here, not the name
+            // of the switch it throws.
             Command::new(
-                "Right Panel: Info",
-                ShowRightPanel(crate::core::config::RightPanelTab::Info),
+                if sidebar_hidden {
+                    "Show Left Sidebar"
+                } else {
+                    "Hide Left Sidebar"
+                },
+                ToggleLeftPanel,
             ),
             Command::new(
+                if right_panel_open {
+                    "Hide Right Panel"
+                } else {
+                    "Show Right Panel"
+                },
+                ToggleRightPanel,
+            ),
+            Command::new("Show Code Panel", ToggleCodePanel),
+            // Was "Toggle Tab Sidebar", one row away from "Toggle Left Sidebar"
+            // and indistinguishable from it.
+            Command::new(
+                if tab_bar_left {
+                    "Tab Bar: Move to Top"
+                } else {
+                    "Tab Bar: Move to Left Sidebar"
+                },
+                ToggleTabSidebar,
+            ),
+            Command::new("Right Panel: Info", ShowRightPanel(RightPanelTab::Info)),
+            Command::new(
                 "Right Panel: Outline",
-                ShowRightPanel(crate::core::config::RightPanelTab::Outline),
+                ShowRightPanel(RightPanelTab::Outline),
             ),
             Command::new(
                 "Right Panel: Changes",
-                ShowRightPanel(crate::core::config::RightPanelTab::Changes),
+                ShowRightPanel(RightPanelTab::Changes),
             ),
-            Command::new(
-                "Right Panel: Files",
-                ShowRightPanel(crate::core::config::RightPanelTab::Files),
-            ),
-            Command::new("Clear", ClearTerminal),
+            Command::new("Right Panel: Files", ShowRightPanel(RightPanelTab::Files)),
+            Command::new("Change Theme…", OpenThemePicker),
+            Command::new("Reset Font Size", ResetFontSize),
+            Command::new("Enter Full Screen", ToggleFullscreen),
+        ];
+
+        let terminal = [
+            // Was "Clear", which never said what it cleared.
+            Command::new("Clear Scrollback", ClearTerminal),
             Command::new("Find in Terminal…", FindInTerminal),
-            Command::new("Reopen Closed Tab", ReopenClosedTab),
+            Command::new("Find Next", FindNext),
+            Command::new("Find Previous", FindPrevious),
+            Command::new("Copy", CopyText),
+            Command::new("Cut", CutText),
+            Command::new("Paste", PasteText),
+            Command::new("Select All", SelectAllText),
+        ];
+
+        let ssh = [
             Command::new("SSH: Add Connection…", OpenSshConnectInput),
             Command::new("SSH: Manage Profiles…", OpenSshProfiles),
-            Command::new("Reconnect SSH Session", RestartSshSession),
+            // Was "Reconnect SSH Session" — the one bare sibling among five.
+            Command::new("SSH: Reconnect Session", RestartSshSession),
             Command::new("SSH: Remote Files", ToggleSftp),
             Command::new("SSH: Port Forwarding", ShowSshForwards),
-            Command::new("Code Panel", ToggleCodePanel),
-            Command::new("Change Theme…", OpenThemePicker),
-            Command::new("Open Settings", OpenSettings),
-            Command::new("Reset Font Size", ResetFontSize),
-            Command::new("Restart Daemon…", RestartDaemon),
+        ];
+
+        let agents = [
             Command::new("Agent: Send Selection", SendSelectionToAgent)
                 .with_subtitle("selection → running coding agent"),
             Command::new("Agent: Send Git Diff for Review", SendGitDiffToAgent)
                 .with_subtitle("git diff → running coding agent"),
-        ]
+        ];
+
+        let application = [
+            // Was "Open Settings" while the menu bar, the tray and the home page
+            // all said "Settings" — four names for one destination.
+            Command::new("Settings…", OpenSettings),
+            Command::new("Keyboard Shortcuts", ShowKeyboardShortcuts),
+            Command::new("About tty7", About),
+            Command::new("Check for Updates…", CheckForUpdates),
+            Command::new("Documentation", OpenDocumentation),
+            Command::new("Join the Discord", OpenDiscord),
+            Command::new("Report an Issue…", ReportIssue),
+            Command::new("Restart Daemon…", RestartDaemon)
+                .with_subtitle("ends every running shell; layout is kept"),
+            Command::new("Quit tty7", Quit).with_subtitle("sessions keep running"),
+        ];
+
+        let mut out = Vec::new();
+        let mut push = |cmds: Vec<Command>, group: CommandGroup| {
+            out.extend(cmds.into_iter().map(|c| c.in_group(group)));
+        };
+        push(tabs.into(), CommandGroup::TabsPanes);
+        push(workspaces.into(), CommandGroup::Workspaces);
+        push(view.into(), CommandGroup::View);
+        push(terminal.into(), CommandGroup::Terminal);
+        push(ssh.into(), CommandGroup::Ssh);
+        push(agents.into(), CommandGroup::Agents);
+        push(application.into(), CommandGroup::Application);
+        out
     }
 
     /// The workspace sub-list: every workspace tty7 knows about, most recently
@@ -358,42 +695,113 @@ impl Command {
     }
 }
 
-/// Case-insensitive subsequence match: every character of `query` must appear
-/// in `title`, in order (but not necessarily contiguously). An empty query
-/// matches everything. This is the simple "fuzzy" rule the palette filters on.
-pub fn fuzzy_match(query: &str, title: &str) -> bool {
-    let mut needle = query.chars().flat_map(char::to_lowercase).peekable();
-    for ch in title.chars().flat_map(char::to_lowercase) {
-        if needle.peek() == Some(&ch) {
-            needle.next();
-        }
+/// Score how well `query` matches `text`, or `None` when it doesn't match at
+/// all. Higher is better; an empty query scores every candidate 0.
+///
+/// The rule is still "every character of the query appears in order", but the
+/// old boolean version left results in catalog order, so typing `sr` put "New
+/// Tab" (**s**plit… no — the first row whose letters happened to line up) above
+/// "Split Right". Scoring adds what makes a palette feel like it read your
+/// mind: matches on word boundaries and runs of adjacent characters count for
+/// much more than letters scattered through a long title.
+pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
+    let needle: Vec<char> = query
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if needle.is_empty() {
+        return Some(0);
     }
-    // All needle chars consumed → matched. An empty query trivially satisfies this.
-    needle.peek().is_none()
+    let hay: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    if needle.len() > hay.len() {
+        return None;
+    }
+
+    let mut qi = 0usize;
+    let mut score = 0i32;
+    let mut run = 0i32;
+    let mut prev_hit = false;
+    for (i, ch) in hay.iter().enumerate() {
+        if qi >= needle.len() {
+            break;
+        }
+        if *ch != needle[qi] {
+            prev_hit = false;
+            run = 0;
+            continue;
+        }
+        score += 1;
+        // Start of the string, or of a word: "sr" → "**S**plit **R**ight" is
+        // what the user meant, and it must outrank the same letters buried
+        // mid-word somewhere else.
+        let word_start = i == 0 || !hay[i - 1].is_alphanumeric();
+        if word_start {
+            score += 12;
+        }
+        if i == 0 {
+            score += 10;
+        }
+        if prev_hit {
+            run += 1;
+            score += 6 + run.min(8);
+        } else {
+            run = 0;
+        }
+        prev_hit = true;
+        qi += 1;
+    }
+    if qi < needle.len() {
+        return None;
+    }
+
+    if hay == needle {
+        score += 120;
+    } else if hay.starts_with(&needle) {
+        score += 50;
+    }
+    // Among equally good matches, prefer the shorter title: "Copy" should beat
+    // "Copy Working Directory" for the query "copy".
+    score -= (hay.len() as i32) / 6;
+    Some(score)
 }
 
-/// True when `query` fuzzy-matches a command's subtitle (e.g. typing a hostname
-/// matches a profile row whose subtitle is `user@host`). A command with no
-/// subtitle never matches this way.
-fn fuzzy_match_subtitle(query: &str, cmd: &Command) -> bool {
-    cmd.subtitle
+/// The best score for a command against `query`: its title, or its subtitle at
+/// a discount (a subtitle hit is a weaker signal of intent than a title hit,
+/// but typing a hostname should still find the profile row it belongs to).
+fn command_score(query: &str, cmd: &Command) -> Option<i32> {
+    let title = fuzzy_score(query, &cmd.title);
+    let subtitle = cmd
+        .subtitle
         .as_deref()
-        .is_some_and(|s| fuzzy_match(query, s))
+        .and_then(|s| fuzzy_score(query, s))
+        .map(|s| s / 2 - 25);
+    match (title, subtitle) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// One rendered band of the list: an optional header plus its rows. A search
+/// collapses everything into a single header-less section ranked by score.
+#[derive(Clone)]
+struct Section {
+    title: Option<SharedString>,
+    commands: Vec<Command>,
 }
 
 /// Feeds the command catalog to gpui-component's `ListState`. It keeps the full
-/// catalog plus the subset matching the current query (`matched`), re-filtering
-/// in `perform_search` whenever the search input changes.
+/// catalog plus the sections matching the current query, re-filtering in
+/// `perform_search` whenever the search input changes.
 pub struct PaletteDelegate {
     /// The full catalog: static commands followed by per-tab switch entries.
     commands: Vec<Command>,
-    /// The subset matching the current query — exactly what the list renders.
-    matched: Vec<Command>,
+    /// Exactly what the list renders, in render order.
+    sections: Vec<Section>,
     input: Option<PaletteInput>,
-    query: String,
-    /// Whether this is the root catalog, where a query that parses as
-    /// `user@host[:port]` injects live "Connect to …" / "Save … as profile"
-    /// rows so QuickConnect shares the one entry box (PRD §6.2 ①).
+    /// Whether this is the root catalog: grouped when idle, and a query that
+    /// parses as `user@host[:port]` injects live "Connect to …" / "Save … as
+    /// profile" rows so QuickConnect shares the one entry box (PRD §6.2 ①).
     quick_connect_root: bool,
     /// Index of the highlighted row, mirrored from the list's own selection so
     /// `render_item` can mark it. `None` when nothing matches.
@@ -408,22 +816,74 @@ enum PaletteInput {
 impl PaletteDelegate {
     pub fn new(commands: Vec<Command>) -> Self {
         Self {
-            matched: commands.clone(),
+            sections: vec![Section {
+                title: None,
+                commands: commands.clone(),
+            }],
             commands,
             input: None,
-            query: String::new(),
             quick_connect_root: false,
             selected: Some(IndexPath::default()),
         }
     }
 
-    /// The root delegate: like [`new`], but a query that parses as a QuickConnect
-    /// target injects live connect/save rows.
-    pub fn root(commands: Vec<Command>) -> Self {
-        Self {
+    /// The root delegate: grouped headers while idle, QuickConnect rows on a
+    /// host-like query.
+    pub fn root(commands: Vec<Command>, cx: &App) -> Self {
+        let mut this = Self {
             quick_connect_root: true,
             ..Self::new(commands)
+        };
+        this.sections = this.grouped_sections(cx);
+        this
+    }
+
+    /// The idle (empty-query) layout: a Recent band built from
+    /// [`Config::command_frecency`], then one band per [`CommandGroup`].
+    ///
+    /// Recent exists because the catalog's order is authored, not personal: the
+    /// first screenful used to be whatever was typed first — four Focus Pane
+    /// directions and four Resize Pane directions — while Change Theme and
+    /// Settings sat below the fold.
+    fn grouped_sections(&self, cx: &App) -> Vec<Section> {
+        let cfg = cx.global::<Config>();
+        let now = crate::core::config::unix_now();
+        let mut sections = Vec::new();
+
+        let mut recent: Vec<(f64, &Command)> = self
+            .commands
+            .iter()
+            .filter_map(|c| {
+                let id = c.kind.id()?;
+                let usage = cfg.command_frecency.get(id)?;
+                let score = usage.score(now);
+                (score > 0.0).then_some((score, c))
+            })
+            .collect();
+        recent.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        recent.truncate(RECENT_ROWS);
+        if !recent.is_empty() {
+            sections.push(Section {
+                title: Some("Recent".into()),
+                commands: recent.into_iter().map(|(_, c)| c.clone()).collect(),
+            });
         }
+
+        for group in CommandGroup::ORDER {
+            let commands: Vec<Command> = self
+                .commands
+                .iter()
+                .filter(|c| c.group == group)
+                .cloned()
+                .collect();
+            if !commands.is_empty() {
+                sections.push(Section {
+                    title: Some(group.title().into()),
+                    commands,
+                });
+            }
+        }
+        sections
     }
 
     /// The QuickConnect rows for a query at the root, if it parses as a target.
@@ -457,34 +917,52 @@ impl PaletteDelegate {
     }
 
     fn ssh_connect() -> Self {
-        let matched = vec![Command::ssh_connect_command("")];
         Self {
             commands: Vec::new(),
-            matched,
+            sections: vec![Section {
+                title: None,
+                commands: vec![Command::ssh_connect_command("")],
+            }],
             input: Some(PaletteInput::SshConnect),
-            query: String::new(),
             quick_connect_root: false,
             selected: Some(IndexPath::default()),
         }
     }
 
-    /// The command kind at the given (filtered) index path, if any. Called by
-    /// `app.rs` when the list confirms a selection.
+    /// The command kind at the given index path, if any. Called by `app.rs`
+    /// when the list confirms a selection.
     pub fn command_at(&self, ix: IndexPath) -> Option<CommandKind> {
-        self.matched.get(ix.row).map(|c| c.kind.clone())
+        self.sections
+            .get(ix.section)?
+            .commands
+            .get(ix.row)
+            .map(|c| c.kind.clone())
     }
 
     /// The currently highlighted command, if any (for the ⌘⏎ / → edit gesture).
     pub fn selected_command(&self) -> Option<CommandKind> {
         self.selected.and_then(|ix| self.command_at(ix))
     }
+
+    /// The first selectable row, or `None` when nothing matched.
+    fn first_row(&self) -> Option<IndexPath> {
+        let section = self.sections.iter().position(|s| !s.commands.is_empty())?;
+        Some(IndexPath::new(0).section(section))
+    }
 }
 
 impl ListDelegate for PaletteDelegate {
     type Item = ListItem;
 
-    fn items_count(&self, _section: usize, _cx: &App) -> usize {
-        self.matched.len()
+    fn sections_count(&self, _cx: &App) -> usize {
+        self.sections.len().max(1)
+    }
+
+    fn items_count(&self, section: usize, _cx: &App) -> usize {
+        self.sections
+            .get(section)
+            .map(|s| s.commands.len())
+            .unwrap_or(0)
     }
 
     /// Re-filter the catalog against the live query and reset the highlight to
@@ -493,28 +971,90 @@ impl ListDelegate for PaletteDelegate {
         &mut self,
         query: &str,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        cx: &mut Context<ListState<Self>>,
     ) -> Task<()> {
         if let Some(PaletteInput::SshConnect) = self.input {
-            self.query = query.to_string();
-            self.matched = vec![Command::ssh_connect_command(query)];
+            self.sections = vec![Section {
+                title: None,
+                commands: vec![Command::ssh_connect_command(query)],
+            }];
+        } else if query.trim().is_empty() {
+            // Idle: the grouped map of the app (root), or the sub-list as-is.
+            self.sections = if self.quick_connect_root {
+                self.grouped_sections(cx)
+            } else {
+                vec![Section {
+                    title: None,
+                    commands: self.commands.clone(),
+                }]
+            };
         } else {
-            let mut matched: Vec<Command> = Vec::new();
+            // Searching: one flat, header-less band ranked by match quality.
+            // Headers would only get in the way of "type three letters, hit
+            // Enter", and the ranking already puts the best row first.
+            let mut scored: Vec<(i32, Command)> = self
+                .commands
+                .iter()
+                .filter_map(|c| command_score(query, c).map(|s| (s, c.clone())))
+                .collect();
+            // Stable sort, so equal scores keep catalog order.
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            let mut commands: Vec<Command> = Vec::new();
             // At the root, a query that parses as a connect target leads with
-            // QuickConnect rows (PRD §6.2 ①), above the fuzzy-matched catalog.
+            // QuickConnect rows (PRD §6.2 ①), above the ranked catalog.
             if self.quick_connect_root {
-                matched.extend(Self::quick_connect_commands(query));
+                commands.extend(Self::quick_connect_commands(query));
             }
-            matched.extend(
-                self.commands
-                    .iter()
-                    .filter(|c| fuzzy_match(query, &c.title) || fuzzy_match_subtitle(query, c))
-                    .cloned(),
-            );
-            self.matched = matched;
+            commands.extend(scored.into_iter().map(|(_, c)| c));
+            self.sections = vec![Section {
+                title: None,
+                commands,
+            }];
         }
-        self.selected = (!self.matched.is_empty()).then(IndexPath::default);
+        self.selected = self.first_row();
         Task::ready(())
+    }
+
+    fn render_section_header(
+        &mut self,
+        section: usize,
+        _window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> Option<impl IntoElement> {
+        let title = self.sections.get(section)?.title.clone()?;
+        Some(
+            // Same fixed height as a row: the card's viewport is sized to a
+            // whole number of `PALETTE_ROW_H` units, and a header of any other
+            // height would leave the last visible row sliced by the card edge.
+            h_flex()
+                .h(px(PALETTE_ROW_H))
+                .px(px(11.))
+                .items_center()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(title),
+        )
+    }
+
+    fn render_empty(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> impl IntoElement {
+        // A blank card reads as a hang. Name the miss and point at the one
+        // thing this box does besides run commands.
+        v_flex()
+            .py_8()
+            .gap_1()
+            .items_center()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child("No matching commands")
+            .child(
+                div()
+                    .text_xs()
+                    .child("Type user@host to connect over SSH instead."),
+            )
     }
 
     fn render_item(
@@ -523,7 +1063,7 @@ impl ListDelegate for PaletteDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
-        let cmd = self.matched.get(ix.row)?;
+        let cmd = self.sections.get(ix.section)?.commands.get(ix.row)?.clone();
 
         // Read the colours we need as Copy values, then release the theme borrow
         // so we can borrow `cx` again for the keybinding lookup below.
@@ -537,8 +1077,7 @@ impl ListDelegate for PaletteDelegate {
         // command palette feel professional and teaches the shortcut in passing.
         let keys = cmd
             .kind
-            .binding_action()
-            .and_then(|action| crate::ui::keymap::effective_key(action, cx))
+            .key_spec(cx)
             .map(|spec| crate::ui::keymap::key_tokens(&spec));
 
         // Title, with an optional dimmed subtitle to its right (a profile's
@@ -578,7 +1117,10 @@ impl ListDelegate for PaletteDelegate {
         }
 
         Some(
-            ListItem::new(ix.row)
+            // Keyed by section *and* row: with grouped sections a bare row index
+            // repeats across bands, and duplicate element ids make the list
+            // reuse the wrong row's state.
+            ListItem::new(("palette-row", ix.section * 1000 + ix.row))
                 .selected(Some(ix) == self.selected)
                 // Fixed-height, dense rows (see `PALETTE_ROW_H`: the card's
                 // list viewport is sized to a whole number of rows). The 5px
@@ -663,13 +1205,15 @@ impl PaletteView {
         Self::build_list_with_delegate(PaletteDelegate::new(commands), window, cx)
     }
 
-    /// The root list, whose delegate injects live QuickConnect rows.
+    /// The root list: grouped while idle, and its delegate injects live
+    /// QuickConnect rows for a host-like query.
     fn build_root_list(
         commands: Vec<Command>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ListState<PaletteDelegate>> {
-        Self::build_list_with_delegate(PaletteDelegate::root(commands), window, cx)
+        let delegate = PaletteDelegate::root(commands, cx);
+        Self::build_list_with_delegate(delegate, window, cx)
     }
 
     fn build_list_with_delegate(
@@ -775,9 +1319,13 @@ impl EventEmitter<PaletteEvent> for PaletteView {}
 
 /// Fixed command-row height (see `render_item`). The list viewport must hold a
 /// whole number of rows, or the card's bottom edge cuts the last one mid-height.
+/// Section headers are pinned to the same height for the same reason.
 const PALETTE_ROW_H: f32 = 30.;
 /// Rows visible before the list scrolls.
 const PALETTE_VISIBLE_ROWS: f32 = 12.;
+/// How many entries the idle "Recent" band shows. Small on purpose: it's a
+/// shortcut to the two or three things you actually repeat, not a history log.
+const RECENT_ROWS: usize = 5;
 
 impl Render for PaletteView {
     /// The centered overlay: a dim full-window scrim plus the command card. The
@@ -895,5 +1443,89 @@ mod tests {
         // Contains ':' but the port segment is invalid → parse fails.
         assert!(row_titles("java:99999").is_empty());
         assert!(row_titles("@").is_empty());
+    }
+
+    #[test]
+    fn empty_query_matches_everything() {
+        assert_eq!(fuzzy_score("", "anything"), Some(0));
+    }
+
+    #[test]
+    fn non_subsequence_does_not_match() {
+        assert_eq!(fuzzy_score("zzz", "Split Right"), None);
+        assert_eq!(fuzzy_score("thgir", "Split Right"), None);
+    }
+
+    /// The ranking's whole job: word-initials and prefixes beat letters
+    /// scattered through a longer title.
+    #[test]
+    fn word_initials_outrank_scattered_letters() {
+        let target = fuzzy_score("sr", "Split Right").expect("matches");
+        // "Se...r" — an s and a later r, neither on a word boundary after the
+        // first, in a longer title.
+        let scattered = fuzzy_score("sr", "SSH: Manage Profiles…").expect("matches");
+        assert!(
+            target > scattered,
+            "expected 'Split Right' ({target}) to outrank 'SSH: Manage Profiles…' ({scattered})"
+        );
+    }
+
+    #[test]
+    fn exact_and_prefix_beat_mid_string() {
+        let exact = fuzzy_score("copy", "Copy").expect("matches");
+        let longer = fuzzy_score("copy", "Copy Working Directory").expect("matches");
+        assert!(
+            exact > longer,
+            "expected exact 'Copy' ({exact}) above 'Copy Working Directory' ({longer})"
+        );
+    }
+
+    /// A subtitle hit still finds the row, but never outranks a title hit —
+    /// typing a hostname should reach the profile whose subtitle carries it.
+    #[test]
+    fn subtitle_matches_are_found_but_discounted() {
+        let cmd = Command::new("prod-web", CommandKind::NewTab)
+            .with_subtitle("deploy@10.0.0.5".to_string());
+        assert!(command_score("10.0.0", &cmd).is_some());
+        let title_hit = command_score("prod", &cmd).expect("title matches");
+        let subtitle_hit = command_score("deploy", &cmd).expect("subtitle matches");
+        assert!(title_hit > subtitle_hit);
+    }
+
+    /// Every command that can be filed under Recent needs a stable id, and no
+    /// two commands may share one — a collision would make the Recent band
+    /// promote the wrong row.
+    #[test]
+    fn stable_ids_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for kind in [
+            CommandKind::NewTab,
+            CommandKind::SplitRight,
+            CommandKind::ClearTerminal,
+            CommandKind::CopyText,
+            CommandKind::CutText,
+            CommandKind::PasteText,
+            CommandKind::SelectAllText,
+            CommandKind::FindInTerminal,
+            CommandKind::FindNext,
+            CommandKind::FindPrevious,
+            CommandKind::OpenSettings,
+            CommandKind::ShowKeyboardShortcuts,
+            CommandKind::About,
+            CommandKind::Quit,
+            CommandKind::ShowRightPanel(RightPanelTab::Info),
+            CommandKind::ShowRightPanel(RightPanelTab::Files),
+        ] {
+            let id = kind.id().expect("static command has an id");
+            assert!(seen.insert(id), "duplicate command id {id:?}");
+        }
+    }
+
+    /// Instance-specific commands must stay out of the frecency store.
+    #[test]
+    fn dynamic_commands_have_no_id() {
+        assert!(CommandKind::ActivateTab(2).id().is_none());
+        assert!(CommandKind::SetTheme(0).id().is_none());
+        assert!(CommandKind::QuickConnect("a@b".into()).id().is_none());
     }
 }
