@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [26.7.4] - 2026-07-26
+
+### Added
+
+- **Grok Build gets the full hook integration** — Settings → Agents grows a
+  sixth row, installing tty7's hooks to `~/.grok/hooks/tty7.json`. A grok pane
+  now carries the same live status the other agents do (blue "working" → green
+  "done", amber "needs you" when grok asks a question), and after a restart it
+  relaunches `grok --resume <id>` with the original launch flags instead of a
+  bare shell. Panes that only ever had the Claude Code hooks installed are
+  relabeled to grok rather than reporting as "Claude Code", and grok's brand
+  mark replaces the generic robot avatar. (#174)
+- **Edit, File and Help menus** — copy/cut/paste/select-all, undo/redo and
+  find/find-next now live in a real Edit menu; `About tty7`, `Check for
+  Updates…`, `Hide tty7` and Services sit in the app menu; Docs, Discord and
+  `Report an Issue` are reachable from Help; and tab actions that used to exist
+  only in a context menu (Rename Tab, New Worktree Tab, Close Other Tabs, Close
+  Tabs to the Right, Copy Working Directory) are real actions you can also find
+  in the palette and rebind in Settings. (#175)
+
+### Changed
+
+- **The menu bar follows the HIG** — `tty7 · File · Edit · View · Window ·
+  Help` replaces `tty7 · Shell · Window · View`. The `Shell` menu is gone: its
+  new / close / split / rename items are File's job everywhere else, and the
+  name collided with Settings → Shell, which configures something entirely
+  different. View gained the layout toggles and pane commands that were
+  chord-only, and `Delete Workspace…` moved behind its own rule at the bottom
+  of File. (#175)
+- **The command palette is ranked, banded, and says what it will do** — results
+  are scored rather than filtered, so word-initials and prefixes outrank
+  scattered letters; the idle list opens on `Recent` (frecency) followed by
+  Tabs & Panes · Workspaces · View · Terminal · SSH · Agents · Application
+  instead of 47 flat rows. Names describe the outcome and the current state
+  (`Hide Left Sidebar`, `Tab Bar: Move to Left Sidebar`) rather than the switch,
+  one namespace prefix per subsystem, and the naming grammar is written down at
+  the top of `palette.rs`. (#175)
+- **Settings re-sectioned around what you're configuring** — the orphan `Shell`
+  page folds into Terminal's first group, a new `Input` page collects the prompt
+  editor, selection/clipboard and keyboard settings, Terminal drops from seven
+  groups to four, and notifications moved to Window & Tabs where the rest of the
+  app-level behaviour lives. The search index grew from 14 entries to 51 with
+  titles pinned to the rendered row labels, so `opacity`, `blur`, `completion`,
+  `ctrl-r` and `grouping` now find their rows. (#175)
+- **The tab bar defaults to the left sidebar** — a fresh install opens with the
+  vertical tab rail instead of the horizontal title-bar strip. Anyone who has
+  flipped the setting or hit `ToggleTabSidebar` has an explicit value persisted
+  and keeps their layout. (#171)
+- **Idle chrome tiles paint at the rail's ink weight** — title-bar toggles,
+  panel tabs, `+` and their siblings now draw their glyph in
+  `sidebar_foreground` instead of the near-black `foreground`, with full
+  strength reserved for the selected tile. The chrome no longer reads a step
+  darker than everything it neighbours, and "on" gets a second cue beyond the
+  grey capsule. (#176)
+
 ### Fixed
 
 - **Non-ASCII output survives a Finder/Dock launch** — macOS GUI launches can
@@ -18,7 +73,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inherited or configured locale exists — explicit locale choices still win.
   The derived name is checked against the locales actually installed before it
   is exported, so it stays loadable on remote hosts too, where ssh forwards
-  `LC_*` by default. ([#178](https://github.com/l0ng-ai/tty7/issues/178))
+  `LC_*` by default.
+  ([#178](https://github.com/l0ng-ai/tty7/issues/178), #173, #180)
+- **Right-click Paste dropped images, and Copy looked disabled** — copy, cut,
+  paste and undo each had two implementations, a chord handler and an action
+  handler, which had drifted: the context menu's Paste skipped the image branch
+  ⌘V had, so pasting a screenshot into an agent pane worked by keyboard but not
+  by menu, and Copy rendered disabled whenever the selection lived in the prompt
+  editor rather than the terminal grid. Both now route through one method each.
+  (#175)
+- **The palette named the other window's sidebar** — the stateful palette titles
+  read the config copies of `sidebar_collapsed` / `right_panel_visible`, which
+  only record whichever window toggled them last. With two windows in different
+  states, one window's palette offered "Show Left Sidebar" while its rail was
+  already out. Each window now labels the toggles from its own chrome state.
+  (#175)
+- **No more update prompts for a half-built release** — the release step ran
+  inside the build matrix, so the first platform to finish published a release
+  carrying only its own assets, and that release became `/releases/latest`
+  immediately. The in-app update check polls exactly that endpoint, so users
+  were prompted to download a version whose `.dmg` was still notarizing. All
+  four platforms now upload artifacts and a single gated job assembles one
+  **draft** release with every asset. (#172)
 
 ## [26.7.3] - 2026-07-25
 
