@@ -68,53 +68,77 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         "icons/terminal.svg" => include_bytes!("../../assets/icons/terminal.svg"),
         // A git glyph on the detail-panel spec below (gpui-component bundles
         // none). Serves both the sidebar row's branch line and the Changes tab.
-        // Drawn as an actual commit graph — a trunk with a node at each end,
-        // branching once — rather than lucide's long arc slung between two
-        // floating rings: that one is the loosest, most lopsided shape in a row
-        // of four, and at the sidebar's 11px a stroked ring's hole collapses into
-        // a blur anyway. Nodes are filled here.
+        // Drawn as a commit graph — a trunk with a node at each end, branching
+        // once — rather than lucide's long arc slung between two floating rings:
+        // that one is the loosest, most lopsided shape in a row of four. Nodes
+        // are filled, because at the sidebar's 11px a stroked ring's hole
+        // collapses into a blur.
         "icons/git-branch.svg" => include_bytes!("../../assets/icons/git-branch.svg"),
-        // Filled-panel dock glyphs for the window chrome: an outlined frame with
-        // one inset solid block marking which dock is open (the "commercial-app"
-        // look). gpui-component only ships the hollow line `panel-left/right`, so
-        // tty7 carries its own filled variants for the title bar controls.
+        // Dock glyphs for the window chrome: a rounded frame with one inset solid
+        // block marking which dock is open. gpui-component only ships the hollow
+        // line `panel-left/right`, which says a panel exists but not which one is
+        // showing, so tty7 carries its own. The block is a flat fill, not a wash —
+        // nothing in this set relies on partial alpha surviving rasterisation.
         "icons/panel-left.svg" => include_bytes!("../../assets/icons/panel-left.svg"),
         "icons/panel-right.svg" => include_bytes!("../../assets/icons/panel-right.svg"),
-        // The chrome glyphs that sit beside those dock tiles, redrawn to share
-        // their weight and their solid-mass vocabulary. Lucide's stock `plus` is
-        // a thin bare cross that reads far lighter than the framed dock icon
-        // next to it, and its `ellipsis` strokes three `r=1` circles — at 18px
-        // the cap overlaps its own fill and the dots blur into grey smudges.
-        //
-        // `plus` is the one deliberate departure from the spec below: a bare
-        // cross has no enclosing shape to carry weight, so it runs stroke 2.4 on
-        // a tighter 6→18 span. Matching the spec exactly would leave it visibly
-        // frailer than the framed tile beside it.
+        // The chrome glyphs beside those dock tiles. Lucide's `ellipsis` strokes
+        // three `r=1` circles, and at 18px the cap overlaps its own fill and the
+        // dots blur into grey smudges, so these are filled to the node rule below.
         "icons/plus.svg" => include_bytes!("../../assets/icons/plus.svg"),
         "icons/ellipsis.svg" => include_bytes!("../../assets/icons/ellipsis.svg"),
         // The detail panel's own set: four tab tiles at 18px and four controls at
         // 13px, all in one panel, so they're drawn to one spec instead of taken
         // from lucide as-is.
         //
-        //   stroke      1.9 (except `plus` — see above)
-        //   radius      2.6–3.2, never 2.0
-        //   span        3.2→20.8, both axes; circles widen to ~2.5→21.5, since a
-        //               round shape reads smaller at equal geometry
-        //   nodes       always filled, r ≥ 1.35 — a stroked dot hazes below 16px
+        // The spec is "humanist": full, rounded, near-square. Every glyph here
+        // draws the *conventional* thing — a magnifier is a magnifier, a folder
+        // is a folder, a sheet has a dog-ear. Several rounds of this set tried
+        // swapping those metaphors for cleverer ones (terminal-native objects,
+        // brand-derived panels, deliberately unclosed forms) and every one of
+        // them cost more recognition than it bought character. What carries the
+        // set is how the familiar shape is *drawn*, not which shape it is.
         //
-        // The stock glyphs share none of that: they mix stroke weights, sit a
-        // 21-wide circle next to an 18-wide folder, and leave so much dead space
-        // inside the frame that the row reads as four glyphs from four sets.
+        //   stroke      2.1, flat across the set, round caps and joins
+        //   radius      3.4–4.4 — generous, matching the app's own 10px panels
+        //   span        3.4→20.6, near-square bounding box; circles widen ~4%,
+        //               since a round shape reads smaller at equal geometry
+        //   curvature   one step fuller than a mechanical arc would give (`eye`,
+        //               `folder`'s shoulder), which is what makes the set feel
+        //               drawn rather than constructed
+        //   nodes       filled, r ≥ 1.6 — a stroked dot hazes below 16px
         //
-        // Shape choices worth keeping: `info` is a panel with two lines written
-        // in it — a picture of what the tab actually opens (cwd, shell, branch,
-        // changes) — rather than the circled `i`, which is the most-drawn icon
-        // there is and says "help" as readily as "details"; Outline's last row is
-        // cut short, because three full-width rules read as a hamburger menu
-        // rather than a list;
-        // `folder-closed` drops its lid rule, which at 18px only crowded the top
-        // of the box; `copy`'s back sheet wraps three sides and stops on its own
-        // curves instead of poking two raw stubs out of an L.
+        // The five craft rules the set is held to, in the order they're usually
+        // violated:
+        //
+        //   1. Optical weight, not geometric: round shapes are drawn ~4% larger
+        //      than square ones so a row of mixed glyphs reads level.
+        //   2. Tangent, never intrusion: `search`'s handle leaves the circle at
+        //      its 45° tangent point rather than aiming at the centre — an
+        //      overlap there shows as a lump at 64px.
+        //   3. Even interior rhythm: within one glyph, gaps between strokes are
+        //      equal (`file`'s two text rules are spaced as far apart as each is
+        //      from the frame). Uneven interior air is the single biggest source
+        //      of "drawn sloppily".
+        //   4. One terminal treatment: every end is round, every corner shares
+        //      the radius band. Don't mix a hard-folded corner into this set.
+        //   5. Equal apparent size, not equal bounds: `folder` is wide and short
+        //      so it's drawn wider; `file` is narrow and tall so it's drawn
+        //      taller. They occupy the same visual area, not the same rectangle.
+        //
+        // The stock lucide glyphs share none of that: they mix stroke weights,
+        // sit a 21-wide circle next to an 18-wide folder, and leave so much dead
+        // space inside the frame that a row reads as four glyphs from four sets.
+        //
+        // Shape choices worth keeping: `info` is a panel with a title bar ruled
+        // across the top and one content line under it — a picture of what the
+        // tab actually opens (cwd, shell, branch, changes) — rather than the
+        // circled `i`, which is the most-drawn icon there is and says "help" as
+        // readily as "details"; the title rule is also what keeps it from
+        // colliding with `panel-left`, which is the same frame with a block in
+        // it. Outline's last row is cut short, because three full-width rules
+        // read as a hamburger menu rather than a list. `copy`'s back sheet wraps
+        // three sides and stops on its own curves instead of poking two raw stubs
+        // out of an L.
         "icons/list.svg" => include_bytes!("../../assets/icons/list.svg"),
         "icons/folder-closed.svg" => include_bytes!("../../assets/icons/folder-closed.svg"),
         "icons/folder-open.svg" => include_bytes!("../../assets/icons/folder-open.svg"),
@@ -125,9 +149,13 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         // `folder` and `file` carry no detail-panel role of their own — they're
         // here because overriding `folder-open` above would otherwise split the
         // file tree down the middle, drawing expanded rows on this spec and
-        // collapsed ones (and every file) from stock lucide. Same shape as
-        // `folder-closed`: upstream's only difference between the two is the lid
-        // rule this set drops anyway.
+        // collapsed ones (and every file) from stock lucide.
+        //
+        // `folder` is the file tree's collapsed row; `folder-closed` is the
+        // Files *tab* label, and carries one inner rule so the two names stop
+        // resolving to one identical drawing. The rule is legible there because
+        // the tab renders at 18px — at the tree's 13px it would only crowd the
+        // box, which is why the collapsed row doesn't wear it.
         "icons/folder.svg" => include_bytes!("../../assets/icons/folder.svg"),
         "icons/file.svg" => include_bytes!("../../assets/icons/file.svg"),
         // The circled `i` that `info.svg` used to be, kept under its own name for
@@ -139,8 +167,9 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         // The Files tab's remote (SFTP) mode needs a refresh it doesn't need
         // locally: the local tree runs a recursive filesystem watcher and
         // invalidates itself, a remote listing has nothing watching it. Drawn to
-        // the circle rule above (2.7→21.3) so it sits level with the `eye` beside
-        // it rather than lucide's r=9 `rotate-cw`, which reads a step small.
+        // the circle rule above (r 8.6) so it sits level with the `eye` beside it
+        // rather than lucide's r=9 `rotate-cw`, whose arrow head is also a size
+        // step heavier than anything else in the row.
         "icons/refresh.svg" => include_bytes!("../../assets/icons/refresh.svg"),
         "icons/agents/claude.svg" => include_bytes!("../../assets/icons/agents/claude.svg"),
         "icons/agents/codex.svg" => include_bytes!("../../assets/icons/agents/codex.svg"),
