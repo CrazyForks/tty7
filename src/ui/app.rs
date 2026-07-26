@@ -807,6 +807,12 @@ impl Tty7App {
         // to the theme — skip, or the pin would re-trigger a redundant apply.
         let this = cx.weak_entity();
         let appearance_watch = window.observe_window_appearance(move |window, cx| {
+            // This is the only place the OS flip is observed, so cache it here —
+            // from the *window*, never `cx.window_appearance()`, which would
+            // re-enter gpui's already-borrowed Linux client and panic. Before the
+            // early return, so a flip that happens while following is off still
+            // lands. See `ui::theme::SystemAppearance`.
+            crate::ui::theme::note_system_appearance(window, cx);
             if !cx.global::<Config>().theme_follow_system {
                 return;
             }

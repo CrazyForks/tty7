@@ -358,6 +358,10 @@ fn main() {
             set_dock_icon_for_bare_binary();
             // Load user config once and stash it as a global for views to read.
             cx.set_global(Config::load());
+            // Seed the cached OS light/dark appearance before anything resolves a
+            // theme from it. It has to be read here, off the appearance-observer
+            // path — see `ui::theme::SystemAppearance`.
+            crate::ui::theme::refresh_system_appearance(cx);
             // Read `session.json` (migrating a pre-multi-window file) before any
             // window is built: windows claim their workspace from this store
             // rather than each parsing the file themselves. It also dedupes

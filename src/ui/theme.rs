@@ -248,15 +248,60 @@ pub(crate) fn window_background(bg: &presets::ActiveBackground) -> Background {
     }
 }
 
-/// Whether the OS is currently in dark mode, as gpui reports it. Only
-/// meaningful while the native appearance isn't pinned (see
+/// The OS light/dark appearance, cached as a global rather than asked of the
+/// platform on demand.
+///
+/// gpui's Linux backends dispatch a window's appearance-changed callback while
+/// the platform client's `RefCell` is *already* mutably borrowed: both the
+/// Wayland and X11 XDP handlers hold `client.borrow_mut()` across
+/// `set_appearance`, which invokes the callback synchronously. `window_appearance`
+/// re-borrows that same cell, so calling it from inside an appearance observer
+/// panics with "RefCell already borrowed". The portal source emits one appearance
+/// event during startup, which made `theme_follow_system: true` — the only path
+/// that reads the OS appearance from that observer — panic on *every* launch.
+///
+/// `Window::appearance()` reads the window's own cell instead, and that borrow is
+/// released before the callback runs. So the observer caches what the window
+/// reports and every other caller reads the cache. (Zed keeps a `SystemAppearance`
+/// global for the same reason.)
+#[derive(Clone, Copy)]
+pub(crate) struct SystemAppearance {
+    dark: bool,
+}
+
+impl gpui::Global for SystemAppearance {}
+
+fn is_dark(appearance: gpui::WindowAppearance) -> bool {
+    matches!(
+        appearance,
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+    )
+}
+
+/// Seed [`SystemAppearance`] from the platform. Only safe *off* the
+/// appearance-observer path (see the type's note): at startup, and on macOS right
+/// after the native pin is released.
+pub(crate) fn refresh_system_appearance(cx: &mut App) {
+    let dark = is_dark(cx.window_appearance());
+    cx.set_global(SystemAppearance { dark });
+}
+
+/// Cache the appearance a window just reported. This is the observer-safe update
+/// — the one that runs on an actual OS light/dark flip.
+pub(crate) fn note_system_appearance(window: &Window, cx: &mut App) {
+    let dark = is_dark(window.appearance());
+    cx.set_global(SystemAppearance { dark });
+}
+
+/// Whether the OS is currently in dark mode, per the cached [`SystemAppearance`].
+/// Only meaningful while the native appearance isn't pinned (see
 /// [`sync_native_appearance`]) — a pinned appearance reports the pin, not the
 /// OS setting, which is why callers gate on `Config::theme_follow_system`.
 pub(crate) fn system_dark(cx: &App) -> bool {
-    matches!(
-        cx.window_appearance(),
-        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
-    )
+    // Unset only before startup seeds it, i.e. before any theme resolves; light
+    // is the same default the config ships.
+    cx.try_global::<SystemAppearance>()
+        .is_some_and(|appearance| appearance.dark)
 }
 
 /// The id of the theme that should be on screen right now: the light/dark
@@ -300,6 +345,13 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     // until the pin is cleared.
     if follow {
         sync_native_appearance(None);
+        // The cache may still hold the pin that call just released (the observer
+        // caches whatever the window reports, pin included), so re-read it from
+        // the platform. macOS-only on both counts: nothing pins the appearance
+        // elsewhere, and this is exactly the platform read that would re-enter
+        // gpui's borrowed Linux client — see [`SystemAppearance`].
+        #[cfg(target_os = "macos")]
+        refresh_system_appearance(cx);
     }
     let theme = presets::by_id(cx, &effective_preset_id(cx));
     let config = cx.global::<Config>();
@@ -516,3 +568,38 @@ fn sync_native_appearance(dark: Option<bool>) {
 
 #[cfg(not(target_os = "macos"))]
 fn sync_native_appearance(_dark: Option<bool>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// The follow-system slot has to come from the cached [`SystemAppearance`],
+    /// not from a fresh `cx.window_appearance()` — that read is what re-enters
+    /// gpui's borrowed Linux client and panics inside the appearance observer.
+    /// The test platform always reports `Light`, so the dark half only passes
+    /// while the cache is what's consulted.
+    #[gpui::test]
+    fn effective_preset_follows_the_cached_system_appearance(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(Config {
+                theme_follow_system: true,
+                theme_preset_light: "light-slot".into(),
+                theme_preset_dark: "dark-slot".into(),
+                ..Config::default()
+            });
+
+            cx.set_global(SystemAppearance { dark: false });
+            assert!(!system_dark(cx));
+            assert_eq!(effective_preset_id(cx), "light-slot");
+
+            cx.set_global(SystemAppearance { dark: true });
+            assert!(system_dark(cx));
+            assert_eq!(effective_preset_id(cx), "dark-slot");
+
+            // Following off, the manual preset wins whatever the OS is doing.
+            cx.global_mut::<Config>().theme_follow_system = false;
+            assert_eq!(effective_preset_id(cx), Config::default().theme_preset);
+        });
+    }
+}
