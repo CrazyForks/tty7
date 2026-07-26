@@ -432,31 +432,6 @@ impl Tty7App {
             .into_any_element()
     }
 
-    /// The Files header's one control. No refresh button: the tree runs a
-    /// recursive filesystem watcher over its roots and invalidates its own caches,
-    /// so a manual refresh is a button that does what already happened.
-    fn files_controls(&self, cx: &mut Context<Self>) -> AnyElement {
-        let show_hidden = self.file_tree.show_hidden;
-        crate::ui::tab_strip::chrome_tile_sized(
-            Button::new("panel-tree-hidden").icon(Icon::new(IconName::Eye)),
-            TILE_SIZE_SM,
-            TILE_GLYPH_SM,
-            show_hidden,
-            cx,
-        )
-        .rounded_md()
-        .tooltip(if show_hidden {
-            "Hide dotfiles"
-        } else {
-            "Show dotfiles"
-        })
-        .on_click(cx.listener(|this, _, _w, cx| {
-            this.file_tree.show_hidden = !this.file_tree.show_hidden;
-            cx.notify();
-        }))
-        .into_any_element()
-    }
-
     /// A tab's filter box — the same borderless magnifier + input the tab rail
     /// uses, so everything in the window searches the same way. Sits under the
     /// header rather than in it: it's a full-width control, not a trailing tile.
@@ -1334,8 +1309,10 @@ impl Tty7App {
             return self.render_panel_sftp(host.unwrap_or_default(), window, cx);
         }
 
-        let controls = self.files_controls(cx);
-        let title = self.panel_title("Files", None, Some(controls), cx);
+        // No header control: the tree's one view option (dotfiles) is a
+        // right-click away in the tree itself (`file_tree::dotfiles_menu_item`),
+        // which is where you are when you want it.
+        let title = self.panel_title("Files", None, None, cx);
         let search = self.panel_search(&self.file_search.clone(), cx);
         let rows = self.render_file_tree_rows(window, cx);
         v_flex()
