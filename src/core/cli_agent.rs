@@ -211,6 +211,9 @@ impl CLIAgent {
             // Copilot CLI: `copilot --resume <sessionId>` (`-r` shorthand) —
             // the one hooks-covered agent that was missing from this table.
             CLIAgent::Copilot => Some(format!("copilot{flags} --resume {session_id}")),
+            // Grok Build: `grok --resume <id-or-title>`; a UUID-shaped value
+            // always takes the id path, which is what its hooks report.
+            CLIAgent::Grok => Some(format!("grok{flags} --resume {session_id}")),
             _ => None,
         }
     }
@@ -268,6 +271,27 @@ impl CLIAgent {
             // `--last` targets "the most recent session" and would contradict
             // the explicit id we inject.
             CLIAgent::Codex => &["--last"],
+            // Beyond the session-targeting flags (`--load` is grok's hidden
+            // alias for `--resume`; `--session-id` names a *new* session and
+            // `--fork-session` would branch off the one we mean to continue),
+            // the worktree pair goes too: `--worktree` with no value mints a
+            // fresh git worktree on every relaunch, and `--worktree-ref`
+            // requires `--worktree`, so leaving it behind would make grok
+            // reject the resume outright.
+            CLIAgent::Grok => &[
+                "--resume",
+                "-r",
+                "--load",
+                "--continue",
+                "-c",
+                "--session-id",
+                "-s",
+                "--fork-session",
+                "--worktree",
+                "-w",
+                "--worktree-ref",
+                "--ref",
+            ],
             _ => &[],
         };
         let mut i = 0;
@@ -314,8 +338,11 @@ impl CLIAgent {
 
     /// Brand accent (0xRRGGBB) for the tab chip's agent dot. Chosen for legibility
     /// on both light and dark themes rather than exact brand black/white. A pure
-    /// black or white dot vanishes against one theme, so monochrome vendors get
-    /// a recognizable mid-tone hue instead; Codex keeps its black field.
+    /// *white* field vanishes against a light theme, so vendors whose mark is a
+    /// grey or gradient monochrome (Cursor) get a recognizable mid-tone hue
+    /// instead. A black field is a different case: it stays darker than even the
+    /// darkest theme background and the white mark on it carries the badge, so
+    /// vendors who actually brand in black (Codex, Grok) keep it.
     pub fn accent_rgb(self) -> u32 {
         match self {
             CLIAgent::Claude => 0xD97757,      // Claude terracotta
@@ -333,7 +360,7 @@ impl CLIAgent {
             CLIAgent::Hermes => 0x8B5CF6,      // violet
             CLIAgent::Vibe => 0xFF7000,        // Mistral orange
             CLIAgent::Antigravity => 0x2563EB, // Google blue (darker than Gemini's)
-            CLIAgent::Grok => 0x64748B,        // xAI is monochrome → slate
+            CLIAgent::Grok => 0x000000,        // xAI brands in black
             CLIAgent::Qwen => 0x7C3AED,        // Qwen purple
         }
     }
@@ -355,6 +382,7 @@ impl CLIAgent {
             CLIAgent::Cursor => "icons/agents/cursor.svg",
             CLIAgent::Goose => "icons/agents/goose.svg",
             CLIAgent::Droid => "icons/agents/droid.svg",
+            CLIAgent::Grok => "icons/agents/grok.svg",
             // No brand mark bundled → generic robot glyph.
             CLIAgent::Aider
             | CLIAgent::Pi
@@ -362,7 +390,6 @@ impl CLIAgent {
             | CLIAgent::Hermes
             | CLIAgent::Vibe
             | CLIAgent::Antigravity
-            | CLIAgent::Grok
             | CLIAgent::Qwen => "icons/bot.svg",
         }
     }
@@ -916,9 +943,12 @@ mod tests {
         }
     }
 
+    /// The two vendors who actually brand in black keep the black field rather
+    /// than the mid-tone substitute monochrome marks otherwise get.
     #[test]
-    fn codex_avatar_uses_its_black_brand_field() {
+    fn black_branded_avatars_keep_their_brand_field() {
         assert_eq!(CLIAgent::Codex.accent_rgb(), 0x000000);
+        assert_eq!(CLIAgent::Grok.accent_rgb(), 0x000000);
     }
 
     #[test]
@@ -1370,6 +1400,34 @@ mod tests {
         assert_eq!(
             CLIAgent::Copilot.resume_command("s-9", None).as_deref(),
             Some("copilot --resume s-9")
+        );
+        // Grok: mode flags survive, and every way of naming another session is
+        // stripped so the injected id is the only target left.
+        assert_eq!(
+            CLIAgent::Grok
+                .resume_command("g-2", Some(&argv(&["grok", "--model", "grok-code"])))
+                .as_deref(),
+            Some("grok --model grok-code --resume g-2")
+        );
+        assert_eq!(
+            CLIAgent::Grok
+                .resume_command(
+                    "g-2",
+                    Some(&argv(&["grok", "--resume", "g-1", "--fork-session"]))
+                )
+                .as_deref(),
+            Some("grok --resume g-2")
+        );
+        // `--worktree` would mint a fresh git worktree on every restore, and
+        // `--worktree-ref` can't survive without it.
+        assert_eq!(
+            CLIAgent::Grok
+                .resume_command(
+                    "g-3",
+                    Some(&argv(&["grok", "-w", "--worktree-ref", "main", "--yolo"]))
+                )
+                .as_deref(),
+            Some("grok --yolo --resume g-3")
         );
     }
 
