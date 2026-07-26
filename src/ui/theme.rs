@@ -7,6 +7,7 @@ use gpui::{
     App, Background, Hsla, Menu, MenuItem, OsAction, Pixels, Point, SystemMenuType, Window,
     WindowBackgroundAppearance, linear_color_stop, linear_gradient, point, px, rgb,
 };
+use gpui_component::scroll::ScrollbarShow;
 use gpui_component::{Theme, ThemeMode};
 
 use crate::core::actions::*;
@@ -374,6 +375,11 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     }
     let m = theme.neutrals();
     let active = theme.active_palette();
+    // Read before `Theme::global_mut` borrows `cx`. macOS reports the overlay /
+    // legacy scroller preference here; Windows reports the accessibility
+    // "always show scrollbars" setting (false by default) and Linux always
+    // false — which is exactly the platform split we want below.
+    let auto_hide_scrollbars = cx.should_auto_hide_scrollbars();
 
     // Never `Opaque`: on macOS 26 (Tahoe) flipping a window's opacity after
     // creation doesn't reach the compositor — the window keeps compositing
@@ -469,6 +475,38 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
 
     t.caret = rgb(m.caret).into();
     t.selection = rgb(m.selection).into(); // text selection highlight
+
+    // Overlay scrollbars (right panel, file tree, tab rail — see
+    // `ui::scrollbar`). gpui-component's `Scrollbar` paints the thumb from
+    // `tokens.scrollbar_thumb{,_hover}` and the track from the plain
+    // `scrollbar` field; the stock values are fixed neutral greys per light/dark
+    // mode, so on a tinted theme the thumb reads as a foreign grey. Derive both
+    // from this theme's own foreground instead — the same background→foreground
+    // mix ladder the borders and chips use.
+    //
+    // The track stays fully transparent: the thumb floats over the content the
+    // way macOS overlay scrollbars do, and a filled channel would put a vertical
+    // slab down the edge of every panel.
+    let scrollbar_thumb: Hsla = rgb(presets::mix(m.background, m.foreground, 0.26)).into();
+    let scrollbar_thumb_hover: Hsla = rgb(presets::mix(m.background, m.foreground, 0.42)).into();
+    t.scrollbar = gpui::transparent_black();
+    t.scrollbar_thumb = scrollbar_thumb;
+    t.scrollbar_thumb_hover = scrollbar_thumb_hover;
+    t.tokens.scrollbar = gpui::transparent_black().into();
+    t.tokens.scrollbar_thumb = scrollbar_thumb.into();
+    t.tokens.scrollbar_thumb_hover = scrollbar_thumb_hover.into();
+
+    // Follow the platform: auto-hide (fade in on scroll, out when idle) where
+    // the OS uses overlay scrollbars — the macOS default — and stay permanently
+    // visible where it doesn't, which is Windows and Linux. gpui-component's own
+    // `sync_scrollbar_appearance` picks `Hover` for that second case, meaning the
+    // bar only appears once the pointer is within 16px of the panel edge; that's
+    // the "no scrollbar at all" report from issue #185 on Windows.
+    t.scrollbar_show = if auto_hide_scrollbars {
+        ScrollbarShow::Scrolling
+    } else {
+        ScrollbarShow::Always
+    };
 
     // Round every gpui-component widget (buttons, inputs, selects, switches,
     // segmented controls, menus) to match the shell's own hand-rolled chrome,

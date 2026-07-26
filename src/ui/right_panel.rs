@@ -32,6 +32,7 @@ use crate::ui::app::{
     CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App, tile_trailing_inset,
     tile_trailing_inset_sm,
 };
+use crate::ui::scrollbar::with_vertical_scrollbar;
 
 /// Bounds for the panel's width, mirroring the rail's: a floor so the tree never
 /// becomes an ellipsis parade, and a ceiling as a fraction of the window so a
@@ -77,6 +78,13 @@ pub(crate) struct RightPanelState {
     /// already watching finishes connecting — and the loop reads this on each
     /// reschedule so it picks the change up on the next tick.
     pub(crate) procs_forwards: bool,
+    /// Scroll position of the shared body container (Info / Outline / Changes),
+    /// owned here rather than left to gpui's element-id state so the overlay
+    /// scrollbar has a handle to read the offset from and to drag.
+    pub(crate) scroll: gpui::ScrollHandle,
+    /// The Files tab's local tree scrolls in its own container (it carries the
+    /// tree's focus handle and key bindings), so it needs its own handle.
+    pub(crate) tree_scroll: gpui::ScrollHandle,
 }
 
 /// How often the Info tab re-queries processes and ports while it's open. Fast
@@ -465,18 +473,22 @@ impl Tty7App {
     /// The body's scrolling area, so every tab shares one scroll container and
     /// one content inset.
     fn panel_scroll(&self, inner: AnyElement, title: AnyElement) -> AnyElement {
+        let body = div()
+            .id("right-panel-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.right_panel.scroll)
+            .child(inner);
         v_flex()
             .flex_1()
             .min_h_0()
             .child(title)
-            .child(
-                div()
-                    .id("right-panel-body")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(inner),
-            )
+            .child(with_vertical_scrollbar(
+                "right-panel-body-scrollbar",
+                body,
+                &self.right_panel.scroll,
+            ))
             .into_any_element()
     }
 
