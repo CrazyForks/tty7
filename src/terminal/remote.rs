@@ -1616,6 +1616,10 @@ fn terminal_config_from_user(user_config: &crate::core::config::Config) -> Confi
         scrolling_history: user_config.scrollback_limit,
         default_cursor_style: alacritty_cursor_style(user_config.cursor_style),
         semantic_escape_chars: user_config.word_separators.clone(),
+        // `alacritty_terminal` leaves this off for embedders by default. tty7's
+        // input encoder supports CSI-u, so allow foreground applications to
+        // negotiate it instead of collapsing modified keys to legacy bytes.
+        kitty_keyboard: true,
         ..Config::default()
     }
 }
@@ -1650,6 +1654,43 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn kitty_keyboard_negotiation_reports_the_requested_mode() {
+        let config = terminal_config_from_user(&crate::core::config::Config::default());
+        assert!(config.kitty_keyboard);
+
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+
+        // Pi and other modern TUIs push their requested progressive-enhancement
+        // flags, then query the active mode before deciding how to parse keys.
+        DaemonMsg::Output(b"\x1b[>7u\x1b[?u".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+
+        let mut reply = None;
+        for _ in 0..200 {
+            while let Ok(event) = term.events.try_recv() {
+                if let AlacEvent::PtyWrite(text) = event {
+                    reply = Some(text);
+                }
+            }
+            if reply.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(reply.as_deref(), Some("\x1b[?7u"));
+        assert!(
+            term.term
+                .lock()
+                .mode()
+                .contains(TermMode::DISAMBIGUATE_ESC_CODES)
+        );
+    }
 
     #[test]
     fn spawn_retry_only_for_daemon_disconnects() {
