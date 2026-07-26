@@ -95,7 +95,8 @@ impl Tty7App {
             // An id + `overflow_y_scroll` makes the row column scroll on its own
             // when the tabs outgrow the window height, leaving the "+" footer
             // pinned (same pattern the settings panel uses). `track_scroll` lets
-            // `activate` pull the selected row into view.
+            // `activate` pull the selected row into view — and feeds the overlay
+            // scrollbar the wrapper below hangs over this column.
             .id("tab-sidebar-list")
             .track_scroll(&self.sidebar_scroll)
             .flex_1()
@@ -962,7 +963,11 @@ impl Tty7App {
                             .on_double_click(|_, window, _| window.titlebar_double_click())
                     })
                     .child(top_bar)
-                    .child(list),
+                    .child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "tab-sidebar-scrollbar",
+                        list,
+                        &self.sidebar_scroll,
+                    )),
             )
             .child(handle)
     }

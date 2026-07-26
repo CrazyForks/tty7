@@ -543,7 +543,8 @@ pub struct Tty7App {
     pub(crate) right_panel_tab: RightPanelTab,
     pub(crate) sidebar_collapsed: bool,
     /// Scroll handle for the sidebar's row list, so activating a tab scrolls its
-    /// row into view.
+    /// row into view — and so the rail's overlay scrollbar has an offset to
+    /// track and drag (see [`crate::ui::scrollbar`]).
     pub(crate) sidebar_scroll: gpui::ScrollHandle,
     /// `Some` while a tab / group is being dragged to a new position, in either
     /// the strip or the rail: the frozen geometry the live preview reflow is

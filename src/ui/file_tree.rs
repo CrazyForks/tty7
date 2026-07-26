@@ -1120,11 +1120,12 @@ impl Tty7App {
         } else {
             self.file_tree.search_rows()
         };
-        v_flex()
+        let column = v_flex()
             .id("right-panel-tree-rows")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.right_panel.tree_scroll)
             .px_1()
             .pb_1()
             // Keyboard nav (arrows / enter / rename) followed the tree out of the
@@ -1136,8 +1137,12 @@ impl Tty7App {
             .children(
                 rows.iter()
                     .flat_map(|row| self.render_tree_row(row, window, cx)),
-            )
-            .into_any_element()
+            );
+        crate::ui::scrollbar::with_vertical_scrollbar(
+            "right-panel-tree-scrollbar",
+            column,
+            &self.right_panel.tree_scroll,
+        )
     }
 
     /// One row (plus, when an inline edit targets it, the edit input row).
