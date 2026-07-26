@@ -1247,9 +1247,18 @@ impl Tty7App {
                 let app = cx.entity().downgrade();
                 let path = path.clone();
                 let is_root = row.is_root;
+                let show_hidden = self.file_tree.show_hidden;
                 move |menu, _window, cx| {
                     let danger = cx.theme().danger;
-                    Self::tree_row_context_menu(menu, &path, is_dir, is_root, danger, &app)
+                    Self::tree_row_context_menu(
+                        menu,
+                        &path,
+                        is_dir,
+                        is_root,
+                        show_hidden,
+                        danger,
+                        &app,
+                    )
                 }
             });
 
@@ -1279,12 +1288,16 @@ impl Tty7App {
         out
     }
 
-    /// The per-row right-click menu, mirroring Warp's Project Explorer set.
+    /// The per-row right-click menu, mirroring Warp's Project Explorer set, plus
+    /// the tree's one view option (dotfiles) — which lives here rather than as a
+    /// header button: it is set once and then forgotten, and a tile in the header
+    /// spends the panel's scarcest row on it forever.
     fn tree_row_context_menu(
         menu: PopupMenu,
         path: &Path,
         is_dir: bool,
         is_root: bool,
+        show_hidden: bool,
         danger: gpui::Hsla,
         app: &gpui::WeakEntity<Self>,
     ) -> PopupMenu {
@@ -1379,6 +1392,8 @@ impl Tty7App {
                 }
             }));
 
+        menu = menu.separator().item(dotfiles_menu_item(show_hidden, app));
+
         if !is_root {
             menu = menu.separator().item(
                 PopupMenuItem::element(move |_window, _cx| {
@@ -1395,6 +1410,27 @@ impl Tty7App {
         }
         menu
     }
+}
+
+/// The tree's dotfile switch as a row of the tree's existing right-click menu.
+///
+/// The label states what the click will do rather than checking off the current
+/// state: a single checked item makes `PopupMenu` reserve a left icon gutter on
+/// *every* row in the menu (see `tab_strip::window_chrome`), and the menu has a
+/// dozen rows with nothing to put in one.
+fn dotfiles_menu_item(show_hidden: bool, app: &gpui::WeakEntity<Tty7App>) -> PopupMenuItem {
+    let app = app.clone();
+    PopupMenuItem::new(if show_hidden {
+        "Hide Dotfiles"
+    } else {
+        "Show Dotfiles"
+    })
+    .on_click(move |_, _window, cx| {
+        let _ = app.update(cx, |this, cx| {
+            this.file_tree.show_hidden = !this.file_tree.show_hidden;
+            cx.notify();
+        });
+    })
 }
 
 /// The little drag ghost shown while a row is dragged toward a terminal.
