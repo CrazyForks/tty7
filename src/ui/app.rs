@@ -9,7 +9,9 @@ use gpui_component::color_picker::{ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::select::{SearchableVec, SelectEvent, SelectState};
 use gpui_component::slider::{SliderEvent, SliderState};
-use gpui_component::{ActiveTheme as _, IndexPath, TitleBar, WindowExt as _};
+use gpui_component::{
+    ActiveTheme as _, IndexPath, InteractiveElementExt as _, TitleBar, WindowExt as _,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -188,6 +190,79 @@ pub(crate) fn title_bar_hug_offset() -> f32 {
     } else {
         tile_trailing_inset() - TITLE_BAR_LEAD
     }
+}
+
+/// Edge of the brand mark that anchors the window's leading corner off macOS
+/// (see [`window_mark`]). Between a chrome tile's 32px hit box and its 13px
+/// glyph: the mark paints no hover capsule, so what has to sit level with the
+/// tiles beside it is its *ink* — and solid art reads heavier than line work at
+/// equal size, hence short of the tile box rather than matching it.
+pub(crate) const WINDOW_MARK_SIZE: f32 = 20.;
+
+/// The "duo" mark — the same art the app icon and the About page carry — drawn
+/// at the leading edge of the title-bar row, or `None` on macOS.
+///
+/// macOS owns that corner: the traffic lights sit there, and [`TITLE_BAR_LEAD`]
+/// reserves them 80px. Everywhere else it is empty. The row's contents are the
+/// rail's controls at its *right* end and the window chrome at the far side, so
+/// the window's leading corner — the slot Windows reads as the app's identity,
+/// filled by Explorer, VS Code and Zed alike — held nothing at all, which comes
+/// across as unfinished rather than restrained.
+///
+/// Drawn, never clicked. It is not a menu button, so it stays out of the tile
+/// rhythm (no hover capsule) and deliberately takes no `occlude()`: the row it
+/// lives in is a `WindowControlArea::Drag`, and letting the mark fall through to
+/// that keeps the strip grabbable instead of punching a dead 20px hole in it.
+/// Make a row that stands in for the title bar behave like one: drag it to move
+/// the window, double-click it to zoom.
+///
+/// Three rows do this. The rail's top zone sits level with the real bar but
+/// outside it (the bar only spans the column beside the rail), and the code and
+/// diff overlays each cover the bar with a header of their own drawn to its line.
+/// Without this they are all dead strips: 40px across the top of the window that
+/// look exactly like the caption and do nothing when you grab them.
+///
+/// Driven the way gpui-component's own `TitleBar` drives it — a press arms a
+/// flag and the first *move* starts the window move — so a plain click, and a
+/// double-click, still land intact. Note that on Windows the drag area maps to
+/// HTCAPTION and the OS claims the press before gpui hit-tests, so every button
+/// inside one of these rows needs an `occlude()` wrapper to get its clicks back.
+pub(crate) fn title_bar_drag(row: gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div> {
+    let should_move = Rc::new(Cell::new(false));
+    row.window_control_area(gpui::WindowControlArea::Drag)
+        .on_mouse_down(gpui::MouseButton::Left, {
+            let should_move = should_move.clone();
+            move |_, _, _| should_move.set(true)
+        })
+        .on_mouse_up(gpui::MouseButton::Left, {
+            let should_move = should_move.clone();
+            move |_, _, _| should_move.set(false)
+        })
+        .on_mouse_move(move |_, window, _| {
+            if should_move.replace(false) {
+                window.start_window_move();
+            }
+        })
+        .on_double_click(|_, window, _| window.titlebar_double_click())
+}
+
+pub(crate) fn window_mark() -> Option<impl IntoElement> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    // Decoded once and shared: the title bar re-renders on every cursor blink,
+    // and building a fresh `Image` per frame would re-copy the PNG and miss
+    // gpui's image cache, which is keyed on the image's identity.
+    static LOGO: std::sync::OnceLock<Arc<gpui::Image>> = std::sync::OnceLock::new();
+    let logo = LOGO
+        .get_or_init(|| {
+            Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                include_bytes!("../../assets/logo@256.png").to_vec(),
+            ))
+        })
+        .clone();
+    Some(img(logo).size(px(WINDOW_MARK_SIZE)).flex_shrink_0())
 }
 
 /// One tab: a split-pane tree plus an optional user-assigned name. Settings is
@@ -5198,6 +5273,26 @@ impl Render for Tty7App {
         } else {
             (Some(title_bar), None)
         };
+        // And where the overlays hang. Normally on the terminal column, which they
+        // fill: the bar is that column's first child, so an `inset_0` overlay
+        // covers it and the overlay's own header row lands *on* the caption line —
+        // which is what both headers are drawn for (title-bar height, the bar's
+        // insets, a full-size chrome tile for their one control).
+        //
+        // With the bar hoisted, a column-anchored overlay starts 40px down and its
+        // header sits one row too low: level with the panel's tab row instead of
+        // with the caption. So it hangs on the row that owns the bar instead,
+        // inset from the right by the panel's width — covering the bar's band over
+        // the terminal column (which carries nothing there but the drag region, or
+        // the rail's controls while it's collapsed: exactly what an overlay covers
+        // with the panel closed) and stopping short of the panel, so the ─ ▢ ✕
+        // group and the corner chrome keep their own surface and their clicks.
+        let (column_overlays, hoisted_overlays) = if panel_below_title_bar {
+            (Vec::new(), overlays)
+        } else {
+            (overlays, Vec::new())
+        };
+        let panel_px = self.right_panel_px(window, cx);
         // The terminal column, and the anchor for both overlays: they fill it —
         // and, since the panel is a sibling rather than a child, stop short of the
         // panel for free. With the bar spanning above, they stop short of it too,
@@ -5211,7 +5306,7 @@ impl Render for Tty7App {
             .relative()
             .when_some(column_title_bar, |this, bar| this.child(bar))
             .child(body_area)
-            .children(overlays);
+            .children(column_overlays);
         let panel_row = div()
             .flex_1()
             .min_h_0()
@@ -5233,6 +5328,8 @@ impl Render for Tty7App {
                     .min_w_0()
                     .flex()
                     .flex_col()
+                    // The containing block for the hoisted overlays below.
+                    .relative()
                     .child(
                         // The bar's own band over the panel, painted in the panel's
                         // surface so the column still reads as one continuous
@@ -5265,6 +5362,19 @@ impl Render for Tty7App {
                             .child(bar),
                     )
                     .child(panel_row)
+                    // Last child, so they paint over both the bar and the column.
+                    // Each overlay is `absolute().inset_0()` against this wrapper,
+                    // which is the only thing that has to know where the panel
+                    // starts.
+                    .children(hoisted_overlays.into_iter().map(|overlay| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .bottom_0()
+                            .right(px(panel_px))
+                            .child(overlay)
+                    }))
                     .into_any_element(),
                 None => panel_row.into_any_element(),
             })
