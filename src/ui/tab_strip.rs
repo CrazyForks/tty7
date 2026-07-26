@@ -631,14 +631,23 @@ impl Tty7App {
             .when(!cfg!(target_os = "macos"), |this| this.pr_1())
             .child(
                 div().occlude().flex_shrink_0().child(
+                    // Never drawn selected, exactly like the rail's own toggle
+                    // (`tab_sidebar`): the panel being open is already on screen —
+                    // it *is* the panel — so a lit capsule only restates it, and
+                    // the two panel toggles would disagree about what a chrome tile
+                    // means. The state lives in the tooltip's verb instead.
                     chrome_tile(
                         Button::new("titlebar-right-panel")
                             .icon(Icon::empty().path("icons/panel-right.svg")),
-                        panel_open,
+                        false,
                         cx,
                     )
                     .rounded_lg()
-                    .tooltip("Detail Panel")
+                    .tooltip(if panel_open {
+                        "Hide Detail Panel"
+                    } else {
+                        "Show Detail Panel"
+                    })
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.toggle_right_panel(cx);
                     })),
