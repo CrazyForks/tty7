@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CJK and emoji stop falling through to the OS on Windows and Linux** — the
+  default `font_fallbacks` named only faces that ship with macOS (Menlo, Apple
+  Color Emoji), so off macOS the entire chain matched nothing and every
+  ideograph and pictograph was resolved by the platform's own cascade instead.
+  The bundled Hack primary carries no CJK at all, so on Windows this was every
+  Chinese character in every pane. Defaults are now chosen per platform —
+  PingFang SC / Apple Color Emoji on macOS, Microsoft YaHei / Segoe UI Emoji on
+  Windows, Noto on Linux — and those stock names are appended to a
+  hand-written list as well, so a `config.json` that predates this change (or
+  was copied from another machine) is repaired at use time without being
+  rewritten. Maple Mono NF CN stays first on every platform: its 1.2em CJK
+  advance is the only exact fit for the two-column slot Hack's 0.60205em cell
+  produces, so a 1.0em stock face is left-aligned there with the remaining
+  ~0.2em showing as a gap on the right of each character.
+
 ## [26.7.4] - 2026-07-26
 
 ### Added

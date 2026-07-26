@@ -24,6 +24,31 @@
 - **Window opacity & blur** — Settings → Appearance → Window; applies to every theme, *Follow theme* returns to the theme's own `opacity` / `blur`
 - **CJK / IME input**
 
+## Fonts
+
+- **Hack is bundled** — it ships inside the binary, so the default renders identically everywhere without relying on a system install
+- **Primary + ordered fallbacks** — `font_family` and `font_fallbacks` in `config.json`; optional `font_family_bold` / `font_family_italic` for distinct faces, and `font_features` to pass OpenType features through (contextual ligatures stay off unless you ask for them)
+- **Platform-aware defaults** — the fallback list names faces the host OS actually ships (PingFang SC / Apple Color Emoji on macOS, Microsoft YaHei / Segoe UI Emoji on Windows, Noto on Linux). Those stock names are appended to a hand-written list too, so a `config.json` written on another platform still resolves
+
+### CJK and the two-column grid
+
+A cell is one advance of the primary face, and a wide (CJK) character is pinned
+to exactly two of them. A CJK fallback therefore sits flush in its slot only if
+its ideographs advance **twice** the primary's Latin advance.
+
+Bundled Hack advances 0.60205em, so a two-column slot is 1.2041em — while every
+stock CJK face (Microsoft YaHei, PingFang SC, Noto Sans CJK) advances 1.0em.
+Those glyphs get left-aligned in the slot and the leftover ~0.2em lands as a gap
+on the right of every character.
+
+[Maple Mono NF CN](https://github.com/subframe7536/maple-font) is tried first on
+every platform for exactly this reason — 0.6em Latin, 1.2em CJK, an exact
+two-cell fit against Hack. It is referenced by name only, never bundled (~20MB
+per weight): install it and tty7 picks it up with no config change.
+
+For CJK set *tight* rather than merely even, change the primary face instead —
+one that advances 0.5em (Sarasa Mono SC, say) makes two columns exactly 1.0em.
+
 ## Coding agents
 
 tty7 recognizes third-party coding agents running in a pane (Claude Code,

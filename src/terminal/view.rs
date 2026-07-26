@@ -784,19 +784,34 @@ fn transcode_to_png(bytes: &[u8], format: gpui::ImageFormat) -> Option<Vec<u8>> 
     Some(out)
 }
 
-/// The font fallback chain: the user's configured list with the bundled "Hack"
-/// pinned to the end. Hack ships inside the binary (`register_bundled_fonts`)
-/// and covers the symbols prompt themes lean on — `❯`, `➜`, box drawing, the
-/// sharp powerline wedges — with ink that fits a monospace advance. Without
-/// this anchor, a custom `font_family` that lacks one of those codepoints
-/// falls through the whole configured list into the OS cascade, which happily
-/// serves a proportional glyph wider than the cell that `paint_glyphs`'
-/// per-cell clip then truncates (issue #17's severed `➜`).
+/// The font fallback chain: the user's configured list, then this platform's
+/// stock faces, then the bundled "Hack" pinned to the end.
+///
+/// Hack ships inside the binary (`register_bundled_fonts`) and covers the
+/// symbols prompt themes lean on — `❯`, `➜`, box drawing, the sharp powerline
+/// wedges — with ink that fits a monospace advance. Without this anchor, a
+/// custom `font_family` that lacks one of those codepoints falls through the
+/// whole configured list into the OS cascade, which happily serves a
+/// proportional glyph wider than the cell that `paint_glyphs`' per-cell clip
+/// then truncates (issue #17's severed `➜`).
+///
+/// Hack carries no CJK at all (1548 codepoints mapped, zero ideographs), so on
+/// a chain that names only macOS faces every Chinese character falls through to
+/// the OS cascade too. [`platform_last_resort_fallbacks`] is appended for the
+/// same reason the Hack anchor exists — to keep the last word ours rather than
+/// the cascade's — and it repairs already-persisted configs, which a change to
+/// `Config::default` alone would never reach.
 fn fallback_chain(family: &str, configured: &[String]) -> Vec<String> {
     let mut chain = configured.to_vec();
-    if family != "Hack" && !chain.iter().any(|f| f == "Hack") {
-        chain.push("Hack".to_string());
+    let mut pin = |name: &str| {
+        if family != name && !chain.iter().any(|f| f == name) {
+            chain.push(name.to_string());
+        }
+    };
+    for name in crate::core::config::platform_last_resort_fallbacks() {
+        pin(name);
     }
+    pin("Hack");
     chain
 }
 
@@ -6040,27 +6055,66 @@ mod tests {
         let configured = vec!["Menlo".to_string(), "Apple Color Emoji".to_string()];
 
         // A custom primary that may lack the prompt symbols → Hack appended.
-        assert_eq!(
-            fallback_chain("JetBrains Mono", &configured),
-            ["Menlo", "Apple Color Emoji", "Hack"]
-        );
+        let chain = fallback_chain("JetBrains Mono", &configured);
+        assert_eq!(chain[..2], ["Menlo", "Apple Color Emoji"]);
+        assert_eq!(chain.last().unwrap(), "Hack");
 
         // Hack as the primary face already covers everything it could add.
-        assert_eq!(
-            fallback_chain("Hack", &configured),
-            ["Menlo", "Apple Color Emoji"]
-        );
+        let chain = fallback_chain("Hack", &configured);
+        assert_eq!(chain[..2], ["Menlo", "Apple Color Emoji"]);
+        assert!(!chain.iter().any(|f| f == "Hack"));
 
         // A user who lists Hack explicitly keeps their chosen position.
         let with_hack = vec!["Hack".to_string(), "Menlo".to_string()];
-        assert_eq!(fallback_chain("SF Mono", &with_hack), ["Hack", "Menlo"]);
+        let chain = fallback_chain("SF Mono", &with_hack);
+        assert_eq!(chain[..2], ["Hack", "Menlo"]);
 
         // "Hack Nerd Font" is a different family — the bundled face still lands.
         assert_eq!(
-            fallback_chain("Hack Nerd Font", &[]),
-            ["Hack"],
+            fallback_chain("Hack Nerd Font", &[]).last().unwrap(),
+            "Hack",
             "a Hack-prefixed family name must not suppress the bundled anchor"
         );
+    }
+
+    /// Hack has no ideographs, so a chain naming only faces this OS lacks sends
+    /// every CJK glyph into the platform cascade — where a 1.0em face gets
+    /// left-aligned inside `element.rs`'s 1.2041em two-column slot. The stock
+    /// names have to be in the chain even for a config written before the fix.
+    #[test]
+    fn fallback_chain_appends_platform_stock_faces() {
+        let stock = crate::core::config::platform_last_resort_fallbacks();
+        assert!(!stock.is_empty(), "every platform needs a CJK last resort");
+
+        // The pre-fix default: macOS-only names, nothing Windows/Linux can match.
+        let legacy = vec![
+            "Menlo".to_string(),
+            "Hasklug Nerd Font Mono".to_string(),
+            "Maple Mono NF CN".to_string(),
+            "Apple Color Emoji".to_string(),
+        ];
+        let chain = fallback_chain("Hack", &legacy);
+        for name in stock {
+            assert!(
+                chain.iter().any(|f| f == name),
+                "{name} missing from repaired chain {chain:?}"
+            );
+        }
+
+        // The user's own order is never displaced — stock faces land behind it.
+        assert_eq!(chain[..legacy.len()], legacy[..]);
+
+        // Already-listed stock faces aren't duplicated.
+        let explicit = vec![stock[0].to_string()];
+        let chain = fallback_chain("Hack", &explicit);
+        assert_eq!(
+            chain.iter().filter(|f| *f == stock[0]).count(),
+            1,
+            "stock face duplicated in {chain:?}"
+        );
+
+        // A stock face chosen as the *primary* isn't re-added as its own fallback.
+        assert!(!fallback_chain(stock[0], &[]).iter().any(|f| f == stock[0]));
     }
 
     /// The wheel reaches the app only through the modes it negotiated: mouse
