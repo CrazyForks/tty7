@@ -467,7 +467,7 @@ pub(crate) struct SettingsState {
     pub(crate) shell_args_input: Entity<InputState>,
     /// Custom working-directory path (used when the strategy is `Custom`).
     pub(crate) wd_path_input: Entity<InputState>,
-    /// Command template run when ⌘-clicking a file link (Links section). Empty
+    /// Command template run when ⌘/Ctrl-clicking a file link (Links section). Empty
     /// clears the override, restoring the built-in "open in default app".
     pub(crate) link_file_command_input: Entity<InputState>,
     /// Mouse-scroll multiplier slider (Terminal section).
@@ -621,6 +621,14 @@ pub(crate) struct Recording {
 /// — reuse the primary family with synthesized emphasis". Chosen to be an
 /// unlikely real font name.
 pub(crate) const FONT_DEFAULT_LABEL: &str = "Default (match primary)";
+
+/// How the link-click modifier is spelled in the Links copy. It's gpui's
+/// `secondary` (see `Modifiers::secondary`), so it must read ⌘ on macOS and
+/// Ctrl on Windows/Linux — same split `key_tokens` uses for keycaps.
+#[cfg(target_os = "macos")]
+const LINK_MODIFIER_LABEL: &str = "⌘";
+#[cfg(not(target_os = "macos"))]
+const LINK_MODIFIER_LABEL: &str = "Ctrl";
 
 /// Humanize a CamelCase action name for display: "CloseActiveTab" → "Close
 /// Active Tab".
@@ -3093,7 +3101,7 @@ impl Tty7App {
             .child(self.section_header("Links", cx))
             .child(self.settings_row(
                 "Detect URLs",
-                "Underline links on hover and open them on ⌘-click.",
+                format!("Underline links on hover and open them on {LINK_MODIFIER_LABEL}-click."),
                 link_switch,
                 cx,
             ))
@@ -3105,9 +3113,12 @@ impl Tty7App {
             ))
             .child(self.settings_row(
                 "Open files with",
-                "Command run when ⌘-clicking a file link, instead of the default app. \
-                 Use {path}, {line}, {column}; a flag whose value is absent is dropped \
-                 (e.g. herdr edit {path} --line={line}). Empty uses the default app.",
+                format!(
+                    "Command run when {LINK_MODIFIER_LABEL}-clicking a file link, instead of \
+                     the default app. Use {{path}}, {{line}}, {{column}}; a flag whose value \
+                     is absent is dropped (e.g. herdr edit {{path}} --line={{line}}). Empty \
+                     uses the default app."
+                ),
                 link_file_command_control,
                 cx,
             ))
