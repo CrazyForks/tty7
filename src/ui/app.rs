@@ -843,10 +843,16 @@ impl Tty7App {
             // First run (no session file): the very first terminal has no
             // predecessor to inherit from, so start in the app's current
             // directory (None → default behavior).
-            None => {
-                let first = new_terminal(font_size, None, None, None, window, cx);
-                (vec![Tab::new(Pane::leaf(first))], 0)
-            }
+            None => match new_terminal(font_size, None, None, None, window, cx) {
+                Ok(first) => (vec![Tab::new(Pane::leaf(first))], 0),
+                // The daemon we just tried to start isn't answering. A window
+                // with no tabs is a legal state (it shows the home page), and
+                // far better than taking the launch down over it.
+                Err(e) => {
+                    log::error!("first terminal failed to start: {e}");
+                    (Vec::new(), 0)
+                }
+            },
             // A saved session (with tabs, or an empty home-page state): rebuild it
             // the same way a daemon restart does.
             some => tabs_from_session(some, font_size, window, cx),
@@ -1265,7 +1271,13 @@ impl Tty7App {
             return;
         };
         let alive = alive_panes();
-        let pane = session_to_pane(&st.pane, &alive, self.font_size, window, cx);
+        let Some(pane) = session_to_pane(&st.pane, &alive, self.font_size, window, cx) else {
+            // Nothing came back (an unreachable daemon). Put the entry back so
+            // the tab is still reopenable once the daemon is up again.
+            window.push_notification("Could not reopen the tab: no terminal started", cx);
+            self.closed.push(st);
+            return;
+        };
         // Leaving the current tab for the reopened one; snapshot its focused
         // pane so switching back restores it (same as `activate`).
         self.remember_active_pane(window, cx);
@@ -2712,7 +2724,14 @@ impl Tty7App {
                 .focused_or_first(window, cx)
                 .and_then(|leaf| leaf.read(cx).local_cwd())
         });
-        let tab = new_terminal(self.font_size, cwd, None, shell, window, cx);
+        let tab = match new_terminal(self.font_size, cwd, None, shell, window, cx) {
+            Ok(view) => view,
+            Err(e) => {
+                log::error!("new tab spawn failed: {e}");
+                window.push_notification(format!("Could not open a terminal: {e}"), cx);
+                return;
+            }
+        };
         // Leaving the current tab for the new one; snapshot its focused pane
         // so switching back restores it (same as `activate`).
         self.remember_active_pane(window, cx);
@@ -2826,7 +2845,14 @@ impl Tty7App {
             }
         } else {
             let shell = target.read(cx).shell_spec();
-            new_terminal(self.font_size, cwd, None, shell, window, cx)
+            match new_terminal(self.font_size, cwd, None, shell, window, cx) {
+                Ok(view) => view,
+                Err(e) => {
+                    log::error!("split spawn failed: {e}");
+                    window.push_notification(format!("Could not split the pane: {e}"), cx);
+                    return;
+                }
+            }
         };
         if let Some(tab) = self.tabs.get_mut(self.active) {
             if tab.pane.split_leaf(&target, axis, new.clone()) {
@@ -3368,7 +3394,14 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let view = new_terminal(self.font_size, Some(wt.path), None, None, window, cx);
+        let view = match new_terminal(self.font_size, Some(wt.path), None, None, window, cx) {
+            Ok(view) => view,
+            Err(e) => {
+                log::error!("worktree tab spawn failed: {e}");
+                window.push_notification(format!("Could not open a terminal: {e}"), cx);
+                return;
+            }
+        };
         self.remember_active_pane(window, cx);
         self.maximized = None;
         let insert_at = self.new_tab_insert_at(cx);
@@ -5693,7 +5726,12 @@ fn tabs_from_session(
     let alive = alive_panes();
     let mut tabs: Vec<Tab> = Vec::with_capacity(session.tabs.len());
     for st in &session.tabs {
-        let pane = session_to_pane(&st.pane, &alive, font_size, window, cx);
+        // A tab whose every leaf failed to come back has nothing to show; drop
+        // it rather than restore an empty frame (or, worse, abort the launch).
+        let Some(pane) = session_to_pane(&st.pane, &alive, font_size, window, cx) else {
+            log::error!("dropping a restored tab: no pane in it could be started");
+            continue;
+        };
         tabs.push(Tab {
             pane,
             name: st.name.clone(),
@@ -5707,8 +5745,9 @@ fn tabs_from_session(
             sidebar_group: std::cell::RefCell::new(st.sidebar_group.clone()),
         });
     }
-    // Clamp the saved active index into the rebuilt range.
-    let active = session.active.min(tabs.len() - 1);
+    // Clamp the saved active index into the rebuilt range (which can be empty
+    // when nothing restored).
+    let active = session.active.min(tabs.len().saturating_sub(1));
     (tabs, active)
 }
 
@@ -5716,13 +5755,17 @@ fn tabs_from_session(
 /// `pane_id` is still alive in the daemon re-`attach`es (process + scrollback
 /// intact); otherwise it spawns a fresh shell in the saved cwd. `alive` is the
 /// daemon's current pane set, computed once by the caller.
+///
+/// `None` when nothing under this node could be started (an unreachable
+/// daemon): restore drops what it can't rebuild instead of leaving `Empty`
+/// nodes — which every tree operation ignores — in a live tab.
 fn session_to_pane(
     sp: &SessionPane,
     alive: &std::collections::HashSet<u64>,
     font_size: f32,
     window: &mut Window,
     cx: &mut Context<Tty7App>,
-) -> Pane {
+) -> Option<Pane> {
     match sp {
         SessionPane::Leaf {
             cwd,
@@ -5743,7 +5786,7 @@ fn session_to_pane(
                 if let Some(spec) = ssh_spec.clone() {
                     let resolved = crate::ui::ssh_connect::resolve_persisted_ssh_spec(spec, cx);
                     match new_terminal_native(font_size, cwd.clone(), resolved, window, cx) {
-                        Ok(view) => return Pane::leaf(view),
+                        Ok(view) => return Some(Pane::leaf(view)),
                         // Keep restore alive: fall through to a local shell in
                         // this slot rather than aborting startup.
                         Err(e) => log::error!("restoring native SSH pane failed: {e}"),
@@ -5752,7 +5795,13 @@ fn session_to_pane(
             }
             // A shell pick isn't persisted in the session, so a stale pane that
             // must respawn comes back on the default shell.
-            let view = new_terminal(font_size, cwd.clone(), restore, None, window, cx);
+            let view = match new_terminal(font_size, cwd.clone(), restore, None, window, cx) {
+                Ok(view) => view,
+                Err(e) => {
+                    log::error!("restoring pane failed: {e}");
+                    return None;
+                }
+            };
             // A pane that could NOT re-attach lost its running agent with the
             // daemon; when we captured that agent's native session id, hand
             // the fresh shell its resume command so the conversation picks up
@@ -5766,20 +5815,32 @@ fn session_to_pane(
             {
                 view.read(cx).run_command_line(&cmd);
             }
-            Pane::leaf(view)
+            Some(Pane::leaf(view))
         }
         SessionPane::Split { axis, ratio, a, b } => {
             let axis = match axis {
                 SessionAxis::Horizontal => Axis::Horizontal,
                 SessionAxis::Vertical => Axis::Vertical,
             };
-            let a = session_to_pane(a, alive, font_size, window, cx);
-            let b = session_to_pane(b, alive, font_size, window, cx);
-            Pane::split_node(axis, *ratio, a, b)
+            // One side failing collapses the split onto the survivor, exactly
+            // as closing that pane by hand would.
+            match (
+                session_to_pane(a, alive, font_size, window, cx),
+                session_to_pane(b, alive, font_size, window, cx),
+            ) {
+                (Some(a), Some(b)) => Some(Pane::split_node(axis, *ratio, a, b)),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            }
         }
     }
 }
 
+/// Build a shell-backed terminal view, wiring the per-pane subscriptions every
+/// pane needs. Fallible: the daemon can refuse the spawn (it died, it's
+/// wedged, the shell doesn't exist), and every caller here runs inside a gpui
+/// input callback, where a panic can't unwind and would abort the app instead
+/// of surfacing the failure. Report it, don't `expect` it.
 fn new_terminal(
     font_size: f32,
     working_directory: Option<std::path::PathBuf>,
@@ -5787,10 +5848,10 @@ fn new_terminal(
     shell: Option<ShellSpec>,
     window: &mut Window,
     cx: &mut Context<Tty7App>,
-) -> Entity<TerminalView> {
+) -> anyhow::Result<Entity<TerminalView>> {
+    let parts = TerminalView::spawn_shell_terminal(working_directory, restore_pane, shell)?;
     let view = cx.new(|cx| {
-        let mut view = TerminalView::new(working_directory, restore_pane, shell, window, cx)
-            .expect("failed to start terminal");
+        let mut view = TerminalView::from_shell_parts(parts, window, cx);
         // Inherit the current global font size so new panes match existing ones.
         view.font_size = px(font_size);
         view
@@ -5816,7 +5877,7 @@ fn new_terminal(
     )
     .detach();
     watch_pane_focus(&view, window, cx);
-    view
+    Ok(view)
 }
 
 /// Re-render the app whenever `view` takes focus. Nothing else does this: a
