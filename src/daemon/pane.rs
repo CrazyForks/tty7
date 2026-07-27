@@ -22,11 +22,14 @@
 //! the PTY owner is the one place that injects it, so there's a single source of
 //! truth and no duplicated rc logic. It covers zsh, bash and fish; on
 //! Windows (and any other shell) the pane simply launches bare and the
-//! cwd/prompt sniffing stays dormant.
+//! cwd/prompt sniffing stays dormant. A shell that ends up uninstrumented
+//! anyway — an rc file that `exec`s into another shell, a nested one started by
+//! hand — has its cwd tracked from the process table instead, on the reader's
+//! foreground poll (see [`apply_probed_cwd`]).
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -587,7 +590,10 @@ struct PaneState {
     /// subscriber a newer attach just installed (e.g. session-restore reattach,
     /// where the old GUI's connection lingers while the new one takes over).
     subscriber_epoch: u64,
-    /// Latest cwd sniffed from OSC 7, so a fresh attach can be told immediately.
+    /// The pane's current directory, so a fresh attach can be told immediately.
+    /// Seeded with the spawn directory, refined by the shell's OSC 7 reports,
+    /// and — for shells that emit none — corrected from the process table by the
+    /// reader's poll (see [`apply_probed_cwd`]).
     cwd: Option<PathBuf>,
     /// Shell prompt/command state from OSC 133.
     shell: ShellState,
@@ -640,6 +646,11 @@ struct ForegroundProbes {
     /// no agent") clears the chip. A detected agent travels with the `argv` it
     /// was identified from, kept for flag carry-over on session resume.
     agent: Box<dyn Fn() -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> + Send>,
+    /// The PTY owner's cwd straight from the process table. `None` means "no
+    /// reading" (native SSH, Windows, or a process we can't inspect), never
+    /// "no cwd" — see [`apply_probed_cwd`] for how a reading is reconciled with
+    /// the shell's own OSC 7 report.
+    cwd: Box<dyn Fn() -> Option<PathBuf> + Send>,
 }
 
 /// The local-PTY backend: the same handles `DaemonPane` has always owned.
@@ -851,6 +862,7 @@ impl DaemonPane {
         let fg_master = master.clone();
         let remote_master = master.clone();
         let agent_master = master.clone();
+        let cwd_master = master.clone();
         let reader = Self::spawn_reader(
             state,
             shutting_down,
@@ -860,6 +872,7 @@ impl DaemonPane {
             ForegroundProbes {
                 remote: Box::new(move || foreground_remote_context(&remote_master)),
                 agent: Box::new(move || foreground_agent(&agent_master)),
+                cwd: Box::new(move || foreground_cwd(&cwd_master, shell_pid)),
             },
             death,
         );
@@ -954,7 +967,9 @@ impl DaemonPane {
         // and no process-table SSH detection runs (this pane already *is* SSH).
         // The agent probe's `None` is "no opinion" (never applied), so an agent
         // identified from its sentinel events keeps its chip — the poll used to
-        // wipe it within half a second.
+        // wipe it within half a second. The cwd probe likewise: this pane's
+        // directory lives in the remote's namespace, and the only cwd the local
+        // process table could offer is meaningless here.
         let reader = Self::spawn_reader(
             state,
             shutting_down,
@@ -964,6 +979,7 @@ impl DaemonPane {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                cwd: Box::new(|| None),
             },
             death,
         );
@@ -1013,8 +1029,8 @@ impl DaemonPane {
     /// the pane not-alive and sending `Exited`, keeping the ring for a later
     /// attach, or handing an unattached pane to `on_dead` (see [`DeathReporter`]).
     ///
-    /// The two off-hot-path foreground probes (remote context + coding agent)
-    /// travel together in [`ForegroundProbes`]: both are process-table reads run
+    /// The off-hot-path foreground probes (remote context, coding agent, cwd)
+    /// travel together in [`ForegroundProbes`]: all are process-table reads run
     /// on the same 0.5 s poll, and bundling them keeps the signature at arity.
     fn spawn_reader(
         state: Arc<Mutex<PaneState>>,
@@ -1031,6 +1047,7 @@ impl DaemonPane {
         let ForegroundProbes {
             remote: foreground_remote,
             agent: foreground_agent_fn,
+            cwd: foreground_cwd_fn,
         } = probes;
         std::thread::Builder::new()
             .name("tty7-daemon-pane-reader".to_string())
@@ -1148,6 +1165,9 @@ impl DaemonPane {
                             // "no opinion" and is never applied — see
                             // [`ForegroundProbes::agent`].
                             let agent = poll_now.then(&foreground_agent_fn).flatten();
+                            // Same gate, same flattening: `None` is "nothing to
+                            // read", not "no cwd", so it never clears one.
+                            let probed_cwd = poll_now.then(&foreground_cwd_fn).flatten();
 
                             let tr1 = trace.then(std::time::Instant::now);
                             let mut st = state.lock().unwrap();
@@ -1168,6 +1188,10 @@ impl DaemonPane {
                             if let Some(agent) = agent {
                                 apply_agent(&mut st, agent);
                             }
+                            // Last: a remote transition in this same chunk has
+                            // already cleared the cwd, and `apply_probed_cwd`
+                            // declines to speak for a remote pane.
+                            apply_probed_cwd(&mut st, probed_cwd);
                             if let Some(tr1) = tr1 {
                                 tr_disp_t += tr1.elapsed();
                             }
@@ -1462,84 +1486,13 @@ impl DaemonPane {
         }
     }
 
-    /// Best-effort foreground cwd via `proc_pidinfo` (macOS), preferring the PTY's
-    /// foreground process group over the shell pid.
-    #[cfg(target_os = "macos")]
-    fn foreground_cwd(&self) -> Option<PathBuf> {
-        use std::ffi::CStr;
-
-        let pty = self.pty()?;
-        let read_cwd = |pid: i32| -> Option<PathBuf> {
-            if pid <= 0 {
-                return None;
-            }
-            let mut vinfo: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-            let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
-            // SAFETY: zeroed buffer of the expected type; real size passed; read
-            // back only on success.
-            let ret = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDVNODEPATHINFO,
-                    0,
-                    &mut vinfo as *mut _ as *mut libc::c_void,
-                    size,
-                )
-            };
-            if ret != size {
-                return None;
-            }
-            // SAFETY: on success the kernel NUL-terminates `vip_path`.
-            let s =
-                unsafe { CStr::from_ptr(vinfo.pvi_cdir.vip_path.as_ptr() as *const libc::c_char) }
-                    .to_str()
-                    .ok()?;
-            if s.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(s))
-            }
-        };
-
-        let pgid = pty
-            .master
-            .lock()
-            .ok()
-            .and_then(|m| m.process_group_leader());
-        pgid.and_then(read_cwd)
-            .or_else(|| read_cwd(pty.shell_pid.map(|p| p as i32).unwrap_or(0)))
-    }
-
-    /// Best-effort foreground cwd via `/proc/<pid>/cwd` (Linux), preferring the
-    /// PTY's foreground process group over the shell pid.
-    #[cfg(target_os = "linux")]
+    /// Best-effort foreground cwd read straight from the process table — what
+    /// `List` reports for a pane whose shell has yet to emit an OSC 7, and (via
+    /// the reader's 0.5 s poll) what keeps an *unintegrated* shell's cwd honest.
+    /// `None` for a native-SSH pane: there is no local process to read.
     fn foreground_cwd(&self) -> Option<PathBuf> {
         let pty = self.pty()?;
-        let read_cwd = |pid: i32| -> Option<PathBuf> {
-            if pid <= 0 {
-                return None;
-            }
-            std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
-        };
-        let pgid = pty
-            .master
-            .lock()
-            .ok()
-            .and_then(|m| m.process_group_leader());
-        pgid.and_then(read_cwd)
-            .or_else(|| read_cwd(pty.shell_pid.map(|p| p as i32).unwrap_or(0)))
-    }
-
-    /// Other platforms: no proc-query fallback (cwd only known via OSC 7).
-    /// No cwd fallback on Windows (or other non-mac/Linux targets): reading another
-    /// process's working directory needs PEB traversal via `ReadProcessMemory`,
-    /// which is undocumented and brittle across bitness/elevation. cwd there comes
-    /// from OSC 7 (the PowerShell shell integration emits it); `None` here just
-    /// means "no out-of-band fallback", so a shell without integration reports no
-    /// cwd rather than a wrong one.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    fn foreground_cwd(&self) -> Option<PathBuf> {
-        None
+        foreground_cwd(&pty.master, pty.shell_pid)
     }
 
     /// Executable basename of the PTY's foreground process-group leader, used as the
@@ -2002,6 +1955,59 @@ fn apply_agent_signals(
     }
 }
 
+/// Reconcile a process-table cwd reading with what the pane already reports.
+/// Called with the state lock held, off the 0.5 s poll.
+///
+/// **Why this exists.** OSC 7 is the precise channel, but it only speaks for
+/// shells tty7 managed to instrument. A shell that `exec`s into another one from
+/// its rc file (`exec fish` in `.zshrc`), a nested shell started by hand, or any
+/// shell tty7 has no integration for emits nothing — and since a pane's cwd is
+/// seeded with its spawn directory, such a pane doesn't report *no* cwd, it
+/// reports a permanently stale one. Every consumer then quietly misbehaves: new
+/// tabs and splits open in the wrong place (issue #187), and so do the git probe
+/// and path completion. The process table knows the truth in all those cases, so
+/// consult it — twice a second, off the hot path, alongside the SSH and agent
+/// probes that already run there.
+///
+/// **Why the shell's spelling still wins when both name the same directory.**
+/// A shell's `$PWD` keeps the *logical* path the user walked in through; the
+/// kernel only knows the physical one. With `~/dev` symlinked onto a volume,
+/// OSC 7 says `/Users/me/dev` and the process table says `/Volumes/x/dev` —
+/// both correct, but the logical one is what the user typed and expects a new
+/// tab to land in. So a reading that resolves to the directory we already report
+/// changes nothing; only a genuine disagreement does.
+fn apply_probed_cwd(st: &mut PaneState, probed: Option<PathBuf>) {
+    let Some(probed) = probed else {
+        return;
+    };
+    // A remote pane's directory lives in the remote's namespace. The local
+    // process table can only see the `ssh` client's own cwd, which would be
+    // attributed to the remote shell — the very confusion `apply_remote_context`
+    // clears the cwd to avoid.
+    if st.remote.is_some() {
+        return;
+    }
+    if st.cwd.as_deref().is_some_and(|cur| same_dir(cur, &probed)) {
+        return;
+    }
+    if let Some(sub) = &st.subscriber {
+        let _ = sub.send(DaemonMsg::Cwd(probed.clone()));
+    }
+    st.cwd = Some(probed);
+}
+
+/// Whether two paths name the same directory — equal as written, or resolving to
+/// the same place through symlinks (see [`apply_probed_cwd`]). A path that can't
+/// be resolved at all (deleted since, or a namespace this machine can't see)
+/// answers `false`: it is not the directory we just read from the kernel.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+}
+
 fn apply_remote_context(st: &mut PaneState, remote: Option<RemoteContext>) {
     if st.remote == remote {
         return;
@@ -2122,6 +2128,85 @@ fn is_foreground_command(fg_pgid: Option<i32>, shell_pid: Option<u32>) -> bool {
         (Some(pg), Some(shell)) if pg > 0 => pg as u32 != shell,
         _ => false,
     }
+}
+
+/// The cwd of whatever currently owns the PTY, via `proc_pidinfo` (macOS).
+/// Prefers the foreground process group over the shell pid: when the user has
+/// started a *nested* shell (`fish` typed into a zsh pane) the outer shell's own
+/// cwd stops tracking their `cd`s, and the group leader is the one that moves.
+#[cfg(target_os = "macos")]
+fn foreground_cwd(
+    master: &Mutex<Box<dyn MasterPty + Send>>,
+    shell_pid: Option<u32>,
+) -> Option<PathBuf> {
+    use std::ffi::CStr;
+
+    let read_cwd = |pid: i32| -> Option<PathBuf> {
+        if pid <= 0 {
+            return None;
+        }
+        let mut vinfo: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        // SAFETY: zeroed buffer of the expected type; real size passed; read
+        // back only on success.
+        let ret = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                &mut vinfo as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if ret != size {
+            return None;
+        }
+        // SAFETY: on success the kernel NUL-terminates `vip_path`.
+        let s = unsafe { CStr::from_ptr(vinfo.pvi_cdir.vip_path.as_ptr() as *const libc::c_char) }
+            .to_str()
+            .ok()?;
+        if s.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(s))
+        }
+    };
+
+    pty_foreground_pgid(master)
+        .and_then(read_cwd)
+        .or_else(|| read_cwd(shell_pid.map(|p| p as i32).unwrap_or(0)))
+}
+
+/// The cwd of whatever currently owns the PTY, via `/proc/<pid>/cwd` (Linux).
+/// Same foreground-group-first preference as the macOS reader.
+#[cfg(target_os = "linux")]
+fn foreground_cwd(
+    master: &Mutex<Box<dyn MasterPty + Send>>,
+    shell_pid: Option<u32>,
+) -> Option<PathBuf> {
+    let read_cwd = |pid: i32| -> Option<PathBuf> {
+        if pid <= 0 {
+            return None;
+        }
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    };
+    pty_foreground_pgid(master)
+        .and_then(read_cwd)
+        .or_else(|| read_cwd(shell_pid.map(|p| p as i32).unwrap_or(0)))
+}
+
+/// No cwd fallback on Windows (or other non-mac/Linux targets): reading another
+/// process's working directory needs PEB traversal via `ReadProcessMemory`,
+/// which is undocumented and brittle across bitness/elevation. cwd there comes
+/// from OSC 7 (the PowerShell shell integration emits it); `None` here just
+/// means "no out-of-band fallback", so a shell without integration reports no
+/// cwd rather than a wrong one.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn foreground_cwd(
+    _master: &Mutex<Box<dyn MasterPty + Send>>,
+    _shell_pid: Option<u32>,
+) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2466,6 +2551,73 @@ mod tests {
         let got = initial_working_directory(Some(file.clone()));
         assert_ne!(got.as_deref(), Some(file.as_path()));
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// Issue #187, end-to-end on a *live* PTY: the process-table cwd reading
+    /// must follow a child that changed directory without saying so. This is the
+    /// shape of an uninstrumented shell — `.zshrc` ending in `exec fish`, a
+    /// nested shell, a shell tty7 has no integration for — where OSC 7 never
+    /// arrives and the pane would otherwise report its spawn directory forever.
+    ///
+    /// Deliberately runs the whole platform chain (`process_group_leader` →
+    /// `proc_pidinfo` / `/proc/<pid>/cwd`) rather than the pure reconciliation
+    /// in [`apply_probed_cwd`]: it is exactly that plumbing the unit tests
+    /// can't see.
+    /// Runs the whole chain a new tab depends on — spawn → PTY → reader poll →
+    /// process-table read → `Cwd` to the client — so a break anywhere in it
+    /// fails here, not in a bug report.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn live_pane_reports_an_uninstrumented_shells_cwd() {
+        // `/usr` is unambiguous, is not the test runner's cwd, and is not a
+        // symlink on either platform (`/tmp` is one on macOS), so the reading
+        // can be compared verbatim.
+        let target = std::path::Path::new("/usr");
+
+        let (tx, rx) = mpsc::channel();
+        let pane = DaemonPane::spawn(
+            1,
+            Some(PathBuf::from("/")), // the spawn directory, and the seeded cwd
+            ws(80, 24),
+            Some(ShellSpec {
+                // `sh` is the point: tty7 has no integration for it, so nothing
+                // in this pane will ever emit an OSC 7. `cd` then `exec cat`
+                // leaves the child parked in a directory it never announced,
+                // holding the PTY foreground group — the `exec fish` case
+                // reduced to its essentials.
+                program: "sh".into(),
+                args: vec!["-c".into(), "cd /usr && exec cat".into()],
+                args_are_tty7_defaults: false,
+            }),
+            || {},
+        )
+        .expect("spawn pane");
+        pane.attach(tx);
+
+        // The poll rides the reader's chunks, so the pane has to say *something*
+        // first; the PTY echoes whatever we send. Bounded, and re-poked each
+        // round so a slow `exec` doesn't need the whole budget in one shot.
+        let mut reported = None;
+        for _ in 0..200 {
+            pane.write_input(b"\n");
+            while let Ok(msg) = rx.try_recv() {
+                if let DaemonMsg::Cwd(p) = msg {
+                    reported = Some(p);
+                }
+            }
+            if reported.as_deref() == Some(target) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        pane.kill();
+
+        assert_eq!(
+            reported.as_deref(),
+            Some(target),
+            "a pane whose shell emits no OSC 7 must still report where it \
+             actually is — this is what a new tab inherits (issue #187)"
+        );
     }
 
     /// End-to-end check of the *live* agent-detection chain this feature rides
@@ -3474,6 +3626,94 @@ mod tests {
         );
     }
 
+    /// Issue #187: a pane whose shell tty7 never managed to instrument — the
+    /// user's `.zshrc` ends in `exec fish`, so no OSC 7 is ever emitted — keeps
+    /// reporting the directory it was *spawned* in, and every new tab opens
+    /// there instead of where the user actually is. The process-table reading
+    /// corrects it, and the client is told.
+    #[test]
+    fn probed_cwd_corrects_a_pane_whose_shell_never_reports_osc7() {
+        let mut st = test_state(true);
+        // What `spawn` seeds: the pane's initial directory, and — with no OSC 7
+        // — for the rest of the pane's life.
+        st.cwd = Some(PathBuf::from("/Users/alice"));
+        let (tx, rx) = mpsc::channel();
+        st.subscriber = Some(tx);
+
+        apply_probed_cwd(&mut st, Some(PathBuf::from("/Users/alice/dev/tty7")));
+
+        assert_eq!(st.cwd.as_deref(), Some(Path::new("/Users/alice/dev/tty7")));
+        assert!(
+            matches!(rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/Users/alice/dev/tty7"))
+        );
+    }
+
+    /// The shell's own spelling outranks the kernel's when both name the same
+    /// directory: `$PWD` keeps the symlinked path the user walked in through,
+    /// and that is the one a new tab should open in. Uses a real symlink so the
+    /// canonicalization is the actual one, not a stand-in.
+    #[test]
+    fn probed_cwd_keeps_the_shells_spelling_for_a_symlinked_path() {
+        let tmp = std::env::temp_dir().join(format!("tty7-cwd-{}", std::process::id()));
+        let real = tmp.join("real");
+        let link = tmp.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        let _ = std::fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real, &link).unwrap();
+
+        let mut st = test_state(true);
+        st.cwd = Some(link.clone()); // as OSC 7 reported it
+        let (tx, rx) = mpsc::channel();
+        st.subscriber = Some(tx);
+
+        // The kernel reports the physical path — same directory, different name.
+        apply_probed_cwd(&mut st, Some(real.canonicalize().unwrap()));
+
+        assert_eq!(st.cwd.as_deref(), Some(link.as_path()));
+        assert!(rx.try_recv().is_err(), "same directory → nothing to tell");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A remote pane's cwd lives in the remote's namespace; the only thing the
+    /// local process table can see is the `ssh` client's own directory, which
+    /// must never be attributed to the remote shell.
+    #[test]
+    fn probed_cwd_declines_to_speak_for_a_remote_pane() {
+        let mut st = test_state(true);
+        st.remote = Some(RemoteContext {
+            kind: RemoteKind::Ssh,
+            argv: vec!["ssh".into(), "build-box".into()],
+            target: "build-box".into(),
+        });
+        st.cwd = None;
+        let (tx, rx) = mpsc::channel();
+        st.subscriber = Some(tx);
+
+        apply_probed_cwd(&mut st, Some(PathBuf::from("/Users/alice/dev/tty7")));
+
+        assert_eq!(st.cwd, None);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// No reading (native SSH, Windows, an unreadable process) is "no opinion",
+    /// never "no cwd" — it must not clear what the pane already reports.
+    #[test]
+    fn probed_cwd_absent_leaves_the_reported_cwd_alone() {
+        let mut st = test_state(true);
+        st.cwd = Some(PathBuf::from("/work"));
+        let (tx, rx) = mpsc::channel();
+        st.subscriber = Some(tx);
+
+        apply_probed_cwd(&mut st, None);
+
+        assert_eq!(st.cwd.as_deref(), Some(Path::new("/work")));
+        assert!(rx.try_recv().is_err());
+    }
+
     /// Attaching replays Size → Snapshot (→ Cwd) in order and installs the
     /// subscriber under a fresh epoch.
     #[test]
@@ -3548,6 +3788,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(move || {
                 dead_flag.store(true, Ordering::SeqCst)
@@ -3568,6 +3809,45 @@ mod tests {
         );
     }
 
+    /// Wiring for issue #187: the reader's foreground poll applies the cwd
+    /// reading, so an uninstrumented shell's directory reaches the client with
+    /// no OSC 7 anywhere in the byte stream. The poll gate opens on the first
+    /// chunk, so one read is enough.
+    #[test]
+    fn reader_poll_applies_the_probed_cwd() {
+        let state = Arc::new(Mutex::new(test_state(true)));
+        let (sub_tx, sub_rx) = mpsc::channel();
+        {
+            let mut st = state.lock().unwrap();
+            st.cwd = Some(PathBuf::from("/Users/alice")); // the spawn directory
+            st.subscriber = Some(sub_tx);
+        }
+
+        let handle = DaemonPane::spawn_reader(
+            state.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OutputGate::new()),
+            Box::new(std::io::Cursor::new(b"alice@host ~ % ".to_vec())),
+            || false,
+            ForegroundProbes {
+                remote: Box::new(|| None),
+                agent: Box::new(|| None),
+                cwd: Box::new(|| Some(PathBuf::from("/Users/alice/dev/tty7"))),
+            },
+            Arc::new(DeathReporter::new(|| {})),
+        );
+        handle.join().unwrap();
+
+        assert_eq!(
+            state.lock().unwrap().cwd.as_deref(),
+            Some(Path::new("/Users/alice/dev/tty7"))
+        );
+        assert!(matches!(sub_rx.try_recv(), Ok(DaemonMsg::Output(_))));
+        assert!(
+            matches!(sub_rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/Users/alice/dev/tty7"))
+        );
+    }
+
     /// Regression: EOF with *nobody* attached must fire `on_dead` so the server
     /// can drop the pane — otherwise a detached pane whose shell exits leaks its
     /// zombie child and replay ring in the registry for the daemon's lifetime.
@@ -3585,6 +3865,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(move || dead_tx.send(()).unwrap())),
         );
@@ -3611,6 +3892,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(move || {
                 dead_flag.store(true, Ordering::SeqCst)

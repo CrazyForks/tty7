@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **New tabs and splits open in the right directory even when the shell can't be
+  instrumented** ([#187](https://github.com/l0ng-ai/tty7/issues/187)) — a pane
+  learned its directory from `OSC 7`, which only shells tty7 injects its
+  integration into ever emit. A shell that `exec`s into another one from its rc
+  file (`exec fish` at the end of `.zshrc`), a nested shell started by hand, or
+  any shell with no integration at all emitted none — and because a pane's
+  directory is seeded with the one it was spawned in, such a pane didn't report
+  *no* directory, it reported a permanently stale one. New tabs, splits, the git
+  probe and path completion all followed it to the wrong place, with nothing on
+  screen to say why. The pane now also reads its directory from the process
+  table, on the same half-second foreground poll that already detects SSH
+  sessions and coding agents. A shell that does emit `OSC 7` keeps its own
+  spelling of the path: `$PWD` preserves the symlinked route the user walked in
+  through, and that is the one a new tab should open in. macOS and Linux;
+  Windows has no equivalent process query and is unchanged.
+
 - **CJK and emoji stop falling through to the OS on Windows and Linux** — the
   default `font_fallbacks` named only faces that ship with macOS (Menlo, Apple
   Color Emoji), so off macOS the entire chain matched nothing and every
