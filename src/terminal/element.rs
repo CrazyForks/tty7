@@ -42,6 +42,11 @@ enum UnderlineKind {
 #[derive(Clone)]
 struct RenderCell {
     c: char,
+    /// Combining marks the emulator stacked on this cell: accents, variation
+    /// selectors, ZWJ-sequence tails. They carry no column of their own, but
+    /// dropping them changes what the shaper sees — `❤` and `❤\u{FE0F}` pick
+    /// different faces — so they ride along and get shaped with their base.
+    marks: Option<Box<[char]>>,
     fg: Hsla,
     bg: Hsla,
     draw_bg: bool,
@@ -66,6 +71,7 @@ impl Default for RenderCell {
     fn default() -> Self {
         Self {
             c: ' ',
+            marks: None,
             fg: Hsla::default(),
             bg: Hsla::default(),
             draw_bg: false,
@@ -195,6 +201,7 @@ fn snapshot_cell(
 
     let mut rc = RenderCell {
         c: cell.c,
+        marks: cell.zerowidth().map(Box::from),
         fg: to_hsla(fgc),
         bg: to_hsla(bgc),
         draw_bg,
@@ -442,9 +449,11 @@ impl GlyphStyle {
 }
 
 /// A blank cell paints no glyph (and today, no underline either — see
-/// `GlyphStyle::draws_on_blanks`).
+/// `GlyphStyle::draws_on_blanks`). A blank carrying combining marks is not
+/// blank: a mark that opens a line lands on the space the grid starts with, and
+/// it still has to be drawn.
 fn is_blank(cell: &RenderCell) -> bool {
-    cell.c == '\0' || cell.c == ' '
+    (cell.c == '\0' || cell.c == ' ') && cell.marks.is_none()
 }
 
 /// One paintable piece of a row produced by [`segment_row`].
@@ -472,6 +481,16 @@ enum RowSeg {
     /// drawing, accented Latin, …) that may route to a fallback face whose
     /// advance isn't the cell width.
     Solo { col: usize },
+    /// A base plus the combining marks stacked on it, shaped as one string so
+    /// the marks reach the shaper. Never batched with neighbours: the marks add
+    /// characters without adding columns, which is exactly the correspondence
+    /// `force_width` relies on in a [`RowSeg::Run`] or [`RowSeg::Wide`].
+    Cluster {
+        col: usize,
+        /// Columns the base occupies — 2 once the grid marked it wide.
+        cells: usize,
+        text: String,
+    },
 }
 
 /// Split one grid row into paintable segments.
@@ -499,6 +518,21 @@ fn segment_row(row: &[RenderCell]) -> Vec<RowSeg> {
             col += 1;
             continue;
         }
+        // Combining marks come first: they can sit on an ASCII base too, and
+        // either way the whole cluster has to reach the shaper in one string.
+        if let Some(marks) = &cell.marks {
+            let cells = if col + 1 < row.len() && row[col + 1].spacer {
+                2
+            } else {
+                1
+            };
+            let mut text = String::with_capacity(1 + marks.len());
+            text.push(cell.c);
+            text.extend(marks.iter());
+            segs.push(RowSeg::Cluster { col, cells, text });
+            col += cells;
+            continue;
+        }
         if !cell.c.is_ascii_graphic() {
             // Wide (two-column) glyph? The trailing spacer is the grid's own
             // width marker, so no Unicode width guessing is needed.
@@ -513,6 +547,7 @@ fn segment_row(row: &[RenderCell]) -> Vec<RowSeg> {
                 while col + 1 < row.len()
                     && !row[col].spacer
                     && !is_blank(&row[col])
+                    && row[col].marks.is_none()
                     && !row[col].c.is_ascii_graphic()
                     && row[col + 1].spacer
                     && GlyphStyle::of(&row[col]) == style
@@ -552,7 +587,11 @@ fn segment_row(row: &[RenderCell]) -> Vec<RowSeg> {
                 col += 1;
                 continue;
             }
-            if c.spacer || !c.c.is_ascii_graphic() || GlyphStyle::of(c) != style {
+            if c.spacer
+                || c.marks.is_some()
+                || !c.c.is_ascii_graphic()
+                || GlyphStyle::of(c) != style
+            {
                 break;
             }
             for _ in 0..gap {
@@ -797,6 +836,16 @@ fn paint_glyphs(
                     }
                     (col, 1, char_string(cell.c), None, true)
                 }
+                // Same pinning as the batched runs, just for one base: two
+                // columns get `force_width` so a fallback emoji face can't
+                // drift, one column paints at the origin like `Solo`.
+                RowSeg::Cluster { col, cells, text } => (
+                    col,
+                    cells,
+                    SharedString::from(text),
+                    (cells == 2).then(|| geom.cell_width * 2.),
+                    cells == 1,
+                ),
             };
 
             let style = GlyphStyle::of(&buf[row_base + start]);
@@ -2062,6 +2111,66 @@ mod tests {
     fn segment_row_ignores_blank_rows() {
         let row: Vec<_> = "  \0 ".chars().map(cell).collect();
         assert!(segment_row(&row).is_empty());
+    }
+
+    fn cluster(col: usize, cells: usize, text: &str) -> RowSeg {
+        RowSeg::Cluster {
+            col,
+            cells,
+            text: text.to_string(),
+        }
+    }
+
+    /// Combining marks reach the shaper attached to their base, in one string.
+    #[test]
+    fn segment_row_shapes_combining_marks_with_their_base() {
+        // Single column: `e` + U+0301 → é.
+        let mut row = vec![cell('a'), cell('e'), cell('b')];
+        row[1].marks = Some(Box::from(['\u{0301}']));
+        assert_eq!(
+            segment_row(&row),
+            [run(0, 1, "a"), cluster(1, 1, "e\u{0301}"), run(2, 1, "b"),]
+        );
+
+        // Two columns: the emulator widened the base, so the cluster owns the
+        // spacer too (❤ + U+FE0F).
+        let mut row = wide_cells("\u{2764}");
+        row[0].marks = Some(Box::from(['\u{FE0F}']));
+        assert_eq!(segment_row(&row), [cluster(0, 2, "\u{2764}\u{FE0F}")]);
+    }
+
+    /// A marked cell never joins a batch: marks add characters without adding
+    /// columns, which would desync `force_width`'s glyph-per-column pinning.
+    #[test]
+    fn segment_row_never_batches_a_marked_cell() {
+        // ASCII run splits around it.
+        let mut row: Vec<_> = "abc".chars().map(cell).collect();
+        row[1].marks = Some(Box::from(['\u{0301}']));
+        assert_eq!(
+            segment_row(&row),
+            [run(0, 1, "a"), cluster(1, 1, "b\u{0301}"), run(2, 1, "c"),]
+        );
+
+        // Wide run splits around it.
+        let mut row = wide_cells("你好世");
+        row[2].marks = Some(Box::from(['\u{FE0F}']));
+        assert_eq!(
+            segment_row(&row),
+            [
+                wide(0, 2, "你"),
+                cluster(2, 2, "好\u{FE0F}"),
+                wide(4, 2, "世"),
+            ]
+        );
+    }
+
+    /// A mark opening a line lands on the space the grid starts with — that
+    /// cell still has ink, so it must not be skipped as blank.
+    #[test]
+    fn segment_row_keeps_a_blank_that_carries_marks() {
+        let mut row = vec![cell(' '), cell(' ')];
+        row[0].marks = Some(Box::from(['\u{0301}']));
+        assert_eq!(segment_row(&row), [cluster(0, 1, " \u{0301}")]);
     }
 
     #[test]
