@@ -848,7 +848,9 @@ fn paint_glyphs(
                     // glyph only covers the font's own line height, which is
                     // what broke every vertical run of `│`/`╭`/`╰` into dashes
                     // at line_height > 1.0 — see `boxdraw`.
-                    if let Some(ink) = super::boxdraw::glyph(cell.c, cell_bounds) {
+                    if let Some(ink) =
+                        super::boxdraw::glyph(cell.c, cell_bounds, window.scale_factor())
+                    {
                         let fg = GlyphStyle::of(cell).fg;
                         for piece in ink {
                             match piece {

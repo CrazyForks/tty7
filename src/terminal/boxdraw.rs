@@ -37,11 +37,20 @@ pub(crate) enum Ink {
 
 /// The ink for `c` sized to `bounds`, or `None` for anything that isn't a
 /// box-drawing/block character (which then renders through the font).
-pub(crate) fn glyph(c: char, bounds: Bounds<Pixels>) -> Option<Vec<Ink>> {
+///
+/// `scale` is the window's device scale factor. Every straight stroke is
+/// snapped to the *device pixel* grid it implies — not for crispness alone,
+/// but for continuity: a cell boundary at a fractional device pixel gets an
+/// antialiasing ramp on both sides, and two abutting 50%-coverage edges
+/// composite to 75% opacity, which perforated every multi-row `│` with a
+/// lighter band at each row boundary. Snapped edges rasterize with no ramp at
+/// all, so adjacent cells butt into one continuous solid — the same reason
+/// kitty's cell-aligned box bitmaps tile seamlessly.
+pub(crate) fn glyph(c: char, bounds: Bounds<Pixels>, scale: f32) -> Option<Vec<Ink>> {
     if !('\u{2500}'..='\u{259f}').contains(&c) {
         return None;
     }
-    let g = Cell::new(&bounds);
+    let g = Cell::new(&bounds, scale);
     if let Some((u, d, l, r)) = arms_of(c) {
         return Some(g.arms(u, d, l, r));
     }
@@ -73,10 +82,11 @@ struct Cell {
     cx: f32,
     cy: f32,
     t: f32,
+    scale: f32,
 }
 
 impl Cell {
-    fn new(b: &Bounds<Pixels>) -> Self {
+    fn new(b: &Bounds<Pixels>, scale: f32) -> Self {
         let x0 = b.origin.x.as_f32();
         let y0 = b.origin.y.as_f32();
         let x1 = x0 + b.size.width.as_f32();
@@ -89,11 +99,24 @@ impl Cell {
             cx: (x0 + x1) / 2.,
             cy: (y0 + y1) / 2.,
             t: ((x1 - x0) * 0.15).round().max(1.),
+            scale: scale.max(0.1),
         }
     }
 
+    /// Snap a logical coordinate onto the device pixel grid.
+    fn snap(&self, v: f32) -> f32 {
+        (v * self.scale).round() / self.scale
+    }
+
+    /// A rectangle with every edge snapped to device pixels (see [`glyph`]).
+    /// Snapping the two edges — not origin + size — is what keeps a shared
+    /// cell boundary shared: both cells snap the same coordinate to the same
+    /// pixel line, so consecutive `│` cells tile with zero gap and zero
+    /// overlap whatever the window position.
     fn rectb(&self, x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
-        Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
+        let (sx0, sy0) = (self.snap(x), self.snap(y));
+        let (sx1, sy1) = (self.snap(x + w), self.snap(y + h));
+        Bounds::new(point(px(sx0), px(sy0)), size(px(sx1 - sx0), px(sy1 - sy0)))
     }
 
     fn rect(&self, x: f32, y: f32, w: f32, h: f32) -> Ink {
@@ -265,16 +288,22 @@ impl Cell {
         let (cx, cy) = (self.cx, self.cy);
         let mut ink = Vec::new();
         // Straight stubs from the arc's ends to the cell edges (zero-length
-        // when the radius already spans the half-axis).
+        // when the radius already spans the half-axis). Each stub reaches one
+        // device pixel *into* the arc band: the stub is pixel-snapped, the arc
+        // isn't, and without the overlap that mismatch reopens a hairline
+        // seam exactly where they hand off.
+        let lap = 1. / self.scale;
         if sy > 0. {
-            ink.push(self.rect(cx - h, cy + r, self.t, self.y1 - (cy + r)));
+            let top = cy + r - lap;
+            ink.push(self.rect(cx - h, top, self.t, self.y1 - top));
         } else {
-            ink.push(self.rect(cx - h, self.y0, self.t, (cy - r) - self.y0));
+            ink.push(self.rect(cx - h, self.y0, self.t, (cy - r + lap) - self.y0));
         }
         if sx > 0. {
-            ink.push(self.rect(cx + r, cy - h, self.x1 - (cx + r), self.t));
+            let left = cx + r - lap;
+            ink.push(self.rect(left, cy - h, self.x1 - left, self.t));
         } else {
-            ink.push(self.rect(self.x0, cy - h, (cx - r) - self.x0, self.t));
+            ink.push(self.rect(self.x0, cy - h, (cx - r + lap) - self.x0, self.t));
         }
         // The arc band, stepped from the vertical stub (θ=0) to the horizontal
         // one (θ=π/2) around the arc centre one radius into the quadrant.
@@ -550,7 +579,7 @@ mod tests {
         for cp in 0x2500u32..=0x259f {
             let c = char::from_u32(cp).unwrap();
             assert!(
-                glyph(c, cell()).is_some(),
+                glyph(c, cell(), 1.).is_some(),
                 "U+{cp:04X} {c} fell through to the font"
             );
         }
@@ -565,7 +594,7 @@ mod tests {
         let (x1, y1) = (x0 + b.size.width.as_f32(), y0 + b.size.height.as_f32());
         for cp in 0x2500u32..=0x259f {
             let c = char::from_u32(cp).unwrap();
-            let (nx, xx, ny, xy) = extents(&glyph(c, b).unwrap());
+            let (nx, xx, ny, xy) = extents(&glyph(c, b, 1.).unwrap());
             assert!(
                 nx >= x0 - 0.01 && xx <= x1 + 0.01 && ny >= y0 - 0.01 && xy <= y1 + 0.01,
                 "U+{cp:04X} {c} paints outside the cell: \
@@ -588,7 +617,7 @@ mod tests {
             let Some((u, d, l, r)) = arms_of(c) else {
                 continue;
             };
-            let (nx, xx, ny, xy) = extents(&glyph(c, b).unwrap());
+            let (nx, xx, ny, xy) = extents(&glyph(c, b, 1.).unwrap());
             if u != Arm::None {
                 assert_eq!(ny, y0, "{c}: up arm misses the top edge");
             }
@@ -627,7 +656,7 @@ mod tests {
             ('╲', true, true, true, true),
         ];
         for (c, u, d, l, r) in expect {
-            let (nx, xx, ny, xy) = extents(&glyph(c, b).unwrap());
+            let (nx, xx, ny, xy) = extents(&glyph(c, b, 1.).unwrap());
             if u {
                 assert_eq!(ny, y0, "{c}: misses the top edge");
             }
@@ -650,7 +679,7 @@ mod tests {
         let b = cell();
         let cx = b.origin.x.as_f32() + b.size.width.as_f32() / 2.;
         let cy = b.origin.y.as_f32() + b.size.height.as_f32() / 2.;
-        for i in glyph('╬', b).unwrap() {
+        for i in glyph('╬', b, 1.).unwrap() {
             let Ink::Rect(r) = i else {
                 panic!("╬ should be rects only");
             };
@@ -670,18 +699,22 @@ mod tests {
         let b = cell();
         let (x0, y0) = (b.origin.x.as_f32(), b.origin.y.as_f32());
         let (w, h) = (b.size.width.as_f32(), b.size.height.as_f32());
-        let (nx, xx, ny, xy) = extents(&glyph('█', b).unwrap());
+        let (nx, xx, ny, xy) = extents(&glyph('█', b, 1.).unwrap());
         assert_eq!(
             (nx, xx, ny, xy),
             (x0, x0 + w, y0, y0 + h),
             "█ isn't the full cell"
         );
-        let (_, _, ny, xy) = extents(&glyph('▀', b).unwrap());
-        assert_eq!((ny, xy), (y0, y0 + h / 2.), "▀ isn't the top half");
-        let (_, _, ny, xy) = extents(&glyph('▄', b).unwrap());
-        assert_eq!((ny, xy), (y0 + h / 2., y0 + h), "▄ isn't the bottom half");
+        // Interior edges (the half-cell split) may sit up to half a device
+        // pixel from nominal after snapping; the outer edges stay exact.
+        let (_, _, ny, xy) = extents(&glyph('▀', b, 1.).unwrap());
+        assert_eq!(ny, y0, "▀ doesn't reach the top");
+        assert!((xy - (y0 + h / 2.)).abs() <= 0.5, "▀ isn't the top half");
+        let (_, _, ny, xy) = extents(&glyph('▄', b, 1.).unwrap());
+        assert_eq!(xy, y0 + h, "▄ doesn't reach the bottom");
+        assert!((ny - (y0 + h / 2.)).abs() <= 0.5, "▄ isn't the bottom half");
         for (c, alpha) in [('░', 0.25), ('▒', 0.5), ('▓', 0.75)] {
-            let ink = glyph(c, b).unwrap();
+            let ink = glyph(c, b, 1.).unwrap();
             assert_eq!(ink.len(), 1);
             let Ink::Shade(r, a) = &ink[0] else {
                 panic!("{c} should be a shade");
@@ -696,13 +729,13 @@ mod tests {
     #[test]
     fn stroke_weights_are_ordered_and_visible() {
         let light = {
-            let Ink::Rect(r) = &glyph('│', cell()).unwrap()[0] else {
+            let Ink::Rect(r) = &glyph('│', cell(), 1.).unwrap()[0] else {
                 panic!()
             };
             r.size.width.as_f32()
         };
         let heavy = {
-            let Ink::Rect(r) = &glyph('┃', cell()).unwrap()[0] else {
+            let Ink::Rect(r) = &glyph('┃', cell(), 1.).unwrap()[0] else {
                 panic!()
             };
             r.size.width.as_f32()
@@ -711,9 +744,43 @@ mod tests {
         assert!(heavy > light, "heavy stroke isn't heavier");
         // A pathologically narrow cell still yields visible ink.
         let tiny = Bounds::new(point(px(0.), px(0.)), size(px(2.), px(4.)));
-        let Ink::Rect(r) = &glyph('│', tiny).unwrap()[0] else {
+        let Ink::Rect(r) = &glyph('│', tiny, 1.).unwrap()[0] else {
             panic!()
         };
         assert!(r.size.width.as_f32() >= 1.);
+    }
+
+    /// The seam regression: with the window at a fractional device-pixel
+    /// offset, every straight stroke must still land on whole device pixels.
+    /// An unsnapped edge rasterizes an antialiasing ramp, and two abutting
+    /// ramps composite to 75% opacity — the perforated `│` runs this module
+    /// was reported for a second time over.
+    #[test]
+    fn straight_strokes_snap_to_device_pixels() {
+        let scale = 2.0;
+        // Deliberately misaligned: fractional origin and cell width.
+        let b = Bounds::new(point(px(10.37), px(20.11)), size(px(9.03), px(21.)));
+        let on_grid = |v: f32| ((v * scale).round() - v * scale).abs() < 1e-3;
+        for cp in 0x2500u32..=0x259f {
+            let c = char::from_u32(cp).unwrap();
+            for i in glyph(c, b, scale).unwrap() {
+                let (Ink::Rect(r) | Ink::Shade(r, _)) = i else {
+                    continue; // arcs and diagonals antialias on purpose
+                };
+                let (x, y) = (r.origin.x.as_f32(), r.origin.y.as_f32());
+                let (x2, y2) = (x + r.size.width.as_f32(), y + r.size.height.as_f32());
+                assert!(
+                    on_grid(x) && on_grid(y) && on_grid(x2) && on_grid(y2),
+                    "U+{cp:04X} {c}: stroke edge off the device grid \
+                     ({x}, {y})..({x2}, {y2}) at scale {scale}"
+                );
+            }
+        }
+        // And two vertically adjacent `│` cells must share their boundary
+        // exactly — same coordinate in, same snapped pixel line out.
+        let below = Bounds::new(point(px(10.37), px(41.11)), size(px(9.03), px(21.)));
+        let bottom = extents(&glyph('│', b, scale).unwrap()).3;
+        let top = extents(&glyph('│', below, scale).unwrap()).2;
+        assert_eq!(bottom, top, "adjacent │ cells no longer tile");
     }
 }
