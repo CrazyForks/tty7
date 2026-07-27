@@ -1196,9 +1196,13 @@ impl TerminalView {
         // its row may not exist any more, and the pointer sits over a different
         // cell regardless. Forget it — the next mouse move records a fresh one.
         // (`grid_line` also refuses a stale row, so this is about not underlining
-        // the wrong cell, not about safety.)
+        // the wrong cell, not about safety.) The link that cell resolved to goes
+        // with it: it is held in grid coordinates the reflow just moved text
+        // under, so keeping it would underline whatever now sits there (and hold
+        // the pointing-hand cursor over it) until the pointer moves again.
         if (cols, rows) != (self.terminal.size().cols, self.terminal.size().rows) {
             self.last_hover_cell = None;
+            self.hovered_link = None;
         }
         self.cell_width = cell_width;
         self.line_height = line_height;
@@ -6867,6 +6871,32 @@ mod gpui_tests {
                     !view.refresh_link_hover(true, cx),
                     "a row outside the grid can't hold a link"
                 );
+            })
+            .unwrap();
+    }
+
+    /// The other half of the fix: the pane that shrank forgets the hover it was
+    /// holding, rather than carrying a cell (and the underline it resolved) that
+    /// now names different text.
+    #[gpui::test]
+    fn a_resize_forgets_the_hovered_cell(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.hover_link_at(0, 23, true, cx);
+                assert_eq!(view.last_hover_cell, Some((0, 23)));
+                view.hovered_link = Some(HoveredLink {
+                    line: 23,
+                    start: 0,
+                    end: 3,
+                });
+                // The same geometry again changes nothing...
+                view.set_grid_size(80, 24, px(8.), px(17.));
+                assert_eq!(view.last_hover_cell, Some((0, 23)));
+                // ...but a split (or a window drag) that shrinks the pane does.
+                view.set_grid_size(80, 8, px(8.), px(17.));
+                assert!(view.last_hover_cell.is_none(), "the cell is stale");
+                assert!(view.hovered_link.is_none(), "so is the link it resolved");
             })
             .unwrap();
     }
