@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A config file saved with a UTF-8 BOM no longer wipes your settings** — every
+  config-dir file is read by a loader that treats any parse error as "there is
+  no file", falling back to defaults. `serde_json` rejects the U+FEFF a BOM puts
+  before the opening brace, so a BOM didn't report a broken config — it reported
+  an absent one, and tty7 came up on defaults with nothing in the log to explain
+  it. Windows makes this easy to hit by accident: PowerShell's `>`, `Out-File`
+  and `Set-Content -Encoding utf8` all write a BOM, so editing `config.json`
+  from a shell was enough to lose every setting. `config.json`, `session.json`
+  (which lost every workspace the same way) and hand-authored `themes/*.yaml`
+  now skip a leading BOM.
+
 - **New tabs and splits open in the right directory even when the shell can't be
   instrumented** ([#187](https://github.com/l0ng-ai/tty7/issues/187)) — a pane
   learned its directory from `OSC 7`, which only shells tty7 injects its

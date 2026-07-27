@@ -942,7 +942,8 @@ fn default_image_opacity() -> f32 {
 
 fn load_yaml_theme(path: &std::path::Path) -> Result<Theme, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let file: ThemeFile = serde_yaml::from_str(&text).map_err(|e| e.to_string())?;
+    let file: ThemeFile =
+        serde_yaml::from_str(crate::core::config::strip_bom(&text)).map_err(|e| e.to_string())?;
     let (id, derived_name) = id_and_name(path);
 
     let background = file.background.into_fill()?;
