@@ -124,7 +124,9 @@ mod tests {
 
         let body = std::fs::read_to_string(&path).expect("the hook wrote a record");
         assert!(body.contains("crash-log probe"), "message: {body}");
-        assert!(body.contains("src/core/crash.rs"), "location: {body}");
+        // Bare file name: `panic!`'s location carries the platform's own
+        // separator (`src\core\crash.rs` on Windows).
+        assert!(body.contains("crash.rs:"), "location: {body}");
         assert!(body.contains("test v"), "role + version: {body}");
     }
 
