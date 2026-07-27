@@ -77,6 +77,8 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let active = self.active;
+        // The rail is a sunk column, so its rows read the sidebar ladder.
+        let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
         // While the bare ⌘/Ctrl hold is armed (see `ui::hints`), each of the
         // first nine rows swaps its close affordance for a ⌘N badge — same slot
         // and footprint as the chips, so the vertical list gets the identical
@@ -409,7 +411,7 @@ impl Tty7App {
                     })
                     .when(!is_active, |s| {
                         s.text_color(cx.theme().sidebar_foreground)
-                            .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.5)))
+                            .hover(|s| s.bg(gpui::rgb(sf.hover)))
                     })
                     // Held: a light dimming so the row under your cursor reads
                     // as picked up. Not a lift — it stays in the rail's plane.
@@ -489,12 +491,13 @@ impl Tty7App {
                         // carries alpha; the inactive hover is a half-strength
                         // wash), so flatten them against `sidebar` to get the
                         // opaque colour the float must match.
-                        let backing = if is_active {
-                            cx.theme().sidebar.blend(cx.theme().sidebar_accent)
+                        // Both rungs are opaque ladder colours, so the float's
+                        // backing is just the rung itself — no flattening needed,
+                        // and no alpha to drift out of step with the row it copies.
+                        let backing: gpui::Hsla = if is_active {
+                            gpui::rgb(sf.selected).into()
                         } else {
-                            cx.theme()
-                                .sidebar
-                                .blend(cx.theme().sidebar_accent.opacity(0.5))
+                            gpui::rgb(sf.hover).into()
                         };
                         let mut fade_from = backing;
                         fade_from.a = 0.;

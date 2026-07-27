@@ -240,6 +240,7 @@ impl Tty7App {
     ) -> Stateful<Div> {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
+        let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
         let letter = match forward.kind {
             SshForwardKind::Local => "L",
             SshForwardKind::Remote => "R",
@@ -277,7 +278,7 @@ impl Tty7App {
             .py(px(3.))
             .rounded(px(5.))
             .cursor_pointer()
-            .hover(|s| s.bg(theme.sidebar_accent.opacity(0.55)))
+            .hover(|s| s.bg(gpui::rgb(sf.hover)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.edit_managed_forward(forward_for_edit.clone(), window, cx)
             }))
