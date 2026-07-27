@@ -1769,6 +1769,50 @@ mod tests {
         );
     }
 
+    /// Guards the `alacritty_terminal` pin, not our own code. Upstream reserves
+    /// columns one `char` at a time, so an emoji written as base + `U+FE0F`
+    /// (`❤️`, `🗂️`, `⚠️` — anything whose base is East Asian Width Neutral) gets
+    /// one column instead of two and shoves the rest of the line left by one.
+    /// Our fork re-scores the sequence and widens the cell; a bump back to an
+    /// unpatched rev must fail here rather than in the field (issue #203).
+    #[test]
+    fn emoji_presentation_sequences_reserve_two_columns() {
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+
+        // `x` marks where the emoji ended: column 2 if ❤️ got its two columns,
+        // column 1 if the selector was counted as free.
+        DaemonMsg::Output("\u{2764}\u{FE0F}x".as_bytes().to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+
+        let mut row = String::new();
+        for _ in 0..200 {
+            {
+                let t = term.term.lock();
+                let grid = t.grid();
+                row.clear();
+                for col in 0..3usize {
+                    row.push(
+                        grid[alacritty_terminal::index::Line(0)]
+                            [alacritty_terminal::index::Column(col)]
+                        .c,
+                    );
+                }
+            }
+            if row.contains('x') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            row, "\u{2764} x",
+            "❤️ must hold two columns (glyph + spacer) before the next glyph"
+        );
+    }
+
     #[test]
     fn spawn_retry_only_for_daemon_disconnects() {
         let eof: anyhow::Error =
