@@ -591,7 +591,19 @@ fn legible_ink(bg: u32, seed: u32, floor: f32) -> u32 {
     if contrast(seed, bg) >= floor {
         return seed;
     }
-    let away = if is_dark(bg) { 0xffffff } else { 0x000000 };
+    // Whichever extreme the background is *further* from, exactly as
+    // [`legible_foreground`] picks it — not `is_dark`, whose 0.5 luminance
+    // threshold is the wrong question here. The two answers only diverge on a
+    // midtone background (luminance 0.18…0.5), where `is_dark` still says "dark"
+    // but black outreaches white: an imported scheme on a mid-grey ground would
+    // have been driven to pure white and clamped there *below* the floor, losing
+    // the hue and failing the job in one go. Every built-in is far enough from
+    // the midpoint that this picks what `is_dark` did.
+    let away = if contrast(0xffffff, bg) >= contrast(0x000000, bg) {
+        0xffffff
+    } else {
+        0x000000
+    };
     bisect_contrast(seed, away, bg, floor)
 }
 
@@ -1664,6 +1676,27 @@ mod tests {
         // Unreachable: nothing between these two clears 21:1, so clamp to the
         // far endpoint instead of bisecting to something arbitrary.
         assert_eq!(raise(0x000000, 0x808080, 21.0), 0x808080);
+    }
+
+    /// Conditioning has to take the extreme it can actually *reach*, which on a
+    /// midtone ground is not the one `is_dark`'s 0.5 luminance threshold names.
+    /// A mid-grey background is "dark" by that test, yet white tops out at
+    /// 3.95:1 on it while black manages 5.32:1 — so driving toward white would
+    /// clamp at pure white, below the floor and with the hue thrown away, in the
+    /// one case where a status colour most needs both. Reachable only for an
+    /// imported scheme; every built-in sits far enough from the midpoint that
+    /// this picks the same extreme `is_dark` did.
+    #[test]
+    fn semantic_conditioning_survives_a_midtone_background() {
+        let bg = 0x808080;
+        for seed in [0xff5555u32, 0x50fa7b, 0xf1fa8c, 0x8be9fd] {
+            let ink = legible_ink(bg, seed, TEXT_FLOOR);
+            assert!(
+                contrast(ink, bg) >= TEXT_FLOOR - 0.01,
+                "{seed:#08x} conditioned to {ink:#08x}, only {:.2}:1 on a midtone ground",
+                contrast(ink, bg)
+            );
+        }
     }
 
     /// A bad foreground is swapped for a legible black/white; a good one is kept.

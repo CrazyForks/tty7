@@ -709,6 +709,28 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.input = rgb(surfaces.window.selected).into();
     t.tokens.input = Hsla::from(rgb(surfaces.window.selected)).into();
 
+    // …but `input` only reaches the *outline* path, which reads the field live.
+    // The plain (non-outline) button family is derived from `input` **once**,
+    // inside the `apply_config` that `Theme::change` ran above — i.e. from the
+    // stock `#2f2f2f`, before any of this function's overrides exist — and a
+    // snapshot never sees the fix. So a plain `Button` still hovered and pressed
+    // in that grey, and `Button::selected` (the terminal search bar's `Aa` / `.*`
+    // toggles, the last two in the app) filled from `tokens.secondary_active` the
+    // same way: on Dracula, ~1.03:1 against the surface behind it. That is issue
+    // #197 again, one snapshot removed from the field that fixed it.
+    //
+    // Only the *state* rungs move — `tokens.button` (the resting fill) is left
+    // alone, so a plain button keeps the flat look it has today and only its
+    // hover/pressed/selected join the ladder.
+    let button_hover: Hsla = rgb(surfaces.window.hover).into();
+    let button_active: Hsla = rgb(surfaces.window.selected).into();
+    t.tokens.button_hover = button_hover.into();
+    t.tokens.button_active = button_active.into();
+    t.tokens.secondary_hover = button_hover.into();
+    t.tokens.secondary_active = button_active.into();
+    t.tokens.button_secondary_hover = button_hover.into();
+    t.tokens.button_secondary_active = button_active.into();
+
     // Focus rings: the one place the theme's *real* accent belongs. A ring is ink
     // on the background at 1–2px, which is exactly the job `legible_accent`
     // conditions the seed for; the stock `neutral-300` was both off-theme and
