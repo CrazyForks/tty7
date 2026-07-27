@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The window's leading corner carries the app's mark off macOS** — macOS fills
+  the top-left with the traffic lights; on Windows and Linux that corner was
+  empty, with everything the caption row holds (the rail's "+" and collapse, the
+  corner chrome, the window controls) pushed to a right edge. The "duo" mark now
+  heads the tab rail on its content inset, the line the search box and every row
+  label below it start on, and follows the rail's controls into the title strip
+  when the sidebar is collapsed — so the corner never falls back to nothing.
+  Drawn, never clicked: it takes no hover capsule and no hit box, leaving the
+  strip grabbable through it.
+
 ### Fixed
 
 - **New tabs and splits open in the right directory even when the shell can't be
@@ -25,6 +37,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through, and that is the one a new tab should open in. macOS and Linux;
   Windows has no equivalent process query and is unchanged.
 
+- **The editor and diff overlays keep their header on the caption line when the
+  detail panel is open** — off macOS the title bar is hoisted above
+  `[terminal | panel]` so the ─ ▢ ✕ group can reach the window's corner, which
+  left both overlays — anchored to the terminal column — starting 40px down.
+  Their headers are drawn to *be* the title bar while they're up (its height,
+  its insets, a full chrome tile for their one control), and instead landed a
+  row low, level with the panel's tab row. They now hang on the row that owns
+  the bar, inset by the panel's width, so the corner chrome keeps its surface
+  and its clicks.
+- **Those headers became real title bars** — dragging one now moves the window
+  and double-clicking zooms it. Both covered the caption row and neither did
+  either, with the panel open or closed, so opening a file turned the top of the
+  window into a 40px strip that looked exactly like a title bar and answered
+  nothing. Their controls (the ✕, the diff's back-to-all-files chip) are
+  `occlude()`d to keep taking clicks: a drag region on Windows is HTCAPTION, and
+  the OS claims the press before the app hit-tests.
+- **The rail's top zone lines up with the title bar to the pixel** — the bar
+  reserves a hairline inside its own height that the rail's stand-in row didn't,
+  so everything in that row sat half a pixel low. Invisible on the line-art
+  tiles; not on the mark, which visibly hopped as collapsing the rail handed it
+  over to the bar.
 - **CJK and emoji stop falling through to the OS on Windows and Linux** — the
   default `font_fallbacks` named only faces that ship with macOS (Menlo, Apple
   Color Emoji), so off macOS the entire chain matched nothing and every
