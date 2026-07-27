@@ -340,6 +340,12 @@ pub struct TerminalView {
     /// The in-progress line saved when history navigation starts, so pressing ↓
     /// past the newest entry restores what the user was typing.
     history_stash: String,
+    /// Position of a run of ⌥. presses (readline's `yank-last-arg`): which
+    /// `history` entry the last press took its word from, and the char span it
+    /// left in the line — the next press replaces that span with the word from
+    /// the entry before it. Any other key clears this, so the following ⌥.
+    /// starts a fresh walk at the newest entry.
+    last_word_nav: Option<LastWordWalk>,
     /// A submitted command whose history-file record is deferred until the
     /// shell reports back at its prompt, so the record can carry the command's
     /// exit code (see [`PendingHistory`]).
@@ -446,6 +452,17 @@ struct PendingHistory {
     cwd: Option<std::path::PathBuf>,
     ts: u64,
     seq: u64,
+}
+
+/// Where a run of ⌥. presses has walked to (see
+/// [`TerminalView::last_word_nav`]).
+struct LastWordWalk {
+    /// Index into `history` the last press took its word from.
+    entry: usize,
+    /// Char offset of the word it inserted, and how many chars it spans — the
+    /// next press swaps that range for the word from an older entry.
+    at: usize,
+    len: usize,
 }
 
 /// Seconds since the unix epoch — the timestamp history records carry.
@@ -1172,6 +1189,7 @@ impl TerminalView {
             ranked_cwd: None,
             history_nav: None,
             history_stash: String::new(),
+            last_word_nav: None,
             pending_history: None,
             completion: None,
             completion_generation: 0,
@@ -1655,11 +1673,7 @@ impl TerminalView {
             // Keep the cursor solid while typing (resets the blink phase).
             self.cursor_visible = true;
             // Typing clears the selection and jumps to the prompt.
-            let mut term = self.terminal.term.lock();
-            term.selection = None;
-            term.scroll_display(Scroll::Bottom);
-            self.scroll_frac = 0.;
-            drop(term);
+            self.jump_to_prompt();
             cx.notify();
             // Consume so the key isn't also re-sent through the IME path.
             cx.stop_propagation();
@@ -1776,10 +1790,42 @@ impl TerminalView {
         let m = &ks.modifiers;
         let key = ks.key.as_str();
         self.cursor_visible = true;
+        // The raw key path does this per keystroke; the editor owns the keyboard
+        // at the prompt and every arm below returns early, so it has to happen
+        // once here instead. Without it a key pressed while scrolled up edits a
+        // line the viewport isn't showing (#208).
+        self.jump_to_prompt();
+
+        // ⌃P / ⌃N are readline's spelling of ↑ / ↓ (0x10 / 0x0e on the wire, and
+        // what the shell's own keymap answers when the editor isn't holding the
+        // line). Rewrite them into the arrow keys here rather than giving them
+        // arms of their own, so the two spellings can't drift apart — history
+        // recall, multi-line steps, the completion picker and the reverse-search
+        // menu all treat them identically from this point down.
+        let aliased;
+        let ks = if m.control && !m.platform && !m.alt && matches!(key, "p" | "n") {
+            aliased = gpui::Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: if key == "p" { "up" } else { "down" }.to_string(),
+                key_char: None,
+            };
+            &aliased
+        } else {
+            ks
+        };
+        let m = &ks.modifiers;
+        let key = ks.key.as_str();
+
         // Any key other than a vertical step drops the sticky goal column, so the
         // next ↑/↓ takes its column from wherever the caret ends up.
         if key != "up" && key != "down" {
             self.editor_goal_col = None;
+        }
+        // Likewise, only a repeat of ⌥. continues an insert-last-word walk —
+        // anything else and the next press starts fresh at the newest entry
+        // rather than swallowing whatever now sits left of the caret.
+        if !(m.alt && key == ".") {
+            self.last_word_nav = None;
         }
 
         // A reverse search, when active, owns the keyboard.
@@ -1845,8 +1891,9 @@ impl TerminalView {
         self.close_completion();
 
         // Readline-style control combinations, delegated so this dispatcher stays
-        // scannable. Every Ctrl chord is swallowed at the prompt (recognized or
-        // not), so this always notifies and returns.
+        // scannable. A chord the editor answers is consumed here; one it doesn't
+        // goes on to the shell rather than dying at the prompt. Either way this
+        // branch returns.
         if m.control && !m.platform && !m.alt {
             // Off macOS, word navigation and deletion live on Ctrl (the Windows /
             // Linux convention): Ctrl+←/→ move by word (Shift extends the
@@ -1901,19 +1948,33 @@ impl TerminalView {
                 self.handoff_line_to_shell(&[0x12], cx);
                 return;
             }
-            self.apply_readline_ctrl(key);
-            cx.notify();
+            if self.apply_readline_ctrl(key) {
+                cx.notify();
+            } else if let Some(bytes) = super::input::keystroke_to_bytes(ks, self.kitty_flags()) {
+                // No local widget answers this chord. Swallowing it is the one
+                // thing we mustn't do — the key worked before shell integration
+                // engaged, and zle's keymap (⌃T transpose, a `bindkey` widget,
+                // an fzf binding…) still knows what to do with it.
+                self.handoff_line_to_shell(&bytes, cx);
+            } else {
+                cx.notify();
+            }
             return;
         }
 
-        // Readline-style Meta word chords on the edited line: M-b / M-f motions
-        // and M-d delete-word, mirroring the Alt+←/→/Delete handling below. On
-        // macOS these are reachable only with `macos_option_as_alt` on — with it
-        // off the chord composes a character upstream and arrives here altless,
-        // through the printable-text arm. Other Alt+letter chords stay swallowed
-        // no-ops as before (the local editor can't mirror every zle widget).
+        // Readline-style Meta chords on the edited line: M-b / M-f motions,
+        // M-d delete-word (mirroring the Alt+←/→/Delete handling below) and
+        // M-. insert-last-word. On macOS these are reachable only with
+        // `macos_option_as_alt` on — with it off the chord composes a character
+        // upstream and arrives here altless, through the printable-text arm.
+        // Meta chords with no arm here reach the shell instead of dying (see
+        // the fallthrough at the bottom of the dispatcher).
         if m.alt && !m.platform && !m.control {
             match key {
+                "." => {
+                    self.insert_last_word(cx);
+                    return;
+                }
                 "b" => {
                     self.editor_move_h(false, m.shift, true);
                     cx.notify();
@@ -2038,7 +2099,7 @@ impl TerminalView {
             // events carrying `key_char`; feed them through the same commit path
             // the IME would use so the local editor sees the text. Skip control /
             // Cmd chords and any non-printable char (function keys have no
-            // `key_char`; Alt combos stay editor no-ops as before).
+            // `key_char`).
             _ => {
                 if !m.control && !m.platform && !m.alt {
                     if let Some(ch) = ks.key_char.as_deref() {
@@ -2048,6 +2109,17 @@ impl TerminalView {
                         }
                     }
                 }
+                // A Meta chord with nothing local behind it (M-t transpose-word,
+                // M-u/M-l/M-c case widgets, whatever the user bound) goes to the
+                // shell rather than dying here — same reasoning as the Ctrl side
+                // above. Built from the key name, not `key_char`: the platforms
+                // that deliver Alt chords at all don't reliably carry one.
+                if m.alt && !m.control && !m.platform && key.chars().count() == 1 {
+                    let mut bytes = vec![0x1b];
+                    bytes.extend_from_slice(key.as_bytes());
+                    self.handoff_line_to_shell(&bytes, cx);
+                    return;
+                }
             }
         }
         cx.notify();
@@ -2055,14 +2127,18 @@ impl TerminalView {
 
     /// Apply a readline-style Ctrl chord to the command editor: Ctrl-A/E/B/F
     /// motions (Ctrl-F also accepts the autosuggestion), Ctrl-W/U/K/H deletions
-    /// (each removing the selection first if there is one), Ctrl-L clear-screen,
-    /// Ctrl-R reverse search, Ctrl-C interrupt, and Ctrl-D EOF/forward-delete.
-    /// Unrecognized chords are no-ops (the caller swallows every Ctrl combo at
-    /// the prompt regardless).
+    /// (each removing the selection first if there is one), Ctrl-Y yanking the
+    /// last kill back, Ctrl-L clear-screen, Ctrl-R reverse search, Ctrl-C
+    /// interrupt, and Ctrl-D EOF/forward-delete.
     ///
-    /// The caller resolves Ctrl-J / Ctrl-M (accept-line) and, when the history
-    /// menu is switched off, Ctrl-R before this point — neither reaches here.
-    fn apply_readline_ctrl(&mut self, key: &str) {
+    /// Returns whether the chord was recognized: the caller hands the ones that
+    /// weren't to the shell, so a widget tty7 has no answer for still reaches
+    /// the keymap that does.
+    ///
+    /// The caller resolves Ctrl-J / Ctrl-M (accept-line), Ctrl-P / Ctrl-N (the
+    /// arrow keys by another name) and, when the history menu is switched off,
+    /// Ctrl-R before this point — none of them reach here.
+    fn apply_readline_ctrl(&mut self, key: &str) -> bool {
         match key {
             "r" => self.start_reverse_search(),
             "a" => {
@@ -2103,6 +2179,10 @@ impl TerminalView {
                 }
             }
             "h" => self.cmd.backspace(),
+            // Yank: the other half of ⌃W / ⌃U / ⌃K. Answered locally rather
+            // than handed to the shell — zle keeps its own kill ring, and
+            // yanking from it would paste text this editor never cut.
+            "y" => self.cmd.yank(),
             "l" => {
                 // Clear screen belongs to the shell/readline layer: send the
                 // same form-feed byte the raw terminal path emits for Ctrl+L.
@@ -2133,8 +2213,9 @@ impl TerminalView {
                     self.cmd.delete();
                 }
             }
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
     /// Horizontal caret motion in the editor with selection semantics: Shift
@@ -2272,6 +2353,19 @@ impl TerminalView {
         super::input::tab_bytes(shift, self.kitty_flags())
     }
 
+    /// The housekeeping every input path shares: drop the selection the key
+    /// invalidated and bring the viewport back to the live prompt, whole lines
+    /// (`display_offset`) and sub-line remainder (`scroll_frac`) alike. Acting
+    /// on a line the user can't see is the thing to avoid — so this runs for
+    /// keys handled locally too, not only for bytes that reach the PTY.
+    fn jump_to_prompt(&mut self) {
+        let mut term = self.terminal.term.lock();
+        term.selection = None;
+        term.scroll_display(Scroll::Bottom);
+        drop(term);
+        self.scroll_frac = 0.;
+    }
+
     /// Write a fixed byte sequence to the PTY (for keystrokes delivered as
     /// actions rather than through `on_key_down`, e.g. Tab / Shift-Tab), applying
     /// the same cursor / selection / scroll housekeeping as normal typing.
@@ -2281,11 +2375,7 @@ impl TerminalView {
         }
         self.terminal.write(bytes.to_vec());
         self.cursor_visible = true;
-        let mut term = self.terminal.term.lock();
-        term.selection = None;
-        term.scroll_display(Scroll::Bottom);
-        self.scroll_frac = 0.;
-        drop(term);
+        self.jump_to_prompt();
         cx.notify();
     }
 
@@ -3500,11 +3590,54 @@ impl TerminalView {
         self.terminal.write(submit_bytes(&line, bracketed));
         self.cmd.clear();
         self.cursor_visible = true;
-        let mut term = self.terminal.term.lock();
-        term.selection = None;
-        term.scroll_display(Scroll::Bottom);
-        self.scroll_frac = 0.;
-        drop(term);
+        self.jump_to_prompt();
+        cx.notify();
+    }
+
+    /// Readline's `yank-last-arg` (⌥.): drop the last word of the previous
+    /// command at the caret. Repeating the chord walks further back through the
+    /// history, each press swapping out the word the one before it inserted, so
+    /// a run of presses leaves exactly one word behind. Entries with no words
+    /// are stepped over rather than inserting nothing.
+    fn insert_last_word(&mut self, cx: &mut Context<Self>) {
+        // A repeat resumes one entry older than the last press; a fresh walk
+        // starts at the newest entry.
+        let start = match &self.last_word_nav {
+            Some(walk) => walk.entry.checked_sub(1),
+            None => self.history.len().checked_sub(1),
+        };
+        let Some(mut entry) = start else {
+            // Nothing older to reach (or no history at all) — leave the line as
+            // it stands, the word the previous press inserted included.
+            return;
+        };
+        let word = loop {
+            if let Some(w) = self.history[entry].split_whitespace().next_back() {
+                break w.to_string();
+            }
+            let Some(older) = entry.checked_sub(1) else {
+                return;
+            };
+            entry = older;
+        };
+
+        // Take back what the previous press left, so the walk swaps words in
+        // place rather than piling them up.
+        if let Some(walk) = self.last_word_nav.take() {
+            self.cmd.clear_selection();
+            self.cmd.set_cursor(walk.at);
+            self.cmd.extend_to(walk.at + walk.len);
+            self.cmd.delete_selection();
+        }
+        let at = self.cmd.cursor();
+        self.cmd.insert_str(&word);
+        self.last_word_nav = Some(LastWordWalk {
+            entry,
+            at,
+            len: word.chars().count(),
+        });
+        // The line is now the user's own edit, not a recalled entry.
+        self.history_nav = None;
         cx.notify();
     }
 
@@ -4239,11 +4372,7 @@ impl TerminalView {
         self.write_gap_text(text, text.as_bytes().to_vec(), cx);
         // Keep the cursor solid while committing input (resets the blink phase).
         self.cursor_visible = true;
-        let mut term = self.terminal.term.lock();
-        term.selection = None;
-        term.scroll_display(Scroll::Bottom);
-        self.scroll_frac = 0.;
-        drop(term);
+        self.jump_to_prompt();
         cx.notify();
     }
 
@@ -7926,10 +8055,248 @@ mod gpui_tests {
                 assert_eq!(view.cmd.cursor(), 0);
                 view.handle_editor_key(&meta("f"), cx);
                 assert_eq!(view.cmd.cursor(), 4);
-                // Other Meta letters stay swallowed no-ops (line untouched).
+                // Other Meta letters have no local widget, so they hand the line
+                // to the shell rather than dying here — see
+                // `an_unknown_meta_chord_goes_to_the_shell_with_the_line`.
                 view.handle_editor_key(&meta("z"), cx);
-                assert_eq!(view.cmd.text(), "echo ");
-                assert_eq!(view.cmd.cursor(), 4);
+                assert_eq!(view.cmd.text(), "");
+            })
+            .unwrap();
+    }
+
+    /// Fill the scrollback and park the viewport `offset` lines up inside it,
+    /// so a test can watch a keystroke snap it back to the live prompt.
+    fn scroll_into_history(view: &TerminalView, offset: usize) {
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        let mut term = view.terminal.term.lock();
+        parser.advance(&mut *term, &b"line\r\n".repeat(60));
+        term.scroll_display(Scroll::Delta(offset as i32));
+        assert_eq!(
+            term.grid().display_offset(),
+            offset,
+            "the viewport starts parked in the scrollback"
+        );
+    }
+
+    fn display_offset(view: &TerminalView) -> usize {
+        view.terminal.term.lock().grid().display_offset()
+    }
+
+    /// Scrolled up into the scrollback, recalling history with ↑ must bring the
+    /// viewport back to the live prompt (#208). The local editor owns ↑ and
+    /// returns early, so it never reached the "typing jumps to the prompt"
+    /// housekeeping on the raw key path — leaving the user editing a line they
+    /// cannot see.
+    #[gpui::test]
+    fn history_recall_snaps_the_viewport_back_to_the_prompt(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.history = vec!["echo hello".to_string()];
+                scroll_into_history(view, 10);
+                view.scroll_frac = 0.5;
+
+                view.handle_editor_key(&key("up"), cx);
+
+                assert_eq!(view.cmd.text(), "echo hello", "↑ recalled the entry");
+                assert_eq!(display_offset(view), 0, "and the viewport followed it down");
+                assert_eq!(view.scroll_frac, 0., "the sub-line remainder reset too");
+            })
+            .unwrap();
+    }
+
+    /// ⌃P / ⌃N are readline's history motions, and a raw terminal passes them
+    /// to the shell as 0x10 / 0x0e. The local editor swallows every Ctrl chord
+    /// at the prompt, so without arms of their own they went from "works" to
+    /// "does nothing" the moment shell integration engaged.
+    #[gpui::test]
+    fn ctrl_p_and_ctrl_n_walk_the_history(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.history = ["git status", "cargo build", "echo hello"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+
+                // ⌃P walks back from the newest entry.
+                view.handle_editor_key(&key("ctrl-p"), cx);
+                assert_eq!(view.cmd.text(), "echo hello");
+                view.handle_editor_key(&key("ctrl-p"), cx);
+                assert_eq!(view.cmd.text(), "cargo build");
+                // ⌃N walks forward again.
+                view.handle_editor_key(&key("ctrl-n"), cx);
+                assert_eq!(view.cmd.text(), "echo hello");
+                // Past the newest entry the in-progress line comes back.
+                view.handle_editor_key(&key("ctrl-n"), cx);
+                assert_eq!(view.cmd.text(), "");
+            })
+            .unwrap();
+    }
+
+    /// A Ctrl chord the local editor has no widget for used to be swallowed, so
+    /// engaging shell integration *removed* ⌃T, ⌥T, ⌥U and every `bindkey`
+    /// widget the user had bound. Hand the line to zle instead and let its
+    /// keymap answer — the same escape hatch ⌃R already uses.
+    #[gpui::test]
+    fn an_unknown_ctrl_chord_goes_to_the_shell_with_the_line(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.cmd.set("echo hi");
+                // ⌃T is readline's transpose-chars; tty7 has no widget for it.
+                view.handle_editor_key(&key("ctrl-t"), cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "",
+                    "the line left for the shell, so the local buffer is empty"
+                );
+                assert!(
+                    view.editor_handoff.is_some(),
+                    "the local editor stands down for the rest of the line"
+                );
+            })
+            .unwrap();
+        assert_eq!(next_input(&mut daemon), b"echo hi".to_vec());
+        assert_eq!(next_input(&mut daemon), vec![0x14], "⌃T reached the shell");
+    }
+
+    /// The Meta half of the same gap: ⌥U (upcase-word) and friends were dead at
+    /// the prompt. Unrecognized Meta chords ship the line and the ESC-prefixed
+    /// key, the way a raw terminal would have.
+    #[gpui::test]
+    fn an_unknown_meta_chord_goes_to_the_shell_with_the_line(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.cmd.set("echo hi");
+                view.handle_editor_key(
+                    &gpui::Keystroke {
+                        modifiers: gpui::Modifiers {
+                            alt: true,
+                            ..Default::default()
+                        },
+                        key: "u".to_string(),
+                        key_char: None,
+                    },
+                    cx,
+                );
+                assert_eq!(view.cmd.text(), "");
+            })
+            .unwrap();
+        assert_eq!(next_input(&mut daemon), b"echo hi".to_vec());
+        assert_eq!(next_input(&mut daemon), b"\x1bu".to_vec());
+    }
+
+    /// ⌃W / ⌃U / ⌃K are *kills*, and ⌃Y is what puts a kill back — without it
+    /// the pair was half-implemented: the editor cut text with nowhere to paste
+    /// it from. ⌃Y has to stay local rather than reaching the shell, because
+    /// zle's kill ring is a different buffer and would yank unrelated text.
+    #[gpui::test]
+    fn ctrl_y_yanks_back_what_the_kill_chords_cut(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.cmd.set("echo hello world");
+                view.handle_editor_key(&key("ctrl-w"), cx);
+                assert_eq!(view.cmd.text(), "echo hello ");
+                view.handle_editor_key(&key("ctrl-y"), cx);
+                assert_eq!(view.cmd.text(), "echo hello world");
+                assert!(
+                    view.editor_handoff.is_none(),
+                    "the line never left for the shell"
+                );
+            })
+            .unwrap();
+    }
+
+    /// ⌥. is readline's `yank-last-arg`: it pulls the last word of the previous
+    /// command into the line, and repeating it walks further back through the
+    /// history, replacing what the last press inserted. Frequent enough that
+    /// paying the handoff cost (ghost text and completion gone for the rest of
+    /// the line) on every press would be the wrong trade — tty7 holds the same
+    /// history, so it answers locally.
+    #[gpui::test]
+    fn meta_dot_walks_back_through_the_last_words(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                let meta_dot = gpui::Keystroke {
+                    modifiers: gpui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    key: ".".to_string(),
+                    key_char: None,
+                };
+                view.history = ["git status", "cargo build --release", "echo hello world"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                view.cmd.set("ls ");
+
+                view.handle_editor_key(&meta_dot, cx);
+                assert_eq!(view.cmd.text(), "ls world", "newest entry's last word");
+                view.handle_editor_key(&meta_dot, cx);
+                assert_eq!(view.cmd.text(), "ls --release", "repeat steps one back");
+                view.handle_editor_key(&meta_dot, cx);
+                assert_eq!(view.cmd.text(), "ls status");
+                // Nothing older to reach: the line holds what it had.
+                view.handle_editor_key(&meta_dot, cx);
+                assert_eq!(view.cmd.text(), "ls status");
+                // The caret sits after the inserted word, ready to keep typing.
+                assert_eq!(view.cmd.cursor(), "ls status".chars().count());
+            })
+            .unwrap();
+    }
+
+    /// The walk is only a walk while ⌥. repeats. Once another key edits the
+    /// line, the next ⌥. starts over from the newest entry instead of eating
+    /// whatever happens to sit left of the caret.
+    #[gpui::test]
+    fn an_intervening_key_restarts_the_last_word_walk(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                let meta_dot = gpui::Keystroke {
+                    modifiers: gpui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    key: ".".to_string(),
+                    key_char: None,
+                };
+                view.history = ["cargo build --release", "echo hello world"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+
+                view.handle_editor_key(&meta_dot, cx);
+                assert_eq!(view.cmd.text(), "world");
+                view.handle_editor_key(&key("left"), cx);
+                view.handle_editor_key(&key("end"), cx);
+                view.handle_editor_key(&meta_dot, cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "worldworld",
+                    "a fresh walk appends rather than replacing the earlier word"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Chords the editor *does* answer stay local — handing off would forfeit
+    /// ghost text and completion for the rest of the line, and ⌃A/⌃E/⌃W are
+    /// exactly the keys pressed most often mid-edit.
+    #[gpui::test]
+    fn a_known_ctrl_chord_stays_in_the_local_editor(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.cmd.set("echo hi");
+                view.handle_editor_key(&key("ctrl-w"), cx);
+                assert_eq!(view.cmd.text(), "echo ", "⌃W cut the word locally");
+                assert!(view.editor_handoff.is_none());
             })
             .unwrap();
     }

@@ -24,6 +24,11 @@ pub struct CmdEditor {
     /// shuttle states between the two.
     undo: Vec<(Vec<char>, usize)>,
     redo: Vec<(Vec<char>, usize)>,
+    /// What the last *kill* removed, for [`Self::yank`] to put back — readline's
+    /// kill ring, one slot deep. Only the word/line kills (⌃W, ⌃U, ⌃K, ⌥D and
+    /// the arrow-key spellings of them) write here; a plain character delete is
+    /// not a kill and leaves it untouched.
+    kill: String,
 }
 
 /// Cap on undo history, so a long editing session can't grow it without bound.
@@ -409,6 +414,15 @@ impl CmdEditor {
         }
     }
 
+    /// Remove `s..e` and stash it as the kill ring's contents. The four chords
+    /// below are readline *kills*, not deletes: what they take is meant to come
+    /// back out under [`Self::yank`].
+    fn kill_range(&mut self, s: usize, e: usize) {
+        self.kill = self.chars[s..e].iter().collect();
+        self.chars.drain(s..e);
+        self.shift_anchor_for_removal(s, e);
+    }
+
     /// Delete the word after the cursor (Alt+Delete): skip following whitespace,
     /// then the word.
     pub fn delete_word_right(&mut self) {
@@ -421,8 +435,7 @@ impl CmdEditor {
         while e < n && !self.chars[e].is_whitespace() {
             e += 1;
         }
-        self.chars.drain(self.cursor..e);
-        self.shift_anchor_for_removal(self.cursor, e);
+        self.kill_range(self.cursor, e);
     }
 
     /// Delete the word before the cursor (Ctrl+W / Alt+Backspace).
@@ -430,25 +443,33 @@ impl CmdEditor {
         self.checkpoint();
         let end = self.cursor;
         self.move_word_left();
-        self.chars.drain(self.cursor..end);
-        self.shift_anchor_for_removal(self.cursor, end);
+        self.kill_range(self.cursor, end);
     }
 
     /// Delete from the cursor to the start of the line (Ctrl+U / Cmd+Backspace).
     pub fn delete_to_start(&mut self) {
         self.checkpoint();
-        self.chars.drain(0..self.cursor);
         let end = self.cursor;
         self.cursor = 0;
-        self.shift_anchor_for_removal(0, end);
+        self.kill_range(0, end);
     }
 
     /// Delete from the cursor to the end of the line (Ctrl+K).
     pub fn delete_to_end(&mut self) {
         self.checkpoint();
         let end = self.chars.len();
-        self.chars.drain(self.cursor..);
-        self.shift_anchor_for_removal(self.cursor, end);
+        self.kill_range(self.cursor, end);
+    }
+
+    /// Reinsert the most recent kill at the cursor (Ctrl+Y). A no-op — undo
+    /// checkpoint included — when nothing has been killed yet.
+    pub fn yank(&mut self) {
+        if self.kill.is_empty() {
+            return;
+        }
+        let kill = std::mem::take(&mut self.kill);
+        self.insert_str(&kill);
+        self.kill = kill;
     }
 
     /// Clear the line and reset the cursor and undo history (after submit).
@@ -570,6 +591,58 @@ mod tests {
         d.delete_word_left();
         assert_eq!(d.text(), "git push ");
         assert_eq!(d.cursor(), 9);
+    }
+
+    /// The four readline *kill* chords stash what they removed so ⌃Y can put it
+    /// back; the ring holds the most recent kill only.
+    #[test]
+    fn kills_fill_the_kill_buffer_and_yank_puts_it_back() {
+        let mut e = ed("git push origin", 15);
+        e.delete_word_left();
+        assert_eq!(e.text(), "git push ");
+        e.yank();
+        assert_eq!((e.text().as_str(), e.cursor()), ("git push origin", 15));
+
+        let mut k = ed("hello world", 5);
+        k.delete_to_end();
+        assert_eq!(k.text(), "hello");
+        k.yank();
+        assert_eq!(k.text(), "hello world");
+
+        let mut u = ed("hello world", 6);
+        u.delete_to_start();
+        assert_eq!(u.text(), "world");
+        u.move_end();
+        u.yank();
+        assert_eq!(u.text(), "worldhello ");
+
+        let mut d = ed("git push origin", 4);
+        d.delete_word_right();
+        assert_eq!(d.text(), "git  origin");
+        d.yank();
+        assert_eq!(d.text(), "git push origin");
+    }
+
+    /// A plain character delete is not a kill — readline keeps the two apart,
+    /// so backspacing must not clobber the word ⌃W stashed a moment ago.
+    #[test]
+    fn character_deletes_leave_the_kill_buffer_alone() {
+        let mut e = ed("git push origin", 15);
+        e.delete_word_left();
+        e.backspace();
+        e.delete();
+        assert_eq!(e.text(), "git push");
+        e.yank();
+        assert_eq!(e.text(), "git pushorigin");
+    }
+
+    /// Nothing killed yet: ⌃Y leaves the line and the caret exactly as they
+    /// were rather than inserting an empty string.
+    #[test]
+    fn yank_without_a_kill_does_nothing() {
+        let mut e = ed("hello", 3);
+        e.yank();
+        assert_eq!((e.text().as_str(), e.cursor()), ("hello", 3));
     }
 
     #[test]
