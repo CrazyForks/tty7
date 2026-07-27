@@ -6883,6 +6883,10 @@ mod gpui_tests {
         let (window, _daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
+                // Pin a known geometry first — what the test window measured for
+                // itself is the element's business, and this is about the
+                // transition. Then hover the last row of those 24.
+                view.set_grid_size(80, 24, px(8.), px(17.));
                 view.hover_link_at(0, 23, true, cx);
                 assert_eq!(view.last_hover_cell, Some((0, 23)));
                 view.hovered_link = Some(HoveredLink {
