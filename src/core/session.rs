@@ -300,7 +300,7 @@ impl Workspaces {
     /// `{active, tabs}` session, which migrates to a single open workspace so
     /// upgrading users keep their tabs (and their attached daemon panes).
     pub fn decode(text: &str) -> Result<Self, serde_json::Error> {
-        let value: serde_json::Value = serde_json::from_str(text)?;
+        let value: serde_json::Value = serde_json::from_str(crate::core::config::strip_bom(text))?;
         if value.get("workspaces").is_some() {
             return serde_json::from_value(value);
         }
@@ -757,6 +757,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_utf8_bom_does_not_discard_the_session() {
+        // `Session::load` treats a parse error as "no session", so a BOM on a
+        // hand-edited `session.json` doesn't warn — it drops every workspace
+        // and opens on the home page as if nothing had been saved.
+        // Legacy `{active, tabs}` shape, so this also covers the migration path.
+        let decoded = Workspaces::decode(
+            "\u{FEFF}{\"active\": 0, \"tabs\": [{\"pane\": {\"Leaf\": {\"cwd\": \"/work\"}}}]}",
+        )
+        .expect("a BOM'd session still decodes");
+        let tabs = &decoded
+            .workspaces
+            .first()
+            .expect("migrated workspace")
+            .session
+            .tabs;
+        assert_eq!(tabs.len(), 1);
     }
 
     #[test]

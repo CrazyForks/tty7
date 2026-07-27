@@ -1,10 +1,15 @@
 //! A small, self-contained completion engine for the command editor — tty7's own
 //! engine, not the shell's `compsys`.
 //!
-//! It offers two sources, each candidate carrying the exact char range it
+//! It offers three sources, each candidate carrying the exact char range it
 //! replaces:
 //!   - **command** — builtins + `$PATH` executables, in command position;
-//!   - **path** — files / directories, elsewhere (replace just the word).
+//!   - **path** — files / directories, elsewhere (replace just the word);
+//!   - **remote path** — the same, for a pane whose filesystem is on the far
+//!     end of an SSH connection. The listing itself is a network round-trip the
+//!     view owns, so this module only splits the word into a request
+//!     ([`remote_path_request`]) and turns the answer into candidates
+//!     ([`remote_path_candidates`]) — both pure, both unit-tested.
 //!
 //! History deliberately does *not* feed the menu:
 //! whole-line recall belongs to the inline ghost text (frecency-ranked, cwd
@@ -278,6 +283,150 @@ fn sort_candidates_by_closeness(cands: &mut [Candidate]) {
             .cmp(&b.text.chars().count())
             .then_with(|| a.text.cmp(&b.text))
     });
+}
+
+/// What a path-position Tab in a remote pane needs listed on the *far side*,
+/// produced by [`remote_path_request`] and consumed by
+/// [`remote_path_candidates`] once the listing comes back.
+///
+/// Split in two because the listing is a network round-trip: nothing here
+/// touches a filesystem, so both halves stay pure and testable while the view
+/// owns the async middle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePathRequest {
+    /// Absolute directory to list on the remote.
+    pub dir: String,
+    /// What an entry's name must start with to be offered.
+    pub prefix: String,
+    /// The typed text up to and including the last `/`, re-prepended to every
+    /// candidate so the path the user typed is preserved (as [`complete_path`]
+    /// does locally).
+    pub dir_part: String,
+    /// Char range in the line the candidates replace.
+    pub word_start: usize,
+    pub cursor: usize,
+    /// Drop file entries — the command only takes directories.
+    pub dirs_only: bool,
+}
+
+/// One entry of a remote directory listing, reduced to what completion cares
+/// about. Keeps this module free of the daemon's SFTP protocol types; the view
+/// converts (and is where "a symlink to a directory counts as a directory"
+/// gets decided, since only the protocol knows the link target).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// The remote directory a path-position Tab wants listed, or `None` when the
+/// caret isn't somewhere a remote path listing could help.
+///
+/// `remote_cwd` is the pane's cwd *in the remote's namespace* — the caller must
+/// have established that the pane really is remote. Declines:
+///   - **command position** (a bare first word): those complete from `$PATH`,
+///     and this machine's `$PATH` is the wrong answer for a remote anyway —
+///     that's [`complete_command`]'s call, not a filesystem question.
+///   - **`~`-prefixed words**: expanding one needs the remote's `$HOME`, which
+///     no OSC reports. Declining hands the Tab to the remote shell, which can
+///     expand it.
+///   - a **relative `remote_cwd`**: nothing to resolve against.
+///
+/// Separators are `/` only — deliberately not [`std::path::is_separator`],
+/// which also accepts `\` on Windows. A Windows host talking to a POSIX remote
+/// must not treat a backslash in the *remote's* path as a separator.
+pub fn remote_path_request(
+    line: &str,
+    cursor: usize,
+    remote_cwd: &str,
+) -> Option<RemotePathRequest> {
+    if !remote_cwd.starts_with('/') {
+        return None;
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let mut word_start = cursor;
+    while word_start > 0 && !chars[word_start - 1].is_whitespace() {
+        word_start -= 1;
+    }
+    let word: String = chars[word_start..cursor].iter().collect();
+
+    let is_command = chars[..word_start].iter().all(|c| c.is_whitespace());
+    if is_command && !word.contains('/') {
+        return None;
+    }
+    if word.starts_with('~') {
+        return None;
+    }
+
+    let (dir_part, prefix) = match word.rfind('/') {
+        Some(i) => (&word[..=i], &word[i + 1..]),
+        None => ("", word.as_str()),
+    };
+    // An absolute `dir_part` stands alone; anything else resolves against the
+    // remote cwd. `.`/`..` inside the path are left for the far side to
+    // resolve — an SFTP server handles them, and we have no remote filesystem
+    // to normalize against here.
+    let dir = if dir_part.starts_with('/') {
+        dir_part.to_string()
+    } else if dir_part.is_empty() {
+        remote_cwd.to_string()
+    } else {
+        format!("{}/{dir_part}", remote_cwd.trim_end_matches('/'))
+    };
+
+    Some(RemotePathRequest {
+        dir,
+        prefix: prefix.to_string(),
+        dir_part: dir_part.to_string(),
+        word_start,
+        cursor,
+        dirs_only: current_command(&chars, word_start)
+            .is_some_and(|c| DIR_ONLY_COMMANDS.contains(&c.as_str())),
+    })
+}
+
+/// Turn a remote directory listing into candidates for `req`. Mirrors
+/// [`complete_path`]'s rules exactly — hidden entries only when the prefix asks
+/// for them, `dirs_only` filtering, closeness ordering, the same cap — so a
+/// remote Tab behaves like a local one.
+///
+/// `.` and `..` are dropped: a local `read_dir` never yields them, and offering
+/// them here would make the two panes feel different.
+pub fn remote_path_candidates(req: &RemotePathRequest, entries: &[RemoteEntry]) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = Vec::new();
+    for entry in entries {
+        let name = entry.name.as_str();
+        if name == "." || name == ".." {
+            continue;
+        }
+        if name.starts_with('.') && !req.prefix.starts_with('.') {
+            continue;
+        }
+        if !name.starts_with(&req.prefix) {
+            continue;
+        }
+        if req.dirs_only && !entry.is_dir {
+            continue;
+        }
+        out.push(Candidate {
+            text: format!("{}{name}", req.dir_part),
+            kind: if entry.is_dir {
+                CandidateKind::Dir
+            } else {
+                CandidateKind::File
+            },
+            start: req.word_start,
+            end: req.cursor,
+            description: None,
+            icon: None,
+        });
+        if out.len() >= MAX_CANDIDATES {
+            break;
+        }
+    }
+    sort_candidates_by_closeness(&mut out);
+    out
 }
 
 /// Filesystem path completion. Splits `word` into the directory part (kept
@@ -1156,6 +1305,124 @@ mod tests {
                 remote.pending
             );
         }
+    }
+
+    /// The word under the caret, split and resolved against the *remote* cwd.
+    /// This is the request the pane's SSH connection is asked to list.
+    #[test]
+    fn remote_path_request_splits_the_word_and_resolves_against_the_remote_cwd() {
+        // Bare word: list the cwd itself, nothing to re-prepend.
+        let r = remote_path_request("cat fi", 6, "/home/me").unwrap();
+        assert_eq!(
+            (r.dir.as_str(), r.prefix.as_str(), r.dir_part.as_str()),
+            ("/home/me", "fi", "")
+        );
+        assert_eq!((r.word_start, r.cursor), (4, 6));
+        assert!(!r.dirs_only);
+
+        // Relative subdirectory: resolved against the cwd, typed text preserved.
+        let r = remote_path_request("cat sub/fi", 10, "/home/me").unwrap();
+        assert_eq!(r.dir, "/home/me/sub/");
+        assert_eq!((r.prefix.as_str(), r.dir_part.as_str()), ("fi", "sub/"));
+
+        // Absolute: stands alone, the cwd is irrelevant.
+        let r = remote_path_request("cat /etc/pa", 11, "/home/me").unwrap();
+        assert_eq!(r.dir, "/etc/");
+        assert_eq!(r.prefix, "pa");
+
+        // A trailing separator on the cwd must not double up.
+        let r = remote_path_request("cat sub/", 8, "/").unwrap();
+        assert_eq!(r.dir, "/sub/");
+
+        // `cd` takes directories only — same rule as the local engine.
+        assert!(
+            remote_path_request("cd pro", 6, "/home/me")
+                .unwrap()
+                .dirs_only
+        );
+
+        // A backslash is a filename character on a POSIX remote, not a
+        // separator — even when tty7 itself runs on Windows.
+        let r = remote_path_request(r"cat a\b", 7, "/home/me").unwrap();
+        assert_eq!((r.dir.as_str(), r.prefix.as_str()), ("/home/me", r"a\b"));
+    }
+
+    /// Positions where a remote listing is the wrong answer: the caller falls
+    /// back to the shell handoff for these rather than guessing.
+    #[test]
+    fn remote_path_request_declines_where_a_listing_cannot_help() {
+        // Command position: `$PATH`, not a directory listing.
+        assert!(remote_path_request("ls", 2, "/home/me").is_none());
+        assert!(remote_path_request("", 0, "/home/me").is_none());
+        // ...unless the "command" is itself a path, which is a real listing.
+        assert!(remote_path_request("./scr", 5, "/home/me").is_some());
+
+        // `~` needs the remote's $HOME, which no OSC reports. The remote shell
+        // can expand it; we can't, so we decline and let it have the Tab.
+        assert!(remote_path_request("cat ~/pro", 9, "/home/me").is_none());
+
+        // No absolute cwd to resolve against (the remote shell hasn't reported
+        // one yet, or reported something unusable).
+        assert!(remote_path_request("cat fi", 6, "").is_none());
+        assert!(remote_path_request("cat fi", 6, "relative/dir").is_none());
+    }
+
+    /// A remote listing becomes candidates under exactly the local rules —
+    /// hidden entries stay hidden, the typed directory prefix is preserved, and
+    /// the ordering is the shared closeness sort.
+    #[test]
+    fn remote_path_candidates_mirror_the_local_path_rules() {
+        let entries = |names: &[(&str, bool)]| -> Vec<RemoteEntry> {
+            names
+                .iter()
+                .map(|(n, d)| RemoteEntry {
+                    name: (*n).to_string(),
+                    is_dir: *d,
+                })
+                .collect()
+        };
+        let all = entries(&[
+            (".", true),
+            ("..", true),
+            (".hidden", false),
+            ("src", true),
+            ("setup.py", false),
+            ("s", false),
+            ("other", false),
+        ]);
+        let texts =
+            |cands: Vec<Candidate>| -> Vec<String> { cands.into_iter().map(|c| c.text).collect() };
+
+        let req = remote_path_request("cat s", 5, "/home/me").unwrap();
+        let got = texts(remote_path_candidates(&req, &all));
+        assert_eq!(
+            got,
+            vec!["s", "src", "setup.py"],
+            "prefix-matched, shortest first; `.`/`..`/hidden/non-matching dropped"
+        );
+
+        // The directory kind survives, so the menu can mark it and the insert
+        // can add the trailing separator.
+        let cands = remote_path_candidates(&req, &all);
+        assert!(cands.iter().find(|c| c.text == "src").unwrap().is_dir());
+        assert!(!cands.iter().find(|c| c.text == "s").unwrap().is_dir());
+
+        // The typed directory part is re-prepended to every candidate, and the
+        // replacement range covers the whole word.
+        let req = remote_path_request("cat sub/s", 9, "/home/me").unwrap();
+        let c = &remote_path_candidates(&req, &all)[0];
+        assert_eq!(c.text, "sub/s");
+        assert_eq!((c.start, c.end), (4, 9));
+
+        // A dot prefix opts into hidden entries, as it does locally.
+        let req = remote_path_request("cat .h", 6, "/home/me").unwrap();
+        let got = texts(remote_path_candidates(&req, &all));
+        assert_eq!(got, vec![".hidden"]);
+
+        // `cd` drops the files.
+        let req = remote_path_request("cd s", 4, "/home/me").unwrap();
+        let got = texts(remote_path_candidates(&req, &all));
+        assert_eq!(got, vec!["src"]);
     }
 
     #[test]
