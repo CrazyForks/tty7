@@ -184,6 +184,17 @@ pub struct Config {
     /// `true` by that hint; there is no UI to reset it (nor a reason to).
     #[serde(default)]
     pub workspace_detach_hint_seen: bool,
+    /// Ask before closing the *last* window (the close that also quits the app).
+    /// On by default, which is the behavior every build so far has had.
+    ///
+    /// The prompt was only ever a teaching device, not a safety net: ⌘Q, the
+    /// tray's Quit and the palette's Quit all leave without asking, and nothing
+    /// is lost either way — the panes keep running in the daemon. So once the
+    /// user has learned that (Settings states it permanently under "How sessions
+    /// work"), being asked on every quit is pure friction. Off makes the last
+    /// window close exactly like any other: detach the workspace, quit.
+    #[serde(default = "default_true")]
+    pub confirm_window_close: bool,
     /// How the terminal bell (BEL / `^G`) is signalled. Defaults to a brief
     /// visual flash (the current behavior).
     #[serde(default, deserialize_with = "de_lenient")]
@@ -619,6 +630,7 @@ impl Default for Config {
             restore_session: true,
             show_tray_icon: true,
             workspace_detach_hint_seen: false,
+            confirm_window_close: true,
             // Visual flash preserves the pre-config behavior (the bell always
             // flashed); opting into None/Audible is a deliberate change.
             bell: BellMode::Visual,
@@ -667,7 +679,7 @@ impl Config {
             // Missing/unreadable config is the common case — start with defaults.
             return Config::default();
         };
-        match serde_json::from_str::<Config>(&text) {
+        match serde_json::from_str::<Config>(strip_bom(&text)) {
             Ok(mut cfg) => {
                 cfg.sanitize();
                 cfg
@@ -810,6 +822,21 @@ fn default_config_dir() -> Option<PathBuf> {
 /// config-dir file (`config.json`, `session.json`, `history`).
 pub fn config_path(file: &str) -> Option<PathBuf> {
     Some(config_dir()?.join(file))
+}
+
+/// Drop a leading UTF-8 BOM so a hand-edited config still parses.
+///
+/// `serde_json` rejects U+FEFF before the opening brace, and every config-dir
+/// file is read by a loader that treats *any* parse error as "there is no
+/// config" — so a BOM doesn't surface as an error, it silently resets the
+/// user's settings. Windows makes that easy to hit by accident: PowerShell's
+/// `>`, `Out-File` and `Set-Content -Encoding utf8` all write one, so a quick
+/// `... | Set-Content config.json` is enough to lose every setting.
+///
+/// `read_to_string` decodes the BOM to the single char U+FEFF, so this strips
+/// the char rather than the three raw bytes.
+pub fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{FEFF}').unwrap_or(text)
 }
 
 /// Write `bytes` to `path` atomically: write to a sibling temp file, fsync, then
@@ -1035,6 +1062,31 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(back.ssh_warn_on_close);
         assert_eq!(back.ssh_profile_frecency.get(&id).unwrap().count, 4);
+    }
+
+    /// Opt-*out*, unlike most flags here: a config written before this setting
+    /// existed must keep the prompt, or an update would silently take away the
+    /// one thing telling people their sessions survive a quit.
+    #[test]
+    fn confirm_window_close_defaults_on_and_round_trips() {
+        assert!(Config::default().confirm_window_close);
+
+        let old: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        assert!(old.confirm_window_close);
+
+        let off: Config = serde_json::from_str(r#"{"confirm_window_close": false}"#).unwrap();
+        assert!(!off.confirm_window_close);
+        let json = serde_json::to_string(&off).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(!back.confirm_window_close);
+
+        // ...and a key this build has never heard of — a config last written by
+        // a newer tty7, or hand-edited — must be ignored rather than failing the
+        // whole parse, which `Config::load` would swallow into *defaults*: the
+        // opt-out would come back on with nothing said.
+        let newer: Config =
+            serde_json::from_str(r#"{"confirm_window_close": false, "not_a_setting": 7}"#).unwrap();
+        assert!(!newer.confirm_window_close);
     }
 
     #[test]
@@ -1380,8 +1432,19 @@ mod tests {
         set_config_dir(dir);
     }
 
+    /// Serialize the tests that write the shared `config.json`: they all resolve
+    /// the same pinned path, so without this they clobber each other's file.
+    static CONFIG_FILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_config_file() -> std::sync::MutexGuard<'static, ()> {
+        // A poisoned lock only means another test failed mid-sequence; every
+        // holder rewrites the file from scratch, so the state is still sound.
+        CONFIG_FILE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn save_load_and_shell_command_round_trip_through_disk() {
+        let _guard = lock_config_file();
         pin_config_dir();
         // Persist a config with a non-default shell + font + an SSH profile, then
         // read it back.
@@ -1418,6 +1481,41 @@ mod tests {
         let (program, args) = shell_command().expect("shell override present");
         assert_eq!(program, "fish");
         assert_eq!(args, vec!["-l".to_string()]);
+    }
+
+    #[test]
+    fn a_utf8_bom_does_not_silently_reset_the_config() {
+        let _guard = lock_config_file();
+        pin_config_dir();
+        let path = Config::path().expect("pinned config dir");
+        // Exactly what PowerShell's `>`, `Out-File` and `Set-Content -Encoding
+        // utf8` leave behind.
+        let text = "\u{FEFF}{\"font_size\": 21.0, \"restore_session\": false}";
+        write_atomic(&path, text.as_bytes()).unwrap();
+
+        // The failure this guards is silent by construction: `load` turns *any*
+        // parse error into defaults, so a BOM didn't report a bad config — it
+        // reported no config, and the user's settings appeared to vanish.
+        let loaded = Config::load();
+        assert_eq!(loaded.font_size, 21.0);
+        assert!(!loaded.restore_session);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strip_bom_only_removes_a_leading_marker() {
+        assert_eq!(strip_bom("{}"), "{}");
+        assert_eq!(strip_bom("\u{FEFF}{}"), "{}");
+        // Only the first U+FEFF is a marker. A second one is content, and
+        // content that happens to be a BOM is still invalid JSON — stripping
+        // it too would be guessing at a file we can't rescue.
+        assert_eq!(strip_bom("\u{FEFF}\u{FEFF}{}"), "\u{FEFF}{}");
+        // A BOM *inside* the document is data (U+FEFF is a legal string char),
+        // so it must survive untouched.
+        let inner = "{\"tab_title\":\"\u{FEFF}\"}";
+        assert_eq!(strip_bom(inner), inner);
+        assert_eq!(strip_bom(""), "");
     }
 
     #[test]

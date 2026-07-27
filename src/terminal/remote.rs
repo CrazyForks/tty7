@@ -236,6 +236,24 @@ impl RemoteTerminal {
         let retry_shell = shell.clone();
         match Self::spawn_once(size, cell_w, cell_h, cwd, shell) {
             Ok(term) => Ok(term),
+            Err(first_err) if daemon_not_listening(&first_err) => {
+                // Nothing is on the socket: the daemon died (crash, OOM, a stray
+                // `kill`) since the last pane was opened. Every later spawn would
+                // fail the same way, so bring one back up and retry rather than
+                // leaving the window unable to open another terminal.
+                if let Err(start_err) = crate::daemon::spawn::ensure_running() {
+                    return Err(anyhow::anyhow!(
+                        "daemon not running ({first_err}); starting one failed: {start_err}"
+                    ));
+                }
+                Self::spawn_once(size, cell_w, cell_h, retry_cwd, retry_shell).map_err(
+                    |second_err| {
+                        anyhow::anyhow!(
+                            "daemon not running ({first_err}); started one but Spawn still failed: {second_err}"
+                        )
+                    },
+                )
+            }
             Err(first_err) if daemon_disconnected_before_spawn_reply(&first_err) => {
                 // A live-but-old daemon can accept the connection, panic while
                 // handling Spawn, and close before replying. Restart once so an
@@ -1430,6 +1448,21 @@ fn record_mark(term: &Term<EventProxy>, marks: &crate::terminal::marks::Marks, e
     }
 }
 
+/// Whether the failure is "nothing is listening on the socket" — the daemon is
+/// gone, as opposed to alive but unhappy. On Unix a dead daemon leaves the
+/// socket file behind (`ConnectionRefused`) or removed it on the way out
+/// (`NotFound`); on Windows the named pipe simply isn't there (`NotFound`).
+fn daemon_not_listening(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+        })
+    })
+}
+
 fn daemon_disconnected_before_spawn_reply(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
@@ -1604,10 +1637,14 @@ fn parse_osc_notification(payload: &[u8]) -> Option<(Option<String>, String)> {
 /// isolation (dev vs. real config dir), exactly like every other config-dir file.
 fn connect() -> anyhow::Result<Stream> {
     transport::connect().map_err(|e| {
-        anyhow::anyhow!(
-            "connect to daemon at {}: {e}",
+        // `context`, not a formatted `anyhow!`: callers classify the failure by
+        // downcasting to `io::Error` (see `daemon_not_listening`), and
+        // interpolating the cause into a string would leave the chain with
+        // nothing to find.
+        anyhow::Error::new(e).context(format!(
+            "connect to daemon at {}",
             transport::endpoint_display()
-        )
+        ))
     })
 }
 
@@ -1732,6 +1769,50 @@ mod tests {
         );
     }
 
+    /// Guards the `alacritty_terminal` pin, not our own code. Upstream reserves
+    /// columns one `char` at a time, so an emoji written as base + `U+FE0F`
+    /// (`❤️`, `🗂️`, `⚠️` — anything whose base is East Asian Width Neutral) gets
+    /// one column instead of two and shoves the rest of the line left by one.
+    /// Our fork re-scores the sequence and widens the cell; a bump back to an
+    /// unpatched rev must fail here rather than in the field (issue #203).
+    #[test]
+    fn emoji_presentation_sequences_reserve_two_columns() {
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+
+        // `x` marks where the emoji ended: column 2 if ❤️ got its two columns,
+        // column 1 if the selector was counted as free.
+        DaemonMsg::Output("\u{2764}\u{FE0F}x".as_bytes().to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+
+        let mut row = String::new();
+        for _ in 0..200 {
+            {
+                let t = term.term.lock();
+                let grid = t.grid();
+                row.clear();
+                for col in 0..3usize {
+                    row.push(
+                        grid[alacritty_terminal::index::Line(0)]
+                            [alacritty_terminal::index::Column(col)]
+                        .c,
+                    );
+                }
+            }
+            if row.contains('x') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            row, "\u{2764} x",
+            "❤️ must hold two columns (glyph + spacer) before the next glyph"
+        );
+    }
+
     #[test]
     fn spawn_retry_only_for_daemon_disconnects() {
         let eof: anyhow::Error =
@@ -1740,6 +1821,31 @@ mod tests {
 
         let refused = anyhow::anyhow!("daemon refused Spawn: configured shell missing");
         assert!(!daemon_disconnected_before_spawn_reply(&refused));
+    }
+
+    /// A dead daemon is the one failure the client can fix by itself, and it
+    /// must be told apart from a live daemon saying no — restarting on *that*
+    /// would kill every running pane over a bad shell setting.
+    #[test]
+    fn only_a_dead_daemon_is_worth_starting_one_for() {
+        let connect_failed = |kind| -> anyhow::Error {
+            anyhow::Error::new(std::io::Error::new(kind, "no listener"))
+                .context("connect to daemon at /tmp/tty7.sock")
+        };
+        assert!(daemon_not_listening(&connect_failed(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(daemon_not_listening(&connect_failed(
+            std::io::ErrorKind::NotFound
+        )));
+
+        // A daemon that answered and refused, and one that hung up mid-Spawn:
+        // neither is "not running", and each has its own recovery.
+        let refused = anyhow::anyhow!("daemon refused Spawn: configured shell missing");
+        assert!(!daemon_not_listening(&refused));
+        let eof: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed").into();
+        assert!(!daemon_not_listening(&eof));
     }
 
     /// Without a real daemon, drive the reader path directly: a `UnixStream::pair`

@@ -1262,6 +1262,8 @@ impl Tty7App {
     /// "the parent folder" and matches the rows below rather than a toolbar action.
     fn render_sftp_go_up_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let foreground = cx.theme().foreground;
+        // Matches the directory rows below it, which paint on the popover surface.
+        let sf = cx.global::<crate::ui::presets::Surfaces>().popover;
         h_flex()
             .id("sftp-go-up")
             .items_center()
@@ -1271,7 +1273,7 @@ impl Tty7App {
             .py_1()
             .rounded(cx.theme().radius)
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().accent.opacity(0.5)))
+            .hover(|s| s.bg(gpui::rgb(sf.hover)))
             .child(
                 Icon::new(IconName::FolderOpen)
                     .xsmall()
@@ -1481,7 +1483,7 @@ impl Tty7App {
         let accent = cx.theme().accent;
         let border = cx.theme().border;
         let sidebar = cx.theme().sidebar;
-        let hover = cx.theme().sidebar_accent.opacity(0.4);
+        let hover = gpui::rgb(cx.global::<crate::ui::presets::Surfaces>().sidebar.hover);
         let expanded = self.sftp_panel.tray_expanded || history;
 
         // The summary line: how many are moving and how far along the run is, as
