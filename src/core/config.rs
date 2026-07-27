@@ -184,6 +184,17 @@ pub struct Config {
     /// `true` by that hint; there is no UI to reset it (nor a reason to).
     #[serde(default)]
     pub workspace_detach_hint_seen: bool,
+    /// Ask before closing the *last* window (the close that also quits the app).
+    /// On by default, which is the behavior every build so far has had.
+    ///
+    /// The prompt was only ever a teaching device, not a safety net: ⌘Q, the
+    /// tray's Quit and the palette's Quit all leave without asking, and nothing
+    /// is lost either way — the panes keep running in the daemon. So once the
+    /// user has learned that (Settings states it permanently under "How sessions
+    /// work"), being asked on every quit is pure friction. Off makes the last
+    /// window close exactly like any other: detach the workspace, quit.
+    #[serde(default = "default_true")]
+    pub confirm_window_close: bool,
     /// How the terminal bell (BEL / `^G`) is signalled. Defaults to a brief
     /// visual flash (the current behavior).
     #[serde(default, deserialize_with = "de_lenient")]
@@ -619,6 +630,7 @@ impl Default for Config {
             restore_session: true,
             show_tray_icon: true,
             workspace_detach_hint_seen: false,
+            confirm_window_close: true,
             // Visual flash preserves the pre-config behavior (the bell always
             // flashed); opting into None/Audible is a deliberate change.
             bell: BellMode::Visual,
@@ -1035,6 +1047,31 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(back.ssh_warn_on_close);
         assert_eq!(back.ssh_profile_frecency.get(&id).unwrap().count, 4);
+    }
+
+    /// Opt-*out*, unlike most flags here: a config written before this setting
+    /// existed must keep the prompt, or an update would silently take away the
+    /// one thing telling people their sessions survive a quit.
+    #[test]
+    fn confirm_window_close_defaults_on_and_round_trips() {
+        assert!(Config::default().confirm_window_close);
+
+        let old: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        assert!(old.confirm_window_close);
+
+        let off: Config = serde_json::from_str(r#"{"confirm_window_close": false}"#).unwrap();
+        assert!(!off.confirm_window_close);
+        let json = serde_json::to_string(&off).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(!back.confirm_window_close);
+
+        // ...and a key this build has never heard of — a config last written by
+        // a newer tty7, or hand-edited — must be ignored rather than failing the
+        // whole parse, which `Config::load` would swallow into *defaults*: the
+        // opt-out would come back on with nothing said.
+        let newer: Config =
+            serde_json::from_str(r#"{"confirm_window_close": false, "not_a_setting": 7}"#).unwrap();
+        assert!(!newer.confirm_window_close);
     }
 
     #[test]

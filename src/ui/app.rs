@@ -1089,10 +1089,14 @@ impl Tty7App {
         //
         // The last window is different: closing it also quits the app (a
         // windowless process left in the Dock no longer responds to being
-        // clicked — #147), so that one keeps the reassuring prompt. We veto the
-        // immediate close (return `false`), show it, and quit only if the user
-        // picks "Close"; a one-shot flag lets that post-confirm close through
-        // instead of looping the prompt.
+        // clicked — #147), so that one keeps the reassuring prompt by default.
+        // We veto the immediate close (return `false`), show it, and quit only
+        // if the user picks "Close"; a one-shot flag lets that post-confirm
+        // close through instead of looping the prompt.
+        //
+        // `confirm_window_close` turns the prompt off for users who have learned
+        // the model — it is teaching, not protection (⌘Q never asked), so it has
+        // to be escapable.
         let close_confirmed = std::rc::Rc::new(std::cell::Cell::new(false));
         let weak_app = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -1104,9 +1108,11 @@ impl Tty7App {
                 .upgrade()
                 .is_some_and(|app| app.read(cx).tabs.is_empty());
 
-            // Any window but the last, or an empty one with nothing to
-            // reassure about: detach and go. Prompting here would be friction.
-            if !last_window || empty {
+            // Any window but the last, an empty one with nothing to reassure
+            // about, or a user who has turned the prompt off: detach and go.
+            // Prompting here would be friction.
+            let confirm = cx.global::<Config>().confirm_window_close;
+            if !last_window || empty || !confirm {
                 if let Some(app) = weak_app.upgrade() {
                     app.update(cx, |app, cx| app.detach_workspace(cx));
                 }
@@ -2621,6 +2627,13 @@ impl Tty7App {
     /// every second, so the icon appears/disappears without a restart.
     pub(crate) fn set_show_tray_icon(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.show_tray_icon = on);
+    }
+
+    /// Toggle the "Close Window?" prompt on the last window. The close handler
+    /// reads the flag when it fires, so this applies to the very next ⌘W with no
+    /// restart and nothing to push to open windows.
+    pub(crate) fn set_confirm_window_close(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.confirm_window_close = on);
     }
 
     // ── Input / Mouse setters ───────────────────────────────────────────────

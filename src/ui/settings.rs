@@ -346,6 +346,14 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: WindowTabs,
+            title: "Confirm before closing the last window",
+            // Both spellings of the chord: the prompt this turns off is reached
+            // by ⌘W on macOS and Ctrl-W everywhere else, and the user types
+            // whichever one their own keyboard just used.
+            keywords: "close quit confirm prompt dialog ask again warn last window cmd-w ctrl-w",
+        },
+        SearchEntry {
+            section: WindowTabs,
             title: "Show tray icon",
             keywords: "tray menu bar status item agent attention system icon",
         },
@@ -3441,6 +3449,7 @@ impl Tty7App {
         let restore_session = cfg.restore_session;
         let remember_window_size = cfg.remember_window_size;
         let show_tray_icon = cfg.show_tray_icon;
+        let confirm_window_close = cfg.confirm_window_close;
         let tab_bar_idx = match cfg.tab_bar_position {
             TabBarPosition::Top => 0,
             TabBarPosition::Left => 1,
@@ -3504,6 +3513,10 @@ impl Tty7App {
         let remember_window_switch = crate::ui::theme::switch("wt-remember-window", cx)
             .checked(remember_window_size)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_remember_window_size(*on, cx)))
+            .into_any_element();
+        let confirm_close_switch = crate::ui::theme::switch("wt-confirm-window-close", cx)
+            .checked(confirm_window_close)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_confirm_window_close(*on, cx)))
             .into_any_element();
         let tray_switch = crate::ui::theme::switch("wt-tray-icon", cx)
             .checked(show_tray_icon)
@@ -3588,6 +3601,16 @@ impl Tty7App {
                 "Restore last layout",
                 "Reopen the last window's tabs, splits, and directories on launch. Off starts with a single fresh terminal.",
                 restore_switch,
+                cx,
+            ))
+            // Phrased around what stays true either way: the prompt is there to
+            // teach that closing isn't ending, so the row that turns it off is
+            // the last chance to say so.
+            .child(self.settings_row(
+                "Confirm before closing the last window",
+                "Ask first, since that close also quits tty7. Off closes straight away — \
+                 either way your shells keep running in the background.",
+                confirm_close_switch,
                 cx,
             ))
             .child(self.settings_row(
@@ -4551,6 +4574,28 @@ mod tests {
         }
     }
 
+    /// The close-confirmation toggle is the one people go looking for *after*
+    /// the dialog has annoyed them, so it has to be reachable by what they'd
+    /// type in that moment — not just by its own title.
+    #[test]
+    fn close_confirmation_toggle_is_findable() {
+        // Not a bare "confirm": SSH's own close warning owns that word just as
+        // legitimately, and the nav's per-section counts are what disambiguate.
+        for query in [
+            "ask again",
+            "closing the last window",
+            "dialog",
+            "cmd-w",
+            "ctrl-w",
+        ] {
+            assert_eq!(
+                best_matching_section(query).map(|s| s.profile_label()),
+                Some(SettingsSection::WindowTabs.profile_label()),
+                "query {query:?} should land on Window & Tabs"
+            );
+        }
+    }
+
     /// The index names rows, so a title that no longer matches the rendered row
     /// sends the user to the right page and then leaves them hunting. This
     /// pins the ones that had drifted (the index said "Working directory"; the
@@ -4560,6 +4605,7 @@ mod tests {
         for title in [
             "Start in",
             "Restore last layout",
+            "Confirm before closing the last window",
             "Terminal bell",
             "Report mouse to apps",
             "Open files with",
