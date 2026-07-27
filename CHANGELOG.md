@@ -5,9 +5,45 @@ All notable changes to tty7 are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [26.7.5] - 2026-07-27
 
 ### Added
+
+- **Tab completes remote paths in an SSH pane** — path candidates came off the
+  local filesystem, so a native-SSH pane deliberately passed no cwd and Tab
+  found nothing; a no-match hands the line to the shell, which costs the inline
+  editor until the next prompt. Since paths are what people complete most, in
+  practice every path Tab in an SSH session dropped the user back to the raw
+  shell. Tab now lists the remote directory over the pane's own authenticated
+  connection — the same request the SFTP panel browses with — so nothing is
+  echoed into the scrollback and no prompt hooks are involved. `cd` still filters
+  to directories. Command position and `~/` still fall through, as does a
+  foreground `ssh` typed into a local shell or a WSL pane, neither of which has a
+  tty7-owned connection to ask. (#217)
+
+- **The last-window close confirmation can be turned off** — Settings → Window &
+  Tabs gains **Confirm before closing the last window**, on by default. The
+  prompt is a teaching device, not a safety net: ⌘Q, the tray's Quit and the
+  palette all quit without asking, and nothing is lost either way since the panes
+  keep running in the daemon. Once that model is learned, an extra dialog on
+  every quit is friction. Brings the window-close prompt in line with the SSH
+  close warning, which has had a toggle all along. (#206)
+
+- **The detail panel and tab rail have a scrollbar** — Info / Outline / Changes,
+  the file tree, the remote SFTP listing and the tab rail all scrolled with a
+  container that painted nothing, so a deep tree or a long tab list gave no hint
+  that there was more content or where in it you were. The bar takes its colours
+  from the active theme rather than a stock grey, and follows the platform:
+  auto-hiding on macOS, permanently visible on Windows and Linux. (#193)
+
+- **Foreground applications can negotiate the Kitty keyboard protocol** — the
+  embedded terminal config inherited `kitty_keyboard: false`, so the parser
+  ignored the negotiation sequences and an application asking for progressive
+  enhancement fell back to `modifyOtherKeys`, which tty7 doesn't implement. That
+  collapsed distinct chords onto the same legacy byte — `Shift+Enter` reached the
+  application as a plain carriage return, submitting a prompt instead of
+  inserting a soft newline. Legacy input is unchanged until an application opts
+  in. (#184)
 
 - **The window's leading corner carries the app's mark off macOS** — macOS fills
   the top-left with the traffic lights; on Windows and Linux that corner was
@@ -17,9 +53,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   label below it start on, and follows the rail's controls into the title strip
   when the sidebar is collapsed — so the corner never falls back to nothing.
   Drawn, never clicked: it takes no hover capsule and no hit box, leaving the
-  strip grabbable through it.
+  strip grabbable through it. (#202)
+
+### Changed
+
+- **Interaction state and status colours are derived from the active theme**
+  ([#197](https://github.com/l0ng-ai/tty7/issues/197)) — a segmented control's
+  selected option was indistinguishable from its neighbours on *every* bundled
+  theme (Dracula worst at 1.03:1), because the theme had a colour model but no
+  state model: fixed blend ratios scattered across the code, plus every
+  gpui-component field nobody had noticed still carrying stock greys and Tailwind
+  hues. Each painting surface now carries a state ladder derived to hit a
+  contrast *ratio* against that surface, so the result no longer drifts with the
+  theme — selected-vs-resting goes from 1.20–1.47:1 to 1.70–1.72:1, anchored so
+  Dracula's already-signed-off highlight is a no-op. Ladders are per surface, so
+  a menu row anchors to the popover it actually sits on. Taking a fill now also
+  takes its paired label colour, instead of each site hand-fixing that
+  separately. `danger`/`warning`/`success`/`info`/`link` come from the theme's
+  own ANSI-16 at 33 call sites — Dracula's delete button is literally the
+  `#ff5555` the terminal in the same window paints with. Switches were inverted
+  on every dark theme (a near-black knob on a light track, invisible on the dark
+  one) and now take the light end of the theme's axis with the accent on the
+  checked track. (#205)
+
+- **The bundled icon set is redrawn to one humanist spec** — the previous set
+  accumulated one exception at a time: a heavier `plus` because a bare cross
+  looked frail, a `stock/` prefix to undo overrides that were too heavy at 16px,
+  two names sharing one drawing. All 17 glyphs now hold to a single spec — 2.1
+  stroke throughout, corner radii matching the app's 10px panels, near-square
+  boxes of equal apparent area, round caps and joins everywhere. Metaphors are
+  untouched, so nothing needs relearning; `folder-closed` gains an inner rule
+  that distinguishes it from `folder`, and `info` a title bar that stops it
+  colliding with `panel-left`. (#190)
+
+- **The title bar spans the detail panel off macOS** — the panel was a
+  full-height column *beside* the bar, and the bar lays out ─ ▢ ✕ at its own
+  right end, so opening the panel on Windows or Linux stranded the window
+  controls mid-window with the panel's grey to their right. Layout moves to
+  `[rail | col(bar / row(body, panel))]` so the bar reaches the corner, with the
+  caption row over the panel painted in the panel's own surface — the column
+  reads as one continuous sidebar from the very top instead of starting 40px down
+  in a different colour. The panel's tab tiles move into the section header it
+  was already drawing, since a tile row of its own made three stacked headers
+  before a single line of content. macOS is untouched. (#188)
 
 ### Fixed
+
+- **Splitting or un-maximizing a pane you were hovering no longer kills the app**
+  ([#201](https://github.com/l0ng-ai/tty7/issues/201)) — a pane remembers the
+  cell under the pointer (that's what makes ⌘-hover underline links), and nothing
+  invalidated it when the grid shrank underneath. The remembered row then named a
+  line the grid no longer had, and the next modifier press indexed the grid with
+  it — inside a gpui input callback, which is `extern "C"` and cannot unwind, so
+  the process aborted with the message lost. `⌘⇧D`, `⌘⇧⏎` and dragging the window
+  smaller were all reliable ways to hit it. The hovered cell is dropped on resize
+  and the row is validated before indexing. Two other aborts went with it: `⌘T` /
+  `⌘D` against a dead daemon now restarts it and retries once, and session
+  restore with an unreachable daemon restores what it can instead of dying. A
+  panic anywhere in the GUI now also lands in `<config-dir>/crash.log` with its
+  message, location and backtrace — the OS report only ever kept the abort.
+  (#204)
+
+- **Emoji written with a variation selector take their real width and
+  presentation** ([#203](https://github.com/l0ng-ai/tty7/issues/203)) — `🗂️`,
+  `❤️` and `⚠️` were budgeted one column, so the glyph bled over its neighbour
+  and every following cell on the line shifted left by one, taking selection and
+  click hit-testing with it. The selector is zero-width and lands *after* the
+  base's column budget is spent, and nothing revisited the decision. The same
+  gap made `❤️` render as the black text-presentation heart, identical to bare
+  `❤`, because only `cell.c` reached the shaper — dropping every combining mark,
+  not just variation selectors. The terminal now re-scores the sequence and
+  widens the cell, and carries the marks through to be shaped with their base:
+  `❤️` and `⚠️` come up in colour while their bare forms stay monochrome, and
+  `e` + U+0301 renders as `é`. Narrowing (`U+FE0E` on an already-wide emoji) is
+  still not implemented — it would have to free a column and reflow the line.
+  (#210, #216)
+
+- **Untrusted terminal output can no longer freeze a pane** — with Kitty
+  keyboard negotiation enabled, an upstream `alacritty_terminal` bug became
+  reachable: `push_keyboard_mode` caps its stack by removing from the *title*
+  stack, a copy-paste slip that compiles because both are `Vec`s. With an empty
+  title stack that panics and kills the reader thread, freezing the pane; with a
+  non-empty one it silently drops a saved title, so a later restore returns the
+  wrong one. It doesn't take hostile output — a TUI that pushes without popping
+  reaches the 4096 cap on its own in a long session, and `cat` of a crafted file
+  or a remote host over SSH gets there in one ~20KB burst. Pinned to a patched
+  fork, with a regression test that guards the pin. (#194)
+
+- **`theme_follow_system` no longer panics every launch on Linux** — flipping
+  "sync with system" on in Settings persists immediately, so the app then aborted
+  on every start until `config.json` was hand-edited back, with a backtrace
+  pointing at gpui internals and nothing connecting it to the theme toggle. gpui's
+  Wayland and X11 backends dispatch the appearance-changed callback while the
+  platform client's `RefCell` is already mutably borrowed, and reading
+  `cx.window_appearance()` from that callback re-borrows the same cell. The OS
+  appearance is now cached in a global that the observer fills from the window's
+  own cell, so nothing on the re-entrant path touches the client. macOS and
+  Windows were never affected. (#181)
 
 - **A config file saved with a UTF-8 BOM no longer wipes your settings** — every
   config-dir file is read by a loader that treats any parse error as "there is
@@ -30,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `Set-Content -Encoding utf8` all write a BOM, so editing `config.json`
   from a shell was enough to lose every setting. `config.json`, `session.json`
   (which lost every workspace the same way) and hand-authored `themes/*.yaml`
-  now skip a leading BOM.
+  now skip a leading BOM. (#215)
 
 - **New tabs and splits open in the right directory even when the shell can't be
   instrumented** ([#187](https://github.com/l0ng-ai/tty7/issues/187)) — a pane
@@ -46,7 +176,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions and coding agents. A shell that does emit `OSC 7` keeps its own
   spelling of the path: `$PWD` preserves the symlinked route the user walked in
   through, and that is the one a new tab should open in. macOS and Linux;
-  Windows has no equivalent process query and is unchanged.
+  Windows has no equivalent process query and is unchanged. (#207)
+
+- **Links open on Ctrl+click on Windows and Linux**
+  ([#183](https://github.com/l0ng-ai/tty7/issues/183)) — the link modifier was
+  the platform key, which gpui maps to ⌘ on macOS but to Win/Super elsewhere, a
+  key the OS mostly swallows. Off macOS neither the hover underline nor
+  click-to-open could be triggered at all, and the only way to follow a URL was
+  to select and copy it — while `config.json`'s own docs had promised
+  "⌘/Ctrl-click" all along. Now the same portable secondary modifier the
+  keybindings already use, so ⌃-click keeps meaning right-click on macOS.
+  Settings copy and the docs follow the platform. (#192)
+
+- **Option-as-Meta works with a CJK input source**
+  ([#177](https://github.com/l0ng-ai/tty7/issues/177)) — macOS gives Option two
+  jobs, and routes the chord before the terminal sees it. With a non-ASCII input
+  source active, ⌥F went to the IME, which committed `ƒ` and consumed the event,
+  so the code that turns the chord into `ESC f` never got a say. The setting
+  worked on ASCII layouts and silently did nothing on CJK ones, which is why it
+  read as intermittent rather than broken. gpui can now decide per keystroke
+  rather than once per view, so Meta chords are claimed by the terminal while
+  ordinary text, dead keys and Pinyin composition still reach the IME. gpui
+  accordingly moves to the `l0ng-ai/zed` fork. (#191)
+
+- **A whole command cycle arriving in one read reports both prompt states** —
+  the OSC sniffer folded a chunk's shell-integration marks into one state and
+  sent a single frame, hiding the prompt boundary the client counts to tell a
+  fresh prompt from a same-prompt redraw. Routine over SSH, where a fast
+  command's start mark, output and completion mark leave the remote in one
+  packet. Marks on the same side of a boundary still fold, so an ordinary prompt
+  draw costs one frame as before. (#217)
+
+- **The detail-panel toggle stops drawing itself as selected, and the Files
+  dotfile switch moves into the tree's right-click menu** — follow-ups to the
+  caption-row rework, which left the toggle permanently lit and the dotfile
+  control competing for room on the header line. (#188)
 
 - **The editor and diff overlays keep their header on the caption line when the
   detail panel is open** — off macOS the title bar is hoisted above
@@ -56,19 +220,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its insets, a full chrome tile for their one control), and instead landed a
   row low, level with the panel's tab row. They now hang on the row that owns
   the bar, inset by the panel's width, so the corner chrome keeps its surface
-  and its clicks.
+  and its clicks. (#202)
 - **Those headers became real title bars** — dragging one now moves the window
   and double-clicking zooms it. Both covered the caption row and neither did
   either, with the panel open or closed, so opening a file turned the top of the
   window into a 40px strip that looked exactly like a title bar and answered
   nothing. Their controls (the ✕, the diff's back-to-all-files chip) are
   `occlude()`d to keep taking clicks: a drag region on Windows is HTCAPTION, and
-  the OS claims the press before the app hit-tests.
+  the OS claims the press before the app hit-tests. Double-clicking a stand-in
+  title bar zooms the window on Linux too. (#202)
 - **The rail's top zone lines up with the title bar to the pixel** — the bar
   reserves a hairline inside its own height that the rail's stand-in row didn't,
   so everything in that row sat half a pixel low. Invisible on the line-art
   tiles; not on the mark, which visibly hopped as collapsing the rail handed it
-  over to the bar.
+  over to the bar. (#202)
 - **CJK and emoji stop falling through to the OS on Windows and Linux** — the
   default `font_fallbacks` named only faces that ship with macOS (Menlo, Apple
   Color Emoji), so off macOS the entire chain matched nothing and every
@@ -82,7 +247,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rewritten. Maple Mono NF CN stays first on every platform: its 1.2em CJK
   advance is the only exact fit for the two-column slot Hack's 0.60205em cell
   produces, so a 1.0em stock face is left-aligned there with the remaining
-  ~0.2em showing as a gap on the right of each character.
+  ~0.2em showing as a gap on the right of each character. (#195)
 
 ## [26.7.4] - 2026-07-26
 
