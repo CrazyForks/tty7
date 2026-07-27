@@ -243,7 +243,21 @@ pub(crate) fn title_bar_drag(row: gpui::Stateful<gpui::Div>) -> gpui::Stateful<g
                 window.start_window_move();
             }
         })
-        .on_double_click(|_, window, _| window.titlebar_double_click())
+        .on_double_click(|_, window, _| {
+            // gpui only implements `titlebar_double_click` on macOS — the trait
+            // method is an empty default everywhere else, so on Linux this row
+            // swallowed the double-click and nothing zoomed. `zoom_window` is the
+            // maximise toggle there (x11 `_NET_WM_STATE_MAXIMIZED_*`, wayland
+            // `set_maximized`), and what gpui-component's own `TitleBar` calls on
+            // Linux for exactly this reason. Windows needs neither: the row is a
+            // drag area, which maps to HTCAPTION, and the OS has already restored
+            // or maximised the window before this could run.
+            if cfg!(target_os = "linux") {
+                window.zoom_window();
+            } else {
+                window.titlebar_double_click();
+            }
+        })
 }
 
 pub(crate) fn window_mark() -> Option<impl IntoElement> {
