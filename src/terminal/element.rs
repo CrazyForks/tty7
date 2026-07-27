@@ -834,13 +834,33 @@ fn paint_glyphs(
                 // for a single glyph — it paints at the run origin regardless.
                 RowSeg::Solo { col } => {
                     let cell = &buf[row_base + col];
+                    let cell_bounds = Bounds::new(
+                        point(geom.origin.x + geom.cell_width * (col as f32), y),
+                        size(geom.cell_width, geom.line_height),
+                    );
                     if let Some(shape) = PowerlineShape::of(cell.c) {
-                        let cell_bounds = Bounds::new(
-                            point(geom.origin.x + geom.cell_width * (col as f32), y),
-                            size(geom.cell_width, geom.line_height),
-                        );
                         let path = powerline_path(cell_bounds, shape);
                         window.paint_path(path, GlyphStyle::of(cell).fg);
+                        continue;
+                    }
+                    // Box-drawing / block characters paint as native geometry
+                    // sized to the actual (line-height-stretched) cell. A font
+                    // glyph only covers the font's own line height, which is
+                    // what broke every vertical run of `│`/`╭`/`╰` into dashes
+                    // at line_height > 1.0 — see `boxdraw`.
+                    if let Some(ink) = super::boxdraw::glyph(cell.c, cell_bounds) {
+                        let fg = GlyphStyle::of(cell).fg;
+                        for piece in ink {
+                            match piece {
+                                super::boxdraw::Ink::Rect(r) => window.paint_quad(fill(r, fg)),
+                                super::boxdraw::Ink::Shade(r, alpha) => {
+                                    let mut c = fg;
+                                    c.a *= alpha;
+                                    window.paint_quad(fill(r, c));
+                                }
+                                super::boxdraw::Ink::Path(p) => window.paint_path(p, fg),
+                            }
+                        }
                         continue;
                     }
                     (col, 1, char_string(cell.c), None, true)
