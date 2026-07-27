@@ -347,7 +347,10 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         SearchEntry {
             section: WindowTabs,
             title: "Confirm before closing the last window",
-            keywords: "close quit confirm prompt dialog ask again warn last window cmd-w",
+            // Both spellings of the chord: the prompt this turns off is reached
+            // by ⌘W on macOS and Ctrl-W everywhere else, and the user types
+            // whichever one their own keyboard just used.
+            keywords: "close quit confirm prompt dialog ask again warn last window cmd-w ctrl-w",
         },
         SearchEntry {
             section: WindowTabs,
@@ -4578,7 +4581,13 @@ mod tests {
     fn close_confirmation_toggle_is_findable() {
         // Not a bare "confirm": SSH's own close warning owns that word just as
         // legitimately, and the nav's per-section counts are what disambiguate.
-        for query in ["ask again", "closing the last window", "dialog", "cmd-w"] {
+        for query in [
+            "ask again",
+            "closing the last window",
+            "dialog",
+            "cmd-w",
+            "ctrl-w",
+        ] {
             assert_eq!(
                 best_matching_section(query).map(|s| s.profile_label()),
                 Some(SettingsSection::WindowTabs.profile_label()),

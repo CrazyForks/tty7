@@ -1064,6 +1064,14 @@ mod tests {
         let json = serde_json::to_string(&off).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(!back.confirm_window_close);
+
+        // ...and a key this build has never heard of — a config last written by
+        // a newer tty7, or hand-edited — must be ignored rather than failing the
+        // whole parse, which `Config::load` would swallow into *defaults*: the
+        // opt-out would come back on with nothing said.
+        let newer: Config =
+            serde_json::from_str(r#"{"confirm_window_close": false, "not_a_setting": 7}"#).unwrap();
+        assert!(!newer.confirm_window_close);
     }
 
     #[test]
