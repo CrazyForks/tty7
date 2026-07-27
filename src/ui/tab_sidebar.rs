@@ -13,16 +13,13 @@
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Axis, Bounds, Context, Div, FontWeight, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, SharedString, Stateful, Window,
-    WindowControlArea, canvas, deferred, div, ease_out_quint, linear_color_stop, linear_gradient,
-    prelude::*, px,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, SharedString, Stateful, Window, canvas,
+    deferred, div, ease_out_quint, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenu, ContextMenuExt as _};
-use gpui_component::{
-    ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, h_flex, v_flex,
-};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -751,11 +748,35 @@ impl Tty7App {
         let controls = h_flex()
             .flex_shrink_0()
             .h(px(TITLE_BAR_HEIGHT))
+            // Same box as the real title bar this row stands in for, hairline
+            // included: gpui-component's `TitleBar` draws a `border_b_1` inside its
+            // own `TITLE_BAR_HEIGHT` (tty7 paints it transparent, but it still takes
+            // its pixel), so the bar centres its contents on 19.5 while an
+            // unbordered 40px row centres them on 20. Half a pixel is invisible on
+            // the line-art tiles, and *not* on the solid brand mark: collapsing the
+            // rail hands the mark from this row to the bar, and it visibly hopped up
+            // as it went. Reserve the same pixel here and the handover is still.
+            .border_b_1()
+            .border_color(cx.theme().transparent)
             .items_center()
             .justify_end()
             .gap(px(2.))
             // Glyph's ink, not hit box, on the content edge — see `TILE_PAD`.
             .pr(px(crate::ui::app::tile_trailing_inset()))
+            // The brand mark leads the row, on the rail's own content inset — the
+            // line the search magnifier and every row label below it start on, so
+            // it reads as the head of this column rather than a floating badge.
+            // The spacer is what keeps the controls pinned right once the row has
+            // a leading child (`justify_end` alone no longer does it).
+            .when_some(crate::ui::app::window_mark(), |row, mark| {
+                row.child(
+                    div()
+                        .flex_shrink_0()
+                        .pl(px(crate::ui::app::CONTENT_INSET))
+                        .child(mark),
+                )
+                .child(div().flex_1())
+            })
             // Both tiles are wrapped in an `occlude()` div, exactly like the
             // title-strip chrome. This row is a `WindowControlArea::Drag` (set
             // below), which on Windows maps to HTCAPTION — the OS claims the click
@@ -934,34 +955,13 @@ impl Tty7App {
                     //
                     // The real `TitleBar` — which carries the window's drag region
                     // — only spans the *right* column in this layout, so this strip
-                    // would be dead space you can't grab the window by. Make the
-                    // controls' own row act like the title bar it sits level with:
-                    // drag to move, double-click to zoom. Driven exactly like
-                    // `TitleBar` does it (and the settings overlay's stand-in
-                    // strip): a press arms a flag and the first *move* starts the
-                    // window move, so a plain click — and a double-click — still
-                    // lands intact, while the buttons on the right keep taking
-                    // their own clicks.
-                    .child({
-                        let should_move = Rc::new(Cell::new(false));
-                        controls
-                            .id("sidebar-titlebar-drag")
-                            .window_control_area(WindowControlArea::Drag)
-                            .on_mouse_down(MouseButton::Left, {
-                                let should_move = should_move.clone();
-                                move |_, _, _| should_move.set(true)
-                            })
-                            .on_mouse_up(MouseButton::Left, {
-                                let should_move = should_move.clone();
-                                move |_, _, _| should_move.set(false)
-                            })
-                            .on_mouse_move(move |_, window, _| {
-                                if should_move.replace(false) {
-                                    window.start_window_move();
-                                }
-                            })
-                            .on_double_click(|_, window, _| window.titlebar_double_click())
-                    })
+                    // would be dead space you can't grab the window by. `title_bar_drag`
+                    // makes the controls' row act like the bar it sits level with:
+                    // drag to move, double-click to zoom, while the buttons on the
+                    // right keep taking their own clicks (they're `occlude()`d).
+                    .child(crate::ui::app::title_bar_drag(
+                        controls.id("sidebar-titlebar-drag"),
+                    ))
                     .child(top_bar)
                     .child(crate::ui::scrollbar::with_vertical_scrollbar(
                         "tab-sidebar-scrollbar",
