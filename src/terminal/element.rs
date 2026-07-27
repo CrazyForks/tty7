@@ -201,7 +201,16 @@ fn snapshot_cell(
 
     let mut rc = RenderCell {
         c: cell.c,
-        marks: cell.zerowidth().map(Box::from),
+        // `Cell::zerowidth` answers out of the same lazily-boxed `extra` that
+        // holds SGR 58 and OSC 8, so a cell carrying only an underline color or
+        // a hyperlink reports `Some(&[])`. Drop the empties: an empty mark list
+        // is still `Some`, which would pull every linked or SGR-58 cell off the
+        // batched run path onto its own `Cluster` — a `shape_line` per cell for
+        // a whole `ls --hyperlink` listing, and no powerline fast path either.
+        marks: cell
+            .zerowidth()
+            .filter(|marks| !marks.is_empty())
+            .map(Box::from),
         fg: to_hsla(fgc),
         bg: to_hsla(bgc),
         draw_bg,
@@ -2444,5 +2453,55 @@ mod tests {
             assert!(!rc.draw_bg, "spacers never paint");
             assert_eq!(rc.underline, UnderlineKind::None);
         }
+    }
+
+    /// SGR 58, OSC 8 and combining marks all live in alacritty's one lazily
+    /// boxed `extra`, so `Cell::zerowidth` says `Some(&[])` for a cell that
+    /// merely carries a color or a link. Only real marks may set `marks`: an
+    /// empty list is still `Some`, and `segment_row` would take every linked
+    /// cell off the batched run path onto a `shape_line` of its own.
+    #[test]
+    fn only_real_combining_marks_set_marks() {
+        let palette = [Rgb { r: 0, g: 0, b: 0 }; 256];
+        let colors = test_colors();
+        let point = AlacPoint::new(AlacLine(0), AlacColumn(0));
+
+        let mut colored = Cell {
+            c: 'e',
+            flags: Flags::UNDERCURL,
+            ..Cell::default()
+        };
+        colored.set_underline_color(Some(AnsiColor::Indexed(5)));
+        assert_eq!(
+            snapshot_cell(&colored, point, &palette, &colors, None).marks,
+            None,
+            "SGR 58 alone is not a combining mark"
+        );
+
+        let mut linked = Cell {
+            c: 'e',
+            ..Cell::default()
+        };
+        linked.set_hyperlink(Some(alacritty_terminal::term::cell::Hyperlink::new(
+            Some("id"),
+            "https://example.com".to_string(),
+        )));
+        assert_eq!(
+            snapshot_cell(&linked, point, &palette, &colors, None).marks,
+            None,
+            "OSC 8 alone is not a combining mark"
+        );
+
+        let mut marked = Cell {
+            c: '\u{2764}',
+            ..Cell::default()
+        };
+        marked.push_zerowidth('\u{FE0F}');
+        assert_eq!(
+            snapshot_cell(&marked, point, &palette, &colors, None)
+                .marks
+                .as_deref(),
+            Some(&['\u{FE0F}'][..]),
+        );
     }
 }
