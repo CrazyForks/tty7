@@ -2561,11 +2561,9 @@ mod tests {
     ///
     /// Deliberately runs the whole platform chain (`process_group_leader` →
     /// `proc_pidinfo` / `/proc/<pid>/cwd`) rather than the pure reconciliation
-    /// in [`apply_probed_cwd`]: it is exactly that plumbing the unit tests
-    /// can't see.
-    /// Runs the whole chain a new tab depends on — spawn → PTY → reader poll →
-    /// process-table read → `Cwd` to the client — so a break anywhere in it
-    /// fails here, not in a bug report.
+    /// in [`apply_probed_cwd`]: spawn → PTY → reader poll → process-table read →
+    /// `Cwd` to the client is exactly the plumbing the unit tests can't see, so
+    /// a break anywhere in it fails here rather than in a bug report.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn live_pane_reports_an_uninstrumented_shells_cwd() {
@@ -3652,6 +3650,14 @@ mod tests {
     /// directory: `$PWD` keeps the symlinked path the user walked in through,
     /// and that is the one a new tab should open in. Uses a real symlink so the
     /// canonicalization is the actual one, not a stand-in.
+    ///
+    /// Unix only, and not because the reconciliation is: creating a symlink on
+    /// Windows needs `SeCreateSymbolicLinkPrivilege`, which an unelevated shell
+    /// without Developer Mode does not hold, so the setup — not the assertion —
+    /// fails on an ordinary Windows box with `ERROR_PRIVILEGE_NOT_HELD`. Nothing
+    /// is lost by skipping it there: `foreground_cwd` answers `None` off
+    /// macOS/Linux, so no Windows pane ever reaches this comparison.
+    #[cfg(unix)]
     #[test]
     fn probed_cwd_keeps_the_shells_spelling_for_a_symlinked_path() {
         let tmp = std::env::temp_dir().join(format!("tty7-cwd-{}", std::process::id()));
@@ -3659,10 +3665,7 @@ mod tests {
         let link = tmp.join("link");
         std::fs::create_dir_all(&real).unwrap();
         let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&real, &link).unwrap();
 
         let mut st = test_state(true);
         st.cwd = Some(link.clone()); // as OSC 7 reported it
@@ -3676,6 +3679,24 @@ mod tests {
         assert!(rx.try_recv().is_err(), "same directory → nothing to tell");
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The same rule on the path every platform takes — a reading that matches
+    /// what we already report letter for letter, needing no filesystem at all.
+    /// The poll fires twice a second for the whole life of a pane, so a re-send
+    /// here would be a `Cwd` frame (and the git probe behind it) twice a second
+    /// on an idle shell.
+    #[test]
+    fn probed_cwd_matching_the_reported_one_says_nothing() {
+        let mut st = test_state(true);
+        st.cwd = Some(PathBuf::from("/Users/alice/dev/tty7"));
+        let (tx, rx) = mpsc::channel();
+        st.subscriber = Some(tx);
+
+        apply_probed_cwd(&mut st, Some(PathBuf::from("/Users/alice/dev/tty7")));
+
+        assert_eq!(st.cwd.as_deref(), Some(Path::new("/Users/alice/dev/tty7")));
+        assert!(rx.try_recv().is_err());
     }
 
     /// A remote pane's cwd lives in the remote's namespace; the only thing the
