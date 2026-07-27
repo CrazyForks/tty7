@@ -1117,12 +1117,14 @@ impl DaemonPane {
                             // really reading them. The proc query runs only when a
                             // mark actually claims the prompt — about once per prompt.
                             // See issue #26.
-                            if signals.shell.as_ref().is_some_and(|s| s.at_prompt)
-                                && foreground_running()
-                            {
-                                if let Some(s) = signals.shell.as_mut() {
+                            if signals.shell.iter().any(|s| s.at_prompt) && foreground_running() {
+                                for s in signals.shell.iter_mut() {
                                     s.at_prompt = false;
                                 }
+                                // Clearing the flag can leave neighbours identical;
+                                // they no longer describe a crossing, so don't spend
+                                // a frame on each.
+                                signals.shell.dedup();
                             }
 
                             // SSH-context + coding-agent detection are process-table
@@ -1822,7 +1824,9 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
             st.cwd = Some(cwd);
         }
     }
-    if let Some(shell) = signals.shell {
+    // One frame per entry: the client needs every prompt-boundary crossing the
+    // chunk carried, not just where it ended up (see [`SniffSignals::shell`]).
+    for shell in signals.shell {
         // Windows: agent identity rides the C mark's command capture — ConPTY
         // has no foreground process group for the Unix 0.5 s poll to read an
         // argv from. `C;<cmd>` detects, `D` cleared `command` so it applies
@@ -2287,7 +2291,20 @@ struct ShellState {
 #[derive(Default)]
 struct SniffSignals {
     cwd: Option<PathBuf>,
-    shell: Option<ShellState>,
+    /// Shell states completed in this chunk, in stream order — one entry per
+    /// `at_prompt` *transition*, not one per marker: a run of marks on the same
+    /// side of the prompt boundary folds into its latest state, so the ordinary
+    /// `D`/`A`/`B` chunk still yields the single entry it always did.
+    ///
+    /// Only the last state describes "what the shell is doing now", but the
+    /// client keys its prompt *cycle* off the false→true edge
+    /// (`terminal::remote::ShellState::cycle` — what releases a Tab handoff, see
+    /// `TerminalView::editor_handoff`). Collapsing to the last state alone hides
+    /// that edge whenever a whole command cycle (`C` … `D`) lands in one read —
+    /// routine over SSH, where a fast command's output arrives in a single
+    /// packet — and the handed-off prompt would then never come back to tty7's
+    /// line editor.
+    shell: Vec<ShellState>,
     /// Sentinel agent events completed in this chunk, in stream order — each
     /// one is a state-machine step, so unlike cwd/shell they must *all* apply
     /// (a `stop` directly after a `notification` still means "done").
@@ -2315,9 +2332,9 @@ impl OscSniffer {
         }
     }
 
-    /// Feed a chunk; return any cwd / shell-state change completed within it. (If a
-    /// chunk completes several markers, the last cwd / last shell state wins, which
-    /// is the only state worth reporting.)
+    /// Feed a chunk; return any cwd / shell-state change completed within it. (If
+    /// a chunk completes several cwd markers the last one wins; shell states keep
+    /// every prompt-boundary crossing — see [`SniffSignals::shell`].)
     fn feed(&mut self, bytes: &[u8]) -> SniffSignals {
         let mut signals = SniffSignals::default();
         let shell = &mut self.shell;
@@ -2326,7 +2343,15 @@ impl OscSniffer {
                 signals.cwd = Some(path);
             } else if let Some(rest) = payload.strip_prefix(b"133;") {
                 if handle_osc133(shell, rest) {
-                    signals.shell = Some(shell.clone());
+                    match signals.shell.last_mut() {
+                        // Still on the same side of the prompt boundary: fold in,
+                        // latest wins (it carries the freshest exit code / command
+                        // capture). Only a crossing earns its own entry.
+                        Some(last) if last.at_prompt == shell.at_prompt => {
+                            *last = shell.clone();
+                        }
+                        _ => signals.shell.push(shell.clone()),
+                    }
                 }
             } else if let Some(event) = crate::core::cli_agent::parse_agent_event(payload) {
                 signals.agent_events.push(event);
@@ -3131,17 +3156,53 @@ mod tests {
     fn sniff_osc133_prompt() {
         let mut s = OscSniffer::new();
         let b = s.feed(b"\x1b]133;B\x07");
-        assert!(b.shell.as_ref().unwrap().active);
-        assert!(b.shell.as_ref().unwrap().at_prompt);
+        assert!(b.shell.last().unwrap().active);
+        assert!(b.shell.last().unwrap().at_prompt);
 
         let c = s.feed(b"\x1b]133;C\x07");
-        assert!(!c.shell.as_ref().unwrap().at_prompt);
+        assert!(!c.shell.last().unwrap().at_prompt);
 
         // D (command finished) means no command is running, so we're back at the
         // prompt: at_prompt is true again (it also carries the exit code).
         let d = s.feed(b"\x1b]133;D;130\x07");
-        assert!(d.shell.as_ref().unwrap().at_prompt);
-        assert_eq!(d.shell.as_ref().unwrap().last_exit_code, Some(130));
+        assert!(d.shell.last().unwrap().at_prompt);
+        assert_eq!(d.shell.last().unwrap().last_exit_code, Some(130));
+    }
+
+    /// A whole command cycle inside ONE chunk still reports the prompt-boundary
+    /// crossing. The client counts `at_prompt` false→true edges to tell a fresh
+    /// prompt from a same-prompt redraw, and a Tab handoff only returns the line
+    /// to tty7's editor on that edge (`TerminalView::editor_handoff`). Reporting
+    /// just the chunk's final state hid the edge whenever `C` … `D` arrived
+    /// together — the norm over SSH, where a fast command's whole output lands in
+    /// one read — so one Tab in an ssh pane disabled the local editor for good.
+    #[test]
+    fn a_full_command_cycle_in_one_chunk_still_reports_leaving_the_prompt() {
+        let mut s = OscSniffer::new();
+        s.feed(b"\x1b]133;A\x07\x1b]133;B\x07"); // sitting at the prompt
+
+        // Enter → command → output → done → next prompt, all in one read.
+        let sig =
+            s.feed(b"\x1b]133;C;echo%20hi\x07hi\r\n\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07");
+        let states: Vec<bool> = sig.shell.iter().map(|s| s.at_prompt).collect();
+        assert_eq!(
+            states,
+            vec![false, true],
+            "the chunk must report leaving the prompt and coming back, not just the end state"
+        );
+        assert_eq!(sig.shell.last().unwrap().last_exit_code, Some(0));
+        assert_eq!(sig.shell.last().unwrap().command, None);
+    }
+
+    /// The flip side: marks that stay on one side of the boundary fold into a
+    /// single state, so the ordinary prompt draw still costs exactly one frame.
+    #[test]
+    fn marks_on_the_same_side_of_the_prompt_boundary_fold_into_one_state() {
+        let mut s = OscSniffer::new();
+        let sig = s.feed(b"\x1b]133;D;3\x07\x1b]133;A\x07\x1b]133;B\x07");
+        assert_eq!(sig.shell.len(), 1, "D/A/B is one at-prompt state");
+        assert!(sig.shell[0].at_prompt);
+        assert_eq!(sig.shell[0].last_exit_code, Some(3));
     }
 
     /// The C mark's command capture (tty7 extension, PowerShell integration) —
@@ -3156,7 +3217,7 @@ mod tests {
         // A submitted `claude --help` (space percent-encoded, as the
         // PowerShell body emits it).
         let c = s.feed(b"\x1b]133;C;claude%20--help\x07");
-        let shell = c.shell.as_ref().unwrap();
+        let shell = c.shell.last().unwrap();
         assert!(!shell.at_prompt);
         assert_eq!(shell.command.as_deref(), Some("claude --help"));
         assert_eq!(
@@ -3166,19 +3227,19 @@ mod tests {
 
         // The command finishing (D) clears the capture → the agent clears.
         let d = s.feed(b"\x1b]133;D;0\x07");
-        let shell = d.shell.as_ref().unwrap();
+        let shell = d.shell.last().unwrap();
         assert_eq!(shell.command, None);
         assert_eq!(agent_from_shell_mark(shell, &custom), None);
 
         // A non-agent command sets the capture but detects nothing.
         let c = s.feed(b"\x1b]133;C;git%20status\x07");
-        let shell = c.shell.as_ref().unwrap();
+        let shell = c.shell.last().unwrap();
         assert_eq!(shell.command.as_deref(), Some("git status"));
         assert_eq!(agent_from_shell_mark(shell, &custom), None);
 
         // A bare `C` (a foreign shell integration) leaves no capture.
         let c = s.feed(b"\x1b]133;C\x07");
-        assert_eq!(c.shell.as_ref().unwrap().command, None);
+        assert_eq!(c.shell.last().unwrap().command, None);
 
         // A stray A/B mid-command (a nested/remote shell drawing its own
         // prompt) must NOT wipe the capture — only D (command finished) does.
@@ -3186,21 +3247,21 @@ mod tests {
         // what keeps the agent chip alive while the agent runs.
         let _ = s.feed(b"\x1b]133;C;codex\x07");
         let a = s.feed(b"\x1b]133;A\x1b]133;B\x07");
-        assert_eq!(a.shell.as_ref().unwrap().command.as_deref(), Some("codex"));
+        assert_eq!(a.shell.last().unwrap().command.as_deref(), Some("codex"));
         let d = s.feed(b"\x1b]133;D;0\x07");
-        assert_eq!(d.shell.as_ref().unwrap().command, None);
+        assert_eq!(d.shell.last().unwrap().command, None);
 
         // A multi-line command arrives %0A-joined (fish re-joins the split
         // list with it) and decodes back to real newlines.
         let c = s.feed(b"\x1b]133;C;echo%20a%0Aecho%20b\x07");
         assert_eq!(
-            c.shell.as_ref().unwrap().command.as_deref(),
+            c.shell.last().unwrap().command.as_deref(),
             Some("echo a\necho b")
         );
 
         // An all-whitespace payload is no capture, like a bare `C`.
         let c = s.feed(b"\x1b]133;C;%20%20\x07");
-        assert_eq!(c.shell.as_ref().unwrap().command, None);
+        assert_eq!(c.shell.last().unwrap().command, None);
     }
 
     /// The Windows apply gate ([`shell_mark_capture_changed`]): detection
@@ -3214,7 +3275,7 @@ mod tests {
 
         // A wrapper launch: capture set, but detection has no answer.
         let mut prev = ShellState::default();
-        let c = s.feed(b"\x1b]133;C;.%5Cdev.ps1\x07").shell.unwrap();
+        let c = s.feed(b"\x1b]133;C;.%5Cdev.ps1\x07").shell.pop().unwrap();
         assert!(shell_mark_capture_changed(&prev, &c));
         assert_eq!(
             agent_from_shell_mark(&c, &std::collections::HashMap::new()),
@@ -3224,13 +3285,13 @@ mod tests {
 
         // Stray foreign prompt marks mid-command: same capture, no re-apply —
         // an agent branded by sentinel events keeps its chip.
-        let ab = s.feed(b"\x1b]133;A\x1b]133;B\x07").shell.unwrap();
+        let ab = s.feed(b"\x1b]133;A\x1b]133;B\x07").shell.pop().unwrap();
         assert!(!shell_mark_capture_changed(&prev, &ab));
         prev = ab;
 
         // The command finishing clears the capture: that change applies (its
         // `None` is what clears the chip at the prompt).
-        let d = s.feed(b"\x1b]133;D;0\x07").shell.unwrap();
+        let d = s.feed(b"\x1b]133;D;0\x07").shell.pop().unwrap();
         assert!(shell_mark_capture_changed(&prev, &d));
     }
 
@@ -3239,13 +3300,13 @@ mod tests {
         let mut s = OscSniffer::new();
         let sig = s.feed(b"\x1b]133;V;1\x07");
         assert!(
-            sig.shell.is_none(),
+            sig.shell.is_empty(),
             "edit-mode metadata must not bump prompt state or prompt sequence"
         );
 
         let b = s.feed(b"\x1b]133;B\x07");
-        assert!(b.shell.as_ref().unwrap().active);
-        assert!(b.shell.as_ref().unwrap().at_prompt);
+        assert!(b.shell.last().unwrap().active);
+        assert!(b.shell.last().unwrap().at_prompt);
     }
 
     /// The foreground-command predicate: only a process group *other* than the
@@ -3274,18 +3335,20 @@ mod tests {
         // The remote fish draws its prompt: A (start) then B (input begins).
         let mut signals = s.feed(b"\x1b]133;A\x1b]133;B\x07");
         assert!(
-            signals.shell.as_ref().unwrap().at_prompt,
+            signals.shell.last().unwrap().at_prompt,
             "the raw marks read as at-prompt"
         );
 
         // The reader consults the foreground gate before reporting. With ssh (a
         // different process group) on the PTY, the prompt flag is cleared.
         let ssh_running = is_foreground_command(Some(2000), Some(1000));
-        if signals.shell.as_ref().is_some_and(|st| st.at_prompt) && ssh_running {
-            signals.shell.as_mut().unwrap().at_prompt = false;
+        if signals.shell.iter().any(|st| st.at_prompt) && ssh_running {
+            for st in signals.shell.iter_mut() {
+                st.at_prompt = false;
+            }
         }
         assert!(
-            !signals.shell.as_ref().unwrap().at_prompt,
+            !signals.shell.last().unwrap().at_prompt,
             "a foreground program's prompt marks must not engage the local editor"
         );
 
@@ -3293,10 +3356,12 @@ mod tests {
         // local prompt) keep at_prompt true — the local editor still engages.
         let mut local = s.feed(b"\x1b]133;A\x1b]133;B\x07");
         let shell_idle = is_foreground_command(Some(1000), Some(1000));
-        if local.shell.as_ref().is_some_and(|st| st.at_prompt) && shell_idle {
-            local.shell.as_mut().unwrap().at_prompt = false;
+        if local.shell.iter().any(|st| st.at_prompt) && shell_idle {
+            for st in local.shell.iter_mut() {
+                st.at_prompt = false;
+            }
         }
-        assert!(local.shell.as_ref().unwrap().at_prompt);
+        assert!(local.shell.last().unwrap().at_prompt);
     }
 
     /// Regression: a well-formed OSC marker directly following an *unterminated*
@@ -3315,7 +3380,7 @@ mod tests {
         let mut s = OscSniffer::new();
         let sig = s.feed(b"\x1b]133;A\x1b]133;B\x07");
         assert!(
-            sig.shell.as_ref().map(|sh| sh.at_prompt).unwrap_or(false),
+            sig.shell.last().is_some_and(|sh| sh.at_prompt),
             "OSC 133;B after an unterminated 133;A was dropped (no resync on `]`)"
         );
 
@@ -3345,13 +3410,13 @@ mod tests {
         let mut s = OscSniffer::new();
 
         // A command was running…
-        assert!(!s.feed(b"\x1b]133;C\x07").shell.as_ref().unwrap().at_prompt);
+        assert!(!s.feed(b"\x1b]133;C\x07").shell.last().unwrap().at_prompt);
 
         // …then finishes: D (in its own chunk, before any prompt text) already
         // marks us back at the prompt.
         let d = s.feed(b"\x1b]133;D;0\x07");
         assert!(
-            d.shell.as_ref().unwrap().at_prompt,
+            d.shell.last().unwrap().at_prompt,
             "D should mark us back at the prompt before the prompt text is drawn"
         );
 
@@ -3363,12 +3428,12 @@ mod tests {
             b"\x1b]133;A\x07\x1b]7;file://host/repo/tty7\x07\r\ntty7 git:(main) \xe2\x9e\x9c ",
         );
         assert!(
-            chunk.shell.as_ref().unwrap().at_prompt,
+            chunk.shell.last().unwrap().at_prompt,
             "prompt visible but at_prompt=false — the mis-routing window is still open"
         );
 
         // The trailing B finally arrives and keeps it true.
-        assert!(s.feed(b"\x1b]133;B\x07").shell.as_ref().unwrap().at_prompt);
+        assert!(s.feed(b"\x1b]133;B\x07").shell.last().unwrap().at_prompt);
     }
 
     /// `pty_size` never reports a zero dimension (a 0×0 window would make the
@@ -3499,16 +3564,16 @@ mod tests {
         let mut s = OscSniffer::new();
         // D with no code.
         let d = s.feed(b"\x1b]133;D\x07");
-        assert!(d.shell.as_ref().unwrap().at_prompt);
-        assert_eq!(d.shell.as_ref().unwrap().last_exit_code, None);
+        assert!(d.shell.last().unwrap().at_prompt);
+        assert_eq!(d.shell.last().unwrap().last_exit_code, None);
 
         // D with a non-numeric code stays None.
         let d = s.feed(b"\x1b]133;D;oops\x07");
-        assert_eq!(d.shell.as_ref().unwrap().last_exit_code, None);
+        assert_eq!(d.shell.last().unwrap().last_exit_code, None);
 
         // A negative exit code parses.
         let d = s.feed(b"\x1b]133;D;-1\x07");
-        assert_eq!(d.shell.as_ref().unwrap().last_exit_code, Some(-1));
+        assert_eq!(d.shell.last().unwrap().last_exit_code, Some(-1));
     }
 
     /// A fresh `PaneState` for the PTY-less state-machine tests.
@@ -4119,12 +4184,12 @@ mod tests {
         apply_signals(
             &mut st,
             SniffSignals {
-                shell: Some(ShellState {
+                shell: vec![ShellState {
                     active: true,
                     at_prompt: true,
                     last_exit_code: Some(0),
                     command: None,
-                }),
+                }],
                 ..SniffSignals::default()
             },
         );
