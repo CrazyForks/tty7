@@ -336,6 +336,11 @@ pub struct TerminalView {
     /// when it opened. Typing/Backspace re-filter it in place; it closes on
     /// accept, on Escape, or once the edited word no longer matches anything.
     completion: Option<CompletionSession>,
+    /// Whether a remote directory listing for completion is on the wire (see
+    /// [`Self::spawn_remote_path_completion`]). Holding Tab down would
+    /// otherwise dial the daemon once per repeat while the first answer is
+    /// still travelling.
+    remote_completion_inflight: bool,
     /// Monotonic tag bumped every time a completion session opens or closes.
     /// Dynamic generators run on background threads and land their results here
     /// via `cx.spawn`; each task captures the generation it was spawned under and
@@ -1139,6 +1144,7 @@ impl TerminalView {
             completion: None,
             completion_generation: 0,
             editor_handoff: None,
+            remote_completion_inflight: false,
             reverse_search: None,
             integration_notice: None,
             integration_notice_shown: false,
@@ -3750,6 +3756,12 @@ impl TerminalView {
         let line = self.cmd.text();
         let cursor = self.cmd.cursor();
         let Some(comp) = super::completion::complete(&line, cursor, cwd.as_deref()) else {
+            // Nothing *locally*. A native-SSH pane can still answer for the
+            // remote filesystem over its own connection — ask before giving up
+            // the line (see `spawn_remote_path_completion`).
+            if self.spawn_remote_path_completion(&line, cursor, forward, cx) {
+                return;
+            }
             // Nothing to offer. Don't swallow the keypress (#136) — hand the
             // line to the shell and let its completion have the Tab.
             self.handoff_tab_to_shell(!forward, cx);
@@ -3763,15 +3775,6 @@ impl TerminalView {
         // classic behavior byte-for-byte.
         let has_pending = !comp.pending.is_empty();
 
-        if !has_pending && comp.candidates.len() == 1 {
-            // Unique match: accept it outright.
-            let c = comp.candidates[0].clone();
-            self.completion_insert(&c, c.start);
-            self.cursor_visible = true;
-            cx.notify();
-            return;
-        }
-
         // The word range is carried by any candidate; with none (pure-generator
         // slot) derive it from the caret so the session still knows what it
         // replaces.
@@ -3779,26 +3782,18 @@ impl TerminalView {
             Some(c) => (c.start, c.end),
             None => (word_start_of(&line, cursor), cursor),
         };
-        let word: String = line
-            .chars()
-            .skip(word_start)
-            .take(word_end - word_start)
-            .collect();
-        let s = CompletionSession::new(word_start, word.clone(), comp.candidates);
-        if !has_pending
-            && let Some(lcp) = s.common_prefix()
-            && lcp.chars().count() > word.chars().count()
-        {
-            // Static-only: fill the longest common prefix when it extends the
-            // typed word. All candidates share it, so the fill never invalidates
-            // the set. With generators pending we skip this — the eventual set
-            // may share a shorter prefix, and mutating the line before results
-            // arrive would be jarring.
-            self.apply_candidate(&line, word_start, word_end, &lcp);
-        }
-        let generation = self.open_completion(s);
-        self.cursor_visible = true;
-        cx.notify();
+        let Some(generation) = self.offer_candidates(
+            &line,
+            word_start,
+            word_end,
+            comp.candidates,
+            has_pending,
+            cx,
+        ) else {
+            // A unique match was accepted outright; nothing is open to merge into,
+            // and a static-only slot has no generators anyway.
+            return;
+        };
 
         // Kick off each generator on the background executor and merge results
         // back on the main thread, tagged with this session's generation.
@@ -3822,6 +3817,168 @@ impl TerminalView {
             })
             .detach();
         }
+    }
+
+    /// Put `cands` in front of the user: accept a unique match outright, else
+    /// open the menu over them (filling the longest common prefix first).
+    /// Returns the opened session's generation, or `None` when a unique match
+    /// was accepted and no menu exists.
+    ///
+    /// `has_pending` means more candidates are still inbound, which disables
+    /// both shortcuts: a result landing a moment later could add to or change
+    /// the pick, and mutating the line before then would be jarring.
+    fn offer_candidates(
+        &mut self,
+        line: &str,
+        word_start: usize,
+        word_end: usize,
+        cands: Vec<completion::Candidate>,
+        has_pending: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        if !has_pending && cands.len() == 1 {
+            let c = cands[0].clone();
+            self.completion_insert(&c, c.start);
+            self.cursor_visible = true;
+            cx.notify();
+            return None;
+        }
+        let word: String = line
+            .chars()
+            .skip(word_start)
+            .take(word_end - word_start)
+            .collect();
+        let s = CompletionSession::new(word_start, word.clone(), cands);
+        if !has_pending
+            && let Some(lcp) = s.common_prefix()
+            && lcp.chars().count() > word.chars().count()
+        {
+            // Fill the longest common prefix when it extends the typed word.
+            // All candidates share it, so the fill never invalidates the set.
+            self.apply_candidate(line, word_start, word_end, &lcp);
+        }
+        let generation = self.open_completion(s);
+        self.cursor_visible = true;
+        cx.notify();
+        Some(generation)
+    }
+
+    /// The pane's cwd as a path on the *remote* — `Some` only for a native-SSH
+    /// pane whose remote shell has reported an absolute cwd (OSC 7). Those are
+    /// the panes tty7 itself dialled, so the daemon holds an authenticated
+    /// connection we can ask about that filesystem; every other pane kind
+    /// (a foreground `ssh`, WSL, plain local) answers `None`.
+    fn remote_ssh_cwd(&self) -> Option<String> {
+        let remote = self.terminal.remote_context()?;
+        if remote.kind != crate::daemon::protocol::RemoteKind::NativeSsh {
+            return None;
+        }
+        let cwd = self.cwd()?.to_string_lossy().into_owned();
+        cwd.starts_with('/').then_some(cwd)
+    }
+
+    /// Complete a path against the *remote* filesystem, over the pane's own SSH
+    /// connection. Returns whether a request went out — the caller then leaves
+    /// the Tab to us instead of handing the line to the shell.
+    ///
+    /// The listing is a daemon round-trip (`SftpList` on the pane's existing
+    /// authenticated connection — the same channel the SFTP panel browses
+    /// with), so it cannot answer this keystroke synchronously. Results land on
+    /// the main thread and only *then* behave as a local Tab would; see
+    /// [`Self::remote_path_results`] for what happens to a stale or empty one.
+    ///
+    /// Out-of-band deliberately. The other way to read a remote directory is to
+    /// inject a listing command into the live shell and scrape it back out of
+    /// the PTY — the only option for a terminal that merely *bootstrapped into*
+    /// a session someone else dialled. tty7 opened this connection itself, so it
+    /// can just ask: nothing is echoed into the scrollback, no prompt hooks need
+    /// suppressing, and there's no stray background process to cancel when the
+    /// user hits Enter. The in-band route stays the answer for the pane kinds
+    /// that have no tty7-owned connection (a foreground `ssh`, WSL), which is
+    /// why those decline in [`Self::remote_ssh_cwd`] rather than pretend.
+    fn spawn_remote_path_completion(
+        &mut self,
+        line: &str,
+        cursor: usize,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(cwd) = self.remote_ssh_cwd() else {
+            return false;
+        };
+        let Some(req) = completion::remote_path_request(line, cursor, &cwd) else {
+            return false;
+        };
+        // A listing for this same keystroke is already on the wire. Swallow the
+        // repeat rather than dialling again — the answer is about to arrive and
+        // will open the menu.
+        if self.remote_completion_inflight {
+            return true;
+        }
+        self.remote_completion_inflight = true;
+        let pane_id = self.pane_id;
+        let dir = req.dir.clone();
+        let line = line.to_string();
+        cx.spawn(async move |this, cx| {
+            let listed = cx
+                .background_spawn(async move { RemoteTerminal::sftp_list(pane_id, &dir) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.remote_completion_inflight = false;
+                view.remote_path_results(
+                    req,
+                    &line,
+                    cursor,
+                    listed.unwrap_or_default(),
+                    forward,
+                    cx,
+                )
+            });
+        })
+        .detach();
+        true
+    }
+
+    /// Land a remote directory listing as completion candidates.
+    ///
+    /// Three outcomes, in the order they're checked:
+    ///   - **the line moved on** while the network answered: drop it. The
+    ///     answer describes a word the user is no longer typing, and the Tab
+    ///     that asked for it is long past.
+    ///   - **nothing matched**: fall back to the shell handoff, exactly as a
+    ///     local no-match does (#136). A directory we couldn't read, or a
+    ///     prefix with no entries, is then no worse off than before this
+    ///     existed — the remote's own completion still gets its shot.
+    ///   - **candidates**: offer them like any local Tab.
+    fn remote_path_results(
+        &mut self,
+        req: completion::RemotePathRequest,
+        line: &str,
+        cursor: usize,
+        listed: Vec<crate::daemon::protocol::SftpEntry>,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cmd.text() != line || self.cmd.cursor() != cursor {
+            return;
+        }
+        let entries: Vec<completion::RemoteEntry> = listed
+            .into_iter()
+            .map(|e| completion::RemoteEntry {
+                // Follow symlinks when classifying, as the local path engine
+                // does: a link to a directory takes the trailing `/` and
+                // survives a dirs-only filter (`cd` into one is routine). The
+                // daemon resolved the target for us.
+                is_dir: e.kind == crate::daemon::protocol::SftpEntryKind::Dir || e.target_is_dir,
+                name: e.name,
+            })
+            .collect();
+        let cands = completion::remote_path_candidates(&req, &entries);
+        if cands.is_empty() {
+            self.handoff_tab_to_shell(!forward, cx);
+            return;
+        }
+        self.offer_candidates(line, req.word_start, req.cursor, cands, false, cx);
     }
 
     /// Open a completion menu and bump the generation tag, returning it so a
