@@ -1204,6 +1204,23 @@ impl Tty7App {
         on_pick: impl Fn(&mut Self, usize, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
         let sf = cx.global::<presets::Surfaces>().window;
+        self.segmented_on(sf, id, options, selected, cx, on_pick)
+    }
+
+    /// [`Self::segmented`] for a control that does *not* sit on the settings
+    /// sheet. The track paints its own opaque ground, so it has to be told which
+    /// one: dropped on the right panel's sunk rail, a window-surface track reads
+    /// as a faintly darker box cut out of the column it sits in — and every rung
+    /// above it was derived against the wrong ground.
+    pub(crate) fn segmented_on(
+        &self,
+        sf: presets::Surface,
+        id: &'static str,
+        options: &'static [&'static str],
+        selected: usize,
+        cx: &mut Context<Self>,
+        on_pick: impl Fn(&mut Self, usize, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
         let border = cx.theme().border;
         let on_pick = std::rc::Rc::new(on_pick);
         h_flex()
