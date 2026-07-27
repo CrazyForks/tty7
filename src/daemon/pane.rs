@@ -422,29 +422,68 @@ fn system_locale_identifier() -> Option<String> {
     }
 }
 
+/// What tty7 answers to in `TERM_PROGRAM`. Terminals name themselves in the
+/// form they brand themselves in — `Apple_Terminal`, `iTerm.app`, `WezTerm`,
+/// `ghostty`, `vscode` — so ours is the lowercase product name.
+const TERM_PROGRAM_NAME: &str = "tty7";
+
+/// Env keys that describe our emulator's real capabilities. A user's `env` map
+/// must not override these: the answer isn't a preference, it's a fact about
+/// what the pane on the other end can decode.
+const CAPABILITY_ENV: [&str; 2] = ["TERM", "COLORTERM"];
+
+/// The environment every pane starts with, in application order — tty7's own
+/// advertisements first, then the user's `env` map, which overrides all but
+/// [`CAPABILITY_ENV`]. Returned as a list rather than applied in place so the
+/// precedence is testable without a `CommandBuilder` or a real `config.json`.
+fn pane_environment(
+    extra_env: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let version = env!("CARGO_PKG_VERSION");
+    let mut env = vec![
+        // A widely-available terminfo + truecolor.
+        ("TERM".to_string(), "xterm-256color".to_string()),
+        ("COLORTERM".to_string(), "truecolor".to_string()),
+        // Mark the session as tty7's, for tooling that adapts to its host
+        // terminal — most importantly the `tty7 agent-hook` emitter, which
+        // stays silent without it so globally-installed agent hooks can't leak
+        // escape sequences into other terminals (see `core::agent_hooks`).
+        (
+            crate::core::agent_hooks::TTY7_ENV_MARKER.to_string(),
+            version.to_string(),
+        ),
+        // The de-facto standard pair for "which terminal is this": Apple
+        // Terminal introduced it, and iTerm2, WezTerm, Ghostty, VS Code and
+        // tmux all set it. `TERM` describes terminfo capabilities and can't
+        // answer this — but capability probes (`supports-color`,
+        // `supports-hyperlinks` and the JS CLI ecosystem built on them),
+        // editors applying terminal-specific workarounds, and shell prompts all
+        // branch on the program name, falling back to their most conservative
+        // behaviour when it's missing. `TTY7` doesn't help them: it's ours, and
+        // nothing third-party knows to look for it.
+        //
+        // Deliberately overridable below, unlike the capability keys: this
+        // names an identity, and posing as another terminal is a legitimate way
+        // to get a tool that only recognises a fixed list to light up.
+        ("TERM_PROGRAM".to_string(), TERM_PROGRAM_NAME.to_string()),
+        ("TERM_PROGRAM_VERSION".to_string(), version.to_string()),
+    ];
+    env.extend(
+        extra_env
+            .iter()
+            .filter(|(k, _)| !CAPABILITY_ENV.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+    env
+}
+
 fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<PathBuf>) {
     if let Some(dir) = initial_cwd {
         cmd.cwd(dir);
     }
-    // Advertise a widely-available terminfo + truecolor.
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    // Mark the session as tty7's, for tooling that adapts to its host terminal
-    // — most importantly the `tty7 agent-hook` emitter, which stays silent
-    // without it so globally-installed agent hooks can't leak escape sequences
-    // into other terminals (see `core::agent_hooks`).
-    cmd.env(
-        crate::core::agent_hooks::TTY7_ENV_MARKER,
-        env!("CARGO_PKG_VERSION"),
-    );
-
-    // User-configured environment variables override inherited values (but not
-    // TERM/COLORTERM above, which reflect our emulator's real capabilities).
     let extra_env = crate::core::config::extra_env();
-    for (k, v) in &extra_env {
-        if k != "TERM" && k != "COLORTERM" {
-            cmd.env(k, v);
-        }
+    for (k, v) in pane_environment(&extra_env) {
+        cmd.env(k, v);
     }
 
     // LaunchServices commonly starts a macOS app with no locale variables at
@@ -4040,6 +4079,74 @@ mod tests {
 
         assert!(dead_rx.try_recv().is_ok(), "unattached death → on_dead");
         assert!(dead_rx.try_recv().is_err(), "on_dead must fire only once");
+    }
+
+    /// Every pane is told which terminal it is running in, under the names the
+    /// rest of the world reads (`TERM_PROGRAM`/`TERM_PROGRAM_VERSION`) as well
+    /// as our own `TTY7` marker. Nothing third-party looks for the marker, so
+    /// dropping the standard pair would leave capability probes guessing.
+    #[test]
+    fn pane_environment_advertises_the_terminal_under_the_standard_names() {
+        let env: std::collections::HashMap<_, _> =
+            pane_environment(&std::collections::HashMap::new())
+                .into_iter()
+                .collect();
+        let version = env!("CARGO_PKG_VERSION");
+
+        assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("tty7"));
+        assert_eq!(
+            env.get("TERM_PROGRAM_VERSION").map(String::as_str),
+            Some(version)
+        );
+        assert_eq!(
+            env.get(crate::core::agent_hooks::TTY7_ENV_MARKER)
+                .map(String::as_str),
+            Some(version)
+        );
+        assert_eq!(
+            env.get("TERM").map(String::as_str),
+            Some("xterm-256color"),
+            "terminfo name is what the pane's decoder actually implements"
+        );
+    }
+
+    /// The user's `env` map may rename the terminal — posing as another program
+    /// is how you get a tool that only recognises a fixed list to light up —
+    /// but it may not contradict what our emulator can decode. Later entries
+    /// win, so the ordering is the precedence.
+    #[test]
+    fn pane_environment_lets_configured_env_override_identity_but_not_capability() {
+        let configured = [
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM_VERSION", "3.5.0"),
+            ("TERM", "dumb"),
+            ("COLORTERM", ""),
+            ("EDITOR", "hx"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+
+        let applied: std::collections::HashMap<_, _> =
+            pane_environment(&configured).into_iter().collect();
+
+        assert_eq!(
+            applied.get("TERM_PROGRAM").map(String::as_str),
+            Some("iTerm.app")
+        );
+        assert_eq!(
+            applied.get("TERM_PROGRAM_VERSION").map(String::as_str),
+            Some("3.5.0")
+        );
+        assert_eq!(applied.get("EDITOR").map(String::as_str), Some("hx"));
+        assert_eq!(
+            applied.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert_eq!(
+            applied.get("COLORTERM").map(String::as_str),
+            Some("truecolor")
+        );
     }
 
     /// The macOS UTF-8 fallback applies only when the inherited environment has
