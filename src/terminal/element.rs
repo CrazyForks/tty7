@@ -2146,6 +2146,15 @@ mod tests {
         let mut row = wide_cells("\u{2764}");
         row[0].marks = Some(Box::from(['\u{FE0F}']));
         assert_eq!(segment_row(&row), [cluster(0, 2, "\u{2764}\u{FE0F}")]);
+
+        // Several marks on one base: an above-base vowel and a tone mark both
+        // sit on the consonant (ที่ = ท U+0E17 + ◌ี U+0E35 + ◌่ U+0E48).
+        let mut row = vec![cell('\u{0E17}'), cell('a')];
+        row[0].marks = Some(Box::from(['\u{0E35}', '\u{0E48}']));
+        assert_eq!(
+            segment_row(&row),
+            [cluster(0, 1, "\u{0E17}\u{0E35}\u{0E48}"), run(1, 1, "a")]
+        );
     }
 
     /// A marked cell never joins a batch: marks add characters without adding
