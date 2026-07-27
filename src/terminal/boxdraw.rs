@@ -305,8 +305,31 @@ impl Cell {
         } else {
             ink.push(self.rect(self.x0, cy - h, (cx - r + lap) - self.x0, self.t));
         }
-        // The arc band, stepped from the vertical stub (θ=0) to the horizontal
-        // one (θ=π/2) around the arc centre one radius into the quadrant.
+        // The arc band, from the vertical stub (θ=0) to the horizontal one
+        // (θ=π/2) around the arc centre one radius into the quadrant.
+        //
+        // How this renders decides whether the corner looks like kitty's or
+        // not, and gpui's pipeline dictates the shape (learned the hard way,
+        // twice):
+        //
+        // * A path contour is filled as a triangle FAN from its start vertex,
+        //   and coverage in the intermediate texture only accumulates — there
+        //   is no winding cancellation. A whole-band outline is concave, so
+        //   its fan covered the hollow and every corner rendered as a solid
+        //   quarter-disc blob. Each contour must therefore be *star-shaped
+        //   from its start vertex*: 30° slices of a thin band are, a 90° band
+        //   is not.
+        // * All contours ride in ONE Path. Paths composite as premultiplied
+        //   sprites, so two separately painted segments overlap their
+        //   antialiased edges at 75% opacity — the seam at every joint of the
+        //   first polyline attempt. Within a single path the 4x-MSAA samples
+        //   partition cleanly across shared edges instead.
+        // * The outer edge is a real quadratic (`curve_to`), which the shader
+        //   antialiases *analytically* (Loop–Blinn signed distance) — the
+        //   smooth continuous ramp kitty gets from supersampling. The inner
+        //   edge can't be a curve: with no winding, a concave-side bulge can
+        //   only over-cover. It is a fine polyline instead, whose chord error
+        //   at 7.5° steps (< 0.1px at cell sizes) hides inside the MSAA.
         let (ax, ay) = (cx + sx * r, cy + sy * r);
         let at = |radius: f32, theta: f32| {
             let (x, y) = (
@@ -315,23 +338,32 @@ impl Cell {
             );
             point(px(x), px(y))
         };
-        // Adjacent segments OVERLAP by half a step. Butted edges would each be
-        // antialiased on their own, and two 50%-coverage edges composite to
-        // 75% opacity — a lighter hairline seam at every joint, which is what
-        // made the first cut of this arc read as lumpy next to kitty's. With
-        // the overlap every internal edge lands inside the neighbour's solid
-        // fill (opaque-over-opaque, invisible), leaving only the outer
-        // silhouette to antialias.
-        const STEPS: usize = 16;
-        let step = std::f32::consts::FRAC_PI_2 / STEPS as f32;
-        for i in 0..STEPS {
+        const SEGS: usize = 3;
+        const INNER_PTS: usize = 4;
+        let step = std::f32::consts::FRAC_PI_2 / SEGS as f32;
+        let mut path: Option<gpui::Path<Pixels>> = None;
+        for i in 0..SEGS {
             let t0 = step * i as f32;
-            let t1 = (step * (i as f32 + 1.5)).min(std::f32::consts::FRAC_PI_2);
-            let mut quad = gpui::Path::new(at(r + h, t0));
-            quad.line_to(at(r + h, t1));
-            quad.line_to(at(r - h, t1));
-            quad.line_to(at(r - h, t0));
-            ink.push(Ink::Path(quad));
+            let t1 = step * (i + 1) as f32;
+            let start = at(r + h, t0);
+            let p = match path.as_mut() {
+                Some(p) => {
+                    p.move_to(start);
+                    p
+                }
+                None => path.insert(gpui::Path::new(start)),
+            };
+            // Control point at the tangents' intersection: the exact
+            // quadratic through both endpoints for this arc slice.
+            let ctrl = at((r + h) / (step / 2.).cos(), (t0 + t1) / 2.);
+            p.curve_to(at(r + h, t1), ctrl);
+            p.line_to(at(r - h, t1));
+            for k in (0..INNER_PTS).rev() {
+                p.line_to(at(r - h, t0 + (t1 - t0) * k as f32 / INNER_PTS as f32));
+            }
+        }
+        if let Some(p) = path {
+            ink.push(Ink::Path(p));
         }
         Some(ink)
     }
@@ -587,6 +619,11 @@ mod tests {
 
     /// Nothing may paint outside its own cell: box characters tile, and one
     /// cell's overshoot is its neighbor's artifact.
+    ///
+    /// The tolerance is half a pixel, not exact: a quadratic's *control point*
+    /// sits slightly outside the ink it bounds (tangent-intersection, ~3.5%
+    /// past the arc radius), and `extents` reads raw vertices. The curve
+    /// itself never leaves the cell.
     #[test]
     fn ink_stays_inside_the_cell() {
         let b = cell();
@@ -596,7 +633,7 @@ mod tests {
             let c = char::from_u32(cp).unwrap();
             let (nx, xx, ny, xy) = extents(&glyph(c, b, 1.).unwrap());
             assert!(
-                nx >= x0 - 0.01 && xx <= x1 + 0.01 && ny >= y0 - 0.01 && xy <= y1 + 0.01,
+                nx >= x0 - 0.5 && xx <= x1 + 0.5 && ny >= y0 - 0.5 && xy <= y1 + 0.5,
                 "U+{cp:04X} {c} paints outside the cell: \
                  x {nx}..{xx} vs {x0}..{x1}, y {ny}..{xy} vs {y0}..{y1}"
             );
