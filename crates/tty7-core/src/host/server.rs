@@ -400,6 +400,7 @@ where
         sink: Arc::clone(&sink),
         inflight: Mutex::new(HashMap::new()),
         watches: Mutex::new(HashMap::new()),
+        deferred_watches: Mutex::new(HashMap::new()),
         next_watch: AtomicU64::new(1),
         pool: Pool::new(),
         workspaces: services.workspaces.clone(),
@@ -674,7 +675,7 @@ fn run_job(conn: &Arc<Conn>, req_id: u64, req: ControlRequest, blob: Vec<u8>) {
     }
 
     let wants_blob = req.returns_blob();
-    let (reply, out_blob) = match run_request(conn, req, blob) {
+    let (reply, out_blob) = match run_request(conn, req_id, req, blob) {
         Ok((ok, bytes)) => (ControlReply::Ok(ok), bytes),
         Err(e) => (ControlReply::Err(WireError::from_io(&e)), Vec::new()),
     };
@@ -714,6 +715,7 @@ fn drop_unsendable_hits(hits: &mut Vec<SearchHit>) {
 /// methods that have one, the bulk bytes that ride the frame's blob.
 fn run_request(
     conn: &Arc<Conn>,
+    req_id: u64,
     req: ControlRequest,
     blob: Vec<u8>,
 ) -> io::Result<(ReplyOk, Vec<u8>)> {
@@ -811,7 +813,7 @@ fn run_request(
 
         // ----- watch ---------------------------------------------------------
         ControlRequest::WatchOpen { dirs } => {
-            let id = conn.open_watch(&paths(&dirs))?;
+            let id = conn.open_watch(req_id, &paths(&dirs))?;
             (ReplyOk::WatchId(id), Vec::new())
         }
         ControlRequest::WatchSet { id, dirs } => {
@@ -908,6 +910,17 @@ struct Conn {
     /// leaks nothing.
     inflight: Mutex<HashMap<u64, bool>>,
     watches: Mutex<HashMap<u64, WatchSub>>,
+    /// Watch forwarders that have been set up but must not start until their
+    /// `WatchId` reply has gone out, keyed by the request that opened them.
+    ///
+    /// The forwarder writes to the same sink the reply does, and nothing
+    /// ordered the two: a directory that changed in the instant it was first
+    /// watched could push a batch that overtook the reply. The client files a
+    /// watch id only once `call` returns, so it has no entry for that id yet
+    /// and drops the batch under the unknown-id rule — and since the file tree
+    /// relists only on a watch event, the change stays invisible until
+    /// something else touches the directory.
+    deferred_watches: Mutex<HashMap<u64, (u64, smol::channel::Receiver<Vec<PathBuf>>)>>,
     next_watch: AtomicU64,
     pool: Pool,
     /// The machine's workspace records, when this server serves them.
@@ -988,6 +1001,7 @@ impl Conn {
             .unwrap_or(false);
         if cancelled {
             log::trace!("control request {req_id} was cancelled; dropping its reply");
+            self.start_deferred_watch(req_id, false);
             return;
         }
 
@@ -1009,12 +1023,14 @@ impl Conn {
         // Dropping it instead leaves the client waiting out the request's whole
         // deadline (20s for a search, and again on the next keystroke) for a
         // reply that was never coming.
-        match msg.to_frame() {
-            Ok((k, payload)) => {
-                if let Err(e) = self.sink.send_frame(k, &payload) {
+        let delivered = match msg.to_frame() {
+            Ok((k, payload)) => match self.sink.send_frame(k, &payload) {
+                Ok(()) => true,
+                Err(e) => {
                     log::debug!("control reply {req_id} could not be written: {e}");
+                    false
                 }
-            }
+            },
             Err(e) => {
                 log::warn!("control reply {req_id} could not be encoded: {e}");
                 let excuse = ControlServerMsg::Response {
@@ -1024,12 +1040,18 @@ impl Conn {
                 if let Err(e) = self.sink.send(&excuse) {
                     log::debug!("control error reply {req_id} could not be written: {e}");
                 }
+                false
             }
-        }
+        };
+
+        // Only now, and only if the client actually learned the id: a batch
+        // that overtook this reply would be dropped by a client that has no
+        // entry for it yet. See `Conn::deferred_watches`.
+        self.start_deferred_watch(req_id, delivered);
     }
 
     /// Open a watch and start forwarding its batches as pushes.
-    fn open_watch(&self, dirs: &[PathBuf]) -> io::Result<u64> {
+    fn open_watch(&self, req_id: u64, dirs: &[PathBuf]) -> io::Result<u64> {
         let sub = self.host.watch(dirs)?;
         let id = self.next_watch.fetch_add(1, Ordering::Relaxed);
         // Clone the receiver before the subscription is filed away: the
@@ -1040,8 +1062,40 @@ impl Conn {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, sub);
-        spawn_watch_forwarder(id, rx, Arc::clone(&self.sink));
+        // Parked rather than started — see `deferred_watches`. `finish` starts
+        // it once the reply carrying `id` is on the wire.
+        self.deferred_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(req_id, (id, rx));
         Ok(id)
+    }
+
+    /// Start the forwarder for a watch opened by `req_id`, if there was one.
+    ///
+    /// Called from [`Conn::finish`] after the reply has gone out, and on the
+    /// paths where no reply goes out at all — a cancelled request, or one whose
+    /// reply could not be written — so a parked forwarder is never left holding
+    /// a receiver nobody will read.
+    fn start_deferred_watch(&self, req_id: u64, deliver: bool) {
+        let parked = self
+            .deferred_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&req_id);
+        let Some((id, rx)) = parked else {
+            return;
+        };
+        if !deliver {
+            // The client never learned this id, so every batch would be
+            // dropped. Let the subscription go with the watch entry instead.
+            self.watches
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            return;
+        }
+        spawn_watch_forwarder(id, rx, Arc::clone(&self.sink));
     }
 
     fn set_watch_dirs(&self, id: u64, dirs: &[PathBuf]) -> io::Result<()> {
@@ -1218,6 +1272,30 @@ struct PoolState {
     closed: bool,
 }
 
+impl PoolState {
+    /// Whether a job just queued needs a worker spawned for it.
+    ///
+    /// Compares the backlog against the parked workers rather than asking
+    /// whether *any* worker is parked. `idle` counts a worker from before it
+    /// parks until after it has re-acquired the lock on its way out, so for the
+    /// whole wake-up window a worker that has already been handed a job still
+    /// looks free — and the `notify_one` a second submit sends in that window
+    /// goes to a thread that has left the wait set, so it is lost.
+    ///
+    /// Concretely: with `k` workers parked, a client pipelining `k+1` frames in
+    /// one read — a `Git` plus `k` `ReadDir`s, which is what the file tree and
+    /// the branch line produce together — got `k` of them running and left the
+    /// last queued behind a `git status` that can take twenty seconds. That is
+    /// the head-of-line blocking this pool is elastic in order to avoid.
+    ///
+    /// Counting both sides makes the window harmless: the job destined for a
+    /// parked-but-notified worker is still in `jobs`, so it cancels that
+    /// worker out and the next job over sees no spare capacity.
+    fn wants_another_worker(&self) -> bool {
+        self.jobs.len() > self.idle && self.workers < MAX_WORKERS
+    }
+}
+
 impl Pool {
     fn new() -> Pool {
         Pool {
@@ -1242,9 +1320,10 @@ impl Pool {
         }
         st.jobs.push_back(Box::new(job));
 
-        // Spawn only when nobody is parked to take it, so a steady stream of
-        // requests is served by one warm worker rather than a thread per call.
-        if st.idle == 0 && st.workers < MAX_WORKERS {
+        // Spawn only when the backlog outruns the workers parked to take it, so
+        // a steady stream of requests is served by one warm worker rather than a
+        // thread per call.
+        if st.wants_another_worker() {
             st.workers += 1;
             let inner = Arc::clone(&self.inner);
             match std::thread::Builder::new()
@@ -1615,6 +1694,40 @@ mod pool_tests {
             st.workers, 1,
             "50 sequential jobs should not want 50 threads"
         );
+    }
+
+    /// The spawn decision, at the three states that distinguish it from
+    /// "is anybody parked?".
+    ///
+    /// Driven directly because the state it has to get right — a worker that
+    /// has been notified but has not yet re-acquired the lock, so it is counted
+    /// in `idle` while the job meant for it is still counted in `jobs` — is a
+    /// few instructions wide and a racing test passes against the broken rule
+    /// far more often than it fails.
+    #[test]
+    fn a_worker_is_spawned_when_the_backlog_outruns_the_parked_workers() {
+        let state = |jobs: usize, workers: usize, idle: usize| PoolState {
+            jobs: (0..jobs).map(|_| Box::new(|| ()) as Job).collect(),
+            workers,
+            idle,
+            closed: false,
+        };
+
+        // One parked worker, one job: it is exactly the warm-worker case, and
+        // spawning here is what would cost a thread per request.
+        assert!(!state(1, 1, 1).wants_another_worker());
+
+        // One parked worker, two jobs. The second job arrived inside the
+        // first's wake-up window, so `idle` still says 1 — and the old rule,
+        // which only asked whether `idle == 0`, left this job queued behind a
+        // request that can take twenty seconds.
+        assert!(state(2, 1, 1).wants_another_worker());
+
+        // Nobody parked at all.
+        assert!(state(1, 1, 0).wants_another_worker());
+
+        // And the ceiling still holds.
+        assert!(!state(64, MAX_WORKERS, 0).wants_another_worker());
     }
 
     /// And it does grow when work genuinely overlaps.
@@ -2333,6 +2446,63 @@ mod tests {
             }
         }
         assert!(seen, "no watch event crossed the connection");
+    }
+
+    /// The `WatchId` reply is on the wire before any batch for that id.
+    ///
+    /// The ordering is structural — the forwarder is parked in
+    /// `Conn::deferred_watches` and started by `finish`, so there is no
+    /// interleaving left to hit. This is the end-to-end statement of that, run
+    /// under churn; it does **not** reproduce the old race, whose window was a
+    /// few instructions between `open_watch` returning and `finish` writing on
+    /// the same thread.
+    ///
+    /// What the race cost, when it landed: the client files a watch id only
+    /// once its `call` returns, so a batch that overtook the reply hit a client
+    /// with no entry for that id and was dropped under the unknown-id rule. The
+    /// file tree relists only on a watch event, so that first change stayed
+    /// invisible until something else touched the directory.
+    #[test]
+    fn a_watch_id_reaches_the_client_before_any_batch_for_it() {
+        let (mut client, _ok) = raw();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        ControlClientMsg::Request {
+            req_id: 1,
+            req: ControlRequest::WatchOpen {
+                dirs: vec![tmp.path().to_string_lossy().into_owned()],
+            },
+        }
+        .encode(&mut client)
+        .unwrap();
+        client.flush().unwrap();
+
+        // Churn from the moment the request is sent, so the window between the
+        // watcher going live and the reply going out is a busy one.
+        let churn = tmp.path().to_path_buf();
+        let stop = Arc::new(AtomicBool::new(false));
+        let churning = Arc::clone(&stop);
+        let churner = std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !churning.load(Ordering::SeqCst) {
+                let _ = std::fs::write(churn.join(format!("f{n}")), b"x");
+                n = n.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        // The very first frame back has to be the reply, not an event.
+        let first = ControlServerMsg::read(&mut client).unwrap();
+        stop.store(true, Ordering::SeqCst);
+        churner.join().unwrap();
+
+        match first {
+            ControlServerMsg::Response {
+                req_id: 1,
+                reply: ControlReply::Ok(ReplyOk::WatchId(_)),
+            } => {}
+            other => panic!("a batch overtook the WatchId reply: {other:?}"),
+        }
     }
 
     /// Dropping the subscription releases the *server's* watcher, not just the
