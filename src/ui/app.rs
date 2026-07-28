@@ -7322,13 +7322,9 @@ mod keybinding_gpui_tests {
         // the config dir resolves to. Unpinned, that is the developer's real
         // `~/.config/tty7/config.json`, so running these tests silently reset the
         // user's entire config to `Config::default()` plus the shortcut recorded
-        // here. Pin a scratch dir first, like every other test module that
-        // touches config-dir files (`set_config_dir` is first-call-wins, so this
-        // is a no-op when another test in the same process already pinned one —
-        // also a scratch dir, so the real file stays untouched either way).
-        let dir = std::env::temp_dir().join(format!("tty7-kbtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::core::config::set_config_dir(dir);
+        // here. The test-only `Config::save` now panics rather than allow that;
+        // pin a scratch dir so it doesn't have to.
+        crate::core::config::pin_test_config_dir();
 
         // The pause-to-commit is a real `smol::Timer` (off the deterministic
         // executor), so waiting on it parks the test thread.

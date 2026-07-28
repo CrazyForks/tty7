@@ -405,9 +405,7 @@ mod tests {
     fn update_state_round_trips_and_defaults() {
         // Pin a throwaway config dir (first-call-wins; same scheme the session
         // tests use, so the whole test binary shares one temp dir).
-        let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::core::config::set_config_dir(dir);
+        crate::core::config::pin_test_config_dir();
         let path = UpdateState::path().expect("config dir pinned");
 
         // Missing file → default (never prompted), so we'd prompt.

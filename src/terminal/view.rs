@@ -8455,9 +8455,7 @@ mod gpui_tests {
         // `note_integration_gap` queries the daemon for the pane's foreground
         // process; pin the config dir to a scratch so the control connection
         // fails cleanly instead of reaching a real user daemon.
-        let dir = std::env::temp_dir().join(format!("tty7-noticetest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::core::config::set_config_dir(dir);
+        crate::core::config::pin_test_config_dir();
 
         let (window, _daemon) = harness(cx);
         window
@@ -8553,9 +8551,7 @@ mod gpui_tests {
     fn ctrl_r_steps_matches_and_cmd_enter_runs(cx: &mut TestAppContext) {
         // `submit_command` defers a history-file record; pin the config dir to
         // the shared test scratch so nothing touches the real user history.
-        let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::core::config::set_config_dir(dir);
+        crate::core::config::pin_test_config_dir();
 
         let (window, mut daemon) = harness(cx);
         window
@@ -8602,9 +8598,7 @@ mod gpui_tests {
     fn ctrl_j_and_ctrl_m_submit_the_line_like_enter(cx: &mut TestAppContext) {
         // `submit_command` defers a history-file record; pin the config dir to
         // the shared test scratch so nothing touches the real user history.
-        let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::core::config::set_config_dir(dir);
+        crate::core::config::pin_test_config_dir();
 
         let (window, mut daemon) = harness(cx);
         for (chord, line) in [("ctrl-j", "echo j"), ("ctrl-m", "echo m")] {
@@ -8724,9 +8718,11 @@ mod gpui_tests {
     /// `prompt_seq`/`last_exit_code`), and the file line carries it.
     #[gpui::test]
     fn submitted_command_backfills_its_exit_code(cx: &mut TestAppContext) {
-        let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::core::config::set_config_dir(dir.clone());
+        // `set_config_dir` is first-call-wins and process-wide, so this pin only
+        // takes if no other test got there first — read the *effective* dir back
+        // rather than assuming this one won.
+        crate::core::config::pin_test_config_dir();
+        let dir = crate::core::config::config_dir_path().expect("a config dir resolves");
 
         let (window, mut daemon) = harness(cx);
         let wait = |cx: &mut TestAppContext, pred: &dyn Fn(&TerminalView) -> bool, what: &str| {
