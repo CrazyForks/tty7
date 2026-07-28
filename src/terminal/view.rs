@@ -13,7 +13,7 @@ use gpui::{
 };
 use gpui_component::kbd::Kbd;
 use gpui_component::menu::ContextMenuExt;
-use gpui_component::{ActiveTheme as _, Icon, IconName, h_flex};
+use gpui_component::{ActiveTheme as _, Icon, IconName, WindowExt as _, h_flex};
 
 use super::TermSize;
 use super::cmd_editor::CmdEditor;
@@ -95,14 +95,29 @@ pub struct NativeSshParts {
 
 /// An established shell daemon pane (fresh spawn or re-attach), ready to be
 /// wrapped in a view: the output of the fallible
-/// [`TerminalView::spawn_shell_terminal`], consumed by the infallible
+/// [`TerminalView::spawn_shell_terminal_in`], consumed by the infallible
 /// [`TerminalView::from_shell_parts`].
 pub struct ShellParts {
     terminal: RemoteTerminal,
-    pane_id: u64,
+    /// The daemon's id for this pane. Readable so a pane that arrived after its
+    /// slot was closed can be killed rather than leaked (see
+    /// `ui::app::Tty7App::land_pane`).
+    pub(crate) pane_id: u64,
     /// The explicit shell pick this pane was spawned with, if any; `None` for a
     /// re-attached pane (the pick isn't persisted).
     shell_spec: Option<ShellSpec>,
+    /// The remote workspace this pane was opened *in*, carried through so
+    /// [`TerminalView::from_shell_parts`] can bind the view to the same machine
+    /// the connection went to. `None` for a local pane.
+    ///
+    /// It rides here rather than being set on the view afterwards because the
+    /// two must not be able to disagree: the route is chosen before the pane
+    /// exists, and a view that thought it was somewhere else would send its
+    /// `Kill` and its restore `List` to the wrong daemon.
+    ///
+    /// Readable for the same reason as `pane_id` above: killing an orphaned
+    /// pane has to dial the machine it actually landed on.
+    pub(crate) workspace: Option<crate::terminal::PaneWorkspace>,
 }
 
 /// See `TerminalView::drag_scroll`.
@@ -117,8 +132,53 @@ struct DragScroll {
     side: Side,
 }
 
+/// Whether a pane's reported paths can be asked about on the host it is paired
+/// with — the gate behind [`TerminalView::host_cwd`], lifted out so it can be
+/// tested without standing up a pane and a daemon.
+///
+/// This is the one check keeping a remote path away from a `git` that cannot
+/// see it. The pairing has to *agree*: a shell running on another machine is
+/// only answerable by a host that is that machine, and a local shell only by
+/// the local host. A pane that runs elsewhere but still holds the local host —
+/// a native-SSH or WSL pane, which has no `Host` behind it at all — answers
+/// `false`, which is exactly what the old `remote_context().is_none()` gate
+/// did.
+fn cwd_is_on_host(pane_runs_remotely: bool, host_is_local: bool) -> bool {
+    match pane_runs_remotely {
+        // A local shell: its paths are this machine's, so only the local host
+        // can answer for them.
+        false => host_is_local,
+        // A shell on another machine: only a host that *is* that machine can.
+        true => !host_is_local,
+    }
+}
+
 pub struct TerminalView {
     pub terminal: RemoteTerminal,
+    /// The machine whose filesystem and `git` this pane's paths belong to —
+    /// [`HostId::LOCAL`] for a local or SSH pane, its workspace's machine for a
+    /// remote-workspace pane (set by [`set_workspace`](Self::set_workspace)).
+    ///
+    /// **The id, not the host object.** A reconnect mints a fresh `RemoteHost`
+    /// for the same machine and replaces the registry's entry; a pane holding
+    /// the old `Arc` would keep probing a dead connection forever, and since a
+    /// failed probe deliberately leaves the last good branch line on screen,
+    /// that failure would look exactly like "nothing changed". Resolving
+    /// through [`host`](Self::host) at use time means a reconnect is picked up
+    /// by the next probe with nothing to notify.
+    host_id: crate::ui::host_ops::HostId,
+    /// The remote workspace this pane belongs to, when it is one (design §15).
+    ///
+    /// `None` — the case today, until the M5 window/workspace binding calls
+    /// [`set_workspace`](Self::set_workspace) — means a local pane or an SSH
+    /// pane, and every path that reads this falls back to the pane-addressed
+    /// behaviour it has always had.
+    ///
+    /// It sits beside `host` rather than inside it because the two answer
+    /// different questions: `host` is *whose filesystem is this path on*, this
+    /// is *whose SSH connection do side effects run on, and what owns them*.
+    /// Several workspaces share one `host`; they must not share forwards.
+    workspace: Option<crate::terminal::PaneWorkspace>,
     /// Daemon-assigned id of the pane this view mirrors. Persisted in the session
     /// so a restart can re-`attach` to the still-running pane (process + scrollback
     /// intact) instead of spawning a fresh shell.
@@ -438,8 +498,71 @@ pub(super) struct HoveredLink {
 
 enum LoopbackOpen {
     Forwarded(String),
-    ForwardFailed,
+    ForwardFailed(String),
     NotLoopback,
+}
+
+/// How a ⌘/Ctrl-clicked URL should be opened, decided before anything is done
+/// about it (design §15).
+///
+/// Split out as a pure decision so the branch a pane takes is testable without a
+/// daemon, a connection, or a browser — the three things this feature otherwise
+/// needs all at once.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum LoopbackPlan {
+    /// Not a loopback URL, forwarding is off, or the pane's shell runs on this
+    /// machine: hand the URL to the OS unchanged.
+    Direct,
+    /// A remote whose `localhost` *is* the client's — WSL shares the network
+    /// namespace with its Windows host (design §15's exception). No forward is
+    /// built; the original URL already resolves. Wired now so M8 only has to
+    /// start constructing `RemoteTarget::Wsl`.
+    NoForwardNeeded,
+    /// A native-SSH pane ("连一下"): forward on the pane's own connection, owned
+    /// by the pane, torn down with it.
+    ForwardOnPane(u64),
+    /// A remote-workspace pane ("在上面开发"): forward on the workspace's
+    /// connection, owned by the workspace so it outlives the pane.
+    ForwardOnWorkspace(Box<crate::terminal::PaneWorkspace>),
+}
+
+/// The ⌘-click routing rule, as a pure function of what the pane is.
+///
+/// The workspace is checked *before* the pane's own remote context, and that
+/// order is the whole point: a remote workspace's panes are ordinary local
+/// shells as far as the remote daemon is concerned, so they carry no
+/// `RemoteContext` at all and the SSH-pane test below would decline them.
+pub(super) fn loopback_plan(
+    enabled: bool,
+    workspace: Option<&crate::terminal::PaneWorkspace>,
+    remote_kind: Option<crate::daemon::protocol::RemoteKind>,
+    pane_id: u64,
+) -> LoopbackPlan {
+    // The user's off switch wins everywhere, including hover detection — a
+    // `localhost:3000` that will not be forwarded must not underline either.
+    if !enabled {
+        return LoopbackPlan::Direct;
+    }
+    if let Some(ws) = workspace {
+        if ws.shares_localhost() {
+            return LoopbackPlan::NoForwardNeeded;
+        }
+        // A non-WSL workspace with nothing to forward over cannot be reached;
+        // opening the client's own `localhost` would be a wrong answer dressed
+        // up as a right one, so decline and let the URL through untouched.
+        if ws.spec.is_none() {
+            log::warn!("remote workspace has no connection spec; not forwarding localhost links");
+            return LoopbackPlan::Direct;
+        }
+        return LoopbackPlan::ForwardOnWorkspace(Box::new(ws.clone()));
+    }
+    // A native-SSH pane forwards over its own russh connection (FR-F4).
+    match remote_kind {
+        Some(crate::daemon::protocol::RemoteKind::NativeSsh) => {
+            LoopbackPlan::ForwardOnPane(pane_id)
+        }
+        _ => LoopbackPlan::Direct,
+    }
 }
 
 /// A submitted command whose history-file record is deferred so it can carry
@@ -870,21 +993,34 @@ impl TerminalView {
     /// back intact; otherwise `spawn` a fresh pane (with the caller's shell
     /// pick, if any). The caller only passes a `restore_pane` it has already
     /// confirmed alive, so we trust it here.
-    pub fn spawn_shell_terminal(
+    ///
+    /// **`workspace: None` is the local path, unchanged down to the byte** —
+    /// [`PaneRoute::for_workspace`] answers `Local`, and `Local` is a bare
+    /// `transport::connect()` with no header in front of it. There is no
+    /// "remote-aware" branch a local pane passes through.
+    ///
+    /// `Some(_)` is the whole of what makes a remote pane remote: the daemon is
+    /// told which machine the connection is for before any `ClientMsg` goes out,
+    /// and everything after — `Spawn`, `Attach`, `Input`, `Output` — lands on
+    /// that machine's `tty7-server` instead of this one's daemon.
+    pub fn spawn_shell_terminal_in(
+        workspace: Option<crate::terminal::PaneWorkspace>,
         working_directory: Option<std::path::PathBuf>,
         restore_pane: Option<u64>,
         shell: Option<ShellSpec>,
     ) -> anyhow::Result<ShellParts> {
+        let route = crate::terminal::PaneRoute::for_workspace(workspace.as_ref());
         let (terminal, pane_id, shell_spec) = match restore_pane {
             Some(id) => (
-                RemoteTerminal::attach(TermSize::new(80, 24), 8, 17, id)?,
+                RemoteTerminal::attach_on(&route, TermSize::new(80, 24), 8, 17, id)?,
                 id,
                 // An attached pane keeps whatever shell it already runs; the
                 // pick that spawned it (if any) isn't persisted.
                 None,
             ),
             None => {
-                let (terminal, id) = RemoteTerminal::spawn(
+                let (terminal, id) = RemoteTerminal::spawn_on(
+                    &route,
                     TermSize::new(80, 24),
                     8,
                     17,
@@ -898,10 +1034,11 @@ impl TerminalView {
             terminal,
             pane_id,
             shell_spec,
+            workspace,
         })
     }
 
-    /// Wrap an established shell pane (from [`Self::spawn_shell_terminal`]) in
+    /// Wrap an established shell pane (from [`Self::spawn_shell_terminal_in`]) in
     /// a view. Infallible by construction — see that function.
     pub fn from_shell_parts(
         parts: ShellParts,
@@ -910,6 +1047,7 @@ impl TerminalView {
     ) -> Self {
         let mut view = Self::with_terminal(parts.terminal, parts.pane_id, window, cx);
         view.shell_spec = parts.shell_spec;
+        view.set_workspace(parts.workspace);
         view
     }
 
@@ -974,7 +1112,10 @@ impl TerminalView {
         let fallbacks = fallback_chain(&font_family, &config.font_fallbacks);
         let font_size = px(config.font_size);
         let line_height_mul = config.line_height;
-        let font_features = config.font_features.clone();
+        let font_features = config
+            .font_features
+            .as_ref()
+            .map(crate::core::config::gpui_font_features);
         let report_mouse = config.mouse_reporting;
         let mut font = gpui::font(font_family);
         font.fallbacks = Some(gpui::FontFallbacks::from_fonts(fallbacks.clone()));
@@ -1140,6 +1281,8 @@ impl TerminalView {
 
         Self {
             terminal,
+            host_id: crate::ui::host_ops::HostId::LOCAL,
+            workspace: None,
             pane_id,
             shell_spec: None,
             ssh_spec: None,
@@ -1270,7 +1413,218 @@ impl TerminalView {
     /// remote, and Git Bash reports genuinely local paths (via `pwd -W`) that
     /// merely originate from a POSIX-looking shell.
     pub fn local_cwd(&self) -> Option<std::path::PathBuf> {
+        self.paths_are_local().then(|| self.cwd())?
+    }
+
+    /// Whether this pane's paths name files on *this* machine.
+    ///
+    /// Two independent ways they may not, and a caller that checks one and not
+    /// the other is silently wrong:
+    ///   - **`remote_context`** — the pane's *own* process is elsewhere (a pane
+    ///     tty7 dialled over SSH, a `wsl.exe` pane, a foreground `ssh`). The
+    ///     daemon reports it, having watched the process.
+    ///   - **`host_id`** — the pane belongs to a **remote workspace** (§15).
+    ///     Nothing about the pane itself is remote *from its own daemon's point
+    ///     of view*: `tty7-server` on the far machine spawned an ordinary local
+    ///     shell and reports `remote_context: None`, exactly as a local daemon
+    ///     would. It is the daemon that is on another machine, which no
+    ///     pane-level signal can express — only this side's binding knows.
+    ///
+    /// Which is why the second test cannot be folded into the first, and why
+    /// every use goes through here rather than re-deriving it: a routed pane
+    /// answering "yes, local" hands its remote cwd to `read_dir`, to `git`, and
+    /// to the file opener, all of which then answer about the wrong machine.
+    fn paths_are_local(&self) -> bool {
+        self.remote_context().is_none() && self.host_id.is_local()
+    }
+
+    /// The pane's cwd *as the machine a sibling pane will spawn on reads it* —
+    /// what "+", a split, and the persisted session hand the new shell.
+    ///
+    /// Deliberately **not** [`local_cwd`](Self::local_cwd), and the difference
+    /// is the whole point. A window shows one machine (§3), so a sibling lands
+    /// on the machine this pane's shell already runs on: for a remote-workspace
+    /// pane that is the far box, where `/home/me/proj` is exactly right and
+    /// withholding it would open every new tab at `$HOME` instead.
+    ///
+    /// What still has to decline is a pane whose shell is on a machine the
+    /// sibling will *not* be on — a native-SSH or WSL pane, whose window is
+    /// otherwise local. `remote_context` is precisely that condition, and it is
+    /// why these callers cannot share the strict accessor: they ask "will the
+    /// new shell be able to chdir here", not "is this file on my disk".
+    pub fn spawnable_cwd(&self) -> Option<std::path::PathBuf> {
         self.remote_context().is_none().then(|| self.cwd())?
+    }
+
+    /// The machine this pane's paths live on — what every filesystem or `git`
+    /// question about this pane must be asked of.
+    ///
+    /// `None` means that machine is not around: a remote workspace whose
+    /// connection closed, or one this process has not connected to yet. It is
+    /// never a local pane — the local host is always resolvable. Callers stop
+    /// there rather than falling back to this machine; asking the local git
+    /// about a remote path is how a pane ends up showing *another* repository's
+    /// branch, which is the bug this whole indirection exists to prevent.
+    pub fn host(&self, cx: &gpui::App) -> Option<crate::ui::host_ops::SharedHost> {
+        crate::ui::host_registry::HostRegistry::lookup(cx, self.host_id)
+    }
+
+    /// The id alone — for the cache lookups and comparisons that never need the
+    /// host object, and so keep working while a machine is disconnected.
+    pub fn host_id(&self) -> crate::ui::host_ops::HostId {
+        self.host_id
+    }
+
+    /// The remote workspace this pane belongs to, if any — what its port
+    /// forwards are owned by and whose SSH connection its SFTP rides (§15).
+    pub fn workspace(&self) -> Option<&crate::terminal::PaneWorkspace> {
+        self.workspace.as_ref()
+    }
+
+    /// Bind this pane to a remote workspace.
+    ///
+    /// A setter rather than a constructor argument so the one
+    /// `TerminalView::new` keeps the shape every existing call site already
+    /// passes, and a local pane needs no change at all.
+    ///
+    /// Called by [`from_shell_parts`](Self::from_shell_parts) with the workspace
+    /// the pane's *connection* was routed to, so the two cannot drift apart.
+    /// Calling it with anything else re-labels a pane without moving it, which
+    /// is why nothing else does.
+    ///
+    /// **This is also what points the pane's path questions at the right
+    /// machine.** The host id comes off the workspace's own `RemoteTarget`,
+    /// through the same `connection_key` the connection was opened under — so
+    /// the id resolves to the very host object
+    /// [`RemoteConnections::insert`](crate::ui::remote_connect::RemoteConnections::insert)
+    /// registered, with no second source of truth to drift from it. Setting the
+    /// route and setting the host is one operation because a pane that ran its
+    /// shell on one machine and its `git` on another would be worse than
+    /// either.
+    pub fn set_workspace(&mut self, workspace: Option<crate::terminal::PaneWorkspace>) {
+        self.host_id = workspace
+            .as_ref()
+            .map_or(crate::ui::host_ops::HostId::LOCAL, |w| w.target.host_id());
+        self.workspace = workspace;
+    }
+
+    /// Where this pane's daemon connections go.
+    ///
+    /// Anything addressed by `pane_id` — `Kill`, the restore-time `List` — has to
+    /// use this rather than the plain local call, because pane ids are per-daemon
+    /// and a remote pane's id names a *different* daemon's pane. Returns
+    /// [`PaneRoute::Local`] for a local pane, which is the call every one of
+    /// those sites makes today.
+    pub fn pane_route(&self) -> crate::terminal::PaneRoute {
+        crate::terminal::PaneRoute::for_workspace(self.workspace.as_ref())
+    }
+
+    /// Design §10's read-only degrade, as the keyboard sees it.
+    ///
+    /// **A local pane always answers `true`** — it has no connection to lose,
+    /// and `workspace()` is `None` for it, so this is a field test and not a
+    /// lookup. A remote pane defers to its workspace's connection state, which
+    /// is the workspace's business and not a pane's: five entry points ask, one
+    /// rule answers.
+    ///
+    /// Deliberately **not** consulted by
+    /// [`handle_event`](Self::handle_event)'s `PtyWrite` arm. Those bytes are
+    /// the emulator answering a question the *remote program* asked — a DA
+    /// report, an OSC colour reply, a cursor-position report — and gating them
+    /// would leave that program waiting for an answer that never comes, which
+    /// is a hang, not a degrade. The rule is about the *user's* keystrokes.
+    fn accepts_input(&self, cx: &gpui::App) -> bool {
+        let Some(ws) = self.workspace().map(|w| w.workspace) else {
+            return true;
+        };
+        crate::ui::remote_workspace::workspace_accepts_input(cx, ws)
+    }
+
+    /// Everything a reconnect needs to know about this pane, read on the UI
+    /// thread before the blocking half runs off it: which pane, and at what
+    /// geometry to bring it back (design §10: "以新客户端的尺寸 Resize").
+    ///
+    /// The geometry is *this* client's current one, not the one the pane was
+    /// recorded at — a laptop that reconnects to a workspace it left on a
+    /// 4K monitor must not come back at 300 columns.
+    pub fn relink_plan(&self) -> (u64, TermSize, u16, u16) {
+        (
+            self.pane_id,
+            self.terminal.size(),
+            self.cell_width.as_f32().round() as u16,
+            self.line_height.as_f32().round() as u16,
+        )
+    }
+
+    /// Adopt a stream that has already re-`Attach`ed to this pane.
+    ///
+    /// The title goes back to the neutral one: the pane wore
+    /// "tty7 — process exited" only because the *link* died, and leaving that on
+    /// a tab whose shell is demonstrably still running would be the UI lying
+    /// about the very thing this reconnect just disproved. A real title arrives
+    /// with the replay if the shell sets one.
+    pub fn adopt_relink(
+        &mut self,
+        stream: crate::daemon::transport::Stream,
+        route: &crate::terminal::PaneRoute,
+        size: TermSize,
+        cell_w: u16,
+        cell_h: u16,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.terminal
+            .adopt_relink(stream, route, size, cell_w, cell_h)?;
+        self.title = "tty7".to_string();
+        cx.notify();
+        Ok(())
+    }
+
+    /// Let go of this pane's link without ending the pane.
+    ///
+    /// Design §10's takeover: another client attached, so this one stops being
+    /// the workspace's session. The pane stays on screen, read-only, exactly as
+    /// a dropped link leaves it — what must *not* happen is this client going on
+    /// holding a stream to a workspace somebody else is now typing in.
+    pub fn detach_link(&mut self, cx: &mut Context<Self>) {
+        self.terminal.detach_link();
+        cx.notify();
+    }
+
+    /// The pane's cwd *when it names a directory on this pane's own
+    /// [`host`](Self::host)* — the accessor the git probe, the diff and the
+    /// worktree actions go through.
+    ///
+    /// This is the generalisation of [`local_cwd`](Self::local_cwd), and the
+    /// two answer differently in exactly one case. `local_cwd` asks "is this
+    /// path on *this machine*", because its callers do something local with it:
+    /// open a file, spawn a local shell, persist a cwd a local shell will be
+    /// restored into. This one asks "is this path on the machine I would ask
+    /// about it", which is the weaker and more useful question — a pane whose
+    /// shell runs over SSH has a perfectly good cwd, it just isn't here.
+    ///
+    /// The gate is *not* "is the pane remote". It is "does the pane's host
+    /// agree with where the pane's shell runs": a remote pane still paired with
+    /// the local host has a cwd nobody in this process can answer for, and
+    /// handing `/home/me/proj` to a local `git` is the collision that gate
+    /// exists to prevent (worse than useless on Windows, where that path is
+    /// drive-relative and resolves to `C:\home\me\proj`). A remote-workspace
+    /// pane does have its own host, so for it this returns the remote path and
+    /// every caller below answers about the remote repository.
+    pub fn host_cwd(&self) -> Option<std::path::PathBuf> {
+        self.cwd_is_on_host().then(|| self.cwd())?
+    }
+
+    /// Whether paths this pane reports are in [`host`](Self::host)'s namespace.
+    /// See [`host_cwd`](Self::host_cwd) for why this is not `remote_context()
+    /// .is_none()`.
+    ///
+    /// "Runs elsewhere" is [`paths_are_local`](Self::paths_are_local) negated,
+    /// **not** `remote_context().is_some()`. A remote-workspace pane's shell is
+    /// perfectly local *to the machine it runs on*, so the `tty7-server` there
+    /// reports no remote context for it — the fact that it is elsewhere is
+    /// carried by the workspace, which is the other half of that accessor.
+    fn cwd_is_on_host(&self) -> bool {
+        cwd_is_on_host(!self.paths_are_local(), self.host_id.is_local())
     }
 
     /// The coding agent running in this pane's foreground, or `None` when none
@@ -1319,7 +1673,7 @@ impl TerminalView {
     pub fn git_status(&self, cx: &App) -> Option<crate::terminal::git_status::GitStatus> {
         let cwd = self.git_status_cwd.as_ref()?;
         cx.try_global::<crate::terminal::git_status::GitStatusCache>()?
-            .status_for(cwd)
+            .status_for(self.host_id, cwd)
     }
 
     /// The cwd the pane's git line reads from — the same path [`git_status`]
@@ -1425,7 +1779,17 @@ impl TerminalView {
             AlacEvent::PtyWrite(text) => self.terminal.write(text.into_bytes()),
             AlacEvent::ChildExit(_) | AlacEvent::Exit => {
                 self.terminal.exited = true;
-                self.title = "tty7 — process exited".to_string();
+                // Say which of the two things happened. For a local pane both
+                // read the same and the wording is unchanged; for a remote
+                // workspace they are opposite facts, and "process exited" on a
+                // pane whose shell is still running on the far machine is the
+                // one claim design §10's degrade must not make — the whole
+                // promise is that the work is still there when the link returns.
+                self.title = if self.workspace().is_some() && !self.terminal.child_exited() {
+                    "tty7 — disconnected".to_string()
+                } else {
+                    "tty7 — process exited".to_string()
+                };
                 // A genuine child exit closes the pane (the app subscribes and
                 // collapses the split / closes the tab). A daemon disconnect
                 // reaches this same arm but must NOT auto-close: the session
@@ -1503,7 +1867,22 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminal.exited {
+        // `terminal.exited` is set by two very different things: the shell
+        // genuinely ending, and the *link* dropping (the reader's teardown sets
+        // the same flag). For a local pane those are the same story and this
+        // early return is unchanged — a local pane's link only dies when its
+        // daemon does.
+        //
+        // For a remote-workspace pane they are not. Design §10's read-only
+        // degrade is precisely the case where the link is gone and the shell is
+        // not: that window must keep scrolling, selecting, copying and
+        // searching, and every one of those runs below this line. What must not
+        // happen — a keystroke reaching the machine — is stopped further down at
+        // [`accepts_input`](Self::accepts_input), and again by the `exited`
+        // checks on `send_to_pty` / `commit_text` themselves.
+        let link_dropped_on_a_remote_pane =
+            self.workspace().is_some() && !self.terminal.child_exited();
+        if self.terminal.exited && !link_dropped_on_a_remote_pane {
             return;
         }
         // Any keystroke dismisses a visible integration notice — it has been
@@ -1590,6 +1969,24 @@ impl TerminalView {
                 "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
             )
         {
+            return;
+        }
+
+        // Design §10's read-only degrade, placed **here and not at the top of
+        // this function**.
+        //
+        // Everything above is the window's own keyboard, not the machine's:
+        // ⌘F opens the search bar, ⌘A selects, ⌘C copies, ⌘1-9 switches tabs.
+        // §10 promises every one of those keeps working while the link is
+        // down — "能滚历史、能选能复制、能 ⌘F 搜索" — and a gate at the top of
+        // `on_key_down` would silently take them all away, turning a read-only
+        // window into an inert one. (⌘V is not an exception that needs handling
+        // here: it reaches [`paste`](Self::paste), which has its own gate.)
+        //
+        // Everything *below* ends up at the PTY: the local line editor whose
+        // Enter ships the line, and the raw key encoder. That is the half that
+        // must not reach a machine we are not attached to.
+        if !self.accepts_input(cx) {
             return;
         }
 
@@ -2388,7 +2785,7 @@ impl TerminalView {
     /// actions rather than through `on_key_down`, e.g. Tab / Shift-Tab), applying
     /// the same cursor / selection / scroll housekeeping as normal typing.
     fn send_to_pty(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        if self.terminal.exited {
+        if self.terminal.exited || !self.accepts_input(cx) {
             return;
         }
         self.terminal.write(bytes.to_vec());
@@ -2430,6 +2827,9 @@ impl TerminalView {
     /// bracketed-paste markers when the app enabled that mode (so shells/editors
     /// treat it as one paste rather than typed-and-executed input).
     pub fn paste(&mut self, text: String, cx: &mut Context<Self>) {
+        if !self.accepts_input(cx) {
+            return;
+        }
         if self.input_active() {
             let trimmed = text.strip_suffix('\n').unwrap_or(&text);
             self.cmd.insert_str(trimmed);
@@ -3002,12 +3402,12 @@ impl TerminalView {
         // doesn't (Windows). The claim dies with the session (`session-end`
         // clears it, and the agent leaving the foreground drops the whole
         // state), so an exited agent falls back to the pane's real directory.
-        // The agent's report goes through the same remote gate as the pane's own
+        // The agent's report goes through the same host gate as the pane's own
         // cwd. A native-SSH pane keeps sentinel-sourced agent state on purpose
         // (`spawn_native_ssh`), so an agent running *on the remote host* reports
-        // a remote path — and being first in the chain it would win over
-        // `local_cwd` unconditionally and hand that path straight to the local
-        // `git`, which is the collision `local_cwd` exists to prevent.
+        // a remote path — and being first in the chain it would win over the
+        // pane's own cwd unconditionally and hand that path to a `git` that
+        // cannot see it, which is the collision `cwd_is_on_host` prevents.
         let session = self.terminal.agent_session();
         // A count that moved means at least one tool finished since the last
         // tick. With no session the counter resets, so a fresh agent's very
@@ -3020,8 +3420,7 @@ impl TerminalView {
             }
         };
         let cwd_now = self
-            .remote_context()
-            .is_none()
+            .cwd_is_on_host()
             .then(|| {
                 session
                     .as_ref()
@@ -3036,16 +3435,17 @@ impl TerminalView {
         }
     }
 
-    /// Kick off an off-thread git probe for `cwd` and fold the result into the
-    /// shared per-repo [`GitStatusCache`] on the main thread. The cache
-    /// brackets the flight (`begin_probe`/`finish_probe`): a probe already in
-    /// flight for the same cwd absorbs this trigger instead of spawning a
-    /// duplicate `git` shell-out, and reruns once when it lands. With no cwd
-    /// (e.g. a remote pane, where a local `git` would be meaningless) the pane
-    /// simply stops reading a status. Callers must source the cwd from
-    /// [`local_cwd`](Self::local_cwd): a remote pane *does* get a cwd once its
-    /// OSC 7 lands, so "remote panes have no cwd" holds only before that and
-    /// cannot be what keeps the local probe away from a remote path.
+    /// Kick off an off-thread git probe for `cwd` on this pane's
+    /// [`host`](Self::host) and fold the result into the shared per-repo
+    /// [`GitStatusCache`] on the main thread. The cache brackets the flight
+    /// (`begin_probe`/`finish_probe`) per `(host, cwd)`: a probe already in
+    /// flight for the same pair absorbs this trigger instead of spawning a
+    /// duplicate, and reruns once when it lands. With no cwd the pane simply
+    /// stops reading a status. Callers must source the cwd from
+    /// [`host_cwd`](Self::host_cwd): a pane whose paths its host cannot answer
+    /// for *does* get a cwd once its OSC 7 lands, so "such panes have no cwd"
+    /// holds only before that and cannot be what keeps the probe away from a
+    /// path it would misread.
     ///
     /// [`GitStatusCache`]: crate::terminal::git_status::GitStatusCache
     fn refresh_git_status(
@@ -3064,45 +3464,72 @@ impl TerminalView {
             }
             return;
         };
+        let id = self.host_id;
+        // A host that is not there cannot be probed, and a probe that fails
+        // would replace a good branch line with nothing. Keep showing the last
+        // answer instead — the reconnect fires a fresh trigger.
+        //
+        // Two ways for it not to be there, both landing here: the machine is
+        // unregistered (its workspace closed, or this process never connected),
+        // or it is registered but its connection is down.
+        //
+        // Still repaint if the cwd moved: `git_status_cwd` is what
+        // `git_status()` resolves through, so leaving the frame unnotified
+        // would keep the *previous* directory's branch line on screen until
+        // some unrelated event happened to notify.
+        let Some(host) = self.host(cx) else {
+            if changed {
+                cx.notify();
+            }
+            return;
+        };
+        if !host.is_connected() {
+            if changed {
+                cx.notify();
+            }
+            return;
+        }
         cx.default_global::<GitStatusCache>(); // first probe of the process creates it
         let claimed = cx.update_global::<GitStatusCache, _>(|cache, _| match trigger {
-            GitRefresh::Edge => cache.begin_probe(&cwd),
-            GitRefresh::Opportunistic => cache.begin_probe_throttled(&cwd, OPPORTUNISTIC_GIT_GAP),
+            GitRefresh::Edge => cache.begin_probe(id, &cwd),
+            GitRefresh::Opportunistic => {
+                cache.begin_probe_throttled(id, &cwd, OPPORTUNISTIC_GIT_GAP)
+            }
         });
         if !claimed {
             return;
         }
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let cwd = cwd.clone();
-                    async move { crate::terminal::git_status::probe(&cwd) }
-                })
-                .await;
-            // Land the result in the shared cache before touching the pane,
-            // and whether or not the pane still exists: the in-flight claim is
-            // keyed by *cwd*, so a pane closed mid-probe that never released
-            // its claim would wedge the git line of every other pane in that
-            // directory — permanently, since nothing else ever clears it.
-            //
-            // Landing through `update_global` wakes the sidebar's
-            // `observe_global`, so every pane in the repo repaints — not just
-            // this one.
-            let rerun =
-                cx.update_global::<GitStatusCache, _>(|cache, _| cache.finish_probe(&cwd, result));
-            // A trigger arrived while we flew; go once more so its state is
-            // observed — unless this pane has since left that cwd. Only edge
-            // triggers set that flag, so the rerun is an edge too.
-            if rerun {
-                let _ = this.update(cx, |view, cx| {
-                    if view.git_status_cwd.as_deref() == Some(&cwd) {
-                        view.refresh_git_status(Some(cwd), GitRefresh::Edge, cx);
-                    }
+        let probe_cwd = cwd.clone();
+        let pane = cx.weak_entity();
+        // `run_detached`, not `run`: the result has to reach the shared cache
+        // whether or not this pane outlives the probe. The claim is keyed by
+        // `(host, cwd)`, so a pane closed mid-flight that never released its
+        // claim would wedge the git line of every other pane in that directory
+        // — permanently, since nothing else ever clears it.
+        crate::ui::host_ops::HostOps::run_detached(
+            host,
+            cx,
+            move |h| crate::terminal::git_status::probe(h, &probe_cwd),
+            move |cx, result| {
+                // Landing through `update_global` wakes the sidebar's
+                // `observe_global`, so every pane in the repo repaints — not
+                // just this one.
+                let rerun = cx.update_global::<GitStatusCache, _>(|cache, _| {
+                    cache.finish_probe(id, &cwd, result)
                 });
-            }
-        })
-        .detach();
+                // A trigger arrived while we flew; go once more so its state is
+                // observed — unless this pane has since left that cwd (or left
+                // entirely). Only edge triggers set that flag, so the rerun is
+                // an edge too.
+                if rerun {
+                    let _ = pane.update(cx, |view, cx| {
+                        if view.git_status_cwd.as_deref() == Some(&cwd) {
+                            view.refresh_git_status(Some(cwd), GitRefresh::Edge, cx);
+                        }
+                    });
+                }
+            },
+        );
     }
 
     /// Fold the pane's rich agent status into turn-level notifications and the
@@ -3364,26 +3791,44 @@ impl TerminalView {
     /// Everywhere else this is `false`, so the raw terminal keeps the keyboard and
     /// behaves exactly as without the editor.
     pub fn input_active(&self) -> bool {
+        self.input_inactive_reason().is_none()
+    }
+
+    /// Why the line editor is standing down, phrased for a log line — `None`
+    /// when it is live.
+    ///
+    /// The conditions live here rather than inline in [`input_active`] because
+    /// "the editor didn't engage" is the shape almost every report of this
+    /// feature takes ("Tab did nothing", "it fell back to the shell"), and six
+    /// silent booleans are indistinguishable from the outside. One list, so the
+    /// answer is a `TTY7_LOG=debug` away instead of a bisect.
+    fn input_inactive_reason(&self) -> Option<&'static str> {
+        if self.terminal.exited {
+            return Some("the shell has exited");
+        }
         // Suppress our command editor only while the search field actually holds
         // keyboard focus (it claims Tab / ↑ / ↓ / typing). If search is open but
         // blurred — e.g. the user clicked back into the terminal — the editor must
         // resume, otherwise keys fall through to the raw PTY path and can't be edited.
-        if self.terminal.exited || self.search_focused {
-            return false;
+        if self.search_focused {
+            return Some("the search field holds the keyboard");
         }
         if self.on_alt_screen() {
-            return false;
+            return Some("the pane is on the alternate screen");
         }
         if self.shell_vi_prompt() {
-            return false;
+            return Some("the shell prompt is in vi mode");
         }
         // A Tab handoff gave this prompt's line to the shell; until a command
         // runs and a fresh prompt cycle starts, the shell's editor owns it,
         // and re-engaging ours would fork the two line buffers.
         if self.editor_handoff == Some(self.terminal.prompt_cycle()) {
-            return false;
+            return Some("this prompt's line was already handed to the shell");
         }
-        self.at_shell_prompt()
+        if !self.at_shell_prompt() {
+            return Some("the shell has not reported a prompt (no OSC 133)");
+        }
+        None
     }
 
     fn shell_vi_prompt(&self) -> bool {
@@ -3514,6 +3959,16 @@ impl TerminalView {
     /// is long-running (or reading stdin) — release the bytes to the PTY and
     /// record them for the deferred wipe.
     fn dump_hold(&mut self, epoch: u64, cx: &mut Context<Self>) {
+        // The one gate that is not next to a keystroke. This runs off a timer
+        // armed while the pane was still attached, so it can fire *after* the
+        // link dropped and after every other check has already returned — held
+        // bytes would then reach the machine as the one thing the read-only
+        // degrade promises cannot happen. Nothing is buffered for later (D6):
+        // the hold is dropped, not queued.
+        if !self.accepts_input(cx) {
+            let _ = self.hold.timeout(epoch);
+            return;
+        }
         if let Some((net, bytes)) = self.hold.timeout(epoch) {
             self.terminal.write(bytes);
             let alt = self.on_alt_screen();
@@ -3795,13 +4250,17 @@ impl TerminalView {
         cx.notify();
 
         let pane_id = self.pane_id;
+        // This pane's own daemon: the id below is only meaningful there, and on
+        // a remote workspace the local daemon would answer about a different
+        // pane that happens to share the number.
+        let route = self.pane_route();
         cx.spawn(async move |this, cx| {
             // Best-effort: no daemon / unknown pane / unreadable process just
             // leaves the generic message standing.
             let fg = cx
                 .background_executor()
                 .spawn(async move {
-                    RemoteTerminal::list_panes()
+                    RemoteTerminal::list_panes_on(&route)
                         .into_iter()
                         .find(|p| p.pane_id == pane_id)
                         .map(|p| p.title)
@@ -3925,6 +4384,26 @@ impl TerminalView {
         self.send_to_pty(chord, cx);
     }
 
+    /// Tab / Shift-Tab arrived. Either our completion answers it, or the raw
+    /// key goes to the shell.
+    ///
+    /// One entry point for both directions so the "why didn't the menu open"
+    /// trace has one place to live — this is the question every report about
+    /// completion turns out to be.
+    fn tab_pressed(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.search_focused {
+            cx.propagate();
+            return;
+        }
+        if let Some(reason) = self.input_inactive_reason() {
+            log::debug!(target: "tty7::completion", "Tab goes straight to the PTY: {reason}");
+            let bytes = self.tab_bytes(!forward);
+            self.send_to_pty(&bytes, cx);
+            return;
+        }
+        self.complete_tab(forward, cx);
+    }
+
     /// Hand the line over and let the shell have the Tab, so its native
     /// completion (compsys, fzf-tab, …) answers what tty7 has nothing for.
     fn handoff_tab_to_shell(&mut self, shift: bool, cx: &mut Context<Self>) {
@@ -3949,6 +4428,7 @@ impl TerminalView {
         }
         // tty7 completion switched off: every Tab goes to the shell.
         if !cx.global::<Config>().tab_completion {
+            log::debug!(target: "tty7::completion", "handing the line to the shell: tab_completion is off");
             self.handoff_tab_to_shell(!forward, cx);
             return;
         }
@@ -3962,10 +4442,14 @@ impl TerminalView {
         // completion only. Falling back to tty7's own directory there would
         // offer *this* machine's filenames for insertion into a remote command
         // line, where they don't exist.
-        let cwd = match self.remote_context() {
-            Some(_) => None,
-            None => self.local_cwd().or_else(|| std::env::current_dir().ok()),
-        };
+        //
+        // The `current_dir` fallback is for a *local* pane whose shell has not
+        // reported OSC 7 yet, and must stay behind the same gate: reaching it
+        // from a remote pane is the same wrong answer by a longer route.
+        let cwd = self
+            .paths_are_local()
+            .then(|| self.local_cwd().or_else(|| std::env::current_dir().ok()))
+            .flatten();
         let line = self.cmd.text();
         let cursor = self.cmd.cursor();
         let Some(comp) = super::completion::complete(&line, cursor, cwd.as_deref()) else {
@@ -3977,6 +4461,12 @@ impl TerminalView {
             }
             // Nothing to offer. Don't swallow the keypress (#136) — hand the
             // line to the shell and let its completion have the Tab.
+            log::debug!(
+                target: "tty7::completion",
+                "handing the line to the shell: no candidates for {line:?} at {cursor} \
+                 (local cwd {cwd:?}, remote cwd {:?})",
+                self.remote_ssh_cwd(),
+            );
             self.handoff_tab_to_shell(!forward, cx);
             return;
         };
@@ -4076,14 +4566,28 @@ impl TerminalView {
         Some(generation)
     }
 
-    /// The pane's cwd as a path on the *remote* — `Some` only for a native-SSH
-    /// pane whose remote shell has reported an absolute cwd (OSC 7). Those are
-    /// the panes tty7 itself dialled, so the daemon holds an authenticated
-    /// connection we can ask about that filesystem; every other pane kind
-    /// (a foreground `ssh`, WSL, plain local) answers `None`.
+    /// The pane's cwd as a path on the *remote*, for panes whose filesystem
+    /// tty7 can ask about over a connection it holds. `None` for every other
+    /// kind, including a plain local pane.
+    ///
+    /// Two shapes qualify, and they are found by different signals:
+    ///   - a **native-SSH pane** — tty7 dialled it, so `remote_context` says so
+    ///     and the daemon holds the authenticated connection under its pane id;
+    ///   - a **remote-workspace pane** (§15) — its `tty7-server` reports it as
+    ///     an ordinary local pane (it *is* one, over there), so `remote_context`
+    ///     is `None` and only this side's `workspace` binding reveals it. The
+    ///     connection is the workspace's, not the pane's.
+    ///
+    /// Everything else declines rather than pretend: a foreground `ssh` and WSL
+    /// have no tty7-owned connection to ask (WSL falls out of
+    /// [`RemoteTerminal::workspace_request`], which needs an SSH spec), and a
+    /// local pane is the local engine's business.
     fn remote_ssh_cwd(&self) -> Option<String> {
-        let remote = self.terminal.remote_context()?;
-        if remote.kind != crate::daemon::protocol::RemoteKind::NativeSsh {
+        let owned = match self.terminal.remote_context() {
+            Some(remote) => remote.kind == crate::daemon::protocol::RemoteKind::NativeSsh,
+            None => self.workspace.is_some(),
+        };
+        if !owned {
             return None;
         }
         let cwd = self.cwd()?.to_string_lossy().into_owned();
@@ -4120,6 +4624,10 @@ impl TerminalView {
             return false;
         };
         let Some(req) = completion::remote_path_request(line, cursor, &cwd) else {
+            log::debug!(
+                target: "tty7::completion",
+                "no remote listing to ask for: {line:?} at {cursor} against {cwd}"
+            );
             return false;
         };
         // A listing for this same keystroke is already on the wire. Swallow the
@@ -4129,13 +4637,19 @@ impl TerminalView {
             return true;
         }
         self.remote_completion_inflight = true;
-        let pane_id = self.pane_id;
+        // Resolved here, on the UI thread: the background call cannot reach the
+        // pane entity, and a remote-workspace pane's listing has to go out on
+        // the *workspace's* connection — its pane id names a pane on the far
+        // daemon, which this one cannot resolve.
+        let route = crate::ui::sftp::SftpRoute::new(self.pane_id, self.workspace.clone());
         let dir = req.dir.clone();
         let line = line.to_string();
+        log::debug!(target: "tty7::completion", "listing {dir} over the remote's own connection");
         cx.spawn(async move |this, cx| {
-            let listed = cx
-                .background_spawn(async move { RemoteTerminal::sftp_list(pane_id, &dir) })
-                .await;
+            let listed = cx.background_spawn(async move { route.list(&dir) }).await;
+            if let Err(e) = &listed {
+                log::warn!(target: "tty7::completion", "remote listing failed: {e}");
+            }
             let _ = this.update(cx, |view, cx| {
                 view.remote_completion_inflight = false;
                 view.remote_path_results(
@@ -4173,6 +4687,10 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         if self.cmd.text() != line || self.cmd.cursor() != cursor {
+            log::debug!(
+                target: "tty7::completion",
+                "dropping a remote listing for {line:?}: the line has moved on"
+            );
             return;
         }
         let entries: Vec<completion::RemoteEntry> = listed
@@ -4187,6 +4705,13 @@ impl TerminalView {
             })
             .collect();
         let cands = completion::remote_path_candidates(&req, &entries);
+        log::debug!(
+            target: "tty7::completion",
+            "{} entries in {}, {} match the word",
+            entries.len(),
+            req.dir,
+            cands.len()
+        );
         if cands.is_empty() {
             self.handoff_tab_to_shell(!forward, cx);
             return;
@@ -4380,7 +4905,7 @@ impl TerminalView {
     /// See `input_text`. The single text-commit path, split by whether the editor
     /// is live at the prompt.
     pub fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        if self.terminal.exited || text.is_empty() {
+        if self.terminal.exited || text.is_empty() || !self.accepts_input(cx) {
             return;
         }
         // While reverse-searching, typed text edits the query, not the line.
@@ -4723,7 +5248,13 @@ impl TerminalView {
 
     /// Open the link under the given cell, if any (OSC 8 hyperlink, plain URL or
     /// existing file or directory path detected in the row text). Returns true if one opened.
-    pub fn open_link_at(&self, col: usize, row: usize, cx: &mut Context<Self>) -> bool {
+    pub fn open_link_at(
+        &self,
+        col: usize,
+        row: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !cx.global::<Config>().link_url {
             return false;
         }
@@ -4741,7 +5272,7 @@ impl TerminalView {
         if let Some(hl) = cell.hyperlink() {
             let uri = hl.uri().to_string();
             drop(term);
-            self.open_url(&uri, cx);
+            self.open_url(&uri, window, cx);
             return true;
         }
 
@@ -4758,7 +5289,7 @@ impl TerminalView {
         let cwd = self.local_cwd();
         if let Some(link) = super::search::link_at(&text, col, cwd.as_deref(), true) {
             match link.target {
-                LinkTarget::Url(url) => self.open_url(&url, cx),
+                LinkTarget::Url(url) => self.open_url(&url, window, cx),
                 LinkTarget::File { path, line, column } => {
                     // A configured template (e.g. opening the file in an editor)
                     // takes precedence; otherwise fall back to the OS opener.
@@ -4772,49 +5303,98 @@ impl TerminalView {
         } else if self.can_forward_loopback(cx)
             && let Some((_, _, url)) = super::loopback::loopback_url_span_at(&text, col)
         {
-            self.open_url(&url, cx);
+            self.open_url(&url, window, cx);
             true
         } else {
             false
         }
     }
 
-    fn open_url(&self, url: &str, cx: &mut Context<Self>) {
+    fn open_url(&self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.forwarded_loopback_url(url, cx) {
             LoopbackOpen::Forwarded(url) => cx.open_url(&url),
             LoopbackOpen::NotLoopback => cx.open_url(url),
-            LoopbackOpen::ForwardFailed => {}
+            // The click produced no browser tab, so it has to say why: silence
+            // here reads as tty7 having ignored the click.
+            LoopbackOpen::ForwardFailed(reason) => {
+                window.push_notification(reason, cx);
+            }
         }
     }
 
     fn forwarded_loopback_url(&self, url: &str, cx: &mut Context<Self>) -> LoopbackOpen {
-        if !self.can_forward_loopback(cx) {
+        let plan = self.loopback_plan(cx);
+        if matches!(plan, LoopbackPlan::Direct) {
             return LoopbackOpen::NotLoopback;
         }
         let Some(loopback) = super::loopback::parse_loopback_url(url) else {
             return LoopbackOpen::NotLoopback;
         };
-        match RemoteTerminal::ensure_loopback_forward(
-            self.pane_id,
-            loopback.forward_host(),
-            loopback.port,
-        ) {
+        // WSL shares the Windows host's `localhost`, so the URL already points at
+        // the right place — building a forward would be pure overhead (design §15).
+        if matches!(plan, LoopbackPlan::NoForwardNeeded) {
+            return LoopbackOpen::NotLoopback;
+        }
+
+        // Establishing a local forward is a `bind()` on this machine plus a
+        // registry insert — no SSH round-trip happens until the browser actually
+        // connects — so this stays a blocking call rather than paying for an
+        // async hop the user would perceive as the click doing nothing.
+        //
+        // The local port is always ephemeral (`bind_port: 0`, chosen by the OS):
+        // the remote's 3000 may well be taken here, and the URL is rewritten to
+        // whichever port we actually got.
+        let forwarded = match &plan {
+            LoopbackPlan::ForwardOnPane(pane_id) => RemoteTerminal::ensure_loopback_forward(
+                *pane_id,
+                loopback.forward_host(),
+                loopback.port,
+            ),
+            LoopbackPlan::ForwardOnWorkspace(ws) => self.ensure_workspace_loopback(ws, &loopback),
+            LoopbackPlan::Direct | LoopbackPlan::NoForwardNeeded => unreachable!("handled above"),
+        };
+        match forwarded {
             Ok(forward) => LoopbackOpen::Forwarded(loopback.forwarded_url(forward.local_port)),
             Err(e) => {
                 log::warn!("failed to forward loopback URL {url}: {e}");
-                LoopbackOpen::ForwardFailed
+                LoopbackOpen::ForwardFailed(format!("Couldn't forward :{} — {e}", loopback.port))
             }
         }
     }
 
+    /// Ask the daemon for a workspace-owned forward to `loopback`'s port.
+    fn ensure_workspace_loopback(
+        &self,
+        ws: &crate::terminal::PaneWorkspace,
+        loopback: &super::loopback::LoopbackUrl,
+    ) -> anyhow::Result<crate::daemon::protocol::LoopbackForward> {
+        let req = RemoteTerminal::workspace_request(
+            ws,
+            self.pane_id,
+            crate::daemon::protocol::WorkspaceOp::EnsureLoopback {
+                remote_host: loopback.forward_host().to_string(),
+                remote_port: loopback.port,
+            },
+        )
+        .ok_or_else(|| anyhow::anyhow!("this workspace has no SSH connection to forward over"))?;
+        match RemoteTerminal::on_workspace(req)? {
+            crate::daemon::protocol::DaemonMsg::LoopbackForward(f) => Ok(f),
+            other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
+        }
+    }
+
+    /// Decide how a ⌘-clicked `localhost:PORT` in *this* pane should be opened.
+    fn loopback_plan(&self, cx: &mut Context<Self>) -> LoopbackPlan {
+        loopback_plan(
+            cx.global::<Config>().ssh_loopback_forward,
+            self.workspace.as_ref(),
+            self.terminal.remote_context().map(|r| r.kind),
+            self.pane_id,
+        )
+    }
+
     fn can_forward_loopback(&self, cx: &mut Context<Self>) -> bool {
-        // A loopback one-click forward runs over the pane's native russh connection
-        // (FR-F4, direct-tcpip). Only native-SSH panes have one.
-        cx.global::<Config>().ssh_loopback_forward
-            && self
-                .terminal
-                .remote_context()
-                .is_some_and(|remote| remote.kind == crate::daemon::protocol::RemoteKind::NativeSsh)
+        !matches!(self.loopback_plan(cx), LoopbackPlan::Direct)
     }
 
     /// Update the remembered hovered link for the screen cell `(col, row)` and
@@ -5692,24 +6272,10 @@ impl Render for TerminalView {
             // Tab → HT (0x09); Shift-Tab → CSI Z (back-tab), the standard sequence.
             // While the search field is focused it owns these keys, so propagate.
             .on_action(cx.listener(|this, _: &SendTab, _w, cx| {
-                if this.search_focused {
-                    cx.propagate();
-                } else if this.input_active() {
-                    this.complete_tab(true, cx);
-                } else {
-                    let bytes = this.tab_bytes(false);
-                    this.send_to_pty(&bytes, cx);
-                }
+                this.tab_pressed(true, cx);
             }))
             .on_action(cx.listener(|this, _: &SendBackTab, _w, cx| {
-                if this.search_focused {
-                    cx.propagate();
-                } else if this.input_active() {
-                    this.complete_tab(false, cx);
-                } else {
-                    let bytes = this.tab_bytes(true);
-                    this.send_to_pty(&bytes, cx);
-                }
+                this.tab_pressed(false, cx);
             }))
             .child(TerminalElement::new(entity))
             .children(search_bar)
@@ -6347,16 +6913,122 @@ fn drag_scroll_step(overshoot: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        SelectEndCopy, WheelRoute, clipboard_paste_text, display_width, drag_scroll_step,
-        encode_mouse, expand_file_command_template, fallback_chain, fig_icon_emoji, fig_icon_glyph,
-        focus_report_bytes, input_overflow_shift, input_overlay_rows, menu_layout, paste_bytes,
-        select_end_copy, shell_escape_path, smooth_scroll_step, submit_bytes, trim_trailing_spaces,
-        wheel_route, wrapped_click_index,
+        LoopbackPlan, SelectEndCopy, WheelRoute, clipboard_paste_text, cwd_is_on_host,
+        display_width, loopback_plan,
+    };
+    use super::{
+        drag_scroll_step, encode_mouse, expand_file_command_template, fallback_chain,
+        fig_icon_emoji, fig_icon_glyph, focus_report_bytes, input_overflow_shift,
+        input_overlay_rows, menu_layout, paste_bytes, select_end_copy, shell_escape_path,
+        smooth_scroll_step, submit_bytes, trim_trailing_spaces, wheel_route, wrapped_click_index,
     };
     use alacritty_terminal::term::TermMode;
     use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths, Modifiers};
     use gpui_component::IconName;
     use std::path::{Path, PathBuf};
+
+    // ── ⌘-click `localhost:PORT` routing (design §15) ────────────────────────
+
+    use crate::core::session::{RemoteTarget, WorkspaceId};
+    use crate::daemon::protocol::RemoteKind;
+    use crate::terminal::PaneWorkspace;
+
+    fn ws(target: RemoteTarget, with_spec: bool) -> PaneWorkspace {
+        PaneWorkspace {
+            workspace: WorkspaceId::new(),
+            target,
+            spec: with_spec.then(|| {
+                Box::new(
+                    serde_json::from_str(
+                        r#"{"host":"dev.box","port":22,"user":"me","auth_mode":"auto"}"#,
+                    )
+                    .unwrap(),
+                )
+            }),
+        }
+    }
+
+    /// A plain local pane never forwards: `localhost:3000` there already means
+    /// this machine.
+    #[test]
+    fn local_pane_opens_localhost_directly() {
+        assert_eq!(loopback_plan(true, None, None, 1), LoopbackPlan::Direct);
+    }
+
+    /// An SSH pane forwards over its own connection, owned by the pane — the
+    /// behaviour that shipped, unchanged.
+    #[test]
+    fn ssh_pane_forwards_on_the_pane() {
+        assert_eq!(
+            loopback_plan(true, None, Some(RemoteKind::NativeSsh), 7),
+            LoopbackPlan::ForwardOnPane(7)
+        );
+        // A non-native remote pane (a plain `ssh` typed into a shell) has no
+        // russh connection to forward over.
+        assert_eq!(
+            loopback_plan(true, None, Some(RemoteKind::Wsl), 7),
+            LoopbackPlan::Direct
+        );
+    }
+
+    /// A remote-workspace pane forwards over the *workspace's* connection. It
+    /// carries no `RemoteContext` at all — its shell is local to the remote
+    /// daemon — which is exactly why the workspace has to be consulted first.
+    #[test]
+    fn remote_workspace_pane_forwards_on_the_workspace() {
+        let w = ws(RemoteTarget::direct("me", "dev.box", 22), true);
+        assert_eq!(
+            loopback_plan(true, Some(&w), None, 7),
+            LoopbackPlan::ForwardOnWorkspace(Box::new(w.clone())),
+            "no RemoteContext, but still forwarded"
+        );
+        // And the workspace wins over a pane-level answer.
+        assert_eq!(
+            loopback_plan(true, Some(&w), Some(RemoteKind::NativeSsh), 7),
+            LoopbackPlan::ForwardOnWorkspace(Box::new(w))
+        );
+    }
+
+    /// **The WSL exception (design §15).** WSL shares `localhost` with its
+    /// Windows host, so the URL already resolves — building a forward would be
+    /// pure overhead. Wired now; M8 supplies the target.
+    #[test]
+    fn wsl_workspace_needs_no_forward() {
+        let w = ws(
+            RemoteTarget::Wsl {
+                distro: "Ubuntu".into(),
+            },
+            false,
+        );
+        assert_eq!(
+            loopback_plan(true, Some(&w), None, 7),
+            LoopbackPlan::NoForwardNeeded
+        );
+    }
+
+    /// A non-WSL workspace with no connection spec cannot be forwarded over.
+    /// Opening the *client's* `localhost` instead would be a wrong answer that
+    /// looks right, so the link is left alone.
+    #[test]
+    fn workspace_without_a_spec_does_not_forward() {
+        let w = ws(RemoteTarget::direct("me", "dev.box", 22), false);
+        assert_eq!(loopback_plan(true, Some(&w), None, 7), LoopbackPlan::Direct);
+    }
+
+    /// The `ssh_loopback_forward` off switch disables every route, including the
+    /// hover underline that `can_forward_loopback` drives off the same plan.
+    #[test]
+    fn the_off_switch_disables_every_route() {
+        let w = ws(RemoteTarget::direct("me", "dev.box", 22), true);
+        assert_eq!(
+            loopback_plan(false, Some(&w), None, 7),
+            LoopbackPlan::Direct
+        );
+        assert_eq!(
+            loopback_plan(false, None, Some(RemoteKind::NativeSsh), 7),
+            LoopbackPlan::Direct
+        );
+    }
 
     #[test]
     fn file_command_template_substitutes_path_line_and_column() {
@@ -7141,6 +7813,74 @@ mod tests {
         assert_eq!(first + visible, 30);
         // A selection inside the first window leaves it unscrolled.
         assert_eq!(menu_layout(40, 0, 30, 3, 10).2, 0);
+    }
+
+    /// The gate that keeps a remote path away from a `git` that cannot see it.
+    ///
+    /// Only the two *agreeing* pairings answer yes. The third row is the one
+    /// that matters — a shell on another machine paired with the local host —
+    /// because handing `/home/me/proj` to the local `git` does not fail
+    /// cleanly: on Windows that path is drive-relative and quietly resolves to
+    /// `C:\\home\\me\\proj`, so an unrelated local repository's branch and diff
+    /// would be reported as the remote pane's own.
+    #[test]
+    fn only_a_matching_host_may_answer_for_a_panes_paths() {
+        // Local shell on the local host: the ordinary case.
+        assert!(cwd_is_on_host(false, true));
+        // Remote shell on a host that is that machine: a remote-workspace pane,
+        // whose git line, diff and worktree offer all hang off this row.
+        assert!(cwd_is_on_host(true, false));
+
+        // Remote shell still paired with the local host — a native-SSH or WSL
+        // pane, which has no `Host` behind it: refused.
+        assert!(!cwd_is_on_host(true, true));
+        // Local shell paired with a remote host: equally meaningless.
+        assert!(!cwd_is_on_host(false, false));
+    }
+
+    /// A pane's machine comes from its workspace, and the two move together:
+    /// [`TerminalView::set_workspace`] is the only thing that sets either, so a
+    /// pane cannot end up running its shell on one machine and asking `git` on
+    /// another.
+    ///
+    /// Checked against `PaneWorkspace` directly rather than through a live view
+    /// (which needs a window, a daemon and a pane): the derivation under test is
+    /// the target → `HostId` one, and pinning it here is what catches a future
+    /// `set_workspace` that forgets the host half. The ids must agree with what
+    /// `RemoteConnections::insert` registered — same `connection_key`, checked
+    /// by `connection_keys_match_the_contract_table` in `tty7-core`.
+    #[test]
+    fn a_panes_host_is_its_workspaces_machine() {
+        use crate::core::session::{RemoteTarget, WorkspaceId};
+        use crate::ui::host_ops::HostId;
+
+        let target = RemoteTarget::Alias {
+            alias: "build-box".into(),
+        };
+        let ws = PaneWorkspace {
+            workspace: WorkspaceId::new(),
+            target: target.clone(),
+            spec: None,
+        };
+
+        // What `set_workspace` computes, for each of its two inputs.
+        let remote = ws.target.host_id();
+        assert_eq!(remote, target.host_id(), "the workspace's own machine");
+        assert!(!remote.is_local(), "a remote workspace is not this machine");
+        assert_eq!(
+            HostId::from_connection_key("ssh-alias:build-box"),
+            remote,
+            "the id the connection was opened under, or the registry lookup misses"
+        );
+
+        // Two workspaces on one box are one machine — one connection, one host
+        // object, one git probe shared by both.
+        let sibling = PaneWorkspace {
+            workspace: WorkspaceId::new(),
+            target,
+            spec: None,
+        };
+        assert_eq!(sibling.target.host_id(), remote);
     }
 }
 
@@ -8471,6 +9211,332 @@ mod gpui_tests {
         assert_eq!(next_input(&mut daemon), b"ping".to_vec());
     }
 
+    // ── Design §10's read-only degrade, at the five keystroke entry points ───
+
+    /// Install a store holding one remote workspace with no connection, and
+    /// bind `view` to it. `RemoteLinks` has never heard of the machine, so
+    /// `status_of` answers `Disconnected` — the state a window sits in between
+    /// losing a link and getting it back.
+    fn bind_to_a_disconnected_remote_workspace(
+        view: &mut TerminalView,
+        cx: &mut Context<TerminalView>,
+    ) -> crate::core::session::WorkspaceId {
+        use crate::core::session::{
+            RemoteRef, RemoteTarget, WorkspaceId, WorkspaceStore, Workspaces,
+        };
+        use crate::terminal::PaneWorkspace;
+        let host = RemoteRef::new(
+            RemoteTarget::direct("me", "build-box", 22),
+            WorkspaceId::new(),
+        );
+        let entry = crate::core::session::Workspace::on_remote(host.clone());
+        let id = entry.id;
+        WorkspaceStore::install_for_test(
+            cx,
+            Workspaces {
+                workspaces: vec![entry],
+                active: None,
+            },
+        );
+        view.set_workspace(Some(PaneWorkspace {
+            workspace: id,
+            target: host.target,
+            spec: Some(Box::new(
+                serde_json::from_str(
+                    r#"{"host":"build-box","port":22,"user":"me","auth_mode":"auto"}"#,
+                )
+                .unwrap(),
+            )),
+        }));
+        id
+    }
+
+    /// Design §10: a window that is not attached **still shows, scrolls,
+    /// selects and searches — but typing goes nowhere**, and nothing is
+    /// buffered for later (D6).
+    ///
+    /// All five entry points a keystroke can take, because a rule enforced at
+    /// four of them is not enforced: the one that is missed is the one a user
+    /// finds.
+    #[gpui::test]
+    fn a_disconnected_remote_pane_swallows_every_kind_of_typing(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, window, cx| {
+                bind_to_a_disconnected_remote_workspace(view, cx);
+
+                type_char(view, "x", window, cx);
+                view.commit_text("y", cx);
+                view.paste("pasted".into(), cx);
+                view.send_to_pty(b"raw", cx);
+                // The typeahead timer: armed while attached, fires afterwards.
+                view.dump_hold(0, cx);
+            })
+            .unwrap();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            None,
+            "a read-only window must not put one byte of typing on the wire"
+        );
+    }
+
+    /// The rest of design §10's degrade, and the half a gate at the top of
+    /// `on_key_down` would silently destroy: **a read-only window is not an
+    /// inert one.**
+    ///
+    /// "能滚历史、能选能复制、能 ⌘F 搜索" — the window's own keyboard belongs to
+    /// the window, not to the machine. ⌘A and ⌘C are dispatched *inside*
+    /// `on_key_down` (`handle_cmd_shortcut`), so a gate at the top of that
+    /// function takes them away; this drives the real dispatcher to prove it
+    /// does not. (⌘F is a registered action and never enters `on_key_down` at
+    /// all, which is why it survives either placement — and why testing only
+    /// ⌘F would have missed this entirely.)
+    #[gpui::test]
+    fn a_disconnected_remote_pane_still_selects_and_copies(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Output(b"secrets".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        for _ in 0..400 {
+            cx.run_until_parked();
+            let ready = window
+                .update(cx, |view, _, _| {
+                    let term = view.terminal.term.clone();
+                    let term = term.lock();
+                    term.grid()[alacritty_terminal::index::Line(0)][Column(0)].c == 's'
+                })
+                .unwrap();
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let chord = |key: &str| KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: Modifiers {
+                    platform: true,
+                    ..Modifiers::default()
+                },
+                key: key.into(),
+                key_char: None,
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        window
+            .update(cx, |view, window, cx| {
+                bind_to_a_disconnected_remote_workspace(view, cx);
+                // A dropped link marks the pane `exited` (the reader's teardown
+                // sets the same flag a real child exit does). That must not take
+                // the window's own keyboard away.
+                view.terminal.exited = true;
+                view.on_key_down(&chord("a"), window, cx);
+                assert!(
+                    view.terminal.term.lock().selection.is_some(),
+                    "⌘A must still select on a read-only window"
+                );
+                view.on_key_down(&chord("c"), window, cx);
+            })
+            .unwrap();
+        let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert!(
+            copied.is_some_and(|t| t.contains("secrets")),
+            "⌘C must still copy on a read-only window"
+        );
+    }
+
+    /// The other half of the same rule, and the one that is easy to get wrong:
+    /// a **terminal query reply is not user input**.
+    ///
+    /// DA / DSR / OSC colour answers are the emulator replying to something the
+    /// *remote program* asked. Gating them would not degrade the window, it
+    /// would hang the program — it waits for an answer that never comes.
+    #[gpui::test]
+    fn a_disconnected_remote_pane_still_answers_terminal_queries(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                bind_to_a_disconnected_remote_workspace(view, cx);
+                view.handle_event(AlacEvent::PtyWrite("\x1b[?62;c".into()), cx);
+            })
+            .unwrap();
+        assert_eq!(
+            next_input(&mut daemon),
+            b"\x1b[?62;c".to_vec(),
+            "a query reply is the emulator's answer, not the user's typing"
+        );
+    }
+
+    /// A dropped link and a finished shell are opposite facts, and the tab must
+    /// not confuse them: on a remote workspace the shell is still running over
+    /// there, which is the entire promise of the degrade.
+    #[gpui::test]
+    fn a_dropped_link_does_not_claim_the_process_exited(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                bind_to_a_disconnected_remote_workspace(view, cx);
+                view.handle_event(AlacEvent::Exit, cx);
+                assert_eq!(view.title, "tty7 — disconnected");
+
+                // A local pane's wording is untouched.
+                view.set_workspace(None);
+                view.handle_event(AlacEvent::Exit, cx);
+                assert_eq!(view.title, "tty7 — process exited");
+            })
+            .unwrap();
+    }
+
+    /// The other side of that exemption: **a local pane's exited check is not
+    /// touched.** A pane whose shell ended still swallows every key exactly as
+    /// it did before remote workspaces existed.
+    #[gpui::test]
+    fn an_exited_local_pane_still_swallows_every_key(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, window, cx| {
+                view.terminal.exited = true;
+                let cmd_a = KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: Modifiers {
+                            platform: true,
+                            ..Modifiers::default()
+                        },
+                        key: "a".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                view.on_key_down(&cmd_a, window, cx);
+                assert!(
+                    view.terminal.term.lock().selection.is_none(),
+                    "an exited local pane is finished; its keyboard is unchanged"
+                );
+            })
+            .unwrap();
+    }
+
+    /// **A local pane is not gated, ever.** It has no connection to lose, and a
+    /// gate that could answer `false` for one would brick the app — so the
+    /// check is a field test on `workspace()`, and this pins that it stays one.
+    #[gpui::test]
+    fn a_local_pane_types_exactly_as_it_always_did(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, window, cx| {
+                // Even with a store installed that knows about a *remote*
+                // workspace — the global existing must not change a local pane.
+                bind_to_a_disconnected_remote_workspace(view, cx);
+                view.set_workspace(None);
+                assert!(view.accepts_input(cx));
+                type_char(view, "z", window, cx);
+            })
+            .unwrap();
+        assert_eq!(next_input(&mut daemon), b"z".to_vec());
+    }
+
+    // ── Design §10's reconnect: the pane relink ──────────────────────────────
+
+    /// The pane half of a reconnect swaps the socket **in place**: same `Term`,
+    /// same event channel, same shared signals — because the view's event pump
+    /// subscribes once, at construction, and a fresh terminal would leave the
+    /// pane on screen and permanently deaf.
+    ///
+    /// Also pins the honest replay boundary: the mirror is reset, so what is on
+    /// screen after a relink is the machine's own record and not the pre-drop
+    /// screen with a second copy replayed underneath it.
+    #[gpui::test]
+    fn a_relink_moves_the_pane_onto_the_new_socket_and_resets_the_mirror(cx: &mut TestAppContext) {
+        let (window, mut old_daemon) = harness(cx);
+        let read_row = |cx: &mut TestAppContext, len: usize| -> String {
+            window
+                .update(cx, |view, _, _| {
+                    let term = view.terminal.term.clone();
+                    let term = term.lock();
+                    let grid = term.grid();
+                    (0..len)
+                        .map(|c| grid[alacritty_terminal::index::Line(0)][Column(c)].c)
+                        .collect()
+                })
+                .unwrap()
+        };
+
+        // Something on screen from before the drop, through the real reader.
+        DaemonMsg::Output(b"before".to_vec())
+            .encode(&mut old_daemon)
+            .unwrap();
+        let mut seen = String::new();
+        for _ in 0..400 {
+            cx.run_until_parked();
+            seen = read_row(cx, 6);
+            if seen == "before" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(seen, "before", "the pre-drop screen is what we relink over");
+
+        let (new_client, mut new_daemon) = UnixStream::pair().unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.adopt_relink(
+                    new_client,
+                    &crate::terminal::PaneRoute::Local,
+                    TermSize::new(100, 30),
+                    8,
+                    17,
+                    cx,
+                )
+                .expect("the swap itself cannot fail");
+                assert_eq!(
+                    view.title, "tty7",
+                    "a relinked pane is not \"process exited\""
+                );
+            })
+            .unwrap();
+        // The pre-drop screen is gone rather than doubled: whatever the daemon
+        // replays next is the whole truth, and the part the ring dropped is
+        // simply absent — not interpolated, not implied to be coming.
+        assert_ne!(
+            read_row(cx, 6),
+            "before",
+            "the mirror must be reset before the daemon replays onto it"
+        );
+
+        // Design §10's last step: resize to *this* client's geometry.
+        let resize = loop {
+            match ClientMsg::read(&mut new_daemon).expect("the new socket is live") {
+                ClientMsg::Resize(win) => break win,
+                _ => continue,
+            }
+        };
+        assert_eq!((resize.cols, resize.rows), (100, 30));
+
+        // And input now goes to the new machine, not the dead one.
+        window
+            .update(cx, |view, _, cx| view.send_to_pty(b"after", cx))
+            .unwrap();
+        assert_eq!(next_input(&mut new_daemon), b"after".to_vec());
+
+        // The retired socket is *closed*, not merely unused: reading it runs
+        // out. That is what ends the old reader thread, and it is why a relink
+        // cannot leave two readers racing to feed one grid.
+        let mut leftovers: Vec<Vec<u8>> = Vec::new();
+        loop {
+            match ClientMsg::read(&mut old_daemon) {
+                Ok(ClientMsg::Input(bytes)) => leftovers.push(bytes),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            leftovers.is_empty(),
+            "the retired socket must never see another byte: {leftovers:?}"
+        );
+    }
+
     /// Buffer search (Cmd+F) end-to-end: the case ("Aa") and regex (".*")
     /// toggles change the match set, a broken regex flags an error instead of a
     /// silent zero-match, and closing persists the query. Drives the real
@@ -9122,6 +10188,72 @@ mod gpui_tests {
                 assert!(
                     s.all.is_empty(),
                     "the stale result stayed out of the new menu"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A remote-workspace pane's cwd is a path on the **far** machine, and the
+    /// pane itself never says so: `tty7-server` over there spawned an ordinary
+    /// local shell and reports `remote_context: None`, exactly as a local
+    /// daemon would. The machine that moved is the *daemon*, which no
+    /// pane-level signal can express — only this side's workspace binding
+    /// knows.
+    ///
+    /// So both accessors have to consult it, and they fail in opposite
+    /// directions when they don't:
+    ///   - `local_cwd` says yes and hands `/home/me/proj` to `read_dir`, to the
+    ///     link opener, and to Tab's local path engine — answers about *this*
+    ///     machine dressed as the remote's;
+    ///   - `remote_ssh_cwd` says no, so Tab never asks the remote over SFTP and
+    ///     silently hands the line to the shell instead. That one is only
+    ///     annoying; the first one is wrong.
+    #[gpui::test]
+    fn a_remote_workspace_pane_reports_its_cwd_as_remote(cx: &mut TestAppContext) {
+        use std::io::Write as _;
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Cwd(std::path::PathBuf::from("/home/me/proj"))
+            .encode(&mut daemon)
+            .unwrap();
+        daemon.flush().unwrap();
+        // The reader is a real thread; poll rather than sleep a fixed span.
+        for _ in 0..200 {
+            let seen = window
+                .update(cx, |view, _, _| view.cwd().is_some())
+                .unwrap();
+            if seen {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, _, cx| {
+                // Unbound, this is a plain local pane: the path is this
+                // machine's, and there is no remote to ask about it.
+                assert_eq!(
+                    view.local_cwd(),
+                    Some(std::path::PathBuf::from("/home/me/proj"))
+                );
+                assert_eq!(view.remote_ssh_cwd(), None);
+
+                bind_to_a_disconnected_remote_workspace(view, cx);
+
+                // The premise: nothing about the pane became remote.
+                assert!(
+                    view.remote_context().is_none(),
+                    "the far daemon reports a plain local pane — if this ever \
+                     stops holding, the binding below is no longer the only signal"
+                );
+                assert_eq!(
+                    view.local_cwd(),
+                    None,
+                    "a routed pane's cwd is not a path on this machine"
+                );
+                assert_eq!(
+                    view.remote_ssh_cwd(),
+                    Some("/home/me/proj".to_string()),
+                    "Tab must ask the workspace's connection about it"
                 );
             })
             .unwrap();

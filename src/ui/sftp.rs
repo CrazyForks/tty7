@@ -72,6 +72,99 @@ pub(crate) enum SftpEdit {
     },
 }
 
+/// Which SSH connection this panel's requests run on — the *only* thing that
+/// differs between an SSH pane and a remote workspace (design §15).
+///
+/// A plain `Copy`-able bundle rather than a lookup at each call site, because
+/// every request runs on a background executor: the pane entity is not reachable
+/// from there, so the route has to be resolved on the UI thread and moved in.
+/// Both arms end at the same `SftpManager` on the same daemon; a remote
+/// workspace's transfers are local-daemon SFTP over the workspace's own
+/// connection, which is what makes "drag a file to Finder" land on *this*
+/// machine.
+#[derive(Clone, Debug)]
+pub(crate) struct SftpRoute {
+    pane_id: u64,
+    workspace: Option<crate::terminal::PaneWorkspace>,
+}
+
+impl SftpRoute {
+    /// The route to a pane, given the workspace it belongs to (`None` for a
+    /// pane that owns its own connection). Public to the crate because the
+    /// panel is not the only caller any more: Tab completion lists a remote
+    /// directory over the same route, and must not grow a second copy of the
+    /// pane-vs-workspace decision.
+    pub(crate) fn new(pane_id: u64, workspace: Option<crate::terminal::PaneWorkspace>) -> Self {
+        Self { pane_id, workspace }
+    }
+
+    fn workspace_op(
+        &self,
+        op: crate::daemon::protocol::WorkspaceOp,
+    ) -> Option<crate::daemon::protocol::WorkspaceRequest> {
+        RemoteTerminal::workspace_request(self.workspace.as_ref()?, self.pane_id, op)
+    }
+
+    pub(crate) fn list(&self, path: &str) -> Result<Vec<SftpEntry>, String> {
+        let Some(req) = self.workspace_op(crate::daemon::protocol::WorkspaceOp::SftpList {
+            path: path.to_string(),
+        }) else {
+            return RemoteTerminal::sftp_list(self.pane_id, path);
+        };
+        match RemoteTerminal::on_workspace(req) {
+            Ok(crate::daemon::protocol::DaemonMsg::SftpEntries(e)) => Ok(e),
+            Ok(other) => Err(format!("unexpected reply: {other:?}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub(crate) fn op(&self, op: SftpOp) -> SftpOpResult {
+        let Some(req) =
+            self.workspace_op(crate::daemon::protocol::WorkspaceOp::SftpOp { op: op.clone() })
+        else {
+            return RemoteTerminal::sftp_op(self.pane_id, op);
+        };
+        match RemoteTerminal::on_workspace(req) {
+            Ok(crate::daemon::protocol::DaemonMsg::SftpOpResult(r)) => r,
+            Ok(other) => SftpOpResult::Error(format!("unexpected reply: {other:?}")),
+            Err(e) => SftpOpResult::Error(e.to_string()),
+        }
+    }
+
+    pub(crate) fn transfer_start(&self, spec: SftpTransferSpec) -> Result<u64, String> {
+        let Some(req) =
+            self.workspace_op(crate::daemon::protocol::WorkspaceOp::SftpTransferStart {
+                spec: spec.clone(),
+            })
+        else {
+            return RemoteTerminal::sftp_transfer_start(spec);
+        };
+        match RemoteTerminal::on_workspace(req) {
+            Ok(crate::daemon::protocol::DaemonMsg::SftpTransferStarted { job_id }) => Ok(job_id),
+            Ok(other) => Err(format!("unexpected reply: {other:?}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub(crate) fn transfer_list(&self) -> Vec<SftpJobProgress> {
+        let Some(req) = self.workspace_op(crate::daemon::protocol::WorkspaceOp::SftpTransferList)
+        else {
+            return RemoteTerminal::sftp_transfer_list(self.pane_id);
+        };
+        match RemoteTerminal::on_workspace(req) {
+            Ok(crate::daemon::protocol::DaemonMsg::SftpTransferProgress(jobs)) => jobs,
+            Ok(other) => {
+                log::warn!("unexpected reply to a workspace transfer list: {other:?}");
+                Vec::new()
+            }
+            Err(e) => {
+                log::warn!("workspace transfer list failed: {e}");
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// State for the remote file browser. One pane's listing at a time, bound to a
 /// pane id — the detail panel shows one pane, so the browser follows it.
 pub(crate) struct SftpPanelState {
@@ -80,6 +173,11 @@ pub(crate) struct SftpPanelState {
     /// not by a toggle: the browser is a *view of the pane*, so which pane you're
     /// looking at is the only thing that decides it.
     pub(crate) open_pane_id: Option<u64>,
+    /// The remote workspace the open pane belongs to, when it is one (design
+    /// §15). Captured beside `open_pane_id` because every SFTP call needs it and
+    /// the calls run on a background executor, where the pane entity is out of
+    /// reach. `None` — the case for SSH panes — keeps the pane-addressed path.
+    pub(crate) open_workspace: Option<crate::terminal::PaneWorkspace>,
     /// The remote directory currently listed (absolute POSIX path).
     pub(crate) cwd: String,
     /// Where each pane was last browsing, so switching panes — or tabs — and
@@ -132,6 +230,7 @@ impl SftpPanelState {
         });
         Self {
             open_pane_id: None,
+            open_workspace: None,
             cwd: "/".to_string(),
             cwds: std::collections::HashMap::new(),
             entries: Vec::new(),
@@ -311,13 +410,43 @@ impl Tty7App {
         // old pane's transfers under the next one until its first poll lands —
         // the same flash `sync_procs` clears the process list for.
         self.sftp_panel.jobs.clear();
+        self.sftp_panel.open_workspace = None;
         // Invalidate the poll loop.
         self.sftp_panel.poll_gen = self.sftp_panel.poll_gen.wrapping_add(1);
         cx.notify();
     }
 
+    /// How this panel's requests reach the far side: the open pane's own
+    /// connection, or — for a remote-workspace pane — the workspace's (§15).
+    ///
+    /// Resolved on the UI thread and cloned into every background call, because
+    /// the pane entity is not reachable from a background executor.
+    fn sftp_route(&self) -> SftpRoute {
+        SftpRoute {
+            pane_id: self.sftp_panel.open_pane_id.unwrap_or_default(),
+            workspace: self.sftp_panel.open_workspace.clone(),
+        }
+    }
+
+    /// The remote workspace a pane belongs to, read off the pane itself.
+    fn pane_workspace(
+        &self,
+        pane_id: u64,
+        window: &Window,
+        cx: &App,
+    ) -> Option<crate::terminal::PaneWorkspace> {
+        let leaf = self
+            .tabs
+            .get(self.active)?
+            .pane
+            .focused_or_first(window, cx)?;
+        let leaf = leaf.read(cx);
+        (leaf.pane_id == pane_id).then(|| leaf.workspace().cloned())?
+    }
+
     fn sftp_open_at(&mut self, pane_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.sftp_panel.open_pane_id = Some(pane_id);
+        self.sftp_panel.open_workspace = self.pane_workspace(pane_id, window, cx);
         self.sftp_panel.entries.clear();
         self.sftp_panel.error = None;
         self.sftp_panel.editing = None;
@@ -351,11 +480,10 @@ impl Tty7App {
     /// works, and the error would be noise on a path nobody typed.
     fn sftp_navigate_login_dir(&mut self, pane_id: u64, cx: &mut Context<Self>) {
         self.sftp_panel.loading = true;
+        let route = self.sftp_route();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move {
-                    RemoteTerminal::sftp_op(pane_id, SftpOp::Realpath { path: ".".into() })
-                })
+                .background_spawn(async move { route.op(SftpOp::Realpath { path: ".".into() }) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // The browser may have moved on (pane switch, or the user typed a
@@ -405,9 +533,10 @@ impl Tty7App {
         cx.notify();
 
         let list_path = path.clone();
+        let route = self.sftp_route();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { RemoteTerminal::sftp_list(pane_id, &list_path) })
+                .background_spawn(async move { route.list(&list_path) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // Drop the reply if the panel moved on (closed, switched pane, or a
@@ -553,7 +682,7 @@ impl Tty7App {
             remote,
             recursive,
         };
-        match RemoteTerminal::sftp_transfer_start(spec) {
+        match self.sftp_route().transfer_start(spec) {
             Ok(_) => self.sftp_panel.error = None,
             Err(e) => self.sftp_panel.error = Some(e),
         }
@@ -585,11 +714,10 @@ impl Tty7App {
         };
         let cwd = self.sftp_panel.cwd.clone();
         let path = remote_join(&cwd, &entry.name);
+        let route = self.sftp_route();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move {
-                    RemoteTerminal::sftp_op(pane_id, SftpOp::Readlink { path })
-                })
+                .background_spawn(async move { route.op(SftpOp::Readlink { path }) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.sftp_panel.open_pane_id != Some(pane_id) {
@@ -624,10 +752,9 @@ impl Tty7App {
     /// Run a one-shot SFTP op (mkdir/rename/chmod/delete) off-thread, then refresh
     /// the listing on success. Keeps the UI responsive during the round-trip.
     fn sftp_run_op(&mut self, pane_id: u64, op: SftpOp, cx: &mut Context<Self>) {
+        let route = self.sftp_route();
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { RemoteTerminal::sftp_op(pane_id, op) })
-                .await;
+            let result = cx.background_spawn(async move { route.op(op) }).await;
             let _ = this.update(cx, |this, cx| {
                 if this.sftp_panel.open_pane_id != Some(pane_id) {
                     return;
@@ -798,7 +925,7 @@ impl Tty7App {
                 remote: remote_join(&cwd, &name),
                 recursive,
             };
-            if let Err(e) = RemoteTerminal::sftp_transfer_start(spec) {
+            if let Err(e) = self.sftp_route().transfer_start(spec) {
                 self.sftp_panel.error = Some(e);
             }
         }
@@ -846,8 +973,8 @@ impl Tty7App {
     }
 
     fn sftp_poll_jobs(&mut self, cx: &mut Context<Self>) {
-        if let Some(pane_id) = self.sftp_panel.open_pane_id {
-            self.sftp_panel.jobs = RemoteTerminal::sftp_transfer_list(pane_id);
+        if self.sftp_panel.open_pane_id.is_some() {
+            self.sftp_panel.jobs = self.sftp_route().transfer_list();
             cx.notify();
         }
     }
@@ -886,15 +1013,21 @@ impl Tty7App {
                             this.sftp_close_browser(cx);
                             return None;
                         }
-                        this.sftp_panel.open_pane_id
+                        // The route, not just the id: a remote workspace's
+                        // jobs are filed under the workspace, so polling by
+                        // pane id would come back empty every time.
+                        this.sftp_panel
+                            .open_pane_id
+                            .is_some()
+                            .then(|| this.sftp_route())
                     })
                     .ok()
                     .flatten();
-                let Some(pane_id) = pane else { break };
+                let Some(route) = pane else { break };
                 // Poll off the main thread so the blocking control round-trip
                 // doesn't jank the UI.
                 let jobs = cx
-                    .background_spawn(async move { RemoteTerminal::sftp_transfer_list(pane_id) })
+                    .background_spawn(async move { route.transfer_list() })
                     .await;
                 let keep = this
                     .update(cx, |this, cx| {

@@ -1,6 +1,6 @@
 [package]
 name = "tty7"
-version = "26.7.6"
+version.workspace = true
 edition = "2024"
 description = "A terminal workbench: shells, persistent sessions, SSH, coding agents — GPU-rendered on Zed's gpui, pure Rust"
 repository = "https://github.com/l0ng-ai/tty7"
@@ -14,6 +14,21 @@ name = "tty7"
 path = "src/main.rs"
 
 [dependencies]
+# The framework-free half of tty7: wire protocol, session daemon, PTY, the
+# native SSH engine, and the domain model the headless `tty7-server` shares with
+# this GUI. Everything that does *not* need gpui lives there — see
+# `docs/2026-07-27-remote-workspace-design.md` §11.
+# `gssapi` is off in tty7-core's defaults (a static musl `tty7-server` cannot
+# link the system krb5 it binds); the GUI, which builds against a real desktop
+# toolchain, turns it on so managed SSH connections keep offering
+# `gssapi-with-mic` exactly as before.
+#
+# `remote-install` is off there for the same shape of reason: it pulls an HTTPS
+# client used only to *download* a `tty7-server` onto a remote machine
+# (design §12, D5). The server binary is the thing being downloaded, so it can
+# never take that path; the GUI, which is the client that pushes it, can.
+tty7-core = { path = "crates/tty7-core", features = ["gssapi", "remote-install"] }
+
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
 gpui-component = { workspace = true }
@@ -29,16 +44,23 @@ smallvec.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 
-# SSH connection-manager data layer (`core::ssh_profile` / `core::keychain`).
-# `uuid` mints stable profile ids (v4) and serde-serializes them as strings;
-# `sha2` hashes private-key file contents to the sha512-hex account key that
-# passphrases are stored under in the OS keychain (per PRD §7.2). Both are already
-# in the tree transitively, so pinning them here adds no new native code. `keyring`
-# 4.x is the OS credential-vault backend: its default `v1` feature auto-selects the
-# platform store (macOS Keychain / Windows Credential Manager / Linux Secret
-# Service), so no per-platform feature guards are needed.
+# SSH profile ids in the connection manager UI (`ui::ssh_connect`,
+# `ui::settings`, the command palette). The profiles themselves — and the
+# secret-free `CredentialRef` they carry — live in `tty7-core`, which `Config`
+# needs to parse `config.json` without gpui.
 uuid = { version = "1", features = ["v4", "serde"] }
-sha2 = "0.11"
+
+# The credential vault's storage half (`core::keychain`). `keyring` 4.x's default
+# `v1` feature auto-selects the platform store (macOS Keychain / Windows
+# Credential Manager / Linux Secret Service), so no per-platform guards are
+# needed.
+#
+# It sits here rather than in `tty7-core` on purpose: every caller is in `ui::`
+# (`ssh_prompt`, `ssh_connect`, `settings`, `app`), and leaving it downstairs made
+# the headless `tty7-server` — a static binary pushed onto machines that have no
+# keychain at all — link `zbus`/`secret-service` and thirty-odd crates behind them
+# for code it can never reach. Only the secret-free naming half (`CredentialRef`,
+# the account scheme) stays in core, where `config.json` parsing needs it.
 keyring = "4"
 
 # Theme files. tty7 themes are authored as YAML (`~/.config/tty7/themes/*.yaml`,
@@ -99,57 +121,6 @@ notify-rust = "4"
 # editor, `ui::code`) reuses it to refresh the tree and detect external edits.
 notify = "8"
 
-# Code panel (file tree + editor, `ui::code`): `ignore` supplies the gitignore
-# matcher chain the file tree uses to dim ignored entries (same crate ripgrep
-# uses). The editor itself needs nothing else — text storage and syntax
-# highlighting both live inside gpui-component's `InputState`.
-ignore = "0.4"
-
-# Cross-platform PTY for the daemon: a Unix pty on Unix, ConPTY on Windows, behind
-# one blocking `Read`/`Write`/`resize` API. This is what lets `daemon::pane` share
-# a single code path across platforms instead of hand-rolling fd/ioctl/signal code.
-portable-pty = "0.8"
-
-# Native (pure-Rust) SSH client for the daemon's russh session engine
-# (`daemon::ssh`). Replaces shelling out to the system `ssh` binary for managed
-# connections: it gives us the protocol stack that GUI-hosted auth, host-key
-# prompts, in-memory connection reuse, and (later) SFTP / native port-forwarding
-# all need. 0.62 folded the old `russh-keys` crate in as `russh::keys` (key
-# parsing + ssh-agent client). The async russh session lives on a small tokio
-# runtime owned by `daemon::ssh`; the rest of the daemon stays std-threads and
-# bridges to it through blocking `Read`/`Write` adapters.
-russh = "0.62"
-
-# SFTP client for the native SSH engine (`daemon::ssh::sftp`, Workstream 5).
-# Not part of russh proper: `russh-sftp` drives the SFTP subsystem over any
-# AsyncRead+AsyncWrite stream, which a russh session channel provides via
-# `Channel::into_stream()`. Version-independent of russh (it only needs the
-# channel byte stream), so it rides the same tokio runtime `daemon::ssh` owns.
-russh-sftp = "2"
-
-# tokio powers only the russh session engine — a single runtime `daemon::ssh`
-# owns. The daemon's PTY/reader/writer threads remain std threads and never touch
-# it; they cross into async through bounded/unbounded channels (the blocking
-# `Read`/`Write` adapters in `daemon::ssh::session`).
-tokio = { version = "1", features = [
-    "rt-multi-thread",
-    "net",
-    "io-util",
-    "sync",
-    "time",
-    "macros",
-    "process",
-    # `fs` powers the local side of SFTP transfers (`daemon::ssh::sftp`): async
-    # file/dir IO on the daemon process's own filesystem during upload/download.
-    "fs",
-] }
-
-# SIMD byte search for the OSC tokenizer's Ground/Ignore fast paths — the
-# sniffers sit on the full-throughput output stream (100+ MB/s at full drain),
-# where a per-byte state machine costs a measurable slice of the reader loop.
-# Already in the tree transitively (vte et al.), so this pins no new code.
-memchr = "2"
-
 # System tray / menu bar status item (`ui::tray`). Rasterizes the bundled SVG
 # logo into the tray bitmap at runtime — gpui's own SVG path only yields a
 # tinted alpha mask, not raw RGBA. The gpui and gpui-component forks both pin
@@ -165,30 +136,11 @@ resvg = { version = "0.47", default-features = false }
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 tray-icon = "0.24"
 
-# `setsid` (daemon detach) and the macOS foreground-process proc queries are the
-# only libc users left, both Unix-only — so the dep is Unix-only too.
+# The pty-size ioctl in `terminal::generator` is the only libc user left in the
+# GUI (the daemon's own libc calls went to tty7-core), and it is Unix-only — so
+# the dep is Unix-only too.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-libgssapi = "0.11"
-
-# The Windows GUI⇄daemon transport is loopback TCP, which (unlike a Unix socket)
-# any local process can connect to — so the daemon authenticates each connection
-# against a random token it writes into the user-private port file. `getrandom`
-# is the OS CSPRNG that mints that token; already in the tree transitively, so
-# this pins no new code. Windows-only, matching the transport it guards.
-[target.'cfg(windows)'.dependencies]
-getrandom = "0.3"
-
-# Toolhelp process enumeration + `TerminateProcess`, used by `daemon::winproc` to
-# title a pane by its foreground command and to tear down a shell's descendant
-# tree on hangup (ConPTY's `kill` only reaches the shell itself). Already in the
-# tree via gpui's Windows backend, so this pins no new code. Windows-only.
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_System_Console",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Threading",
-] }
 
 # Embeds `assets/favicon.ico` into the `.exe` so Windows shows the tty7 logo in
 # the taskbar / window / Explorer (macOS gets its icon from the `.app` bundle via
@@ -237,9 +189,6 @@ ksni = { version = "0.3.6", default-features = false, features = ["blocking", "a
 # into test builds and never reaches a release binary.
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
-# `test-util` unlocks tokio's paused clock (`start_paused`) so the ssh prompt
-# broker's timeout/retry tests run instantly instead of in real time. Dev-only.
-tokio = { version = "1", features = ["test-util", "macros", "rt"] }
 
 [lints]
 workspace = true
@@ -247,10 +196,21 @@ workspace = true
 # ---- Standalone workspace mirroring gpui-component's pins so the git/source
 # ---- caches are shared and versions stay aligned. ----
 [workspace]
-members = ["."]
+members = ["crates/*"]
+# The root `tty7` package is a member implicitly; naming all three here is what
+# makes a bare `cargo build` / `cargo test` at the root cover the whole
+# workspace, which is how CI invokes them.
+default-members = [".", "crates/tty7-core", "crates/tty7-server"]
 
 [workspace.package]
 edition = "2024"
+# The single version for all three crates — `tty7`, `tty7-core`, `tty7-server`
+# all inherit it with `version.workspace = true`. They ship together and a
+# client talking to a server of a different build has to be able to say so, so
+# they must never drift apart. This is the line a release bump edits (and the
+# one nightly's `awk '/^version = /'` stamps: it is the first such line in the
+# file, since the package entries above are all `version.workspace = true`).
+version = "26.7.6"
 
 [workspace.dependencies]
 # Our fork's `tty7` branch carries the local customizations tty7 relies on:

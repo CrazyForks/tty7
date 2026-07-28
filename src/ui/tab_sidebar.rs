@@ -243,10 +243,14 @@ impl Tty7App {
                 // activating this row's tab. The cwd they probe is the same one
                 // the status resolved through, so overlay and counts always
                 // describe the same repo.
-                let git_cwd = tab
-                    .pane
-                    .focused_or_first(window, cx)
-                    .and_then(|leaf| leaf.read(cx).git_status_cwd().map(|p| p.to_path_buf()));
+                let git_cwd = tab.pane.focused_or_first(window, cx).and_then(|leaf| {
+                    let view = leaf.read(cx);
+                    let cwd = view.git_status_cwd()?.to_path_buf();
+                    // The id, not the host: opening the overlay needs no live
+                    // connection — a disconnected machine's last diff is still
+                    // worth showing, and the re-probe resolves the id itself.
+                    Some((view.host_id(), cwd))
+                });
                 let git_line = tab.git_status(Some(window), cx).map(|g| {
                     let mut line = h_flex()
                         .id(("sidebar-git", i))
@@ -271,14 +275,14 @@ impl Tty7App {
                             .flex_shrink_0()
                             .items_center()
                             .gap_1p5()
-                            .when_some(git_cwd, |counts, cwd| {
+                            .when_some(git_cwd, |counts, (host, cwd)| {
                                 counts.cursor_pointer().on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                                         // Swallow the press so the row/label
                                         // handlers don't also activate the tab.
                                         cx.stop_propagation();
-                                        this.toggle_diff_overlay(cwd.clone(), window, cx);
+                                        this.toggle_diff_overlay(host, cwd.clone(), window, cx);
                                     }),
                                 )
                             });
@@ -819,26 +823,54 @@ impl Tty7App {
                     .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
                 ),
             );
+        // The rail's head: which workspace this window is on. A row of its own,
+        // above the search box, because it names the thing the whole column
+        // enumerates. It is deliberately *not* folded into the repo group headers
+        // below — those are repositories, and one workspace holds several of them.
+        let workspace_head = h_flex()
+            .flex_shrink_0()
+            .px(px(crate::ui::app::CONTENT_INSET - 7.))
+            .pt(px(4.))
+            .child(self.workspace_head(cx));
+
         // Borderless "Search tabs…" that sits directly on the sunk surface: a
         // leading magnifier + an appearance-less input, no box and no divider
         // under the bar, so the control row and list read as one continuous rail
         // rather than stacked panels.
+        // Laid out to land on the workspace chip directly above it rather than
+        // on the rail's own inset: the magnifier takes a column the width of the
+        // chip's monogram and the same 6px gap after it, so glyph sits over
+        // glyph and "Search tabs…" over the workspace name. Getting there needs
+        // three numbers that were all being left to their defaults — the chip is
+        // an `xsmall` Button, which adds 4px of padding of its own inside the
+        // rail's inset, and a default-size `Input` carries 12px more whether or
+        // not it draws a box.
+        let chip_inset = crate::ui::app::CONTENT_INSET - 7. + 4.;
         let top_bar = h_flex()
             .flex_shrink_0()
             .items_center()
-            .gap_1()
+            .gap(px(6.))
             .h(px(44.))
-            .px(px(crate::ui::app::CONTENT_INSET))
+            .pl(px(chip_inset))
+            .pr(px(crate::ui::app::CONTENT_INSET))
             .child(
-                Icon::new(IconName::Search)
-                    .small()
-                    .text_color(cx.theme().muted_foreground),
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(Self::AVATAR_PX))
+                    .child(
+                        Icon::new(IconName::Search)
+                            .size(px(14.))
+                            .text_color(cx.theme().muted_foreground),
+                    ),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(&self.sidebar_search).appearance(false)),
+                    .child(Input::new(&self.sidebar_search).appearance(false).pl_0()),
             );
 
         // ── Resize drag (mirrors the split divider in `pane.rs`) ──────────────
@@ -965,6 +997,7 @@ impl Tty7App {
                     .child(crate::ui::app::title_bar_drag(
                         controls.id("sidebar-titlebar-drag"),
                     ))
+                    .child(workspace_head)
                     .child(top_bar)
                     .child(crate::ui::scrollbar::with_vertical_scrollbar(
                         "tab-sidebar-scrollbar",
@@ -994,12 +1027,22 @@ impl Tty7App {
                 if !grouping {
                     return None;
                 }
-                let cwd = tab
-                    .pane
-                    .first_leaf()
-                    .and_then(|leaf| leaf.read(cx).git_status_cwd().map(|p| p.to_path_buf()));
+                // The *lookup* is per machine, so a pane never resolves its
+                // repo through another host's table. The key stays a bare
+                // path, and that is correct rather than a shortcut: a tab
+                // belongs to one workspace, a workspace names one machine in
+                // `Workspace.host`, and a window shows one workspace — design
+                // §3 rules out ever mixing local and remote in one window. So
+                // the qualified key is `(workspace.host_id(), sidebar_group)`
+                // with the host half held once per workspace instead of once
+                // per tab, and two machines can't collide here without a
+                // window the model does not permit.
+                let cwd = tab.pane.first_leaf().and_then(|leaf| {
+                    let view = leaf.terminal()?.read(cx);
+                    Some((view.host_id(), view.git_status_cwd()?.to_path_buf()))
+                });
                 if let Some(known) =
-                    cwd.and_then(|cwd| cx.global::<GitStatusCache>().known_repo_for(&cwd))
+                    cwd.and_then(|(id, cwd)| cx.global::<GitStatusCache>().known_repo_for(id, &cwd))
                 {
                     *tab.sidebar_group.borrow_mut() = known;
                 }

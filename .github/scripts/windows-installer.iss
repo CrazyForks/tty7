@@ -57,6 +57,10 @@ Source: "{#StageDir}\tty7.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\completions\*"; DestDir: "{app}\completions"; Flags: ignoreversion recursesubdirs
 Source: "{#StageDir}\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
+; The Linux musl tty7-server, for serving WSL distros without a download.
+; `skipifsourcedoesntexist` because a build whose server-musl leg was skipped
+; still has to produce an installer. See bundle-windows.ps1.
+Source: "{#StageDir}\server\*"; DestDir: "{app}\server"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 
 [Icons]
 Name: "{autoprograms}\tty7"; Filename: "{app}\tty7.exe"

@@ -460,8 +460,12 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     //
     // This does *not* mean "accent" — the field is gpui-component's name for a
     // row highlight, and pointing the theme's real accent at it is what would
-    // give the saturated snap. `surfaces.popover.selected` says what it is.
-    let accent_fill = rgb(surfaces.popover.selected);
+    // give the saturated snap. `surfaces.popover.cursor` says what it is.
+    //
+    // The `cursor` rung, not `selected`: a menu row is lit for as long as the
+    // pointer is on it and nothing else on that surface is competing, which is
+    // exactly the case the loud rung exists for (see `presets::state`).
+    let accent_fill = rgb(surfaces.popover.cursor);
     let accent_text: Hsla = rgb(m.foreground).into();
     t.accent = accent_fill.into();
     t.accent_foreground = accent_text;
@@ -685,10 +689,11 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     // `accent`), but make the ring colour equal the fill so the box disappears.
     //
     // The palette and its list paint on an elevated panel, so this is the popover
-    // ladder — same reasoning as `accent` above.
+    // ladder — and its `cursor` rung, same reasoning as `accent` above: one row
+    // moves with the arrow keys, and the eye is already tracking it.
     t.list.active_highlight = true;
-    t.list_active = rgb(surfaces.popover.selected).into();
-    t.list_active_border = rgb(surfaces.popover.selected).into();
+    t.list_active = rgb(surfaces.popover.cursor).into();
+    t.list_active_border = rgb(surfaces.popover.cursor).into();
     t.list_hover = rgb(surfaces.popover.hover).into();
 
     // ── Stock widgets that were still wearing gpui-component's defaults ──────
@@ -836,12 +841,12 @@ mod tests {
     #[gpui::test]
     fn effective_preset_follows_the_cached_system_appearance(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            cx.set_global(Config {
+            cx.set_global(Config(crate::core::config::CoreConfig {
                 theme_follow_system: true,
                 theme_preset_light: "light-slot".into(),
                 theme_preset_dark: "dark-slot".into(),
-                ..Config::default()
-            });
+                ..Default::default()
+            }));
 
             cx.set_global(SystemAppearance { dark: false });
             assert!(!system_dark(cx));

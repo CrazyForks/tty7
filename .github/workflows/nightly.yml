@@ -52,7 +52,9 @@ jobs:
 
   # Mirrors release.yml's build matrix; keep the two in sync when editing.
   build:
-    needs: plan
+    # Also behind server-musl: the Windows installer embeds its Linux musl
+    # binary for WSL. See the same note in release.yml.
+    needs: [plan, server-musl]
     if: needs.plan.outputs.build == 'true'
     strategy:
       fail-fast: false
@@ -82,19 +84,13 @@ jobs:
           path: tty7
 
       # Everything versioned — the binary (CARGO_PKG_VERSION), asset names,
-      # DMG plist, Inno installer — reads Cargo.toml, so stamping it here is
-      # the only edit needed. Cargo.lock is left alone: cargo refreshes the
-      # root package's own lock entry automatically, without network access.
+      # DMG plist, Inno installer — reads Cargo.toml, so stamping it is the only
+      # edit needed. Shared with the server-musl job below, and it fails loudly
+      # if the manifest's shape ever moves the version line out from under it.
       - name: Stamp nightly version
         working-directory: tty7
         shell: bash
-        env:
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          awk -v ver="$VERSION" '!done && /^version = /{ $0 = "version = \"" ver "\""; done = 1 } { print }' \
-            Cargo.toml > Cargo.toml.tmp
-          mv Cargo.toml.tmp Cargo.toml
-          grep -m1 '^version' Cargo.toml
+        run: bash .github/scripts/stamp-version.sh "${{ needs.plan.outputs.version }}"
 
       - name: Install Linux system dependencies
         if: matrix.os == 'linux'
@@ -141,6 +137,15 @@ jobs:
         working-directory: tty7
         run: bash .github/scripts/bundle-appimage.sh "${{ matrix.target }}" "${{ matrix.arch }}"
 
+      # See release.yml for why this is best-effort rather than required.
+      - name: Fetch the bundled Linux server
+        if: matrix.os == 'windows'
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          name: nightly-server-x86_64-unknown-linux-musl
+          path: tty7/bundled-server
+
       - name: Package Windows installer + zip
         if: matrix.os == 'windows'
         working-directory: tty7
@@ -161,11 +166,100 @@ jobs:
             tty7/dist/*.AppImage
           if-no-files-found: error
 
+  # Mirrors release.yml's server-musl job; keep the two in sync when editing.
+  # Nightly carries the server binaries too so the remote-install path (§12) can
+  # be exercised against the rolling channel instead of waiting for a tag.
+  server-musl:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -C strip=symbols
+    steps:
+      - name: Checkout tty7
+        uses: actions/checkout@v4
+        with:
+          path: tty7
+
+      # Stamped for the same reason the GUI builds are: the server reports
+      # CARGO_PKG_VERSION over the wire during the version handshake, and a
+      # nightly server claiming the last stable version would make that
+      # negotiation lie. The asset *name* is version-free either way.
+      - name: Stamp nightly version
+        working-directory: tty7
+        run: bash .github/scripts/stamp-version.sh "${{ needs.plan.outputs.version }}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tty7
+          key: ${{ matrix.target }}
+
+      - name: Look for the tty7-server package
+        id: probe
+        working-directory: tty7
+        run: |
+          set -euo pipefail
+          if cargo metadata --no-deps --format-version 1 \
+              | jq -e '[.packages[].name] | index("tty7-server")' >/dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::tty7-server is not a workspace member yet — tonight's nightly carries no remote-server assets"
+          fi
+
+      # No `--locked` here, matching the rest of nightly: the version stamp above
+      # rewrites Cargo.toml, and cargo has to be free to refresh the root
+      # package's own lock entry.
+      - name: Build static tty7-server
+        if: steps.probe.outputs.present == 'true'
+        working-directory: tty7
+        run: cargo zigbuild --release -p tty7-server --target ${{ matrix.target }}
+
+      - name: Assert the binary is static
+        if: steps.probe.outputs.present == 'true'
+        working-directory: tty7
+        run: bash .github/scripts/assert-static.sh "target/${{ matrix.target }}/release/tty7-server"
+
+      - name: Stage the asset
+        if: steps.probe.outputs.present == 'true'
+        working-directory: tty7
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/tty7-server" \
+             "dist/tty7-server-${{ matrix.target }}"
+          chmod +x "dist/tty7-server-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v7
+        if: steps.probe.outputs.present == 'true'
+        with:
+          name: nightly-server-${{ matrix.target }}
+          path: tty7/dist/tty7-server-${{ matrix.target }}
+          if-no-files-found: error
+
   # Single publish step after all platforms succeed, so the rolling release is
   # always complete — a failed platform means tonight's nightly is skipped
   # entirely and users keep yesterday's, never a partial asset set.
   publish:
-    needs: [plan, build]
+    needs: [plan, build, server-musl]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -177,6 +271,25 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # Same contract as release.yml — see docs/remote-server-assets.md. Written
+      # into dist/ before the upload below so it ships as an asset like any
+      # other, and so the prune step at the end sees it as current.
+      - name: Generate checksums.txt
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f checksums.txt
+          # Built in $RUNNER_TEMP and moved in: a redirect straight into dist/
+          # creates the file before find walks the directory, so it would hash
+          # itself as a zero-byte entry. `xargs -r` so an empty dist/ fails
+          # instead of hanging on stdin.
+          find . -type f -printf '%P\n' \
+            | LC_ALL=C sort | xargs -r sha256sum > "$RUNNER_TEMP/checksums.txt"
+          [ -s "$RUNNER_TEMP/checksums.txt" ] || { echo "::error::no assets to checksum"; exit 1; }
+          mv "$RUNNER_TEMP/checksums.txt" checksums.txt
+          sha256sum -c checksums.txt
+          cat checksums.txt
 
       - name: Update rolling nightly release
         run: |

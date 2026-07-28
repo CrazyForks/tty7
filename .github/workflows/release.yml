@@ -10,6 +10,14 @@ permissions:
 
 jobs:
   build:
+    # The Windows installer embeds the Linux musl `tty7-server` so a WSL distro
+    # can be served the binary the client already shipped with, instead of
+    # downloading one (design §12: WSL installs nothing over the network). That
+    # binary comes from `server-musl`, so the two jobs can no longer run in
+    # parallel. Serialising all four platforms behind it costs a few minutes on
+    # a release — cheap next to splitting the Windows entry into its own job and
+    # duplicating the whole toolchain/caching preamble.
+    needs: server-musl
     strategy:
       fail-fast: false
       matrix:
@@ -103,6 +111,19 @@ jobs:
         working-directory: tty7
         run: bash .github/scripts/bundle-appimage.sh "${{ matrix.target }}" "${{ matrix.arch }}"
 
+      # The bundled server for WSL. `continue-on-error` mirrors `server-musl`'s
+      # own probe step: if there is no server asset, the release still ships and
+      # `bundle-windows.ps1` warns. It is not silent at runtime either — a WSL
+      # connect then fails with `MissingBundled`, naming every directory it
+      # searched, rather than quietly falling back to a download.
+      - name: Fetch the bundled Linux server
+        if: matrix.os == 'windows'
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          name: release-server-x86_64-unknown-linux-musl
+          path: tty7/bundled-server
+
       - name: Package Windows installer + zip
         if: matrix.os == 'windows'
         working-directory: tty7
@@ -128,6 +149,100 @@ jobs:
             tty7/dist/*.AppImage
           if-no-files-found: error
 
+  # The headless server binary remote workspaces install on the far machine
+  # (design doc D10/§12). Statically linked against musl so a single binary runs
+  # on any distro whatever its glibc vintage, and shipped as a bare executable
+  # rather than an archive so the client can fetch exactly one file and verify it
+  # against checksums.txt. Asset naming contract: docs/remote-server-assets.md.
+  #
+  # Separate from the `build` matrix above because it shares nothing with it: no
+  # GUI toolchain, no bundling, no code signing, two targets off one runner.
+  server-musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -C strip=symbols
+    steps:
+      - name: Checkout tty7
+        uses: actions/checkout@v4
+        with:
+          path: tty7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # zig provides the musl sysroot and the C cross-compiler for both targets
+      # from one x86_64 runner — see the same job in ci.yml for why the
+      # alternatives (cross, musl-tools) do not cope with aws-lc-rs' cmake build.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tty7
+          key: ${{ matrix.target }}
+
+      # Until the crate split (§11) lands there is no tty7-server to build. Skip
+      # rather than fail, so this workflow can ship ahead of the split; the
+      # release simply carries no server assets until it arrives.
+      - name: Look for the tty7-server package
+        id: probe
+        working-directory: tty7
+        run: |
+          set -euo pipefail
+          if cargo metadata --no-deps --format-version 1 \
+              | jq -e '[.packages[].name] | index("tty7-server")' >/dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::tty7-server is not a workspace member yet — this release will carry no remote-server assets"
+          fi
+
+      # `--locked` for the same reason the GUI build uses it: a release ships the
+      # dependency set the tag recorded. `-p tty7-server` both addresses the
+      # package independently of its path and keeps feature unification off the
+      # GUI's `gssapi` feature, which cannot build under musl.
+      - name: Build static tty7-server
+        if: steps.probe.outputs.present == 'true'
+        working-directory: tty7
+        run: cargo zigbuild --release --locked -p tty7-server --target ${{ matrix.target }}
+
+      - name: Assert the binary is static
+        if: steps.probe.outputs.present == 'true'
+        working-directory: tty7
+        run: bash .github/scripts/assert-static.sh "target/${{ matrix.target }}/release/tty7-server"
+
+      # Flat, version-free asset name — the tag in the download URL carries the
+      # version. See docs/remote-server-assets.md for the contract the client
+      # installer derives this name from.
+      - name: Stage the asset
+        if: steps.probe.outputs.present == 'true'
+        working-directory: tty7
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/tty7-server" \
+             "dist/tty7-server-${{ matrix.target }}"
+          chmod +x "dist/tty7-server-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v7
+        if: steps.probe.outputs.present == 'true'
+        with:
+          name: release-server-${{ matrix.target }}
+          path: tty7/dist/tty7-server-${{ matrix.target }}
+          if-no-files-found: error
+
   # Single assembly step, after all four platforms succeed. The release object is
   # created as a **draft** and left that way: a draft is invisible to both
   # /releases/latest and the releases page, so nothing can prompt a user to
@@ -135,7 +250,7 @@ jobs:
   # empty. Publishing is the release skill's job — it verifies the six assets and
   # writes the body first, then flips the draft. See .claude/skills/release/SKILL.md.
   draft-release:
-    needs: build
+    needs: [build, server-musl]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     env:
@@ -145,6 +260,35 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # sha256 over every asset, so the remote-server installer can verify what
+      # it downloaded before writing it to someone else's machine (design §16 —
+      # a mismatch aborts the install outright). Generated here rather than in
+      # the build jobs because only this job sees the complete asset set, and a
+      # per-job fragment would have to be concatenated in a deterministic order
+      # anyway. GNU coreutils format ("<hex>  <name>"), bare filenames, sorted —
+      # see docs/remote-server-assets.md for the format the client parses.
+      - name: Generate checksums.txt
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f checksums.txt
+          # `find -type f` rather than a glob: nested files (should any appear)
+          # would otherwise be silently skipped, leaving an asset unverifiable.
+          #
+          # Built in $RUNNER_TEMP and moved in, rather than redirected straight
+          # into dist/: the `>` redirect creates its target *before* find walks
+          # the directory, so a file written in place would end up hashing
+          # itself as a zero-byte entry — a line that can never verify.
+          #
+          # `xargs -r` — without it an empty dist/ would leave sha256sum reading
+          # stdin and the job would hang rather than fail.
+          find . -type f -printf '%P\n' \
+            | LC_ALL=C sort | xargs -r sha256sum > "$RUNNER_TEMP/checksums.txt"
+          [ -s "$RUNNER_TEMP/checksums.txt" ] || { echo "::error::no assets to checksum"; exit 1; }
+          mv "$RUNNER_TEMP/checksums.txt" checksums.txt
+          sha256sum -c checksums.txt
+          cat checksums.txt
 
       # Reuse an existing release rather than failing: re-triggering a tag
       # (force-push after a fixed platform) must top up the same draft. If the

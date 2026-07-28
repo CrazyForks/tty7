@@ -13,11 +13,22 @@ pub mod file_tree;
 pub mod forwards;
 pub mod hints;
 pub mod home;
+// The `Host` layer's GUI half (`docs/2026-07-27-remote-workspace-impl-contract.md`
+// §5). The facade and the registry land ahead of the call sites that consume
+// them — the six views move over to `HostOps` as a separate change — so they
+// read as dead code until that merges.
+#[allow(dead_code)]
+pub mod host_ops;
+#[allow(dead_code)]
+pub mod host_registry;
 pub mod keymap;
 pub mod palette;
 pub mod pane;
+pub mod pending_pane;
 pub mod perf;
 pub mod presets;
+pub mod remote_connect;
+pub mod remote_workspace;
 pub mod reorder;
 pub mod right_panel;
 pub mod scrollbar;
@@ -25,6 +36,7 @@ pub mod settings;
 pub mod sftp;
 pub mod ssh_connect;
 pub mod ssh_prompt;
+pub mod switcher;
 pub mod tab_sidebar;
 pub mod tab_strip;
 pub mod theme;

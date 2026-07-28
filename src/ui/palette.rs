@@ -58,11 +58,6 @@ pub enum CommandKind {
     /// Submenu opener: swap the palette to the list of known workspaces.
     /// Handled inside `PaletteView`; never reaches the host.
     OpenWorkspacePicker,
-    /// Show `id`'s workspace. In a window that already has one open elsewhere
-    /// this focuses that window; otherwise the current window swaps over to it
-    /// and its previous workspace detaches into the picker.
-    SwitchToWorkspace(crate::core::session::WorkspaceId),
-    /// Rename this window's workspace in place, from the title-bar chip.
     RenameWorkspace,
     /// Stop this window's workspace: kill its sessions and close the window,
     /// keeping the layout so it can be started again. The counterpart to
@@ -252,8 +247,7 @@ impl CommandKind {
             OpenSshProfiles => "ssh-manage-profiles",
             // Instance-specific: a tab index, a theme slot, a profile id, a
             // typed host. Not stable across sessions, so not tracked.
-            SwitchToWorkspace(_)
-            | OpenSshConnect(_)
+            OpenSshConnect(_)
             | SetTheme(_)
             | ActivateTab(_)
             | ConnectSavedProfile(_)
@@ -357,7 +351,6 @@ impl CommandKind {
             | SendSelectionToAgent
             | SendGitDiffToAgent
             | OpenWorkspacePicker
-            | SwitchToWorkspace(_)
             | OpenThemePicker
             | OpenSshConnectInput
             | OpenSshConnect(_)
@@ -629,40 +622,6 @@ impl Command {
         push(agents.into(), CommandGroup::Agents);
         push(application.into(), CommandGroup::Application);
         out
-    }
-
-    /// The workspace sub-list: every workspace tty7 knows about, most recently
-    /// active first. Open ones are labelled as such — picking one focuses its
-    /// window rather than opening a second one onto the same panes.
-    pub fn workspace_commands(cx: &App) -> Vec<Command> {
-        use crate::core::session::WorkspaceStore;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let mut all: Vec<_> = WorkspaceStore::all(cx).workspaces.iter().collect();
-        all.sort_by(|a, b| b.last_active.cmp(&a.last_active));
-        all.into_iter()
-            .map(|w| {
-                let state = if w.open {
-                    "open".to_string()
-                } else {
-                    crate::ui::home::relative_time(now, w.last_active)
-                };
-                let path = w
-                    .dominant_repo()
-                    .or_else(|| w.first_cwd())
-                    .map(|p| crate::ui::home::display_path(&p))
-                    .unwrap_or_default();
-                let subtitle = if path.is_empty() {
-                    state
-                } else {
-                    format!("{path} · {state}")
-                };
-                Command::new(w.display_name(), CommandKind::SwitchToWorkspace(w.id))
-                    .with_subtitle(subtitle)
-            })
-            .collect()
     }
 
     /// The theme-picker sub-list: one entry per built-in preset, in the presets'
@@ -1158,7 +1117,6 @@ enum PaletteMenu {
     Root,
     Theme,
     SshConnect,
-    Workspace,
 }
 
 /// The command palette as a self-contained view. It owns the `ListState`
@@ -1248,7 +1206,7 @@ impl PaletteView {
         match self.menu {
             PaletteMenu::SshConnect => "user@host [-p 2222 -J jump]",
             PaletteMenu::Root => "Search or type user@host to connect…",
-            PaletteMenu::Theme | PaletteMenu::Workspace => "Search…",
+            PaletteMenu::Theme => "Search…",
         }
     }
 
@@ -1286,10 +1244,13 @@ impl PaletteView {
                         self.menu = PaletteMenu::SshConnect;
                         self.show_ssh_connect(window, cx);
                     }
-                    Some(CommandKind::OpenWorkspacePicker) => {
-                        self.menu = PaletteMenu::Workspace;
-                        let workspaces = Command::workspace_commands(cx);
-                        self.show(workspaces, window, cx);
+                    // Unlike the other openers, this one *leaves*: switching
+                    // workspace has its own surface now (`ui::switcher`), which
+                    // groups by machine and carries per-row actions a palette
+                    // list cannot. Emitting hands the host the job of closing
+                    // this and opening that.
+                    Some(kind @ CommandKind::OpenWorkspacePicker) => {
+                        cx.emit(PaletteEvent::Confirm(kind))
                     }
                     Some(CommandKind::OpenSshConnect(input)) if input.trim().is_empty() => {}
                     Some(kind) => cx.emit(PaletteEvent::Confirm(kind)),
@@ -1333,7 +1294,13 @@ impl Render for PaletteView {
     /// input and the filtered, scrollable, keyboard-driven rows.
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (background, border, popover) = (theme.background, theme.border, theme.popover);
+        let (border, popover) = (theme.border, theme.popover);
+        // The scrim is the shared one (see `presets::Surfaces::scrim`), the same
+        // dim the workspace switcher opens over. What it replaces was a wash of
+        // the window's *own* colour, which barely moved the window — so a card
+        // lifted 5% off it landed at nearly the same value, and both overlays
+        // read as a hole in the screen rather than a card over it.
+        let scrim = crate::ui::presets::scrim_fill(cx);
 
         // The list viewport holds exactly `PALETTE_VISIBLE_ROWS` fixed-height
         // rows plus the list's own 4px top padding (`py_1` below, which scrolls
@@ -1372,7 +1339,7 @@ impl Render for PaletteView {
             .items_start()
             .justify_center()
             .pt(px(120.))
-            .bg(background.opacity(0.45))
+            .bg(scrim)
             // ⌘⏎ or → on a highlighted profile / quick-connect row opens its
             // editor instead of connecting (PRD §6.2 ①). Captured on the scrim
             // (an ancestor of the focused search box) so it fires before the list

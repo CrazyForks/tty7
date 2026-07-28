@@ -27,3 +27,6 @@ repomix-output.*
 # benchmark harness work dir + generated fixtures (scripts/bench/)
 .bench/
 /big.log
+
+# Lavish review artifacts (design surfaces rendered for a single review pass)
+/.lavish/

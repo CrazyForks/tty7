@@ -1380,7 +1380,10 @@ impl TerminalElement {
                 // Super off macOS, which the OS mostly swallows — and every
                 // other terminal there opens links on Ctrl+click.
                 let link_modifier = mods.secondary() || v.link_modifier_down();
-                if link_modifier && button == MouseButton::Left && v.open_link_at(col, row, cx) {
+                if link_modifier
+                    && button == MouseButton::Left
+                    && v.open_link_at(col, row, window, cx)
+                {
                     return;
                 }
                 // Report to the app when in mouse-tracking mode (Shift forces

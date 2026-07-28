@@ -16,6 +16,11 @@ use crate::ui::app::Tty7App;
 /// State for the open sheet. Held on [`Tty7App`] so it survives re-renders and
 /// tab switches; there is at most one, app-wide.
 pub(crate) struct WorktreePrompt {
+    /// The machine the repository is on — the one the eventual
+    /// `git worktree add` runs on. Held for the whole life of the sheet so the
+    /// create cannot end up asking a different host than the defaults were
+    /// probed from.
+    host: crate::ui::host_ops::SharedHost,
     /// The directory the repo was derived from (the right-clicked tab's cwd) —
     /// what the eventual `git worktree add` resolves the repository through.
     cwd: std::path::PathBuf,
@@ -37,6 +42,7 @@ impl Tty7App {
     /// submits, Esc cancels.
     pub(crate) fn open_worktree_prompt(
         &mut self,
+        host: crate::ui::host_ops::SharedHost,
         cwd: std::path::PathBuf,
         defaults: WorktreeDefaults,
         window: &mut Window,
@@ -60,6 +66,7 @@ impl Tty7App {
             })
             .collect();
         self.worktree_prompt = Some(WorktreePrompt {
+            host,
             cwd,
             dir: defaults.dir,
             name,
@@ -113,12 +120,14 @@ impl Tty7App {
         let p = self.worktree_prompt.as_mut().expect("checked above");
         p.busy = true;
         let cwd = p.cwd.clone();
+        let host = p.host.clone();
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { crate::core::worktree::create(&cwd, &req) })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
+        crate::ui::host_ops::HostOps::run_in(
+            host,
+            window,
+            cx,
+            move |h| crate::core::worktree::create(h, &cwd, &req),
+            move |this, result, window, cx| match result {
                 Ok(wt) => {
                     this.worktree_prompt = None;
                     this.open_worktree_tab(wt, window, cx);
@@ -130,9 +139,8 @@ impl Tty7App {
                     window.push_notification(format!("New worktree failed: {e}"), cx);
                     cx.notify();
                 }
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// The sheet itself, floated near the top of the terminal area like the

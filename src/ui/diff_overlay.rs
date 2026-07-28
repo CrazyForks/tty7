@@ -44,6 +44,17 @@ pub(crate) enum DiffLoad {
 /// when closed). Per-tab: switching tabs hides/restores it, closing the tab
 /// drops it; only the active tab's overlay is rendered.
 pub(crate) struct DiffOverlayState {
+    /// The machine the diff is read from — the pane's own host, so an overlay
+    /// opened on a pane whose repository lives elsewhere shows *that*
+    /// repository. Part of the toggle key together with `cwd`: the same path on
+    /// two machines is two different diffs.
+    ///
+    /// The id, not the host object: an overlay outlives a reconnect (it is only
+    /// dropped by closing it or its tab), and the object it was opened with
+    /// belongs to the connection that has since been replaced. Every re-probe
+    /// resolves the id afresh, so a reconnected machine's next refresh lands
+    /// instead of failing forever against a dead client.
+    pub(crate) host_id: crate::ui::host_ops::HostId,
     /// The pane cwd the diff is probed from — the same path the clicked git
     /// line resolved its status through, so overlay and sidebar agree on the
     /// repo. Also the toggle key: re-clicking a line with this cwd closes.
@@ -72,11 +83,12 @@ impl Tty7App {
     /// different cwd swaps the overlay's repo in place.
     pub(crate) fn toggle_diff_overlay(
         &mut self,
+        host: crate::ui::host_ops::HostId,
         cwd: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.toggle_diff_overlay_at(cwd, None, window, cx)
+        self.toggle_diff_overlay_at(host, cwd, None, window, cx)
     }
 
     /// The same toggle, scoped to one file: opens the overlay showing only
@@ -86,6 +98,7 @@ impl Tty7App {
     /// without the overlay blinking shut and re-probing.
     pub(crate) fn toggle_diff_overlay_at(
         &mut self,
+        host: crate::ui::host_ops::HostId,
         cwd: PathBuf,
         focus: Option<String>,
         window: &mut Window,
@@ -108,7 +121,7 @@ impl Tty7App {
             .tabs
             .get_mut(active)
             .and_then(|t| t.diff_overlay.as_mut())
-            .filter(|o| o.cwd == cwd)
+            .filter(|o| o.cwd == cwd && o.host_id == host)
         {
             // Already open on this repo showing this exact thing, and already on
             // top — toggle off.
@@ -138,6 +151,7 @@ impl Tty7App {
         };
         let focus_handle = cx.focus_handle();
         tab.diff_overlay = Some(DiffOverlayState {
+            host_id: host,
             cwd,
             focus_handle: focus_handle.clone(),
             load: DiffLoad::Loading,
@@ -153,9 +167,13 @@ impl Tty7App {
     /// The file the active tab's overlay is currently scoped to, if any — the
     /// Changes panel reads it to mark the matching row as selected, so panel and
     /// overlay can't disagree about what's on screen.
-    pub(crate) fn diff_overlay_focus(&self, cwd: &std::path::Path) -> Option<&str> {
+    pub(crate) fn diff_overlay_focus(
+        &self,
+        host: crate::ui::host_ops::HostId,
+        cwd: &std::path::Path,
+    ) -> Option<&str> {
         let overlay = self.tabs.get(self.active)?.diff_overlay.as_ref()?;
-        (overlay.cwd == cwd).then(|| overlay.focus.as_deref())?
+        (overlay.cwd == cwd && overlay.host_id == host).then_some(overlay.focus.as_deref())?
     }
 
     /// Close the active tab's overlay (Esc, ✕, or the toggle) and give focus
@@ -188,24 +206,32 @@ impl Tty7App {
         if overlay.loading {
             return;
         }
-        overlay.loading = true;
         let cwd = overlay.cwd.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let cwd = cwd.clone();
-                    async move { git_diff::probe(&cwd) }
-                })
-                .await;
-            let _ = this.update(cx, |app, cx| {
-                // Land on every tab whose overlay shows this cwd — the spawning
-                // tab may no longer be active, and sibling tabs on the same repo
-                // are equally stale. A slot closed or swapped to another repo
-                // while we flew is skipped.
+        let id = overlay.host_id;
+        // A machine that is not registered has nothing to probe. Leave `loading`
+        // alone so the overlay keeps the snapshot it has (or its loading state)
+        // and the next trigger tries again — a reconnect re-registers the id.
+        let Some(host) = crate::ui::host_registry::HostRegistry::lookup(cx, id) else {
+            return;
+        };
+        overlay.loading = true;
+        let probe_cwd = cwd.clone();
+        crate::ui::host_ops::HostOps::run(
+            host,
+            cx,
+            move |h| git_diff::probe(h, &probe_cwd),
+            move |app, result, cx| {
+                // Land on every tab whose overlay shows this repo on this
+                // machine — the spawning tab may no longer be active, and
+                // sibling tabs on the same repo are equally stale. A slot
+                // closed or swapped to another repo while we flew is skipped.
                 let mut landed = false;
                 for tab in app.tabs.iter_mut() {
-                    let Some(overlay) = tab.diff_overlay.as_mut().filter(|o| o.cwd == cwd) else {
+                    let Some(overlay) = tab
+                        .diff_overlay
+                        .as_mut()
+                        .filter(|o| o.cwd == cwd && o.host_id == id)
+                    else {
                         continue;
                     };
                     overlay.loading = false;
@@ -218,9 +244,8 @@ impl Tty7App {
                 if landed {
                     cx.notify();
                 }
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// Re-probe the open overlay when the shared status cache learned
@@ -247,7 +272,7 @@ impl Tty7App {
         };
         let Some(status) = cx
             .try_global::<crate::terminal::git_status::GitStatusCache>()
-            .and_then(|cache| cache.status_for(&overlay.cwd))
+            .and_then(|cache| cache.status_for(overlay.host_id, &overlay.cwd))
         else {
             return;
         };

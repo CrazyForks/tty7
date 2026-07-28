@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 
 use alacritty_terminal::vte::ansi::Rgb;
-use gpui::{App, Global};
+use gpui::{App, Global, Hsla};
 use serde::Deserialize;
 
 use crate::terminal::palette::ActivePalette;
@@ -158,7 +158,7 @@ pub struct Semantics {
 
 /// The contrast targets that define how loud each interaction state reads.
 ///
-/// **These four numbers are the app's only knobs for state prominence.** They
+/// **These five numbers are the app's only knobs for state prominence.** They
 /// exist because the alternative — a fixed `mix(bg, fg, t)` per state, which is
 /// what this file used to do — makes the *perceived* step depend on the theme.
 /// The old ladder (`hover` 0.09, `sidebar_sel` 0.12, `list_active` 0.17) put
@@ -171,21 +171,51 @@ pub struct Semantics {
 /// same perceived step, so tuning taste here retunes the whole app at once and
 /// no theme can be an outlier.
 ///
-/// `SELECTED` is 1.70 because that is where the already-signed-off Dracula
-/// highlight sits (`mix(bg, fg, 0.17)` ≈ `#4b4d56`, 1.72:1) — the value the
-/// palette and menu look was tuned against. Anchoring *to* it keeps that look
-/// and pulls the light themes, which were as low as 1.20:1, up to match.
+/// # Two selections, not one
+///
+/// The old ladder had *three* signed-off values, not one, and folding them into
+/// a single `SELECTED` is what made light themes shout: the rail's selected row
+/// went from `#E2E2E2` to `#C0C0C0` on white — a silver slab twice the perceived
+/// step it had been — because it inherited the number the palette cursor was
+/// tuned to. The two are not the same job:
+///
+/// * [`SELECTED`] is a **resting state** — a rail row, a lit toggle, a switch
+///   track. It sits there for the whole session next to unselected siblings, so
+///   it stays quiet and leans on the text channel (see [`super::Surface`]).
+/// * [`CURSOR`] is the **one row under the pointer or keyboard** on a menu or
+///   the command palette: transient, alone on its surface, and the eye is
+///   already following it. It gets the loud rung.
+///
+/// Both are anchored to the Dracula values the look was signed off on —
+/// `mix(bg, fg, 0.12)` for the resting selection, `0.17` for the cursor — so the
+/// theme it was designed on is unmoved and every other theme is pulled onto the
+/// same two perceived steps.
 pub mod state {
     /// Pointer feedback. Deliberately a whisper: it answers the mouse without
     /// competing with the selection it may be sitting next to.
     pub const HOVER: f32 = 1.18;
     /// The resting selection. Never the *only* signal — see [`super::Surface`].
-    pub const SELECTED: f32 = 1.70;
+    pub const SELECTED: f32 = 1.30;
     /// Held down. One step past selected so pressing a selected item still reads.
-    pub const PRESSED: f32 = 2.10;
+    pub const PRESSED: f32 = 1.55;
+    /// The transient cursor row on a menu or overlay list. See the module docs
+    /// for why this is a separate knob from [`SELECTED`].
+    pub const CURSOR: f32 = 1.70;
     /// Resting label text. 4.6:1 keeps a de-emphasised label at WCAG AA on every
     /// theme; the fixed `mix(fg, bg, 0.42)` it replaces drifted with the seed.
     pub const TEXT_RESTING: f32 = 4.6;
+    /// The floor on how far the selected label sits from the resting one, so the
+    /// text channel keeps saying something when the fill beneath it is washed
+    /// out — a translucent window, a blurred background, an unvetted seed.
+    ///
+    /// A floor, not a target: most themes clear it by construction and are left
+    /// alone. It exists because the two label colors are derived from opposite
+    /// ends (`dim` walks the resting one *into* the surface, `ink_on` leaves the
+    /// selected one at the foreground whenever the fill allows), so a theme whose
+    /// foreground sits close to its background can collapse the gap without any
+    /// single derivation being wrong. One Dark Pro's `#abb2bf` on `#282c34` is
+    /// that theme: 1.32:1 on the popover surface before this floor existed.
+    pub const TEXT_STEP: f32 = 1.4;
 }
 
 /// The interaction-state ladder for one painting surface: the fills for each
@@ -216,10 +246,29 @@ pub struct Surface {
     pub hover: u32,
     pub selected: u32,
     pub pressed: u32,
+    /// The louder rung, for the single transient row a pointer or the keyboard
+    /// is *on* — a menu item, the palette's cursor. Not for a resting choice:
+    /// see [`state`] for why the two are separate knobs.
+    pub cursor: u32,
     /// Label color for a resting/unselected item on this surface.
     pub text_resting: u32,
     /// Label color for the selected item. Pair it with `FontWeight::MEDIUM`.
     pub text_selected: u32,
+}
+
+/// The dim a full-window overlay paints over everything behind it.
+///
+/// Deliberately *not* a [`Surface`]: nothing sits on a scrim, it is a veil. Its
+/// only job is to push the window far enough down that the card floating above
+/// it reads as a separate plane.
+#[derive(Debug, Clone, Copy)]
+pub struct Scrim {
+    /// Near-black, but mixed from the theme's own background so a warm theme
+    /// dims warm rather than going slate.
+    pub ink: u32,
+    /// How much of it lands. Lighter on light themes, where the alpha that
+    /// reads as a dim on charcoal reads as a bruise on paper.
+    pub alpha: f32,
 }
 
 /// Every surface the shell actually paints interactive rows on, published as a
@@ -238,9 +287,23 @@ pub struct Surfaces {
     pub sidebar: Surface,
     /// Elevated surfaces: menus, dropdowns, the command palette.
     pub popover: Surface,
+    /// The dim behind a full-window overlay card (the command palette, the
+    /// workspace switcher). Those two paint on `popover` like every other
+    /// elevated surface; only the ground under them is special.
+    pub scrim: Scrim,
 }
 
 impl Global for Surfaces {}
+
+/// The active theme's overlay scrim, ready to hand to `.bg()`.
+///
+/// A free function rather than a `Surfaces` method so the two call sites read
+/// the same either way round — both of them want the fill, neither wants the
+/// ink and the alpha separately.
+pub fn scrim_fill(cx: &App) -> Hsla {
+    let s = cx.global::<Surfaces>().scrim;
+    Hsla::from(gpui::rgb(s.ink)).opacity(s.alpha)
+}
 
 /// The active theme's contrast-conditioned accent (see [`legible_accent`]),
 /// published so a render pass can reach it without cloning the theme registry.
@@ -297,18 +360,18 @@ impl Theme {
         let bg = self.background_color();
         let fg = legible_foreground(bg, self.foreground);
         let selected = raise(base, fg, state::SELECTED);
+        // Dimmed from the foreground until it is merely AA-readable on this
+        // surface, rather than a fixed blend — a resting label must stay
+        // legible on an imported theme nobody vetted, too.
+        let text_resting = dim(fg, base, state::TEXT_RESTING);
         Surface {
             base,
             hover: raise(base, fg, state::HOVER),
             selected,
             pressed: raise(base, fg, state::PRESSED),
-            // Dimmed from the foreground until it is merely AA-readable on this
-            // surface, rather than a fixed blend — a resting label must stay
-            // legible on an imported theme nobody vetted, too.
-            text_resting: dim(fg, base, state::TEXT_RESTING),
-            // Measured against the *selected fill*, not the surface: that fill is
-            // the ground this particular label actually sits on. See `ink_on`.
-            text_selected: ink_on(selected, fg, state::TEXT_RESTING),
+            cursor: raise(base, fg, state::CURSOR),
+            text_resting,
+            text_selected: stepped_ink(selected, base, fg, text_resting),
         }
     }
 
@@ -349,11 +412,29 @@ impl Theme {
         let mut sidebar = self.surface(m.sidebar);
         // The rail's resting label is a tuned value (a lighter 0.28 dim, so rows
         // in a sunk column don't read as disabled), not the generic AA floor.
+        // Moving it moves the step the selected label is measured against, so
+        // that one is re-derived rather than left at what `surface` computed
+        // against the floor it no longer uses.
         sidebar.text_resting = m.sidebar_fg;
+        sidebar.text_selected = stepped_ink(
+            sidebar.selected,
+            sidebar.base,
+            legible_foreground(self.background_color(), self.foreground),
+            sidebar.text_resting,
+        );
         Surfaces {
             window: self.surface(m.background),
             sidebar,
             popover: self.surface(m.popover),
+            scrim: Scrim {
+                ink: mix(m.background, 0x000000, 0.82),
+                // Lighter on light themes: the alpha that reads as a dim over
+                // charcoal reads as a bruise over paper.
+                alpha: match self.dark {
+                    true => 0.55,
+                    false => 0.30,
+                },
+            },
         }
     }
 
@@ -461,7 +542,7 @@ fn dim(ink: u32, surface: u32, target: f32) -> u32 {
 /// other. Raising a fill toward the foreground necessarily moves the ground
 /// closer to the label it carries, and on a theme whose foreground isn't an
 /// extreme — Catppuccin Latte's `#4c4f69` is only 7.4:1 on its own background —
-/// a 1.70:1 selected fill drags the selected label down to 4.14:1, *below* the
+/// a 1.70:1 cursor fill drags the label on it down to 4.14:1, *below* the
 /// resting labels around it. A selection whose text is harder to read than its
 /// neighbours' is not a selection.
 ///
@@ -476,6 +557,30 @@ fn dim(ink: u32, surface: u32, target: f32) -> u32 {
 /// against which even *pure black* tops out at 3.96:1. White text on a dark red
 /// button is the right answer there, and it is only reachable by looking the
 /// other way.
+/// The selected label on `fill`: [`ink_on`]'s answer, then pushed further from
+/// `resting` if the two would not read as a step ([`state::TEXT_STEP`]).
+///
+/// The push is the last resort it looks like — `ink_on` already guarantees the
+/// label is readable on its own fill, and this only widens a gap that is too
+/// narrow *between the two labels*. Most themes never reach it.
+///
+/// Direction is away from `base`, never toward it: `resting` is the foreground
+/// dimmed *into* the surface, so the far side of the surface is the only way to
+/// open the gap without walking the selected label back down onto its own
+/// ground. That also means the on-fill contrast `ink_on` established can only
+/// improve — `fill` sits between `base` and the foreground.
+fn stepped_ink(fill: u32, base: u32, fg: u32, resting: u32) -> u32 {
+    let ink = ink_on(fill, fg, state::TEXT_RESTING);
+    if contrast(ink, resting) >= state::TEXT_STEP {
+        return ink;
+    }
+    let away = match relative_luminance(base) < relative_luminance(resting) {
+        true => 0xffffff,
+        false => 0x000000,
+    };
+    bisect_contrast(ink, away, resting, state::TEXT_STEP)
+}
+
 fn ink_on(fill: u32, fg: u32, target: f32) -> u32 {
     if contrast(fg, fill) >= target {
         return fg;
@@ -1423,14 +1528,23 @@ mod tests {
                 let sel_base = contrast(sf.selected, sf.base);
                 let sel_hover = contrast(sf.selected, sf.hover);
                 let hover_base = contrast(sf.hover, sf.base);
+                let cursor_sel = contrast(sf.cursor, sf.selected);
                 assert!(
-                    sel_base >= 1.6,
+                    sel_base >= 1.25,
                     "{}/{name}: selected is only {sel_base:.2}:1 from the surface",
                     t.id
                 );
                 assert!(
-                    sel_hover >= 1.3,
+                    sel_hover >= 1.08,
                     "{}/{name}: selected is only {sel_hover:.2}:1 from hover",
+                    t.id
+                );
+                // The two selection rungs have to stay apart, or splitting them
+                // bought nothing and a menu's cursor reads as a rail's resting
+                // selection again.
+                assert!(
+                    cursor_sel >= 1.2,
+                    "{}/{name}: cursor is only {cursor_sel:.2}:1 from the resting selection",
                     t.id
                 );
                 assert!(
@@ -1473,21 +1587,35 @@ mod tests {
         );
     }
 
-    /// Anchoring `SELECTED` to 1.70 must leave the signed-off Dracula highlight
-    /// where it was — the value the palette/menu look was tuned against. This is
-    /// what makes the fix a no-op on the theme it was designed on and a lift for
-    /// everything else; if a retune moves Dracula, that was a taste decision and
-    /// wants to be a deliberate one.
+    /// Both selection rungs must leave the signed-off Dracula greys where they
+    /// were — the values the look was tuned against, and two *different* values.
+    /// This is what makes the ratio ladder a no-op on the theme it was designed
+    /// on and a lift for everything else; if a retune moves Dracula, that was a
+    /// taste decision and wants to be a deliberate one.
+    ///
+    /// The resting rung is the half that regressed: folded into `CURSOR`'s
+    /// 1.70:1, the rail's selected row went to `#C0C0C0` on the Light theme —
+    /// twice the perceived step it had ever had.
     #[test]
-    fn dracula_selection_matches_the_signed_off_grey() {
+    fn dracula_selection_matches_the_signed_off_greys() {
         let dracula = builtins().into_iter().find(|t| t.id == "dracula").unwrap();
         let bg = dracula.background_color();
-        let legacy = mix(bg, dracula.foreground, 0.17); // the old `list_active`
-        let now = dracula.surfaces().window.selected;
-        assert!(
-            contrast(now, legacy) < 1.05,
-            "Dracula's selection moved: {now:#08x} vs the tuned {legacy:#08x}"
-        );
+        let s = dracula.surfaces();
+        for (what, now, legacy) in [
+            // The old `sidebar_sel`, against the rail it actually paints on.
+            (
+                "resting",
+                s.sidebar.selected,
+                mix(bg, dracula.foreground, 0.12),
+            ),
+            // The old `list_active`, which was mixed off the window background.
+            ("cursor", s.window.cursor, mix(bg, dracula.foreground, 0.17)),
+        ] {
+            assert!(
+                contrast(now, legacy) < 1.05,
+                "Dracula's {what} selection moved: {now:#08x} vs the tuned {legacy:#08x}"
+            );
+        }
     }
 
     /// A resting label must clear WCAG AA on the surface it sits on, for every
@@ -1542,6 +1670,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ...and that step is guaranteed by construction, not by every built-in
+    /// happening to clear it.
+    ///
+    /// The two label colors are derived from opposite ends — `dim` walks the
+    /// resting one *into* the surface, while `ink_on` leaves the selected one
+    /// sitting at the foreground whenever the fill allows — so on a theme whose
+    /// foreground is close to its background they meet in the middle with
+    /// neither derivation being wrong. One Dark Pro's popover surface is exactly
+    /// that: 1.32:1 before [`stepped_ink`] existed. Widening the gap must not
+    /// hand back the on-fill readability `ink_on` was called for in the first
+    /// place.
+    #[test]
+    fn selected_label_is_stepped_off_the_resting_one() {
+        // One Dark Pro's popover ladder: `#abb2bf` foreground over `#282c34`.
+        let (base, fill, fg) = (0x2f333b, 0x40454d, 0xabb2bf);
+        let resting = dim(fg, base, state::TEXT_RESTING);
+
+        let plain = ink_on(fill, fg, state::TEXT_RESTING);
+        assert!(
+            contrast(plain, resting) < state::TEXT_STEP,
+            "the case this floor exists for no longer collapses — pick another"
+        );
+
+        let ink = stepped_ink(fill, base, fg, resting);
+        assert!(
+            contrast(ink, resting) >= state::TEXT_STEP - 0.01,
+            "stepped to {ink:#08x}, still only {:.2}:1 off the resting label",
+            contrast(ink, resting)
+        );
+        assert!(
+            contrast(ink, fill) >= state::TEXT_RESTING - 0.01,
+            "stepping cost the label its fill: {:.2}:1 on {fill:#08x}",
+            contrast(ink, fill)
+        );
     }
 
     /// A switch's two tracks must both be distinguishable *from each other* and

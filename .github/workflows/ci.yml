@@ -22,6 +22,24 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  # Contract §10.6: `ui::` and `terminal::` must not reach the filesystem or git
+  # directly, because once a workspace can be remote those calls answer for the
+  # wrong machine (§4.3). The allowlist of genuinely-local paths lives in the
+  # script, next to the reason each one is exempt.
+  #
+  # A standalone job on purpose, and one that must stay *non-required*: main's
+  # required checks are `rustfmt` and the three `build & test (<target>)` names,
+  # and folding this into either would make it required the moment it lands —
+  # wedging every open PR on a check they have never seen. Same reasoning as
+  # `server-musl` below. Cheap enough (a checkout and a grep) that it does not
+  # need caching or a toolchain.
+  host-boundary:
+    name: host boundary (§10.6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/scripts/check-host-boundary.sh
+
   build:
     name: build & test (${{ matrix.target }})
     strategy:
@@ -74,3 +92,94 @@ jobs:
 
       - name: Test
         run: cargo test --locked --target ${{ matrix.target }}
+
+  # Static musl builds of the headless server binary that remote workspaces push
+  # onto the far machine (docs/2026-07-27-remote-workspace-design.md, D10/§12).
+  # One binary has to run on any distro without regard to the target's glibc
+  # version, so it is linked fully static against musl rather than built per
+  # distro. Compile-only — this job publishes nothing; release.yml and
+  # nightly.yml carry the same job with an upload step.
+  #
+  # Deliberately a *separate* job rather than two more rows in the `build` matrix
+  # above: those three `build & test (<target>)` names are main's required
+  # checks, and reshaping that matrix would wedge branch protection on every open
+  # PR. Keep this job non-required until it has a few weeks of green — see
+  # docs/remote-server-assets.md.
+  server-musl:
+    name: tty7-server musl (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    # `-C strip=symbols` is applied by rustc through the linker, so it strips the
+    # aarch64 output from an x86_64 runner — plain `strip(1)` would not. Set here
+    # rather than in [profile.release] because the release profile is shared with
+    # the GUI builds, which keep their symbols.
+    env:
+      RUSTFLAGS: -C strip=symbols
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # zig supplies both the musl sysroot and the C cross-compiler, which is
+      # what makes one x86_64 runner able to emit both musl targets. russh's
+      # default crypto backend (aws-lc-rs) builds a sizable C/asm library through
+      # cmake, and that is the part every other approach trips over: `cross`
+      # needs a custom image to get cmake into the sandbox, and Ubuntu's
+      # `musl-tools` only ships an x86_64 `musl-gcc` wrapper with no C++ driver
+      # and nothing at all for aarch64. Verified locally: both targets link
+      # statically and the resulting binaries run under Alpine.
+      #
+      # If setup-zig ever becomes a problem (its GitHub repo is a mirror of a
+      # Codeberg original), cargo-zigbuild also accepts zig from PyPI —
+      # `pip3 install ziglang`, which it finds via CARGO_ZIGBUILD_PYTHON_PATH —
+      # so this can drop to zero third-party actions without changing anything
+      # else.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The crate split (§11) lands separately; until `tty7-server` exists as a
+      # workspace member this job has nothing to build. Skip cleanly rather than
+      # fail, so the workflow can land before the split and simply start working
+      # once it arrives. `--no-deps` keeps this to a manifest parse — no
+      # resolution, no network.
+      - name: Look for the tty7-server package
+        id: probe
+        run: |
+          set -euo pipefail
+          if cargo metadata --no-deps --format-version 1 \
+              | jq -e '[.packages[].name] | index("tty7-server")' >/dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::tty7-server is not a workspace member yet (crate split, design §11 / M1) — nothing to build"
+          fi
+
+      # `-p tty7-server` addresses the package by name, so this survives whatever
+      # directory layout the split settles on. It also keeps feature unification
+      # scoped to the server's own dependency graph: the GUI crate is the one
+      # that turns on tty7-core's `gssapi` feature, and that feature cannot build
+      # under musl (libgssapi-sys wants a system MIT/Heimdal krb5). Building the
+      # whole workspace here would drag it in and fail.
+      - name: Build static tty7-server
+        if: steps.probe.outputs.present == 'true'
+        run: cargo zigbuild --release --locked -p tty7-server --target ${{ matrix.target }}
+
+      - name: Assert the binary is static
+        if: steps.probe.outputs.present == 'true'
+        run: bash .github/scripts/assert-static.sh "target/${{ matrix.target }}/release/tty7-server"
