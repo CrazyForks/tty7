@@ -20,7 +20,8 @@ use gpui_component::select::{SearchableVec, Select, SelectState};
 use gpui_component::sidebar::{Sidebar, SidebarCollapsible, SidebarMenu, SidebarMenuItem};
 use gpui_component::slider::{Slider, SliderState};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex,
+    v_flex,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -290,8 +291,9 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         // ── SSH ─────────────────────────────────────────────────────────────
         SearchEntry {
             section: Ssh,
-            title: "SSH profiles",
-            keywords: "ssh host connection saved profile import ssh_config manage add edit",
+            title: "Hosts",
+            keywords: "ssh host connection saved profile import ssh_config manage add edit \
+                       quick connect",
         },
         SearchEntry {
             section: Ssh,
@@ -518,6 +520,17 @@ pub(crate) struct SettingsState {
     /// edit form); `None` shows the empty state (the "pick a profile" hint plus
     /// the two global security toggles).
     pub(crate) ssh_detail: SshDetail,
+    /// Live filter for the SSH master list. Non-empty narrows the list to hosts
+    /// whose name or address matches, and force-expands every group — results
+    /// hiding inside a collapsed group is the same as not finding them.
+    pub(crate) ssh_filter: Entity<InputState>,
+    /// Group keys (see [`ssh_group_key`]) whose section in the master list is
+    /// collapsed. Empty = everything expanded.
+    pub(crate) ssh_collapsed_groups: std::collections::HashSet<String>,
+    /// The `user@host[:port]` box in the SSH section's empty state. An empty
+    /// pane whose only content is "select something" wastes the widest column on
+    /// the page; connecting is what someone opening this section came to do.
+    pub(crate) ssh_quick_connect: Entity<InputState>,
     /// Which machine the Agents section is showing and acting on.
     /// [`HostId::LOCAL`] until the user picks one of the connected remotes.
     pub(crate) agent_hooks_host: HostId,
@@ -586,11 +599,55 @@ pub(crate) enum ThemeSlot {
 /// The SSH section's right-pane selection (see [`SettingsState::ssh_detail`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SshDetail {
-    /// Nothing selected — the right pane shows the empty state (the "pick a
-    /// profile" hint plus the two global security toggles).
+    /// Nothing selected — the right pane shows the quick-connect empty state.
     None,
+    /// The settings every host inherits. Its own row at the top of the master
+    /// list rather than a block pinned under the form: "each host starts from
+    /// these and can override one" is a thing the list's shape can say, and a
+    /// paragraph under an unrelated form cannot.
+    Defaults,
     /// A profile's edit form (paired with `ssh_form`, keyed by the profile id).
     Profile(Uuid),
+}
+
+/// The master list's bucket for `profile.group`: imported aliases first, then
+/// any user-defined group, then the ungrouped ones. The key is the raw `group`
+/// value (`""` for ungrouped) so it can key the collapsed-set directly.
+fn ssh_group_key(p: &SshProfile) -> &str {
+    p.group.as_deref().unwrap_or("")
+}
+
+/// The header text for a group key. The import bucket is labelled by the file
+/// it mirrors — `Imported from ssh_config` describes a past action, and this
+/// group is a live link to a file the user edits elsewhere.
+fn ssh_group_label(key: &str) -> &str {
+    match key {
+        crate::core::ssh_config::IMPORTED_GROUP => "~/.ssh/config",
+        "" => "In tty7",
+        other => other,
+    }
+}
+
+/// Sort rank for a group key: imported first, ungrouped last, custom groups in
+/// between (alphabetical among themselves).
+fn ssh_group_rank(key: &str) -> u8 {
+    match key {
+        crate::core::ssh_config::IMPORTED_GROUP => 0,
+        "" => 2,
+        _ => 1,
+    }
+}
+
+/// Whether a profile survives the master list's filter. `query` is already
+/// trimmed and lowercased. Matches the name and the address separately rather
+/// than the rendered `user@host:port` line, so typing a port still finds the
+/// host but typing `@` doesn't match everything.
+fn ssh_row_matches(p: &SshProfile, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let hit = |s: &str| s.to_lowercase().contains(query);
+    hit(&p.name) || hit(&p.host) || hit(&p.user) || hit(&p.port.to_string())
 }
 
 /// The live edit-form state for one SSH profile, folded into Settings → SSH.
@@ -623,8 +680,8 @@ pub(crate) struct SshProfileForm {
     // Jump host (a profile name; empty = none).
     jump: Entity<InputState>,
 
-    // Forwards, one rule per line: `L bind_host:bind_port target_host:target_port [desc]`.
-    forwards: Entity<InputState>,
+    // Port forwards, one row of inputs per rule (see [`ForwardRuleForm`]).
+    forwards: Vec<ForwardRuleForm>,
 
     // Advanced text inputs.
     identity_files: Entity<InputState>,
@@ -652,6 +709,62 @@ pub(crate) struct SshProfileForm {
     /// Keeps the inputs' change subscriptions alive for this form; dropped (and
     /// re-created) whenever the form is rebuilt for another profile.
     _subs: Vec<Subscription>,
+}
+
+/// One port-forward rule as live inputs.
+///
+/// The whole set used to be a single multi-line text box in which each rule had
+/// to be typed as `L bind_host:port target_host:port [description]` — a syntax
+/// nothing on the page taught, and the only field in this form that could
+/// silently drop what you entered (an unparsable line was skipped on save).
+pub(crate) struct ForwardRuleForm {
+    pub(crate) kind: ForwardKind,
+    pub(crate) bind_host: Entity<InputState>,
+    pub(crate) bind_port: Entity<InputState>,
+    pub(crate) target_host: Entity<InputState>,
+    pub(crate) target_port: Entity<InputState>,
+    pub(crate) description: Entity<InputState>,
+}
+
+impl ForwardRuleForm {
+    /// Read the row back into a rule, or `None` when it is too incomplete to
+    /// connect: a listener needs a port, and everything but Dynamic needs a
+    /// target. The UI flags such a row rather than dropping it quietly.
+    fn collect(&self, cx: &App) -> Option<ForwardRule> {
+        let val = |e: &Entity<InputState>| e.read(cx).value().trim().to_string();
+        let bind_port: u16 = val(&self.bind_port).parse().ok().filter(|p| *p > 0)?;
+        let bind = HostPort::new(val(&self.bind_host), bind_port);
+        let target = if self.kind == ForwardKind::Dynamic {
+            HostPort::default()
+        } else {
+            let port: u16 = val(&self.target_port).parse().ok().filter(|p| *p > 0)?;
+            let host = val(&self.target_host);
+            if host.is_empty() {
+                return None;
+            }
+            HostPort::new(host, port)
+        };
+        Some(ForwardRule {
+            kind: self.kind,
+            bind,
+            target,
+            description: val(&self.description),
+        })
+    }
+
+    /// Whether the row has anything typed in it at all. An untouched row added
+    /// by "Add rule" is not an error — it just hasn't been filled in yet.
+    fn is_blank(&self, cx: &App) -> bool {
+        [
+            &self.bind_host,
+            &self.bind_port,
+            &self.target_host,
+            &self.target_port,
+            &self.description,
+        ]
+        .iter()
+        .all(|e| e.read(cx).value().trim().is_empty())
+    }
 }
 
 /// In-progress capture of a new shortcut for one action (click a Keybindings
@@ -734,69 +847,50 @@ fn split_lines(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parse the forwards text area (one rule per line) into [`ForwardRule`]s.
-/// Lines that don't parse are skipped rather than failing the whole save.
-fn parse_forwards(s: &str) -> Vec<ForwardRule> {
-    let mut out = Vec::new();
-    for line in s.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(4, char::is_whitespace);
-        let kind = match parts.next().map(|k| k.to_ascii_uppercase()) {
-            Some(k) if k == "L" || k == "LOCAL" => ForwardKind::Local,
-            Some(k) if k == "R" || k == "REMOTE" => ForwardKind::Remote,
-            Some(k) if k == "D" || k == "DYNAMIC" => ForwardKind::Dynamic,
-            _ => continue,
-        };
-        let Some(bind) = parts.next().and_then(parse_host_port) else {
-            continue;
-        };
-        // Dynamic ignores the target; Local/Remote need it.
-        let target = if kind == ForwardKind::Dynamic {
-            HostPort::default()
-        } else {
-            match parts.next().and_then(parse_host_port) {
-                Some(t) => t,
-                None => continue,
-            }
-        };
-        let description = parts.next().unwrap_or("").trim().to_string();
-        out.push(ForwardRule {
-            kind,
-            bind,
-            target,
-            description,
-        });
-    }
-    out
+/// The five inputs of a forward row, in tab order. Used to subscribe the row
+/// (and nothing else needs to know the field names).
+fn forward_row_inputs(row: &ForwardRuleForm) -> [&Entity<InputState>; 5] {
+    [
+        &row.bind_host,
+        &row.bind_port,
+        &row.target_host,
+        &row.target_port,
+        &row.description,
+    ]
 }
 
-/// Render `ForwardRule`s back into the text-area format.
-fn forwards_text(rules: &[ForwardRule]) -> String {
-    rules
-        .iter()
-        .map(|r| {
-            let kind = match r.kind {
-                ForwardKind::Local => "L",
-                ForwardKind::Remote => "R",
-                ForwardKind::Dynamic => "D",
-            };
-            let bind = format!("{}:{}", r.bind.host, r.bind.port);
-            if r.kind == ForwardKind::Dynamic {
-                format!("{kind} {bind} {}", r.description)
-                    .trim()
-                    .to_string()
-            } else {
-                let target = format!("{}:{}", r.target.host, r.target.port);
-                format!("{kind} {bind} {target} {}", r.description)
-                    .trim()
-                    .to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Build one forward row's inputs, seeded from `rule`. Port `0` seeds an empty
+/// box rather than a literal `0` — the stored default for "unset".
+fn seed_forward_row(
+    window: &mut Window,
+    cx: &mut Context<Tty7App>,
+    rule: &ForwardRule,
+) -> ForwardRuleForm {
+    let port = |p: u16| if p == 0 { String::new() } else { p.to_string() };
+    ForwardRuleForm {
+        kind: rule.kind,
+        bind_host: seed_hinted(window, cx, &rule.bind.host, "localhost"),
+        bind_port: seed_hinted(window, cx, &port(rule.bind.port), "8080"),
+        target_host: seed_hinted(window, cx, &rule.target.host, "127.0.0.1"),
+        target_port: seed_hinted(window, cx, &port(rule.target.port), "80"),
+        description: seed_hinted(window, cx, &rule.description, "what it's for"),
+    }
+}
+
+/// [`seed_input`] with a placeholder — the forward rows carry no labels of
+/// their own, so the hint text is what says which box is which.
+fn seed_hinted(
+    window: &mut Window,
+    cx: &mut Context<Tty7App>,
+    value: &str,
+    placeholder: &'static str,
+) -> Entity<InputState> {
+    let value = value.to_string();
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(placeholder)
+            .default_value(value)
+    })
 }
 
 /// Build an `InputState` seeded with `value` (single- or multi-line). A free
@@ -1262,7 +1356,7 @@ impl Tty7App {
     /// puts the control on the same ladder every hand-rolled surface reads.
     pub(crate) fn segmented(
         &self,
-        id: &'static str,
+        id: impl Into<SharedString>,
         options: &'static [&'static str],
         selected: usize,
         cx: &mut Context<Self>,
@@ -1280,16 +1374,19 @@ impl Tty7App {
     pub(crate) fn segmented_on(
         &self,
         sf: presets::Surface,
-        id: &'static str,
+        id: impl Into<SharedString>,
         options: &'static [&'static str],
         selected: usize,
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, usize, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
         let border = cx.theme().border;
+        // Taken by name rather than as a `&'static str` so per-row controls (the
+        // forward rules) can carry an id derived from their index.
+        let id: SharedString = id.into();
         let on_pick = std::rc::Rc::new(on_pick);
         h_flex()
-            .id(id)
+            .id(gpui::ElementId::Name(id.clone()))
             .h(px(24.))
             .rounded_lg()
             .border_1()
@@ -1307,9 +1404,9 @@ impl Tty7App {
                 let active = i == selected;
                 let on_pick = on_pick.clone();
                 h_flex()
-                    // `(id, i)` keeps each segment's element id unique across the
-                    // several segmented controls on the page.
-                    .id((id, i))
+                    // A per-segment id keeps each one unique across the several
+                    // segmented controls on the page.
+                    .id(gpui::ElementId::NamedInteger(id.clone(), i as u64))
                     .items_center()
                     .justify_center()
                     .h_full()
@@ -1876,167 +1973,171 @@ impl Tty7App {
             .into_any_element()
     }
 
-    /// The left (master) column: the Import / Add buttons on top, then the
-    /// saved-profile list (each row selects into the detail pane).
+    /// The left (master) column: a Hosts header carrying the add / overflow
+    /// affordances, a live filter, then the list — `Defaults` pinned on top and
+    /// every saved host bucketed by group into a collapsible section.
+    ///
+    /// The filter leads, and Add / Import shrank to icon affordances, because
+    /// that is the order the column is actually used in: past a dozen hosts,
+    /// finding one *is* the job. Two full-width buttons on top read as a page
+    /// header while pushing the content that matters below the fold.
     fn render_ssh_master(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         // Rows in this list paint on the settings sheet, i.e. the window surface.
         let sf = cx.global::<presets::Surfaces>().window;
         let profiles = cx.global::<Config>().ssh_profiles.clone();
-        let detail = self
-            .active_settings()
-            .map(|s| s.ssh_detail)
-            .unwrap_or(SshDetail::None);
+        let (filter, collapsed, detail) = match self.active_settings() {
+            Some(s) => (
+                s.ssh_filter.clone(),
+                s.ssh_collapsed_groups.clone(),
+                s.ssh_detail,
+            ),
+            None => return div().into_any_element(),
+        };
+        let query = filter.read(cx).value().trim().to_lowercase();
+        // Which profiles have a connected pane right now: each row's dot, and the
+        // count a collapsed group header keeps showing.
+        let live = self.live_ssh_profiles(cx);
+        let menu_app = cx.entity().downgrade();
 
-        // Import / Add stacked full-width: the long import label doesn't fit beside
-        // Add in the narrow column.
         let header = v_flex()
             .gap_2()
             .child(
-                // Plain (not `.primary()`): a solid near-black fill reads far too
-                // heavy against this soft, mostly-outline sheet — a subtle default
-                // fill still reads as the primary create action above outline Import.
-                Button::new("ssh-profiles-add")
-                    .label("Add profile")
-                    .small()
-                    .w_full()
-                    .on_click(cx.listener(|this, _, window, cx| this.add_new_profile(window, cx))),
+                // The same weight every other section leads with. Tried as the nav
+                // rail's small-caps label instead, and it read as a sub-header of
+                // the nav rather than the title of a column: every other page in
+                // Settings opens with a title at this size, and this column is
+                // where this page starts. So it gets the line to itself.
+                self.header_text("Hosts", cx),
             )
             .child(
-                Button::new("ssh-profiles-import")
-                    .label("Import from ~/.ssh/config")
-                    .outline()
-                    .small()
-                    .w_full()
-                    .on_click(cx.listener(|this, _, _w, cx| this.import_ssh_config_profiles(cx))),
+                // One toolbar row: the filter, then the two affordances that act on
+                // the list. The borderless magnifier-then-input is the nav header's
+                // settings search, laid out the same way — a boxed field would be
+                // the only outlined control on a sheet that has none, and would read
+                // as a different kind of search from the one two columns to its left.
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        // Stock magnifier, not tty7's: at this size the redraw
+                        // reads thin and its handle stubby. See `assets::STOCK_PREFIX`.
+                        Icon::empty()
+                            .path("stock/icons/search.svg")
+                            .size(px(16.))
+                            .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&filter).appearance(false).pl_0()),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_0p5()
+                            .child(
+                                Button::new("ssh-profiles-add")
+                                    .icon(Icon::new(IconName::Plus))
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_new_profile(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("ssh-profiles-more")
+                                    // Stock `⋯`, not tty7's: the redraw's filled
+                                    // `r=2` dots smear at this size. See the row
+                                    // menu below and `assets::STOCK_PREFIX`.
+                                    .icon(Icon::empty().path("stock/icons/ellipsis.svg"))
+                                    .ghost()
+                                    .small()
+                                    .dropdown_menu_with_anchor(
+                                        gpui::Anchor::TopRight,
+                                        move |menu, _window, _cx| {
+                                            Self::ssh_master_menu(menu, &menu_app)
+                                        },
+                                    ),
+                            ),
+                    ),
             );
 
-        let mut list = v_flex().gap_0p5().w_full();
+        // Bucket by group, keeping each group's config order. Filtering happens
+        // before bucketing, so a group the query empties drops out whole instead
+        // of leaving a header standing over nothing.
+        let mut groups: Vec<(String, Vec<SshProfile>)> = Vec::new();
+        for p in profiles.iter().filter(|p| ssh_row_matches(p, &query)) {
+            let key = ssh_group_key(p).to_string();
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, bucket)) => bucket.push(p.clone()),
+                None => groups.push((key, vec![p.clone()])),
+            }
+        }
+        groups.sort_by(|a, b| {
+            ssh_group_rank(&a.0)
+                .cmp(&ssh_group_rank(&b.0))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        // Defaults sits above the groups and outside the filter: it owns the
+        // security toggles, and hiding those behind a query nobody thinks to type
+        // is how a setting becomes undiscoverable.
+        let mut list = v_flex().gap_0p5().w_full().child(self.render_ssh_row(
+            "ssh-defaults-row",
+            "Defaults",
+            "Inherited by every host",
+            detail == SshDetail::Defaults,
+            None,
+            sf,
+            cx.listener(|this, _, _w, cx| this.select_ssh_defaults(cx)),
+            None,
+            cx,
+        ));
+
         if profiles.is_empty() {
             list = list.child(
                 div()
                     .py_4()
                     .text_sm()
                     .text_color(muted)
-                    .child("No saved profiles yet. Add one, or import from ~/.ssh/config."),
+                    .child("No saved hosts yet."),
+            );
+        } else if groups.is_empty() {
+            list = list.child(
+                div()
+                    .py_4()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(format!("Nothing matches {query}.")),
             );
         }
-        for p in &profiles {
-            let id = p.id;
-            let row_idx = id.as_u128() as usize;
-            let subtitle = to_connect_string(p);
-            let title = if p.name.is_empty() {
-                subtitle.clone()
-            } else {
-                p.name.clone()
-            };
-            let selected = detail == SshDetail::Profile(id);
-            // A group so this row's ⋯ affordance can reveal on hover
-            // (progressive disclosure) without touching its neighbours.
-            let group_name = SharedString::from(format!("ssh-profile-row-{row_idx}"));
-            let hover_group = group_name.clone();
-            // Weak handles so the hover ⋯ dropdown and the right-click context
-            // menu can drive the same `Tty7App` handlers the inline buttons used.
-            let menu_app = cx.entity().downgrade();
-            let ctx_app = cx.entity().downgrade();
-            list = list.child(
-                h_flex()
-                    .id(("ssh-profile-row", row_idx))
-                    .group(group_name.clone())
-                    .items_center()
-                    .justify_between()
-                    .w_full()
-                    .py_2()
-                    .px_2()
-                    .rounded_md()
-                    // The window ladder, both channels. This row used to tint with
-                    // `secondary.opacity(0.4)` — a 9% grey at 40% alpha, i.e. an
-                    // effective 3.6% tint, which put the selected row 1.05–1.12:1
-                    // from a resting one and 1.02–1.06:1 from a hovered one. It was
-                    // the second site named in issue #197. Multiplying a soft grey
-                    // by alpha is how a fill silently disappears: the result depends
-                    // on whatever it happens to be composited over, which is
-                    // exactly the unknown a per-surface ladder removes.
-                    .when(selected, |r| r.bg(gpui::rgb(sf.selected)))
-                    // A subtle hover fill so the whole row reads as the (clickable)
-                    // select affordance; the selected row keeps its own highlight.
-                    .when(!selected, |r| r.hover(|s| s.bg(gpui::rgb(sf.hover))))
-                    // Left-click anywhere on the row selects it — its edit form
-                    // opens in the detail pane. Clicks on the trailing ⋯ are
-                    // swallowed by its wrapper, so they don't also start an edit.
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            if let Some(profile) = cx
-                                .global::<Config>()
-                                .ssh_profiles
-                                .iter()
-                                .find(|p| p.id == id)
-                                .cloned()
-                            {
-                                this.ssh_form_load(&profile, window, cx);
-                            }
-                        }),
-                    )
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .truncate()
-                                    // The label channel: the selected row's title
-                                    // steps up in colour and weight, so which
-                                    // profile is loaded in the detail pane reads
-                                    // from the type and not from the fill alone.
-                                    .when(selected, |d| {
-                                        d.text_color(gpui::rgb(sf.text_selected))
-                                            .font_weight(FontWeight::MEDIUM)
-                                    })
-                                    .when(!selected, |d| d.text_color(gpui::rgb(sf.text_resting)))
-                                    .child(title),
-                            )
-                            .child(div().text_xs().text_color(muted).truncate().child(subtitle)),
-                    )
-                    .child(
-                        // Trailing ⋯ overflow menu, revealed on row hover. Its
-                        // wrapper swallows the mouse-down so opening the menu never
-                        // also fires the row's select click.
-                        div()
-                            .flex_shrink_0()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .when(!selected, move |s| {
-                                s.opacity(0.).group_hover(hover_group, |s| s.opacity(1.))
-                            })
-                            .child(
-                                Button::new(("ssh-prof-menu", row_idx))
-                                    // Stock `⋯`, not tty7's: the redraw's filled
-                                    // `r=2` dots are weighted for the title bar's
-                                    // 18px tiles and smear into three blobs at the
-                                    // 16px `small()` uses. See `assets::STOCK_PREFIX`.
-                                    .icon(Icon::empty().path("stock/icons/ellipsis.svg"))
-                                    .ghost()
-                                    .small()
-                                    .dropdown_menu_with_anchor(
-                                        gpui::Anchor::TopRight,
-                                        move |menu, _window, cx| {
-                                            Self::ssh_profile_row_menu(
-                                                menu,
-                                                id,
-                                                cx.theme().danger,
-                                                &menu_app,
-                                            )
-                                        },
-                                    ),
-                            ),
-                    )
-                    // Right-click anywhere on the row opens the same menu.
-                    .context_menu(move |menu, _window, cx| {
-                        Self::ssh_profile_row_menu(menu, id, cx.theme().danger, &ctx_app)
-                    }),
-            );
+
+        for (key, bucket) in groups {
+            // A live query force-expands every group: a match hiding inside a
+            // collapsed section is the same as no match at all.
+            let is_collapsed = query.is_empty() && collapsed.contains(&key);
+            let live_here = bucket.iter().filter(|p| live.contains(&p.id)).count();
+            list = list.child(self.render_ssh_group_header(
+                &key,
+                bucket.len(),
+                is_collapsed,
+                live_here,
+                cx,
+            ));
+            if is_collapsed {
+                continue;
+            }
+            for p in &bucket {
+                list = list.child(self.render_ssh_host_row(
+                    p,
+                    detail == SshDetail::Profile(p.id),
+                    live.contains(&p.id),
+                    sf,
+                    cx,
+                ));
+            }
         }
 
         v_flex()
@@ -2049,6 +2150,306 @@ impl Tty7App {
             .into_any_element()
     }
 
+    /// The master column's overflow menu: the `~/.ssh/config` link lives here
+    /// rather than on a permanent full-width button, because it is a once-in-a-
+    /// while action and the list beneath it is not.
+    fn ssh_master_menu(menu: PopupMenu, app: &gpui::WeakEntity<Self>) -> PopupMenu {
+        menu.min_w(px(200.))
+            .item(PopupMenuItem::new("Import from ~/.ssh/config").on_click({
+                let app = app.clone();
+                move |_, _window, cx| {
+                    let _ = app.update(cx, |this, cx| this.import_ssh_config_profiles(cx));
+                }
+            }))
+            .item(PopupMenuItem::new("Expand all groups").on_click({
+                let app = app.clone();
+                move |_, _window, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        if let Some(s) = this.active_settings_mut() {
+                            s.ssh_collapsed_groups.clear();
+                        }
+                        cx.notify();
+                    });
+                }
+            }))
+    }
+
+    /// One collapsible group header in the master list. Collapsed, it keeps
+    /// showing how many of its hosts are connected — folding a section away
+    /// should hide the rows, not the fact that something in there is live.
+    fn render_ssh_group_header(
+        &self,
+        key: &str,
+        count: usize,
+        collapsed: bool,
+        live_here: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let sf = cx.global::<presets::Surfaces>().window;
+        let owned_key = key.to_string();
+        let chevron = if collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+        h_flex()
+            .id(SharedString::from(format!("ssh-group-{key}")))
+            .items_center()
+            .gap_1()
+            .w_full()
+            .mt_2()
+            .py_1()
+            .px_1p5()
+            .rounded_md()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(muted)
+            .hover(|s| s.bg(gpui::rgb(sf.hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _w, cx| {
+                    cx.stop_propagation();
+                    this.toggle_ssh_group(owned_key.clone(), cx);
+                }),
+            )
+            .child(Icon::new(chevron).size(px(10.)))
+            .child(div().truncate().child(ssh_group_label(key).to_string()))
+            .child(div().child(format!("· {count}")))
+            .child(div().flex_1())
+            .when(collapsed && live_here > 0, |row| {
+                row.child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(div().size(px(5.)).rounded_full().bg(cx.theme().success))
+                        .child(div().child(live_here.to_string())),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// One host row: status dot, name over `user@host:port`, and a hover `⋯`.
+    fn render_ssh_host_row(
+        &self,
+        p: &SshProfile,
+        selected: bool,
+        live: bool,
+        sf: presets::Surface,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = p.id;
+        let row_idx = id.as_u128() as usize;
+        let subtitle = to_connect_string(p);
+        let title = if p.name.is_empty() {
+            subtitle.clone()
+        } else {
+            p.name.clone()
+        };
+        self.render_ssh_row(
+            SharedString::from(format!("ssh-profile-row-{row_idx}")),
+            title,
+            subtitle,
+            selected,
+            Some(live),
+            sf,
+            cx.listener(move |this, _, window, cx| {
+                if let Some(profile) = cx
+                    .global::<Config>()
+                    .ssh_profiles
+                    .iter()
+                    .find(|p| p.id == id)
+                    .cloned()
+                {
+                    this.ssh_form_load(&profile, window, cx);
+                }
+            }),
+            Some(id),
+            cx,
+        )
+    }
+
+    /// The shared shape of a master-list row (Defaults and every host). `dot`
+    /// is `None` for rows that can't be connected; `menu_for` adds the hover `⋯`
+    /// and right-click menu for a saved profile.
+    #[allow(clippy::too_many_arguments)]
+    fn render_ssh_row(
+        &self,
+        element_id: impl Into<gpui::ElementId>,
+        title: impl Into<SharedString>,
+        subtitle: impl Into<SharedString>,
+        selected: bool,
+        dot: Option<bool>,
+        sf: presets::Surface,
+        on_select: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+        menu_for: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let success = cx.theme().success;
+        let border = cx.theme().border;
+        let title: SharedString = title.into();
+        let group_name = SharedString::from(format!("ssh-row-group-{title}"));
+        let hover_group = group_name.clone();
+
+        let row = h_flex()
+            .id(element_id)
+            .group(group_name)
+            .items_center()
+            .gap_2()
+            .w_full()
+            .py_2()
+            .px_2()
+            .rounded_md()
+            // The window ladder, both channels — see issue #197: multiplying a
+            // soft grey by alpha is how a fill silently disappears.
+            .when(selected, |r| r.bg(gpui::rgb(sf.selected)))
+            .when(!selected, |r| r.hover(|s| s.bg(gpui::rgb(sf.hover))))
+            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                cx.stop_propagation();
+                on_select(ev, window, cx);
+            })
+            .when_some(dot, |row, live| {
+                row.child(
+                    div()
+                        .flex_shrink_0()
+                        .size(px(6.))
+                        .rounded_full()
+                        .when(live, |d| d.bg(success))
+                        // A hollow ring when idle, so the dot column reads as a
+                        // status slot rather than appearing only for live hosts
+                        // and shunting every other row's text left.
+                        .when(!live, |d| d.border_1().border_color(border)),
+                )
+            })
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .truncate()
+                            // The label channel: a selected row steps up in colour
+                            // and weight, so which row is loaded reads from the
+                            // type and not from the fill alone.
+                            .when(selected, |d| {
+                                d.text_color(gpui::rgb(sf.text_selected))
+                                    .font_weight(FontWeight::MEDIUM)
+                            })
+                            .when(!selected, |d| d.text_color(gpui::rgb(sf.text_resting)))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate()
+                            .child(subtitle.into()),
+                    ),
+            );
+
+        // `.context_menu()` wraps the row in a different element type, so the two
+        // cases can't be a `when_some` — they're branched into `AnyElement` here.
+        let Some(id) = menu_for else {
+            return row.into_any_element();
+        };
+        // Weak handles so the hover `⋯` dropdown and the right-click menu drive
+        // the same handlers.
+        let menu_app = cx.entity().downgrade();
+        let ctx_app = cx.entity().downgrade();
+        let row_idx = id.as_u128() as usize;
+        row.child(
+            // The wrapper swallows the mouse-down so opening the menu never also
+            // fires the row's select click.
+            div()
+                .flex_shrink_0()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .when(!selected, move |s| {
+                    s.opacity(0.).group_hover(hover_group, |s| s.opacity(1.))
+                })
+                .child(
+                    Button::new(("ssh-prof-menu", row_idx))
+                        .icon(Icon::empty().path("stock/icons/ellipsis.svg"))
+                        .ghost()
+                        .small()
+                        .dropdown_menu_with_anchor(
+                            gpui::Anchor::TopRight,
+                            move |menu, _window, cx| {
+                                Self::ssh_profile_row_menu(menu, id, cx.theme().danger, &menu_app)
+                            },
+                        ),
+                ),
+        )
+        .context_menu(move |menu, _window, cx| {
+            Self::ssh_profile_row_menu(menu, id, cx.theme().danger, &ctx_app)
+        })
+        .into_any_element()
+    }
+
+    /// Saved profiles with a connected pane open right now, by id. Read off the
+    /// live panes rather than tracked separately, so it can't go stale.
+    fn live_ssh_profiles(&self, cx: &App) -> std::collections::HashSet<Uuid> {
+        use crate::daemon::protocol::SshPhase;
+        let mut live = std::collections::HashSet::new();
+        for tab in &self.tabs {
+            for leaf in tab.pane.terminals() {
+                let v = leaf.read(cx);
+                if !matches!(v.ssh_phase(), Some(SshPhase::Connected)) || v.terminal.exited {
+                    continue;
+                }
+                if let Some(id) = v
+                    .ssh_spec()
+                    .and_then(|s| s.profile_id.clone())
+                    .and_then(|id| Uuid::parse_str(&id).ok())
+                {
+                    live.insert(id);
+                }
+            }
+        }
+        live
+    }
+
+    /// Point the detail pane at the global defaults, dropping any open edit form.
+    pub(crate) fn select_ssh_defaults(&mut self, cx: &mut Context<Self>) {
+        if let Some(s) = self.active_settings_mut() {
+            s.ssh_form = None;
+            s.ssh_detail = SshDetail::Defaults;
+        }
+        cx.notify();
+    }
+
+    /// Collapse / expand one group of the master list.
+    ///
+    /// Collapsing the group that holds the current selection hands the detail
+    /// pane back to Defaults: otherwise the form stays open on a host whose row
+    /// is no longer anywhere on screen, and nothing on the page says which host
+    /// is being edited.
+    fn toggle_ssh_group(&mut self, key: String, cx: &mut Context<Self>) {
+        let selected_here = match self.active_settings().map(|s| s.ssh_detail) {
+            Some(SshDetail::Profile(id)) => cx
+                .global::<Config>()
+                .ssh_profiles
+                .iter()
+                .find(|p| p.id == id)
+                .is_some_and(|p| ssh_group_key(p) == key),
+            _ => false,
+        };
+        let Some(s) = self.active_settings_mut() else {
+            return;
+        };
+        let collapsing = !s.ssh_collapsed_groups.remove(&key);
+        if collapsing {
+            s.ssh_collapsed_groups.insert(key);
+            if selected_here {
+                s.ssh_form = None;
+                s.ssh_detail = SshDetail::Defaults;
+            }
+        }
+        cx.notify();
+    }
+
     /// The right (detail) pane: a selected profile's edit form, or — with nothing
     /// selected — a "pick a profile" hint. The global security defaults render
     /// below either state: tucked into the empty state alone they vanished the
@@ -2058,23 +2459,195 @@ impl Tty7App {
             .active_settings()
             .map(|s| s.ssh_detail)
             .unwrap_or(SshDetail::None);
-        let body: AnyElement = match detail {
+        match detail {
+            SshDetail::Defaults => self.render_ssh_defaults_detail(cx),
             SshDetail::Profile(_)
                 if self.active_settings().is_some_and(|s| s.ssh_form.is_some()) =>
             {
                 self.render_ssh_profile_form(cx)
             }
             // No selection (or a stale profile whose form is gone).
-            _ => div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child("Select a profile to edit, or add a new one.")
-                .into_any_element(),
+            _ => self.render_ssh_empty_state(cx),
+        }
+    }
+
+    /// The detail pane with nothing selected: a quick-connect box, and — when
+    /// `~/.ssh/config` holds aliases tty7 hasn't linked — an offer to link them.
+    ///
+    /// This replaces a one-line "select a profile to edit" hint that left the
+    /// widest column on the page doing nothing.
+    fn render_ssh_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let Some(input) = self.active_settings().map(|s| s.ssh_quick_connect.clone()) else {
+            return div().into_any_element();
         };
+        let target = input.read(cx).value().trim().to_string();
+        let parsed = crate::core::ssh_profile::parse_quick_connect(&target);
+        let saved = cx.global::<Config>().ssh_profiles.len();
+
+        // How many `~/.ssh/config` aliases aren't in the list yet. Read on render:
+        // the file is small, this section is not on a hot path, and a stale count
+        // would advertise work that is already done.
+        let unlinked = {
+            let known: std::collections::HashSet<String> = cx
+                .global::<Config>()
+                .ssh_profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+            crate::core::ssh_config::import_profiles()
+                .into_iter()
+                .filter(|i| !known.contains(&i.profile.name))
+                .map(|i| i.profile.name)
+                .collect::<Vec<_>>()
+        };
+
+        let heading = if saved == 0 {
+            "No hosts yet"
+        } else {
+            "Nothing selected"
+        };
+
+        let mut body = v_flex()
+            .gap_1()
+            .child(self.header_text(heading, cx))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("Type an address to connect now — tty7 offers to save it afterwards."),
+            )
+            .child(
+                h_flex()
+                    .mt_3()
+                    .gap_2()
+                    .child(div().w(px(320.)).child(Input::new(&input).small()))
+                    .child(
+                        Button::new("ssh-quick-connect")
+                            .label("Connect")
+                            .primary()
+                            .small()
+                            // Off until the box holds something that parses: a
+                            // Connect that can only fail is worse than one that
+                            // says it isn't ready.
+                            .disabled(parsed.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.ssh_quick_connect_from_settings(window, cx)
+                            })),
+                    ),
+            );
+
+        if !unlinked.is_empty() {
+            let n = unlinked.len();
+            let names = unlinked.join(", ");
+            body = body.child(
+                h_flex()
+                    .mt_6()
+                    .gap_3()
+                    .items_center()
+                    .w_full()
+                    .max_w(px(460.))
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("{n} more in ~/.ssh/config")),
+                            )
+                            .child(div().text_xs().text_color(muted).truncate().child(names)),
+                    )
+                    .child(
+                        Button::new("ssh-empty-import")
+                            .label("Link")
+                            .small()
+                            .on_click(
+                                cx.listener(|this, _, _w, cx| this.import_ssh_config_profiles(cx)),
+                            ),
+                    ),
+            );
+        }
+
+        // No extra top padding: the detail pane already clears the title bar, and
+        // the heading here has to land on the same baseline as `Hosts` beside it.
+        body.into_any_element()
+    }
+
+    /// Connect the empty state's quick-connect target, closing Settings first so
+    /// the new session is what's on screen.
+    fn ssh_quick_connect_from_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .active_settings()
+            .map(|s| s.ssh_quick_connect.read(cx).value().trim().to_string())
+        else {
+            return;
+        };
+        let Some(qc) = crate::core::ssh_profile::parse_quick_connect(&target) else {
+            return;
+        };
+        self.close_settings(window, cx);
+        self.quick_connect(qc, window, cx);
+    }
+
+    /// The `Defaults` row's detail: what every host inherits, plus the state of
+    /// the `~/.ssh/config` link. Its own page rather than a block pinned under
+    /// the profile form, where it read as part of whichever host was open.
+    fn render_ssh_defaults_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let imported = cx
+            .global::<Config>()
+            .ssh_profiles
+            .iter()
+            .filter(|p| p.group.as_deref() == Some(crate::core::ssh_config::IMPORTED_GROUP))
+            .count();
+
+        let config_block = v_flex()
+            .child(self.section_intro(
+                "~/.ssh/config",
+                match imported {
+                    0 => "No aliases linked yet.".to_string(),
+                    1 => "1 alias linked.".to_string(),
+                    n => format!("{n} aliases linked."),
+                },
+                cx,
+            ))
+            .child(
+                self.settings_row(
+                    "Import aliases",
+                    "Re-reads the file and adds anything new. Edits you make here are \
+                 stored by tty7 — the file itself is never written.",
+                    Button::new("ssh-defaults-import")
+                        .label("Import now")
+                        .small()
+                        .on_click(
+                            cx.listener(|this, _, _w, cx| this.import_ssh_config_profiles(cx)),
+                        )
+                        .into_any_element(),
+                    cx,
+                ),
+            );
+
         v_flex()
-            .child(body)
-            .child(self.section_rule(cx))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .mb_6()
+                    .child(self.header_text("Defaults", cx))
+                    .child(div().text_sm().text_color(muted).child(
+                        "Every host starts from these. Any host can override one under \
+                         its own Advanced.",
+                    )),
+            )
             .child(self.render_ssh_security_block(cx))
+            .child(self.section_rule(cx))
+            .child(config_block)
             .into_any_element()
     }
 
@@ -2156,8 +2729,8 @@ impl Tty7App {
 
         v_flex()
             .child(self.section_intro(
-                "Security defaults",
-                "Apply to every profile; a profile can override each one under Advanced.",
+                "Security",
+                "A host can override either of these under its own Advanced.",
                 cx,
             ))
             .child(self.settings_row(
@@ -2210,7 +2783,11 @@ impl Tty7App {
         let port = seed_input(window, cx, &profile.port.to_string(), false);
         let user = seed_input(window, cx, &profile.user, false);
         let jump = seed_input(window, cx, &jump_name, false);
-        let forwards = seed_input(window, cx, &forwards_text(&profile.forwards), true);
+        let forwards: Vec<ForwardRuleForm> = profile
+            .forwards
+            .iter()
+            .map(|r| seed_forward_row(window, cx, r))
+            .collect();
         let identity_files = seed_input(window, cx, &profile.identity_files.join("\n"), true);
         let proxy_command = seed_input(
             window,
@@ -2259,10 +2836,35 @@ impl Tty7App {
         );
         let login_scripts = seed_input(window, cx, &profile.login_scripts.join("\n"), true);
 
-        // The jump-host summary and the forwards count recompute live from these
-        // two inputs, so a keystroke in either re-renders the section.
+        // Every input in the form is subscribed, not just the few whose values
+        // are echoed elsewhere: the header's Save button is enabled by comparing
+        // the whole form against the saved profile, so any field going stale
+        // would leave Save claiming there is nothing to write.
         let mut subs = Vec::new();
-        for input in [&jump, &forwards] {
+        let mut watch = vec![
+            &name,
+            &host,
+            &port,
+            &user,
+            &jump,
+            &identity_files,
+            &proxy_command,
+            &socks,
+            &http,
+            &kex,
+            &cipher,
+            &mac,
+            &hostkey,
+            &compression,
+            &keepalive_interval,
+            &keepalive_count,
+            &connect_timeout,
+            &login_scripts,
+        ];
+        for row in &forwards {
+            watch.extend(forward_row_inputs(row));
+        }
+        for input in watch {
             subs.push(
                 cx.subscribe_in(input, window, |_this, _i, ev: &InputEvent, _w, cx| {
                     if matches!(ev, InputEvent::Change) {
@@ -2350,7 +2952,7 @@ impl Tty7App {
             identity_files: split_lines(&form.identity_files.read(cx).value()),
             agent_forward: form.agent_forward,
             credential_ref: form.carry_credential_ref.clone(),
-            forwards: parse_forwards(&form.forwards.read(cx).value()),
+            forwards: form.forwards.iter().filter_map(|r| r.collect(cx)).collect(),
             keepalive_interval_s: val(&form.keepalive_interval).parse().ok(),
             keepalive_count_max: val(&form.keepalive_count).parse().ok(),
             connect_timeout_s: val(&form.connect_timeout).parse().ok(),
@@ -2384,22 +2986,13 @@ impl Tty7App {
         Some(id)
     }
 
-    /// Save the form and return the detail pane to its empty state.
+    /// Save the form, leaving it open on the same host.
+    ///
+    /// It used to close back to an empty pane. With the host list permanently
+    /// beside the form that reads as the selection being thrown away; staying
+    /// put also lets the now-disabled Save double as the "saved" acknowledgement.
     pub(crate) fn save_ssh_form(&mut self, cx: &mut Context<Self>) {
         self.save_editing_profile(cx);
-        if let Some(s) = self.active_settings_mut() {
-            s.ssh_form = None;
-            s.ssh_detail = SshDetail::None;
-        }
-        cx.notify();
-    }
-
-    /// Discard unsaved edits and return the detail pane to its empty state (Back).
-    pub(crate) fn close_ssh_form(&mut self, cx: &mut Context<Self>) {
-        if let Some(s) = self.active_settings_mut() {
-            s.ssh_form = None;
-            s.ssh_detail = SshDetail::None;
-        }
         cx.notify();
     }
 
@@ -2513,15 +3106,35 @@ impl Tty7App {
         let Some(form) = self.active_settings().and_then(|s| s.ssh_form.as_ref()) else {
             return div().into_any_element();
         };
-        let is_new = !cx
+        let editing = form.editing;
+        let muted = cx.theme().muted_foreground;
+        let success = cx.theme().success;
+
+        // The header identifies the host and offers the one action this page
+        // exists for. It used to say "Edit profile" beside a ‹ Back — a title
+        // that named the *screen*, on a screen whose subject is a machine.
+        let saved = cx
             .global::<Config>()
             .ssh_profiles
             .iter()
-            .any(|p| p.id == form.editing);
-        let title = if is_new {
-            "New profile"
-        } else {
-            "Edit profile"
+            .find(|p| p.id == editing)
+            .cloned();
+        let collected = self.ssh_form_collect(cx);
+        // A never-saved profile is always dirty; otherwise compare field by field
+        // so Save reads as "there is something to save".
+        let dirty = collected != saved;
+        let address = collected
+            .as_ref()
+            .map(to_connect_string)
+            .unwrap_or_default();
+        let jump_name = form.jump.read(cx).value().trim().to_string();
+        let live = self.live_ssh_profiles(cx).contains(&editing);
+        let name = form.name.read(cx).value().trim().to_string();
+        let host = form.host.read(cx).value().trim().to_string();
+        let title = match (name.is_empty(), host.is_empty()) {
+            (false, _) => name,
+            (true, false) => host,
+            (true, true) => "New host".to_string(),
         };
 
         let auth_idx = match form.auth {
@@ -2533,41 +3146,59 @@ impl Tty7App {
             AuthMode::KeyboardInteractive => 5,
         };
         let header = h_flex()
-            .items_center()
+            .items_start()
             .justify_between()
+            .gap_4()
             .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_1()
                     .child(
-                        Button::new("ssh-form-back")
-                            .label("‹ Back")
-                            .ghost()
-                            .small()
-                            .on_click(cx.listener(|this, _, _w, cx| this.close_ssh_form(cx))),
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(title),
                     )
-                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title)),
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(div().truncate().child(address))
+                            .when(!jump_name.is_empty(), |r| {
+                                r.child(div().child(format!("· via {jump_name}")))
+                            })
+                            .when(live, |r| {
+                                r.child(div().text_color(success).child("· connected"))
+                            }),
+                    ),
             )
             .child(
                 h_flex()
+                    .flex_shrink_0()
                     .gap_2()
                     .child(
+                        Button::new("ssh-form-save")
+                            .label("Save")
+                            .small()
+                            // Off with nothing to write: the button is the page's
+                            // unsaved-changes indicator, so it has to be honest.
+                            .disabled(!dirty)
+                            .on_click(cx.listener(|this, _, _w, cx| this.save_ssh_form(cx))),
+                    )
+                    .child(
+                        // The one action this page exists for, so it carries the
+                        // solid fill — unlike the master column's Add, which sits
+                        // over a list and would shout.
                         Button::new("ssh-form-connect")
                             .label("Connect")
-                            .outline()
+                            .primary()
                             .small()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.save_and_connect_profile(window, cx)
                             })),
-                    )
-                    .child(
-                        // Plain, not `.primary()`: keep the soft sheet aesthetic (see
-                        // the Add-profile / Duplicate-to-Edit buttons) — a near-black
-                        // fill is too jarring here.
-                        Button::new("ssh-form-save")
-                            .label("Save")
-                            .small()
-                            .on_click(cx.listener(|this, _, _w, cx| this.save_ssh_form(cx))),
                     ),
             );
 
@@ -2725,11 +3356,21 @@ impl Tty7App {
         form: &SshProfileForm,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let count = parse_forwards(&form.forwards.read(cx).value()).len();
+        let muted = cx.theme().muted_foreground;
+        let count = form
+            .forwards
+            .iter()
+            .filter(|r| r.collect(cx).is_some())
+            .count();
+        let summary = match count {
+            0 => "none".to_string(),
+            1 => "1 rule, opened with the session".to_string(),
+            n => format!("{n} rules, opened with the session"),
+        };
         let mut section = v_flex().child(self.disclosure_header(
             "ssh-sec-fwd",
-            "Port forwards",
-            &format!("({count})"),
+            "Port forwarding",
+            &summary,
             form.show_forwards,
             cx,
             |this, cx| {
@@ -2739,19 +3380,164 @@ impl Tty7App {
                 }
             },
         ));
-        if form.show_forwards {
-            section = section
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            "One rule per line: L|R|D bind_host:port target_host:port [description]. Dynamic (D) omits the target.",
-                        ),
-                )
-                .child(div().w_full().child(Input::new(&form.forwards).small()));
+        if !form.show_forwards {
+            return section.into_any_element();
         }
-        section.into_any_element()
+
+        for (idx, row) in form.forwards.iter().enumerate() {
+            section = section.child(self.render_forward_rule_row(idx, row, cx));
+        }
+
+        section
+            .child(
+                h_flex().pt_1p5().child(
+                    Button::new("ssh-fwd-add")
+                        .label("+ Add rule")
+                        .ghost()
+                        .small()
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.add_forward_rule(window, cx)),
+                        ),
+                ),
+            )
+            .child(
+                // The direction letters carry the whole meaning of a rule, and
+                // `L`/`R` are the one pair people reliably mix up.
+                h_flex()
+                    .gap_3()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("L — a local port reaches the remote side")
+                    .child("R — a remote port reaches this machine")
+                    .child("D — dynamic SOCKS proxy"),
+            )
+            .into_any_element()
+    }
+
+    /// One forward rule: direction, listener, target, description, remove.
+    fn render_forward_rule_row(
+        &self,
+        idx: usize,
+        row: &ForwardRuleForm,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        // Dynamic listens locally and proxies wherever the client asks, so it has
+        // no fixed target. The boxes stay in place (dimmed) rather than
+        // disappearing, so switching direction doesn't reflow the row.
+        let needs_target = row.kind != ForwardKind::Dynamic;
+        let kind_idx = match row.kind {
+            ForwardKind::Local => 0,
+            ForwardKind::Remote => 1,
+            ForwardKind::Dynamic => 2,
+        };
+        // Filled in but not connectable — flagged here rather than dropped
+        // silently on save, which is what the old text box did.
+        let incomplete = row.collect(cx).is_none() && !row.is_blank(cx);
+
+        // `xsmall` rather than the sheet's usual `small`: five controls share this
+        // row, and 24px is the height the segmented track beside them is fixed at.
+        // The row reads as one compact table cell — that internal alignment beats
+        // matching the full-width single inputs in the rows above.
+        let endpoint = |host: &Entity<InputState>, port: &Entity<InputState>| {
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(div().w(px(104.)).child(Input::new(host).xsmall()))
+                .child(div().text_xs().text_color(muted).child(":"))
+                .child(div().w(px(58.)).child(Input::new(port).xsmall()))
+        };
+
+        v_flex()
+            .gap_0p5()
+            .py_1()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(self.segmented(
+                        format!("ssh-fwd-kind-{idx}"),
+                        &["L", "R", "D"],
+                        kind_idx,
+                        cx,
+                        move |this, ix, _w, cx| {
+                            let kind = match ix {
+                                1 => ForwardKind::Remote,
+                                2 => ForwardKind::Dynamic,
+                                _ => ForwardKind::Local,
+                            };
+                            if let Some(f) = this.ssh_form_mut()
+                                && let Some(r) = f.forwards.get_mut(idx)
+                            {
+                                r.kind = kind;
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .child(endpoint(&row.bind_host, &row.bind_port))
+                    .child(div().text_xs().text_color(muted).child("→"))
+                    .child(
+                        div()
+                            .opacity(if needs_target { 1.0 } else { 0.35 })
+                            .child(endpoint(&row.target_host, &row.target_port)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(80.))
+                            .child(Input::new(&row.description).xsmall()),
+                    )
+                    .child(
+                        Button::new(("ssh-fwd-remove", idx))
+                            .icon(Icon::new(IconName::Close))
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.remove_forward_rule(idx, cx)
+                            })),
+                    ),
+            )
+            .when(incomplete, |col| {
+                col.child(div().text_xs().text_color(danger).child(if needs_target {
+                    "Needs a listen port and a target host:port — won't be saved."
+                } else {
+                    "Needs a listen port — won't be saved."
+                }))
+            })
+            .into_any_element()
+    }
+
+    /// Append a blank forward rule to the open form and subscribe its inputs.
+    fn add_forward_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let row = seed_forward_row(window, cx, &ForwardRule::default());
+        let subs: Vec<_> = forward_row_inputs(&row)
+            .into_iter()
+            .map(|input| {
+                cx.subscribe_in(input, window, |_this, _i, ev: &InputEvent, _w, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        cx.notify();
+                    }
+                })
+            })
+            .collect();
+        if let Some(f) = self.ssh_form_mut() {
+            f.forwards.push(row);
+            f._subs.extend(subs);
+            f.show_forwards = true;
+        }
+        cx.notify();
+    }
+
+    /// Drop one forward rule from the open form.
+    fn remove_forward_rule(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(f) = self.ssh_form_mut()
+            && idx < f.forwards.len()
+        {
+            f.forwards.remove(idx);
+        }
+        cx.notify();
     }
 
     fn render_ssh_profile_advanced_section(
@@ -2795,6 +3581,9 @@ impl Tty7App {
         };
 
         // Verify host keys / warn-on-close tri-states (Default / On / Off).
+        let on_off = |b: bool| if b { "on" } else { "off" };
+        let vhk_default = on_off(cx.global::<Config>().verify_host_keys);
+        let woc_default = on_off(cx.global::<Config>().ssh_warn_on_close);
         let vhk_idx = match form.verify_host_keys {
             None => 0,
             Some(true) => 1,
@@ -2964,7 +3753,10 @@ impl Tty7App {
             )
             .child(self.settings_row(
                 "Verify host keys",
-                "Override the global known_hosts check for this profile.",
+                // Name the value `Default` actually resolves to. "Overrides the
+                // global setting" tells you a mechanism exists but not what it
+                // currently does, which is the only part worth reading here.
+                format!("Default follows Defaults, which is {vhk_default}."),
                 self.segmented(
                     "ssh-form-vhk",
                     &["Default", "On", "Off"],
@@ -2985,7 +3777,7 @@ impl Tty7App {
             ))
             .child(self.settings_row(
                 "Warn before closing",
-                "Override the global confirm-before-closing for this profile.",
+                format!("Default follows Defaults, which is {woc_default}."),
                 self.segmented(
                     "ssh-form-woc",
                     &["Default", "On", "Off"],
@@ -4820,39 +5612,65 @@ mod tests {
         assert_eq!(humanize_action("Quit"), "Quit");
     }
 
+    /// A host is findable by every part of the address it is displayed with,
+    /// not just its name — an imported alias often *is* its hostname.
     #[test]
-    fn forwards_round_trip_through_text() {
-        let rules = vec![
-            ForwardRule {
-                kind: ForwardKind::Local,
-                bind: HostPort::new("127.0.0.1", 8080),
-                target: HostPort::new("10.0.0.1", 80),
-                description: "web".to_string(),
-            },
-            ForwardRule {
-                kind: ForwardKind::Dynamic,
-                bind: HostPort::new("127.0.0.1", 1080),
-                target: HostPort::default(),
-                description: String::new(),
-            },
-        ];
-        let text = forwards_text(&rules);
-        let parsed = parse_forwards(&text);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].kind, ForwardKind::Local);
-        assert_eq!(parsed[0].bind.port, 8080);
-        assert_eq!(parsed[0].target.host, "10.0.0.1");
-        assert_eq!(parsed[0].description, "web");
-        assert_eq!(parsed[1].kind, ForwardKind::Dynamic);
-        assert_eq!(parsed[1].bind.port, 1080);
+    fn the_host_filter_matches_name_address_and_port() {
+        let mut p = SshProfile::new("prod-web");
+        p.host = "10.0.1.21".to_string();
+        p.user = "deploy".to_string();
+        p.port = 2222;
+
+        assert!(ssh_row_matches(&p, ""), "an empty query keeps everything");
+        assert!(ssh_row_matches(&p, "prod"));
+        assert!(ssh_row_matches(&p, "10.0.1"));
+        assert!(ssh_row_matches(&p, "deploy"));
+        assert!(ssh_row_matches(&p, "2222"));
+        assert!(!ssh_row_matches(&p, "staging"));
     }
 
+    /// The filter is case-insensitive on a lowercased query, which is what the
+    /// master column hands it.
     #[test]
-    fn parse_forwards_skips_malformed_lines() {
-        // Bad kind, and a Local rule missing its target — both skipped.
-        let parsed = parse_forwards("X 1:2 3:4\nL 127.0.0.1:9000\nR 0.0.0.0:80 10.0.0.2:8080");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].kind, ForwardKind::Remote);
+    fn the_host_filter_ignores_case() {
+        let mut p = SshProfile::new("Prod-Web");
+        p.host = "Example.COM".to_string();
+        assert!(ssh_row_matches(&p, "prod"));
+        assert!(ssh_row_matches(&p, "example.com"));
+    }
+
+    /// Imported aliases lead, ungrouped hosts trail, and anything the user named
+    /// sits between them — so the `~/.ssh/config` bucket is never buried.
+    #[test]
+    fn group_buckets_sort_imported_first_and_ungrouped_last() {
+        let mut keys = vec!["", "Work", crate::core::ssh_config::IMPORTED_GROUP];
+        keys.sort_by_key(|k| ssh_group_rank(k));
+        assert_eq!(
+            keys,
+            vec![crate::core::ssh_config::IMPORTED_GROUP, "Work", ""]
+        );
+    }
+
+    /// The import bucket is labelled by the file it mirrors: it is a live link
+    /// to something edited elsewhere, not a record of a past import.
+    #[test]
+    fn group_labels_name_the_file_and_the_app() {
+        assert_eq!(
+            ssh_group_label(crate::core::ssh_config::IMPORTED_GROUP),
+            "~/.ssh/config"
+        );
+        assert_eq!(ssh_group_label(""), "In tty7");
+        assert_eq!(ssh_group_label("Work"), "Work");
+    }
+
+    /// A profile's bucket comes off its own `group`, with `None` collapsing to
+    /// the same key the ungrouped section uses.
+    #[test]
+    fn group_key_falls_back_to_the_ungrouped_bucket() {
+        let mut p = SshProfile::new("a");
+        assert_eq!(ssh_group_key(&p), "");
+        p.group = Some("Work".to_string());
+        assert_eq!(ssh_group_key(&p), "Work");
     }
 
     #[test]
