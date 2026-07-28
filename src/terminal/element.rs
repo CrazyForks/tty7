@@ -738,24 +738,6 @@ fn powerline_path(bounds: Bounds<Pixels>, shape: PowerlineShape) -> gpui::Path<P
     }
 }
 
-/// The width `paint_glyphs` clips a segment's paint to.
-///
-/// A batched `Run`/`Wide` segment clips to its exact column span (`cells`
-/// columns): its glyphs come from faces whose advance matches the cell, so
-/// nothing should spill past that span. A lone `solo` glyph is different — it
-/// can be a symbol whose face paints ink well past the single cell the grid
-/// reserved for it: a non-Mono Nerd Font sets a *one-cell advance* on its icons
-/// yet draws up to ~1.9 cells of ink (measured across Hasklug / Meslo /
-/// JetBrainsMono NF), and the OS cascade serves a proportional `➜`/`❯` the same
-/// way. Clipping that to one cell severs the glyph mid-ink — the incomplete
-/// icons and the cut-off arrow in issue #17.
-///
-/// Advance is no signal there (it reads one cell for exactly those overflowing
-/// icons), so a solo glyph gets a two-cell window instead. A glyph that already
-/// fits is untouched — it has no ink to spill — while a symbol that overflows
-/// renders whole, bleeding into a trailing blank the way iTerm2 and Terminal.app
-/// do with non-Mono faces. The two-cell bound keeps a pathological face from
-/// smearing a lone glyph across the row.
 /// What a natively-drawn cell — a Powerline separator or a box-drawing/block
 /// character, both painted as geometry rather than as a font glyph — still has
 /// to send through the text pipeline after its ink is on screen.
@@ -777,6 +759,24 @@ fn native_cell_residue(style: &GlyphStyle) -> Option<char> {
     style.draws_on_blanks().then_some(' ')
 }
 
+/// The width `paint_glyphs` clips a segment's paint to.
+///
+/// A batched `Run`/`Wide` segment clips to its exact column span (`cells`
+/// columns): its glyphs come from faces whose advance matches the cell, so
+/// nothing should spill past that span. A lone `solo` glyph is different — it
+/// can be a symbol whose face paints ink well past the single cell the grid
+/// reserved for it: a non-Mono Nerd Font sets a *one-cell advance* on its icons
+/// yet draws up to ~1.9 cells of ink (measured across Hasklug / Meslo /
+/// JetBrainsMono NF), and the OS cascade serves a proportional `➜`/`❯` the same
+/// way. Clipping that to one cell severs the glyph mid-ink — the incomplete
+/// icons and the cut-off arrow in issue #17.
+///
+/// Advance is no signal there (it reads one cell for exactly those overflowing
+/// icons), so a solo glyph gets a two-cell window instead. A glyph that already
+/// fits is untouched — it has no ink to spill — while a symbol that overflows
+/// renders whole, bleeding into a trailing blank the way iTerm2 and Terminal.app
+/// do with non-Mono faces. The two-cell bound keeps a pathological face from
+/// smearing a lone glyph across the row.
 fn seg_clip_width(solo: bool, cells: usize, cell_width: Pixels) -> Pixels {
     if solo {
         cell_width * 2.
