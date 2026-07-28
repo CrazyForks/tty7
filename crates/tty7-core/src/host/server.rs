@@ -144,6 +144,21 @@ impl Services {
 #[derive(Default)]
 pub struct AttachRegistry {
     live: Mutex<Vec<Live>>,
+    /// Held across *both* tables for the length of one handover.
+    ///
+    /// A takeover moves two things that live in different places: this
+    /// registry's handles, and the `WorkspaceStore`'s record. Each is
+    /// internally locked, and that is not enough — two clients attaching to one
+    /// workspace at the same moment can each win a different table, after which
+    /// the store names a session the registry has already evicted and no
+    /// `detach` can ever clear it, because the token no longer matches. From
+    /// then on the workspace reports a takeover against a client that
+    /// disconnected hours ago.
+    ///
+    /// Coarse on purpose: attach and detach happen once per workspace opened or
+    /// closed, so serializing them costs nothing worth measuring. Always the
+    /// outermost lock of the two, and never held while writing to a peer.
+    handover: Mutex<()>,
 }
 
 struct Live {
@@ -182,6 +197,11 @@ struct Evicted {
 }
 
 impl AttachRegistry {
+    /// Take the handover lock. See [`AttachRegistry::handover`].
+    fn handover(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.handover.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Who holds `workspace` — `(token, hostname)`. Diagnostics and tests.
     pub fn holder(&self, workspace: &str) -> Option<(String, String)> {
         self.locked()
@@ -242,6 +262,14 @@ impl AttachRegistry {
             });
         }
         evicted
+    }
+
+    /// Forget `workspace` whoever holds it — the workspace itself is gone.
+    ///
+    /// Unconditional, unlike [`AttachRegistry::release`]: a delete is not one
+    /// session giving something up, it is the thing ceasing to exist.
+    fn forget_workspace(&self, workspace: &str) {
+        self.locked().retain(|l| l.workspace != workspace);
     }
 
     /// Release `workspace`, but only if `conn` still holds it. `false` means it
@@ -520,13 +548,21 @@ fn attach_workspace(
     dedicated: bool,
 ) -> io::Result<Option<String>> {
     let store = conn.workspaces()?;
-    let displaced = store.attach(
-        workspace,
-        Attachment::new(conn.holder.token.clone(), conn.holder.hostname.clone()),
-    );
-    let evicted = conn
-        .attachments
-        .claim(workspace, conn.id, &conn.holder, dedicated);
+    let (displaced, evicted) = {
+        // Both tables move under one lock. Held only across the two moves —
+        // the notice below goes out with nothing held, because writing to a
+        // peer that has stopped reading must not hold up the next client's
+        // attach.
+        let _handover = conn.attachments.handover();
+        let displaced = store.attach(
+            workspace,
+            Attachment::new(conn.holder.token.clone(), conn.holder.hostname.clone()),
+        );
+        let evicted = conn
+            .attachments
+            .claim(workspace, conn.id, &conn.holder, dedicated);
+        (displaced, evicted)
+    };
 
     if let Some(evicted) = evicted {
         log::info!(
@@ -562,6 +598,7 @@ fn attach_workspace(
 /// then tidied up must not evict the client that took over from it.
 fn detach_workspace(conn: &Arc<Conn>, workspace: &str) -> io::Result<bool> {
     let store = conn.workspaces()?;
+    let _handover = conn.attachments.handover();
     let released = conn.attachments.release(workspace, conn.id);
     let forgotten = store.detach(workspace, &conn.holder.token);
     Ok(released || forgotten)
@@ -814,7 +851,19 @@ fn run_request(
         ControlRequest::WorkspaceDelete { id } => {
             // Deleting what is not there is success — a delete that raced
             // another client's delete has got what it asked for.
-            conn.workspaces()?.delete(&id, conn.workspace_origin)?;
+            let store = conn.workspaces()?;
+            {
+                // The store drops its own attachment on delete; the registry
+                // has to be told, and under the same lock, or the two disagree
+                // with no race needed at all. Left behind, the stale `Live`
+                // entry means the *next* client to attach a workspace with this
+                // id evicts a session nobody displaced — and, that entry being
+                // dedicated, closes its whole link, taking every other
+                // workspace on it down too.
+                let _handover = conn.attachments.handover();
+                store.delete(&id, conn.workspace_origin)?;
+                conn.attachments.forget_workspace(&id);
+            }
             (ReplyOk::Unit, Vec::new())
         }
 
@@ -894,6 +943,7 @@ impl Conn {
     /// earlier is already gone from the registry and is not touched — the exact
     /// case the store's token check exists for, seen from the other side.
     fn release_all_workspaces(&self) {
+        let _handover = self.attachments.handover();
         let released = self.attachments.release_conn(self.id);
         let Some(store) = self.workspaces.as_ref() else {
             return;
@@ -3012,6 +3062,98 @@ mod tests {
         assert!(
             ControlServerMsg::read(&mut laptop).is_err(),
             "a dedicated connection is closed once its workspace is gone"
+        );
+    }
+
+    /// Deleting a workspace clears it from *both* tables.
+    ///
+    /// The store drops its own attachment on delete. If the registry keeps its
+    /// handle, the two disagree with no race needed, and the next client to
+    /// attach that id evicts a session nobody displaced — closing its whole
+    /// link, since a dedicated entry takes every other workspace on that
+    /// connection down with it.
+    #[test]
+    fn deleting_a_workspace_clears_both_attachment_tables() {
+        let (services, _dir) = workspace_services();
+        let registry = Arc::clone(&services.attachments);
+        let store = services.workspaces.clone().unwrap();
+
+        let ((mut laptop, _), _l) =
+            raw_hello(services.clone(), hello_for("w", "tok-laptop", "laptop"));
+        await_holder(&registry, "w", "laptop");
+        assert!(store.attachment("w").is_some());
+
+        ask(
+            &mut laptop,
+            1,
+            ControlRequest::WorkspacePut {
+                id: "w".to_string(),
+                json: ws_record("w", "the workspace"),
+            },
+        );
+        let reply = ask(
+            &mut laptop,
+            2,
+            ControlRequest::WorkspaceDelete {
+                id: "w".to_string(),
+            },
+        );
+        assert!(
+            matches!(reply, ControlReply::Ok(ReplyOk::Unit)),
+            "{reply:?}"
+        );
+
+        assert!(
+            store.attachment("w").is_none(),
+            "the store still names a holder for a workspace that is gone"
+        );
+        assert!(
+            registry.holder("w").is_none(),
+            "the registry still holds a workspace that is gone"
+        );
+    }
+
+    /// The store's record and the registry's handle move under **one** lock.
+    ///
+    /// They are separate tables with separate locks, and taking them one after
+    /// the other is not enough: two clients attaching the same workspace at the
+    /// same instant can each win a different one, after which the store names a
+    /// session the registry has already evicted. No `detach` can clear it — its
+    /// token no longer matches — so from then on the workspace reports a
+    /// takeover against a client that disconnected hours ago.
+    ///
+    /// Held from the test rather than raced, because the window is a few
+    /// instructions wide and a racing test passes against the broken ordering
+    /// far more often than it fails. Holding the handover proves the stronger
+    /// thing anyway: with it held, an attach reaches *neither* table.
+    #[test]
+    fn an_attach_moves_both_tables_under_one_lock() {
+        let (services, _dir) = workspace_services();
+        let registry = Arc::clone(&services.attachments);
+        let store = services.workspaces.clone().unwrap();
+
+        let held = registry.handover();
+        // The handshake replies before the attach, so this returns rather than
+        // blocking on the lock we are holding.
+        let ((_laptop, _ok), _served) =
+            raw_hello(services.clone(), hello_for("w", "tok-laptop", "laptop"));
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            registry.holder("w").is_none(),
+            "the registry was moved while a handover was in flight"
+        );
+        assert!(
+            store.attachment("w").is_none(),
+            "the store was moved while a handover was in flight"
+        );
+
+        drop(held);
+        await_holder(&registry, "w", "laptop");
+        assert_eq!(
+            store.attachment("w").map(|a| a.token).as_deref(),
+            Some("tok-laptop"),
+            "both tables have to name the same session once the handover is done"
         );
     }
 

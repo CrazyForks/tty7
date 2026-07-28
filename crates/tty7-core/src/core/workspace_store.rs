@@ -72,6 +72,20 @@ pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 /// error rather than grow the file until the disk fills.
 pub const MAX_WORKSPACES: usize = 1024;
 
+/// Ceiling on the whole document, which is what a single `WorkspaceList` reply
+/// has to fit into.
+///
+/// The per-record and per-count ceilings above are independent of each other,
+/// and their product is 4 GiB — sixty-four times the frame limit. Seventeen
+/// accepted `WorkspacePut`s of a maximal record are enough to put the array
+/// past it, and from then on *every* `WorkspaceList` on the machine is a reply
+/// that cannot be encoded: every client shows an empty workspace list, and the
+/// only repair is editing the file by hand. So the total is bounded where it is
+/// actually known — at the save — with room to spare under
+/// [`MAX_FRAME`](crate::daemon::protocol::MAX_FRAME), since what is measured
+/// here is the pretty-printed form and the wire carries the compact one.
+pub const MAX_STORE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Ceiling on a record key, which is a workspace uuid in every non-hostile
 /// case.
 const MAX_ID_BYTES: usize = 128;
@@ -172,6 +186,23 @@ struct State {
     /// because the file's array order is what a client lists, and a hash map
     /// would reshuffle the picker on every save for no reason.
     records: Vec<(String, Value)>,
+    /// `(mtime, len)` of the file as this snapshot last saw it, or `None` when
+    /// there was no file.
+    ///
+    /// This store is not always the only writer. The design's answer is one
+    /// server per machine, and `tty7-server --stdio` now starts the daemon
+    /// rather than serving in-process for exactly that reason — but an explicit
+    /// `--serve`, or a daemon that could not be started, still leaves two
+    /// processes over one file. `persist` writes the *whole* document, so
+    /// without noticing that the file moved underneath it, the second to save
+    /// silently drops everything the first did.
+    stamp: Option<(std::time::SystemTime, u64)>,
+}
+
+/// The file's identity as far as [`State::stamp`] is concerned.
+fn stamp_of(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 impl WorkspaceStore {
@@ -186,9 +217,10 @@ impl WorkspaceStore {
     pub fn open(path: impl Into<PathBuf>) -> Arc<WorkspaceStore> {
         let path = path.into();
         let records = load_records(&path);
+        let stamp = stamp_of(&path);
         Arc::new(WorkspaceStore {
+            state: Mutex::new(State { records, stamp }),
             path,
-            state: Mutex::new(State { records }),
             attachments: Mutex::new(Vec::new()),
             subscribers: Mutex::new(Vec::new()),
             next_subscriber: AtomicU64::new(1),
@@ -302,7 +334,7 @@ impl WorkspaceStore {
                     Undo::Remove(st.records.len() - 1)
                 }
             };
-            if let Err(e) = self.persist(&st) {
+            if let Err(e) = self.persist(&st, true) {
                 match undo {
                     Undo::Restore(i, old) => st.records[i].1 = old,
                     Undo::Remove(i) => {
@@ -311,6 +343,7 @@ impl WorkspaceStore {
                 }
                 return Err(e);
             }
+            self.restamp(&mut st);
         }
 
         self.notify(id, origin);
@@ -329,10 +362,11 @@ impl WorkspaceStore {
                 return Ok(false);
             };
             let removed = st.records.remove(i);
-            if let Err(e) = self.persist(&st) {
+            if let Err(e) = self.persist(&st, false) {
                 st.records.insert(i, removed);
                 return Err(e);
             }
+            self.restamp(&mut st);
         }
         // The attachment goes with it: nothing can be attached to a workspace
         // that no longer exists, and leaving the entry would have M6 report a
@@ -440,7 +474,24 @@ impl WorkspaceStore {
         // in-memory state is still a valid state (the undo path restores it
         // before returning) and the file is either the old or the new one, so
         // carrying on is strictly better than taking the server down.
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Re-read when the file moved under us. Cheap — one `stat` — and it is
+        // what keeps a second writer's changes from being overwritten by this
+        // store's whole-document save, since the base we mutate is then theirs
+        // rather than a snapshot from before their write. It also lets a read
+        // see their changes at all: `notify` reaches subscribers in *this*
+        // process only.
+        let on_disk = stamp_of(&self.path);
+        if on_disk != st.stamp {
+            log::debug!(
+                "{} changed underneath this store; re-reading",
+                self.path.display()
+            );
+            st.records = load_records(&self.path);
+            st.stamp = on_disk;
+        }
+        st
     }
 
     fn attachments_locked(&self) -> std::sync::MutexGuard<'_, Vec<(String, Attachment)>> {
@@ -453,7 +504,14 @@ impl WorkspaceStore {
     /// [`Workspaces`](crate::core::session::Workspaces) parses, so this file is
     /// readable by the same code that reads a client's `session.json` and a
     /// human can diff the two.
-    fn persist(&self, st: &State) -> io::Result<()> {
+    /// Write the whole document.
+    ///
+    /// `bounded` asks for [`MAX_STORE_BYTES`] to be enforced. Set by the paths
+    /// that *grow* the file and clear by the ones that shrink it: a store that
+    /// came up holding an over-large file — written by an older build, or by
+    /// hand — must still be able to delete its way back under the limit rather
+    /// than refusing every operation including the repair.
+    fn persist(&self, st: &State, bounded: bool) -> io::Result<()> {
         #[derive(Serialize)]
         struct Doc<'a> {
             workspaces: Vec<&'a Value>,
@@ -462,10 +520,27 @@ impl WorkspaceStore {
             workspaces: st.records.iter().map(|(_, v)| v).collect(),
         };
         let bytes = serde_json::to_vec_pretty(&doc).map_err(io::Error::other)?;
+        if bounded && bytes.len() > MAX_STORE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the workspace store would be {} bytes; the limit is {MAX_STORE_BYTES}, \
+                     which is what one WorkspaceList reply has to fit into",
+                    bytes.len()
+                ),
+            ));
+        }
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         crate::core::config::write_atomic(&self.path, &bytes)
+    }
+
+    /// Record the file's identity after this store wrote it, so the next
+    /// [`WorkspaceStore::locked`] does not mistake its own save for someone
+    /// else's and re-read it.
+    fn restamp(&self, st: &mut State) {
+        st.stamp = stamp_of(&self.path);
     }
 }
 
@@ -630,6 +705,102 @@ mod tests {
             ]},
             "last_active": 1_753_600_000u64,
         })
+    }
+
+    /// Two stores over one file — an explicit `--serve` alongside a daemon, or
+    /// a daemon that could not be started — must not silently undo each other.
+    ///
+    /// `persist` writes the whole document, so a store that mutates a snapshot
+    /// taken before the other's write puts that stale snapshot back. This is
+    /// how a workspace rename made on the laptop vanishes the next time the
+    /// desktop reorders a tab, with nothing reported to either.
+    #[test]
+    fn a_second_writer_does_not_get_overwritten_by_a_stale_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(STORE_FILE);
+        let first = WorkspaceStore::open(&path);
+        let second = WorkspaceStore::open(&path);
+
+        first.put("w1", record("w1", "one"), None).unwrap();
+        first.put("w2", record("w2", "two"), None).unwrap();
+
+        // `second` last read the file when it was empty. It has to notice.
+        second
+            .put("w2", record("w2", "two, renamed"), None)
+            .unwrap();
+
+        let names: Vec<String> = WorkspaceStore::open(&path)
+            .list()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["one", "two, renamed"],
+            "the second writer's save dropped what the first had written"
+        );
+    }
+
+    /// The same, one layer down: a read sees another process's write, because
+    /// `notify` only ever reaches subscribers inside this process.
+    #[test]
+    fn a_read_sees_a_change_another_store_made_to_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(STORE_FILE);
+        let reader = WorkspaceStore::open(&path);
+        let writer = WorkspaceStore::open(&path);
+
+        assert!(reader.get("w1").is_none());
+        writer.put("w1", record("w1", "one"), None).unwrap();
+        assert_eq!(
+            reader.get("w1").map(|r| r["name"].clone()),
+            Some(serde_json::json!("one")),
+            "a read answered from a snapshot older than the file"
+        );
+    }
+
+    /// The per-record and per-count ceilings do not bound their product, so the
+    /// document is bounded where it is known — at the save.
+    ///
+    /// Past `MAX_FRAME` the store is not merely large, it is unreadable: every
+    /// `WorkspaceList` becomes a reply that cannot be encoded, so every client
+    /// shows an empty list and the only repair is editing the file by hand.
+    #[test]
+    fn a_put_that_would_outgrow_one_reply_is_refused_and_undone() {
+        let (store, _dir) = store();
+        // Records big enough that a handful crosses the limit, and small enough
+        // that the test stays quick.
+        let chunk = "x".repeat(2 * 1024 * 1024);
+        let big = |id: &str| {
+            let mut r = record(id, "big");
+            r["padding"] = Value::String(chunk.clone());
+            r
+        };
+
+        let mut accepted = 0;
+        let refusal = loop {
+            let id = format!("w{accepted}");
+            match store.put(&id, big(&id), None) {
+                Ok(()) => accepted += 1,
+                Err(e) => break e,
+            }
+            assert!(accepted < 64, "the total was never bounded");
+        };
+        assert_eq!(refusal.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            refusal.to_string().contains("WorkspaceList"),
+            "the refusal has to say what the limit is for: {refusal}"
+        );
+
+        // Refused, not half-applied: the record that did not fit is not in the
+        // store and is not in the file.
+        assert_eq!(store.len(), accepted);
+        assert!(store.get(&format!("w{accepted}")).is_none());
+        assert_eq!(WorkspaceStore::open(store.path()).len(), accepted);
+
+        // And a delete still works, so a store that came up over the limit can
+        // be repaired rather than being wedged.
+        assert!(store.delete("w0", None).unwrap());
     }
 
     // ── The basics ──────────────────────────────────────────────────────────
