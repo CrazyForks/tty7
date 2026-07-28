@@ -152,12 +152,9 @@ memchr = "2"
 
 # System tray / menu bar status item (`ui::tray`). Rasterizes the bundled SVG
 # logo into the tray bitmap at runtime — gpui's own SVG path only yields a
-# tinted alpha mask, not raw RGBA. The gpui fork pins the same 0.47, so this
-# shares gpui's resvg/usvg/tiny-skia stack. gpui-component still declares its
-# own `resvg = "0.45.1"` (semver-incompatible with 0.47), so one legacy 0.45
-# stack remains until that fork catches up (no type conflicts — only
-# `image::RgbaImage` crosses the boundary); default features off drops the
-# text/font machinery our icon SVGs don't use.
+# tinted alpha mask, not raw RGBA. The gpui and gpui-component forks both pin
+# the same 0.47, so the whole tree shares a single resvg/usvg/tiny-skia stack;
+# default features off drops the text/font machinery our icon SVGs don't use.
 resvg = { version = "0.47", default-features = false }
 
 # The tray icon itself, macOS + Windows: tauri's `tray-icon` (NSStatusItem /
