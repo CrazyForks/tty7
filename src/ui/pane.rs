@@ -542,8 +542,15 @@ impl Pane<Entity<TerminalView>> {
                     // (terminal glyphs + cell fills), unlike a background-tinted
                     // scrim which is near-invisible on a light theme (white on
                     // white). Applied to the container, so a click still lands on
-                    // the terminal and focuses it.
-                    .when(show_focus && !focused, |d| d.opacity(0.55))
+                    // the terminal and focuses it. `dim_inactive_panes` opts out.
+                    .when(
+                        show_focus
+                            && !focused
+                            && cx
+                                .global::<crate::core::config::Config>()
+                                .dim_inactive_panes,
+                        |d| d.opacity(0.55),
+                    )
                     .child(v.clone())
                     .into_any_element()
             }

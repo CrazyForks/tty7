@@ -60,6 +60,11 @@ pub struct Config {
     pub window_opacity: Option<f32>,
     /// Global window-blur override. `None` follows the active theme's `blur`.
     pub window_blur: Option<bool>,
+    /// Fade unfocused panes in a split tab so the focused terminal reads as
+    /// foreground. On by default; when off every pane renders at full opacity
+    /// and only focus (cursor, etc.) distinguishes the active one.
+    #[serde(default = "default_true")]
+    pub dim_inactive_panes: bool,
     /// Optional keybinding overrides: action name (e.g. "NewTab") → keystroke
     /// (e.g. "secondary-t", which is ⌘ on macOS and Ctrl elsewhere). Unknown
     /// actions and unparseable keystrokes are ignored (with a warning) so a bad
@@ -596,6 +601,7 @@ impl Default for Config {
             theme_preset_dark: "dark".to_string(),
             window_opacity: None,
             window_blur: None,
+            dim_inactive_panes: true,
             keybindings: HashMap::new(),
             keybinding_preset: default_preset(),
             prefix: default_prefix(),
