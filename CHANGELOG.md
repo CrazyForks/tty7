@@ -5,9 +5,31 @@ All notable changes to tty7 are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [26.7.6] - 2026-07-28
 
 ### Added
+
+- **Readline parity at the prompt** — keys that worked in a raw terminal stopped
+  working the moment shell integration engaged, because the local command editor
+  owned the keyboard at the prompt and swallowed every chord it didn't
+  recognise. `Ctrl-P` / `Ctrl-N` now walk history exactly like ↑ / ↓ (completion
+  picker and reverse search included); `Ctrl-Y` yanks back whatever `Ctrl-W` /
+  `Ctrl-U` / `Ctrl-K` / `Alt-D` last cut, from a one-slot kill ring of the
+  editor's own — zle's ring holds text this editor never cut, so borrowing it
+  would paste the wrong thing; and `Alt-.` inserts the previous command's last
+  word, repeating to walk further back. Any chord the editor has no answer for
+  — `Ctrl-T`, `Alt-U`, a `bindkey`-ed widget — now hands the line to the shell
+  so zle's keymap decides, instead of vanishing. Pressing any of them while
+  scrolled up snaps the viewport back to the live prompt first, so a recalled
+  line can't be edited off-screen. (#222)
+
+- **One Dark Pro built-in theme** — a ninth built-in, slotted alphabetically
+  among the dark themes. Two deliberate departures from the VS Code theme's
+  terminal set, both caught by this repo's contrast tests: the accent is the
+  editor's focus blue `#528bff` rather than the syntax blue, which sits at the
+  same luminance as the switch knob it has to be legible against; and normal red
+  stays the classic `#e06c75`, because the Pro terminal red lands too close to
+  the warning orange to stay distinguishable. (#224)
 
 - **Panes are told which terminal they're running in** — every pane now carries
   `TERM_PROGRAM=tty7` and `TERM_PROGRAM_VERSION`, the de-facto standard pair
@@ -23,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity, not a capability, and posing as another terminal is a legitimate way
   to get a tool that only recognises a fixed list to light up. Local panes only
   — ssh forwards environment variables solely by agreement between client and
-  server, so a remote host still sees whatever it sets for itself. (#212)
+  server, so a remote host still sees whatever it sets for itself. (#219)
 
 - **Inactive panes only fade if you want them to** — a split tab dims every pane
   but the focused one so the active terminal reads as foreground. That is the
@@ -49,6 +71,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Box-drawing characters no longer break into dashes between rows** — they
+  rendered as font glyphs, and a glyph only covers the font's own line height
+  while the cell is `font_size × line_height` (1.4 by default). At any line
+  height above 1.0 every vertical run of `│` `╭` `╰` was perforated at each row
+  boundary: two-line prompts never closed their corners, TUI frames were dotted
+  down both sides. U+2500–U+257F and U+2580–U+259F are now drawn as native
+  geometry pinned to the cell's real edges — the same special case kitty,
+  Alacritty, WezTerm and iTerm2 all ship, and what tty7's Powerline separators
+  already did. Covers mixed light/heavy weights, the double-line set with its
+  junctions left open, rounded corners, dashes, diagonals, block eighths and the
+  ░▒▓ shades. (#229)
+
+- **Underlines survived box-drawing characters, and strokes stay one weight at
+  fractional DPI** — two things the native-drawing path changed without meaning
+  to, both invisible at the integer device scale it was developed on. An `ESC[4m`
+  span or a hovered URL showed a one-column hole wherever it crossed a box
+  character, because the underline rides the shaped text run and the native cell
+  returned before building one; the cell now shapes a space in its own style, so
+  gpui draws the line from the same `UnderlineStyle` as its neighbours. And at
+  125% / 150% / 175% display scaling a vertical rule alternated thin/thick across
+  every column, since a logical stroke width that isn't a whole number of device
+  pixels rounds differently per column; widths are now laid off the snapped near
+  edge in whole device pixels. Nothing changes at 1x or 2x. (#234)
+
+- **Thai SARA AM lost its vowel and rendered as a dotted circle** — `ำ` (U+0E33)
+  is width 1 and correctly gets its own column, but it is not atomic to the
+  shaper: rustybuzz decomposes it and moves the nikhahit backwards onto the base
+  consonant, which needs the base in the same run. It was being segmented alone,
+  so there was nothing to reorder onto. A following SARA AM is now absorbed into
+  the preceding cell's cluster, so base, tone mark and vowel shape together. Lao
+  SARA AM (U+0EB3) takes the same path and comes along. (#230)
+
 - **Italic CJK rendered as unrelated CJK on Windows** — every character came out
   as a different character, one for one, consistently, so it read as a broken
   locale or a mangled encoding. It was neither. Hack, the bundled default, has no
@@ -60,7 +114,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   right; the outlines they were pointing into belonged to a different face. Fixed
   in our gpui fork by rasterizing the face DirectWrite actually chose, which also
   closes a latent use-after-free in the same cache: it keyed fonts by a raw
-  pointer to a face nothing held a reference to.
+  pointer to a face nothing held a reference to. (#233)
 
 ## [26.7.5] - 2026-07-27
 

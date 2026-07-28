@@ -9538,7 +9538,7 @@ dependencies = [
 
 [[package]]
 name = "tty7"
-version = "26.7.5"
+version = "26.7.6"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
