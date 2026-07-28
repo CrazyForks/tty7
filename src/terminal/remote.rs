@@ -1802,6 +1802,13 @@ impl RemoteTerminal {
 
     /// Send one workspace-scoped request and return the daemon's reply.
     ///
+    /// How long a workspace-addressed request waits for the daemon.
+    ///
+    /// Generous, because behind it is an SSH round trip to the workspace's own
+    /// machine and possibly a connection being established — but finite, which
+    /// is the point.
+    const WORKSPACE_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// The counterpart of the `pane_id`-addressed helpers above for a pane that
     /// lives on a *remote workspace*: there is no pane on the local daemon to
     /// name, so the request carries the workspace and a secret-free spec naming
@@ -1813,6 +1820,17 @@ impl RemoteTerminal {
     /// empty list.
     pub fn on_workspace(req: WorkspaceRequest) -> anyhow::Result<DaemonMsg> {
         let mut stream = connect()?;
+        // Bounded, because the daemon's answer is not just its own work: it
+        // resolves the workspace's SSH connection and, for the forward ops,
+        // waits for the *server* to acknowledge a `cancel_tcpip_forward`. On a
+        // box that has gone unreachable — lid closed, VPN dropped, which is
+        // exactly when someone reaches for Stop Workspace — that acknowledgement
+        // never comes. Without a deadline this read parks forever, and the
+        // thread with it.
+        //
+        // Best effort: a transport that will not take a timeout degrades to the
+        // old unbounded read rather than failing the request outright.
+        let _ = stream.set_read_timeout(Some(Self::WORKSPACE_OP_TIMEOUT));
         ClientMsg::OnWorkspace(Box::new(req)).encode(&mut stream)?;
         match DaemonMsg::read(&mut stream)? {
             DaemonMsg::Error(msg) => Err(anyhow::anyhow!(msg)),

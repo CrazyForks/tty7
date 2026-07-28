@@ -211,6 +211,15 @@ pub(crate) struct FileTreeState {
     /// triangle. `Arc` because `set_dirs` is itself a host call and has to be
     /// handed to the background executor.
     watch: Option<Arc<WatchSub>>,
+    /// The host `watch` was opened against, kept so a subscription is never
+    /// reused across a different one.
+    ///
+    /// A `HostId` is not enough to tell them apart: reconnecting removes the
+    /// dead `RemoteHost` and inserts a fresh one under the *same* id, so the id
+    /// matches while the `ControlClient` behind the old subscription is gone.
+    /// Compared by pointer, which distinguishes both that and an outright
+    /// switch to another machine.
+    watch_host: Option<SharedHost>,
     /// A subscription is being opened. Without this, render would ask for one
     /// per frame until the first answer lands.
     watch_opening: bool,
@@ -255,6 +264,7 @@ impl FileTreeState {
         })
         .detach();
         Self {
+            watch_host: None,
             children: ByHost::default(),
             loads: InFlight::default(),
             stale: HashSet::new(),
@@ -283,6 +293,25 @@ impl FileTreeState {
     fn sync_watch(&mut self, host: SharedHost, dirs: HashSet<PathBuf>, cx: &mut Context<Tty7App>) {
         self.watched = dirs;
         let want: Vec<PathBuf> = self.watched.iter().cloned().collect();
+        // A subscription belongs to the host that opened it. Reconnecting drops
+        // the dead `RemoteHost` and inserts a fresh one under the same
+        // `HostId`, and adopting another workspace can change the host outright
+        // — in both cases the subscription here is over a `ControlClient` that
+        // is gone. `set_dirs` on it then fails with `ConnectionReset`, which is
+        // warned and dropped, and nothing ever opens a new one: after the first
+        // reconnect of a remote workspace the tree stops seeing changes made on
+        // the far side for the rest of the window's life.
+        if !self
+            .watch_host
+            .as_ref()
+            .is_some_and(|opened_with| Arc::ptr_eq(opened_with, &host))
+        {
+            // Dropping the subscription is what unsubscribes, on both sides.
+            self.watch = None;
+            self.watch_host = None;
+            self.watch_busy = false;
+            self.watch_dirty = false;
+        }
         if let Some(sub) = self.watch.clone() {
             if self.watch_busy {
                 self.watch_dirty = true;
@@ -316,6 +345,7 @@ impl FileTreeState {
         }
         self.watch_opening = true;
         let host_id = host.id();
+        let opened_host = Arc::clone(&host);
         let opened_with = self.watched.clone();
         HostOps::run(
             host,
@@ -337,6 +367,7 @@ impl FileTreeState {
                 // independent of the subscription the state holds.
                 let events = sub.events().clone();
                 app.file_tree.watch = Some(sub);
+                app.file_tree.watch_host = Some(opened_host);
                 cx.spawn(async move |app, cx| {
                     while let Ok(batch) = events.recv().await {
                         let ok = app.update(cx, |app, _cx| {
