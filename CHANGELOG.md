@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Panes are told which terminal they're running in** — every pane now carries
+  `TERM_PROGRAM=tty7` and `TERM_PROGRAM_VERSION`, the de-facto standard pair
+  Apple Terminal introduced and iTerm2, WezTerm, Ghostty, VS Code and tmux all
+  set. `TERM` names terminfo capabilities and can't answer "which program is
+  this", so without the pair, capability probes (`supports-color`,
+  `supports-hyperlinks`, and the CLI ecosystem built on them), editors applying
+  terminal-specific workarounds, and shell prompts all fell back to their most
+  conservative behaviour. tty7's own `TTY7` marker doesn't help them — it exists
+  so globally-installed agent hooks stay silent in other terminals, and nothing
+  third-party knows to look for it. Unlike `TERM` and `COLORTERM`, both new
+  variables can be overridden from `env` in `config.json`: they name an
+  identity, not a capability, and posing as another terminal is a legitimate way
+  to get a tool that only recognises a fixed list to light up. Local panes only
+  — ssh forwards environment variables solely by agreement between client and
+  server, so a remote host still sees whatever it sets for itself. (#212)
+
 - **Inactive panes only fade if you want them to** — a split tab dims every pane
   but the focused one so the active terminal reads as foreground. That is the
   right default, but it is not free: at 55% opacity a dim theme's comment color
