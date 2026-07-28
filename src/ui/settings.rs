@@ -1531,6 +1531,7 @@ impl Tty7App {
         };
         let config = cx.global::<Config>();
         let overridden = config.window_opacity.is_some() || config.window_blur.is_some();
+        let dim_inactive_panes = config.dim_inactive_panes;
         let theme = presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
         let opacity = Tty7App::effective_window_opacity(cx);
         let blur = cx.global::<Config>().window_blur.unwrap_or(theme.blur);
@@ -1554,6 +1555,10 @@ impl Tty7App {
                 cx.listener(|this, on: &bool, window, cx| this.set_window_blur(*on, window, cx)),
             )
             .into_any_element();
+        let dim_switch = crate::ui::theme::switch("dim-inactive-panes", cx)
+            .checked(dim_inactive_panes)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_dim_inactive_panes(*on, cx)))
+            .into_any_element();
 
         v_flex()
             // Not "Window": Settings → Window & Tabs owns that word for the
@@ -1571,6 +1576,12 @@ impl Tty7App {
                 "Blur",
                 "Blur whatever is behind a translucent window (macOS).",
                 blur_switch,
+                cx,
+            ))
+            .child(self.settings_row(
+                "Dim inactive panes",
+                "Fade unfocused panes in a split so the active one stands out.",
+                dim_switch,
                 cx,
             ))
             // Only offered while an override is active; otherwise the values

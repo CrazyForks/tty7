@@ -2506,6 +2506,12 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.check_for_updates = on);
     }
 
+    /// Toggle inactive-pane dimming. Applies on the next render — the pane tree
+    /// reads the flag from the `Config` global each frame.
+    pub(crate) fn set_dim_inactive_panes(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.dim_inactive_panes = on);
+    }
+
     pub(crate) fn set_cursor_blink(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.cursor_blink = on);
         // Turning blink off mid-cycle could leave the cursor in its hidden phase;
