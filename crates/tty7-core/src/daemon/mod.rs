@@ -4,6 +4,9 @@
 //!
 //! Layout:
 //! - [`protocol`] — the framed wire messages shared by client and daemon.
+//! - [`control`] — the *control* dialect: the same framing, but multiplexed by
+//!   request id, carrying the filesystem/git RPCs a remote workspace runs
+//!   against a machine that isn't this one.
 //! - [`transport`] — the cross-platform local stream the protocol rides on
 //!   (Unix-domain socket on Unix, loopback TCP on Windows).
 //! - `pane` (daemon side) — owns one PTY/child, a replay ring, and fan-out.
@@ -21,11 +24,16 @@
 //! `terminal::remote::RemoteTerminal`, exposing the same surface as the old
 //! in-process `Terminal` so the view layer is largely unchanged.
 
+pub mod control;
+pub mod duplex;
+pub mod install;
 pub mod pane;
 pub mod pidfile;
 pub mod procinfo;
 pub mod protocol;
 pub(crate) mod remote;
+pub mod remote_link;
+pub mod router;
 pub mod server;
 pub mod spawn;
 /// Native (russh) SSH session engine — see the module docs.

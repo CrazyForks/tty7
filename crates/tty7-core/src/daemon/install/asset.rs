@@ -1,0 +1,429 @@
+//! The pure half of the installer: `uname -sm` → release asset, client version →
+//! release tag → download URL, and the remote paths a server binary lives at.
+//!
+//! Everything here is a total function of its arguments — no network, no SFTP, no
+//! clock — which is the point: [`docs/remote-server-assets.md`] is a *literal*
+//! contract with the release workflow, and a contract is only worth having if
+//! both sides can be tested without standing up the other one.
+//!
+//! [`docs/remote-server-assets.md`]: ../../../../../docs/remote-server-assets.md
+
+use std::fmt;
+
+/// The release asset for a 64-bit x86 Linux box.
+pub const ASSET_X86_64: &str = "tty7-server-x86_64-unknown-linux-musl";
+/// The release asset for a 64-bit ARM Linux box.
+pub const ASSET_AARCH64: &str = "tty7-server-aarch64-unknown-linux-musl";
+/// The sha256 manifest published beside every asset in a release.
+pub const CHECKSUMS_ASSET: &str = "checksums.txt";
+
+/// Where release assets are downloaded from. The tag and asset name are appended
+/// (`{RELEASE_BASE}/{tag}/{asset}`); HTTPS to github.com is the trust anchor for
+/// the checksum file itself (§16).
+pub const RELEASE_BASE: &str = "https://github.com/l0ng-ai/tty7/releases/download";
+
+/// The `XDG_DATA_HOME`-shaped directory tty7 owns on a remote machine, relative
+/// to `$HOME`. Split into components because the installer has to `mkdir` each
+/// level (SFTP has no `mkdir -p`) and because joining is `/`-only regardless of
+/// the *client's* OS — a Windows client must not produce `.local\share`
+/// (contract §4.3).
+pub const INSTALL_DIR_COMPONENTS: [&str; 4] = [".local", "share", "tty7", "bin"];
+
+/// Why a machine cannot be served a `tty7-server`.
+///
+/// Both variants carry the raw `uname -sm` output: the whole value of refusing
+/// instead of guessing is that the user can read the string we refused and either
+/// recognise their box or paste it into an issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsupportedTarget {
+    /// `uname -s` is not `Linux`. A remote tty7-server is a Linux binary; there
+    /// is no macOS/BSD/Solaris asset to fall back to.
+    NotLinux { raw: String },
+    /// `uname -s` is `Linux` but `uname -m` is not one we publish for — 32-bit
+    /// arm, i686, riscv64, or something we have never seen.
+    UnknownMachine { raw: String },
+    /// `uname -sm` did not produce the two whitespace-separated words it is
+    /// specified to. Almost always means the command did not run at all (a login
+    /// shell that printed a banner, a restricted shell) rather than a real
+    /// answer, so it gets its own variant with the raw text.
+    Unparseable { raw: String },
+}
+
+impl UnsupportedTarget {
+    /// The `uname -sm` text this refusal is about, as the remote printed it.
+    pub fn raw(&self) -> &str {
+        match self {
+            Self::NotLinux { raw } | Self::UnknownMachine { raw } | Self::Unparseable { raw } => {
+                raw
+            }
+        }
+    }
+}
+
+impl fmt::Display for UnsupportedTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotLinux { raw } => write!(
+                f,
+                "a remote tty7 workspace needs a Linux host; this machine reports `uname -sm` = {raw:?}"
+            ),
+            Self::UnknownMachine { raw } => write!(
+                f,
+                "no tty7-server is published for this architecture (`uname -sm` = {raw:?}); \
+                 supported: x86_64/amd64 and aarch64/arm64"
+            ),
+            Self::Unparseable { raw } => write!(
+                f,
+                "`uname -sm` did not answer with a system and machine name (got {raw:?})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedTarget {}
+
+/// Map raw `uname -sm` output to the release asset that runs on that machine.
+///
+/// **Exact string match, then fail.** No prefix matching, no "starts with `arm`
+/// so it is probably aarch64" heuristic. Guessing wrong here installs a binary
+/// that dies with `Exec format error` at first exec — an error with no visible
+/// connection to the architecture detection that caused it, on a machine the user
+/// may not be able to inspect. An unknown machine string is a clean, explainable
+/// refusal that names itself (`docs/remote-server-assets.md`).
+///
+/// `amd64` / `arm64` are accepted alongside the values Linux actually reports
+/// because some container images and BSD-flavoured userlands normalise to them.
+pub fn asset_for_uname(uname_sm: &str) -> Result<&'static str, UnsupportedTarget> {
+    let raw = uname_sm.trim().to_string();
+    let mut words = raw.split_whitespace();
+    let (Some(system), Some(machine), None) = (words.next(), words.next(), words.next()) else {
+        return Err(UnsupportedTarget::Unparseable { raw });
+    };
+    if system != "Linux" {
+        return Err(UnsupportedTarget::NotLinux { raw });
+    }
+    match machine {
+        "x86_64" | "amd64" => Ok(ASSET_X86_64),
+        "aarch64" | "arm64" | "armv8l" | "armv8b" => Ok(ASSET_AARCH64),
+        _ => Err(UnsupportedTarget::UnknownMachine { raw }),
+    }
+}
+
+/// Resolve an asset name that arrived over a wire back to a `&'static str`.
+///
+/// [`super::InstallRequest::asset`] is `&'static str` because on the producing
+/// side it is always one of the two consts above. A decoder cannot promise that,
+/// and the relay in `daemon::router` has to rebuild the request a *different
+/// process* raised — so the two known names map to themselves, and anything else
+/// (a client older or newer than the daemon that named it) is leaked.
+///
+/// Leaking is bounded in the way that matters: the value comes from tty7's own
+/// daemon naming one of its own release assets, and a session sees at most a
+/// handful of distinct machines. It is preferred to guessing one of the two
+/// consts, which would show the user a prompt naming the wrong architecture.
+pub fn interned(name: &str) -> &'static str {
+    if name == ASSET_X86_64 {
+        ASSET_X86_64
+    } else if name == ASSET_AARCH64 {
+        ASSET_AARCH64
+    } else {
+        Box::leak(name.to_string().into_boxed_str())
+    }
+}
+
+/// The release tag whose assets a client of `version` must download.
+///
+/// The nightly channel republishes a single rolling `nightly` tag every night, so
+/// a nightly client must not ask for `v26.7.6-nightly.20260727` — that tag does
+/// not exist and never will. Rule: the version contains `-nightly.` → `nightly`;
+/// otherwise `v` + version.
+pub fn release_tag(version: &str) -> String {
+    if version.contains("-nightly.") {
+        "nightly".to_string()
+    } else {
+        format!("v{version}")
+    }
+}
+
+/// The download URL for one asset of one release.
+pub fn download_url(tag: &str, asset: &str) -> String {
+    format!("{RELEASE_BASE}/{tag}/{asset}")
+}
+
+/// Absolute remote paths for one client version's server binary.
+///
+/// Built with explicit `/` joins from an absolute `$HOME` the remote resolved for
+/// us (SFTP does not expand `~`, and `PathBuf::join` would emit `\` on a Windows
+/// client — contract §4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePaths {
+    /// `$HOME/.local/share/tty7/bin`.
+    pub bin_dir: String,
+    /// `$HOME/.local/share/tty7/bin/tty7-server-<version>` — the atomically
+    /// published binary. The version is *in the path* so two clients of different
+    /// versions can coexist on one machine; only the running daemon is singular.
+    pub binary: String,
+    /// `$HOME/.local/share/tty7/bin/.tty7-server-<version>.tmp` — where the bytes
+    /// land before `chmod` + `rename`.
+    ///
+    /// A dotfile, so a half-written upload is not mistaken for an installed
+    /// server by anything globbing the directory, and a *fixed* name per version
+    /// so an install killed mid-upload leaves one reusable file behind instead of
+    /// accumulating random-suffixed litter on someone else's disk.
+    pub temp: String,
+    /// Every directory that must exist before the upload, outermost first. SFTP
+    /// has no recursive mkdir, so the installer walks this.
+    pub dir_chain: Vec<String>,
+}
+
+/// Build the remote paths for `version` under an absolute remote `home`.
+pub fn remote_paths(home: &str, version: &str) -> RemotePaths {
+    let home = home.trim_end_matches('/');
+    let mut dir_chain = Vec::with_capacity(INSTALL_DIR_COMPONENTS.len());
+    let mut cursor = home.to_string();
+    for part in INSTALL_DIR_COMPONENTS {
+        cursor = format!("{cursor}/{part}");
+        dir_chain.push(cursor.clone());
+    }
+    let bin_dir = cursor;
+    RemotePaths {
+        binary: format!("{bin_dir}/{}", binary_name(version)),
+        temp: format!("{bin_dir}/.tty7-server-{version}.tmp"),
+        dir_chain,
+        bin_dir,
+    }
+}
+
+/// The filename a `version`'s server binary is installed under.
+pub fn binary_name(version: &str) -> String {
+    format!("tty7-server-{version}")
+}
+
+/// The version encoded in an installed binary's *path*, if it is one of ours.
+///
+/// This is how the running daemon's build is identified without asking it: the
+/// install path carries the version by construction, so `readlink /proc/<pid>/exe`
+/// on the remote answers "which tty7-server is serving this machine" for every
+/// build we have ever shipped — including ones older than any handshake we could
+/// send them.
+pub fn version_from_path(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next()?;
+    let rest = name.strip_prefix("tty7-server-")?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The contract's mapping table, row for row. This test *is* the client half
+    /// of `docs/remote-server-assets.md`: if the release workflow ever renames an
+    /// asset, this is where the two sides stop agreeing.
+    #[test]
+    fn uname_maps_to_the_published_assets() {
+        for raw in ["Linux x86_64", "Linux amd64"] {
+            assert_eq!(asset_for_uname(raw).unwrap(), ASSET_X86_64, "{raw}");
+        }
+        for raw in [
+            "Linux aarch64",
+            "Linux arm64",
+            "Linux armv8l",
+            "Linux armv8b",
+        ] {
+            assert_eq!(asset_for_uname(raw).unwrap(), ASSET_AARCH64, "{raw}");
+        }
+    }
+
+    /// Real `uname` output ends in a newline, and a shell may pad it. Trimming is
+    /// the only normalisation allowed — the *words* are matched exactly.
+    #[test]
+    fn uname_output_is_trimmed_before_matching() {
+        assert_eq!(asset_for_uname("Linux x86_64\n").unwrap(), ASSET_X86_64);
+        assert_eq!(
+            asset_for_uname("  Linux x86_64  \r\n").unwrap(),
+            ASSET_X86_64
+        );
+    }
+
+    /// The refusal path, which is the whole reason this function exists. Every
+    /// one of these would be a plausible prefix/fuzzy match — `x86_64-v2` starts
+    /// with `x86_64`, `armv7l` starts with `arm`, `Linux` appears inside
+    /// `GNU/Linux` — and each would install a binary that cannot exec.
+    #[test]
+    fn unknown_machines_are_refused_not_guessed() {
+        for raw in [
+            "Linux i686",
+            "Linux i386",
+            "Linux armv7l",
+            "Linux armv6l",
+            "Linux riscv64",
+            "Linux ppc64le",
+            "Linux s390x",
+            "Linux x86_64-v2",
+            "Linux aarch64_be",
+            "Linux ARM64",
+            "Linux X86_64",
+        ] {
+            let err = asset_for_uname(raw).unwrap_err();
+            assert!(
+                matches!(err, UnsupportedTarget::UnknownMachine { .. }),
+                "{raw} must be refused as an unknown machine, got {err:?}"
+            );
+            assert_eq!(err.raw(), raw, "the refusal must quote what it refused");
+        }
+    }
+
+    /// A non-Linux host is refused with its own variant so the message can say
+    /// "needs Linux" rather than "unknown architecture" — the user's next step is
+    /// completely different.
+    #[test]
+    fn non_linux_systems_are_refused() {
+        for raw in [
+            "Darwin arm64",
+            "FreeBSD amd64",
+            "SunOS i86pc",
+            "linux x86_64",
+        ] {
+            assert!(
+                matches!(
+                    asset_for_uname(raw).unwrap_err(),
+                    UnsupportedTarget::NotLinux { .. }
+                ),
+                "{raw}"
+            );
+        }
+    }
+
+    /// Anything that is not exactly two words never reaches the mapping. In
+    /// practice this catches the common failure where the command did not run and
+    /// we got a shell banner, an error message, or nothing at all — and it is the
+    /// guard that keeps a three-word string from silently matching on its first
+    /// two words.
+    #[test]
+    fn output_that_is_not_two_words_is_unparseable() {
+        for raw in [
+            "",
+            "   ",
+            "Linux",
+            "x86_64",
+            "Linux x86_64 GNU/Linux",
+            "bash: uname: command not found",
+        ] {
+            assert!(
+                matches!(
+                    asset_for_uname(raw).unwrap_err(),
+                    UnsupportedTarget::Unparseable { .. }
+                ),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// Stable releases resolve to their own tag; nightlies resolve to the single
+    /// rolling `nightly` tag, because per-night tags are never created.
+    #[test]
+    fn release_tag_sends_nightlies_to_the_rolling_tag() {
+        assert_eq!(release_tag("26.7.5"), "v26.7.5");
+        assert_eq!(release_tag("0.1.0"), "v0.1.0");
+        assert_eq!(release_tag("26.7.6-nightly.20260727"), "nightly");
+        // A pre-release that is *not* a nightly keeps its own tag: only the
+        // nightly channel republishes under a rolling name.
+        assert_eq!(release_tag("26.8.0-rc.1"), "v26.8.0-rc.1");
+    }
+
+    #[test]
+    fn download_urls_point_at_the_release_the_tag_names() {
+        assert_eq!(
+            download_url(&release_tag("26.7.5"), ASSET_X86_64),
+            "https://github.com/l0ng-ai/tty7/releases/download/v26.7.5/tty7-server-x86_64-unknown-linux-musl"
+        );
+        assert_eq!(
+            download_url(&release_tag("26.7.6-nightly.20260727"), CHECKSUMS_ASSET),
+            "https://github.com/l0ng-ai/tty7/releases/download/nightly/checksums.txt"
+        );
+    }
+
+    /// Path construction, including the `mkdir` chain. Asserted literally: these
+    /// strings are what an SFTP server sees, and a `\` in any of them (which is
+    /// what `PathBuf::join` would produce on a Windows client) would create a file
+    /// named `.local\share\tty7\bin` in the remote home directory.
+    #[test]
+    fn remote_paths_are_posix_and_versioned() {
+        let p = remote_paths("/home/me", "26.7.5");
+        assert_eq!(p.bin_dir, "/home/me/.local/share/tty7/bin");
+        assert_eq!(
+            p.binary,
+            "/home/me/.local/share/tty7/bin/tty7-server-26.7.5"
+        );
+        assert_eq!(
+            p.temp,
+            "/home/me/.local/share/tty7/bin/.tty7-server-26.7.5.tmp"
+        );
+        assert_eq!(
+            p.dir_chain,
+            vec![
+                "/home/me/.local",
+                "/home/me/.local/share",
+                "/home/me/.local/share/tty7",
+                "/home/me/.local/share/tty7/bin",
+            ]
+        );
+        assert!(
+            !p.temp.contains('\\') && !p.binary.contains('\\'),
+            "remote paths are POSIX regardless of the client's OS"
+        );
+    }
+
+    /// The temp name is a sibling dotfile of the target, so the finishing rename
+    /// is same-directory (same filesystem → atomic) and a partial upload is not
+    /// mistaken for an installed server.
+    #[test]
+    fn temp_path_is_a_hidden_sibling_of_the_binary() {
+        let p = remote_paths("/home/me", "26.7.5");
+        let dir = |s: &str| s.rsplit_once('/').unwrap().0.to_string();
+        assert_eq!(dir(&p.temp), dir(&p.binary));
+        assert!(p.temp.rsplit('/').next().unwrap().starts_with('.'));
+        assert!(!p.binary.rsplit('/').next().unwrap().starts_with('.'));
+    }
+
+    /// A trailing slash on the resolved home (some SFTP servers return `/root/`)
+    /// must not produce a doubled separator.
+    #[test]
+    fn trailing_slash_on_home_is_absorbed() {
+        assert_eq!(
+            remote_paths("/root/", "1.0.0").binary,
+            "/root/.local/share/tty7/bin/tty7-server-1.0.0"
+        );
+        // Root as home is degenerate but must still be well-formed.
+        assert_eq!(remote_paths("/", "1.0.0").bin_dir, "/.local/share/tty7/bin");
+    }
+
+    /// The inverse used to identify a *running* daemon from its executable path.
+    #[test]
+    fn version_is_recoverable_from_an_install_path() {
+        assert_eq!(
+            version_from_path("/home/me/.local/share/tty7/bin/tty7-server-26.7.4").as_deref(),
+            Some("26.7.4")
+        );
+        assert_eq!(
+            version_from_path("tty7-server-26.7.6-nightly.20260727").as_deref(),
+            Some("26.7.6-nightly.20260727")
+        );
+        // Not ours, or not versioned: no opinion rather than a wrong one.
+        assert_eq!(version_from_path("/usr/bin/tty7-server"), None);
+        assert_eq!(version_from_path("/usr/local/bin/tty7-server-"), None);
+        assert_eq!(version_from_path("/bin/bash"), None);
+    }
+
+    /// Round-trip: the name we install under is the name we recognise later.
+    #[test]
+    fn install_path_and_version_extraction_round_trip() {
+        for version in ["26.7.5", "0.1.0", "26.7.6-nightly.20260727"] {
+            let p = remote_paths("/home/me", version);
+            assert_eq!(version_from_path(&p.binary).as_deref(), Some(version));
+        }
+    }
+}

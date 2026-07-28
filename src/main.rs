@@ -303,11 +303,16 @@ fn main() {
     // panic — no message, no location. Record those to `crash.log` in the config
     // dir. Installed here, right after the config dir resolves, so both the GUI
     // and the daemon below are covered from their first line of real work.
-    crate::core::crash::install(if std::env::args().any(|a| a == "--daemon") {
+    let role = if std::env::args().any(|a| a == "--daemon") {
         "daemon"
     } else {
         "gui"
-    });
+    };
+    crate::core::crash::install(role);
+    // And the ordinary `log::` records, which otherwise go nowhere at all —
+    // the daemon's stdio is `/dev/null` by the time it is detached. Off unless
+    // `TTY7_LOG` asks for it; see `core::logfile`.
+    crate::core::logfile::install(role);
 
     // Daemon mode: when launched with `--daemon` we run the headless persistent
     // terminal server and never open a window. This is the backing process the GUI

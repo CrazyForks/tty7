@@ -16,14 +16,14 @@
 //! opening a second window onto it.
 
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Global, Styled as _, TitlebarOptions,
-    WeakEntity, Window, WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Bounds, Global, Styled as _,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use gpui_component::{Root, TitleBar, WindowExt as _};
 
 use crate::core::config::{Config, StartupMode};
 use crate::core::session::{WorkspaceId, WorkspaceStore};
-use crate::core::window_state::WindowState;
+use crate::core::window_state::{WindowGeometry as _, WindowState};
 use crate::ui::app::Tty7App;
 
 /// How far each additional window is offset from the one before it, so a new
@@ -295,25 +295,50 @@ pub fn menu_order(cx: &App) -> Vec<(WorkspaceId, bool)> {
         .collect()
 }
 
-/// How many of a workspace's panes are still running in the daemon. Zero means
-/// closing it destroys nothing — every shell already exited — so the caller can
-/// skip the confirmation prompt.
-pub fn live_pane_count(cx: &App, workspace: WorkspaceId) -> usize {
-    let Some(ws) = WorkspaceStore::all(cx).get(workspace) else {
-        return 0;
-    };
+/// How many of a workspace's panes are still running on its own machine.
+/// `Some(0)` means closing it destroys nothing — every shell already exited —
+/// so the caller can skip the confirmation prompt.
+///
+/// `None` is "the machine could not be asked", and it exists because the old
+/// `0` conflated the two. A remote workspace whose link was down counted zero
+/// live panes, and "Stop Workspace" then went through **without a prompt** and
+/// killed sessions the user was never told about. Only a machine that answered
+/// can license skipping the confirmation.
+///
+/// Answered synchronously rather than from
+/// [`pane_liveness`](crate::terminal::pane_liveness): the prompt states an exact
+/// number about an irreversible action, so it wants a fresh count, not one that
+/// may be ten seconds old. This runs on a click, not on a frame.
+pub fn live_pane_count(cx: &App, workspace: WorkspaceId) -> Option<usize> {
+    let ws = WorkspaceStore::all(cx).get(workspace)?;
     let claimed = ws.pane_ids();
     if claimed.is_empty() {
-        return 0;
+        return Some(0);
     }
-    // One short-lived control connection, only when there is something to ask
-    // about — the picker renders far more often than a workspace is closed.
-    let alive: std::collections::HashSet<u64> = crate::terminal::RemoteTerminal::list_panes()
-        .into_iter()
-        .filter(|p| p.alive)
-        .map(|p| p.pane_id)
-        .collect();
-    claimed.iter().filter(|id| alive.contains(id)).count()
+    // One short-lived connection, only when there is something to ask about —
+    // the picker renders far more often than a workspace is closed. Routed to
+    // the workspace's own machine: a remote workspace's pane ids mean nothing
+    // to this computer's daemon, so asking it would count whichever *local*
+    // panes happen to hold those numbers and put a "3 running sessions will be
+    // ended" warning on a workspace that has none.
+    let route = crate::ui::remote_workspace::pane_route_for(cx, workspace);
+    match crate::terminal::RemoteTerminal::try_list_panes_on(&route) {
+        Ok(panes) => {
+            let alive: std::collections::HashSet<u64> = panes
+                .into_iter()
+                .filter(|p| p.alive)
+                .map(|p| p.pane_id)
+                .collect();
+            Some(claimed.iter().filter(|id| alive.contains(id)).count())
+        }
+        // This machine is the one case where a refused `List` *is* an answer:
+        // the daemon lives at a known socket on the same box, and one that
+        // cannot be reached is one with nothing running in it. Keeping this
+        // arm is what makes a local workspace behave exactly as it did before
+        // any of this was routed.
+        Err(_) if matches!(route, crate::terminal::PaneRoute::Local) => Some(0),
+        Err(_) => None,
+    }
 }
 
 /// Confirm, then stop `workspace`. Skips the prompt when nothing is running —
@@ -326,6 +351,39 @@ pub fn confirm_and_stop(cx: &mut App, window: &mut Window, workspace: WorkspaceI
 /// already exited, the saved layout is still something to lose.
 pub fn confirm_and_delete(cx: &mut App, window: &mut Window, workspace: WorkspaceId) {
     confirm_destructive(cx, window, workspace, "Delete", delete_workspace);
+}
+
+/// What the confirmation prompt says below its title, given what
+/// [`live_pane_count`] found.
+///
+/// Split out of [`confirm_destructive`] because it is the one part of a
+/// `window.prompt` path that can be tested: the three answers a liveness query
+/// can give — a count, zero, and "could not ask" — each have to reach the user
+/// as a different sentence, and the third one is new. Getting it wrong is not a
+/// wording bug: it is telling somebody nothing will be lost right before ending
+/// their sessions.
+fn destructive_detail(live: Option<usize>, verb: &str) -> String {
+    match (live, verb) {
+        // The machine could not be asked, so no number can be promised — say
+        // what is actually known, which is that anything still running there
+        // is about to end.
+        (None, "Delete") => "Its machine could not be reached. Any sessions still running there \
+                             will be ended, and the layout forgotten."
+            .to_string(),
+        (None, _) => {
+            "Its machine could not be reached. Any sessions still running there will be ended."
+                .to_string()
+        }
+        (Some(0), _) => "Its layout and working directories will be forgotten.".to_string(),
+        (Some(1), "Delete") => {
+            "1 running session will be ended and its layout forgotten.".to_string()
+        }
+        (Some(n), "Delete") => {
+            format!("{n} running sessions will be ended and the layout forgotten.")
+        }
+        (Some(1), _) => "1 running session will be ended.".to_string(),
+        (Some(n), _) => format!("{n} running sessions will be ended."),
+    }
 }
 
 /// Shared confirm-then-act path for the two destructive workspace actions.
@@ -345,17 +403,13 @@ fn confirm_destructive(
         .get(workspace)
         .map(|w| w.display_name())
         .unwrap_or_else(|| "this workspace".to_string());
-    if live == 0 && verb == "Stop" {
+    // Only a machine that *answered* zero licenses skipping the prompt. An
+    // unreachable one is the case most likely to still have work in it.
+    if live == Some(0) && verb == "Stop" {
         act(cx, workspace);
         return;
     }
-    let detail = match (live, verb) {
-        (0, _) => "Its layout and working directories will be forgotten.".to_string(),
-        (1, "Delete") => "1 running session will be ended and its layout forgotten.".to_string(),
-        (n, "Delete") => format!("{n} running sessions will be ended and the layout forgotten."),
-        (1, _) => "1 running session will be ended.".to_string(),
-        (n, _) => format!("{n} running sessions will be ended."),
-    };
+    let detail = destructive_detail(live, verb);
     // Title Case, like every other prompt title in the app — this one used to
     // lowercase "workspace" while its siblings read "Close Window?" /
     // "Quit and Stop Daemon?".
@@ -384,13 +438,43 @@ fn confirm_destructive(
 /// fresh shells. That is the difference from [`delete_workspace`], which throws
 /// the record away too.
 ///
-/// Callers confirm first when [`live_pane_count`] is non-zero; with nothing
+/// Callers confirm first unless [`live_pane_count`] answered zero; with nothing
 /// running there is nothing to lose.
 pub fn stop_workspace(cx: &mut App, workspace: WorkspaceId) {
+    // A remote workspace's panes live on the remote server, and its pane ids are
+    // *that* daemon's. Sending them here would not fail — it would succeed
+    // against whatever local panes happen to hold those numbers, killing a
+    // stranger's shells. The route is what makes "Stop" mean the same thing on
+    // both kinds of workspace.
+    let route = crate::ui::remote_workspace::pane_route_for(cx, workspace);
+    let host = WorkspaceStore::all(cx)
+        .get(workspace)
+        .map(|w| w.host_id())
+        .unwrap_or(crate::ui::host_ops::HostId::LOCAL);
     if let Some(ws) = WorkspaceStore::all(cx).get(workspace) {
-        for pane_id in ws.pane_ids() {
-            crate::terminal::RemoteTerminal::kill_pane(pane_id);
+        let ids = ws.pane_ids();
+        for pane_id in ids {
+            crate::terminal::RemoteTerminal::kill_pane_on(&route, pane_id);
         }
+    }
+    // The panes this machine just reported as alive are the ones we killed, so
+    // the cached answer is now wrong by our own hand. Waiting out its TTL would
+    // leave a green dot on the picker row of a workspace the user just stopped.
+    if cx
+        .try_global::<crate::terminal::pane_liveness::PaneLivenessCache>()
+        .is_some()
+    {
+        cx.update_global::<crate::terminal::pane_liveness::PaneLivenessCache, _>(|cache, _| {
+            cache.invalidate(host)
+        });
+    }
+    // Design §15: a remote workspace's port forwards are owned by the
+    // *workspace*, not by its panes, so nothing else ends them. Done before the
+    // window closes, because the route to the daemon is read off a live pane.
+    if let Some(app) = WindowRegistry::app_for(cx, workspace)
+        && let Some(app) = app.upgrade()
+    {
+        app.read(cx).teardown_workspace_forwards(cx);
     }
     // One workspace is shown by exactly one window, so stopping the work means
     // the window goes with it — leaving an empty frame behind reads as a
@@ -403,9 +487,61 @@ pub fn stop_workspace(cx: &mut App, workspace: WorkspaceId) {
 /// Delete a workspace outright: stop it, then forget it entirely. Irreversible
 /// — nothing about the layout survives.
 pub fn delete_workspace(cx: &mut App, workspace: WorkspaceId) {
+    // Delete it on the machine that owns it first, while the pointer to it is
+    // still on file. Doing this after `WorkspaceStore::remove` would leave the
+    // record stranded on the remote with no way left to name it.
+    delete_on_remote(cx, workspace);
     stop_workspace(cx, workspace);
     WorkspaceStore::remove(cx, workspace);
+    release_unused_hosts(cx);
     refresh_menu(cx);
+}
+
+/// Forget a remote workspace on the machine that owns it (design §10: the
+/// remote's `workspaces.json` is the authority, so deleting only the client's
+/// pointer would leave the workspace there and reappear on the next connect).
+///
+/// A no-op for a local workspace, and for a remote one this client is not
+/// currently connected to — there is no way to reach the record, and the delete
+/// is a user action rather than something to queue and replay later.
+fn delete_on_remote(cx: &mut App, workspace: WorkspaceId) {
+    let Some(host) = WorkspaceStore::remote_ref(cx, workspace) else {
+        return;
+    };
+    let Some(connection) = crate::ui::remote_workspace::connection_for(cx, workspace) else {
+        log::info!(
+            "deleting the local pointer to a workspace on {} without reaching it",
+            host.target
+        );
+        return;
+    };
+    let key = host.store_key();
+    cx.background_executor()
+        .spawn(async move {
+            if let Err(e) = crate::ui::remote_connect::delete_remote_workspace(&connection, key) {
+                log::warn!("could not delete the workspace on {}: {e}", host.target);
+            }
+        })
+        .detach();
+}
+
+/// Drop the connection to any machine no workspace points at any more.
+///
+/// One connection per machine is shared by every workspace on it, so it is
+/// released when the *last* one goes — not when a window closes. Anything less
+/// careful would tear down a live sibling window's host mid-call.
+fn release_unused_hosts(cx: &mut App) {
+    let live: Vec<_> = WorkspaceStore::all(cx)
+        .workspaces
+        .iter()
+        .filter(|w| w.is_remote())
+        .map(|w| w.host_id())
+        .collect();
+    for id in crate::ui::host_registry::HostRegistry::ids(cx) {
+        if !id.is_local() && !live.contains(&id) {
+            crate::ui::remote_connect::RemoteConnections::remove(cx, id);
+        }
+    }
 }
 
 /// Close whichever window is showing `workspace`, if any.
@@ -551,5 +687,52 @@ mod tests {
         // 5 steps further down-right.
         assert_eq!(cascade(b, 5).origin, b.origin);
         assert_eq!(cascade(b, 6).origin, cascade(b, 1).origin);
+    }
+
+    /// The three answers a liveness query can give each reach the user as a
+    /// different sentence — and the counted ones read exactly as they did
+    /// before "could not ask" became expressible.
+    #[test]
+    fn the_confirmation_says_which_of_the_three_answers_it_got() {
+        // Counted: unchanged wording, singular and plural, stop and delete.
+        assert_eq!(
+            destructive_detail(Some(1), "Stop"),
+            "1 running session will be ended."
+        );
+        assert_eq!(
+            destructive_detail(Some(3), "Stop"),
+            "3 running sessions will be ended."
+        );
+        assert_eq!(
+            destructive_detail(Some(1), "Delete"),
+            "1 running session will be ended and its layout forgotten."
+        );
+        assert_eq!(
+            destructive_detail(Some(3), "Delete"),
+            "3 running sessions will be ended and the layout forgotten."
+        );
+        // Counted zero: nothing is running, so only the layout is at stake.
+        assert_eq!(
+            destructive_detail(Some(0), "Delete"),
+            "Its layout and working directories will be forgotten."
+        );
+
+        // Could not ask. It must not claim a number, must not claim nothing
+        // will be lost, and must name the reason.
+        for verb in ["Stop", "Delete"] {
+            let detail = destructive_detail(None, verb);
+            assert!(
+                detail.contains("could not be reached"),
+                "{verb}: {detail:?} must say why there is no count"
+            );
+            assert!(
+                !detail.contains("forgotten.") || verb == "Delete",
+                "{verb}: {detail:?} promises a delete-only consequence"
+            );
+            assert!(
+                !detail.chars().any(|c| c.is_ascii_digit()),
+                "{verb}: {detail:?} states a count it does not have"
+            );
+        }
     }
 }

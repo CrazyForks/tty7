@@ -3,29 +3,25 @@
 //! tokenizer shared by the daemon- and client-side output scanners.
 //!
 //! These modules are framework-light and depend on neither `ui` nor `terminal`,
-//! so the dependency arrow always points *inward* to here. That keeps the door
-//! open to lifting `core` into a standalone crate later without untangling view
-//! code.
+//! so the dependency arrow always points *inward* to here.
+//!
+//! Most of it now lives one crate down, in `tty7-core`, so the headless
+//! `tty7-server` can share it — the modules re-exported below are that crate's,
+//! reachable under their original `crate::core::…` paths. What stays declared
+//! here is either gpui-shaped outright (`actions`, `update`) or the gpui half
+//! of a type whose data moved down (`config`, `session`, `window_state`).
+
+// A glob, so every module `tty7-core` grows is reachable here for free. The
+// four `pub mod`s below deliberately shadow their glob-imported namesakes: each
+// is a thin layer that re-exports the core module's contents itself — gpui for
+// `config` / `session` / `window_state`, the OS keychain for `keychain`.
+pub use tty7_core::core::*;
 
 pub mod actions;
-pub mod agent_hooks;
 pub mod agent_prompt;
-pub mod cli_agent;
 pub mod config;
-pub mod crash;
-// SSH connection-manager data layer (WS1). Its public API is consumed by the
-// daemon-session, auth, forwarding, and UI workstreams, which land separately —
-// so parts of it read as dead code until those merge.
-#[allow(dead_code)]
 pub mod keychain;
-pub mod osc;
-pub mod proc;
 pub mod session;
-pub mod shells;
 pub mod ssh_config;
-#[allow(dead_code)]
-pub mod ssh_profile;
-pub mod threads;
 pub mod update;
 pub mod window_state;
-pub mod worktree;

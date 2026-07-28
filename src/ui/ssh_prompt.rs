@@ -292,6 +292,18 @@ pub(crate) struct SshPromptState {
     remember: bool,
     /// Latest spawn phase, for a small status line.
     phase: Option<SshPhase>,
+    /// A prompt raised by a **routed** connect (a remote workspace's control
+    /// stream) rather than by a pane.
+    ///
+    /// Those have no pane and no `TerminalView` to answer through — the question
+    /// arrives while the route is still being set up, before anything exists to
+    /// render it — so the answer goes back down this channel instead. The sheet
+    /// itself is the same one, which is the point: one auth UI, two producers.
+    routed: Option<crate::ui::remote_connect::PendingAuth>,
+    /// The machine [`routed`](Self::routed) belongs to, kept separately because
+    /// answering *takes* the prompt and the queue still has to be released
+    /// afterwards.
+    routed_host: Option<tty7_core::host::HostId>,
     focus_handle: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -307,6 +319,8 @@ impl SshPromptState {
             inputs: Vec::new(),
             remember: false,
             phase: None,
+            routed: None,
+            routed_host: None,
             focus_handle: cx.focus_handle(),
             _subs: Vec::new(),
         }
@@ -320,6 +334,12 @@ impl SshPromptState {
         self.inputs.clear();
         self.remember = false;
         self._subs.clear();
+        // A routed prompt still parked here was never answered — a connect
+        // thread is blocked on it. Cancelling is the safe direction and the same
+        // answer an unanswered one times out into.
+        if let Some(pending) = self.routed.take() {
+            pending.answer(AuthResponse::Cancelled);
+        }
     }
 }
 
@@ -412,6 +432,68 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// Raise the sheet for a prompt that came off a **routed** connect (a remote
+    /// workspace reaching its machine), rather than off a pane.
+    ///
+    /// **Hands the prompt back** (`GiveBack`) when a sheet is already up, rather
+    /// than dropping it: the caller re-offers it, which is what the start-up auth
+    /// queue in `ui::remote_workspace` does. A dropped
+    /// [`PendingAuth`](crate::ui::remote_connect::PendingAuth) leaves a connect
+    /// thread parked until its 180s timeout.
+    pub(crate) fn raise_routed_auth(
+        &mut self,
+        pending: crate::ui::remote_connect::PendingAuth,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> crate::ui::remote_workspace::SheetOutcome {
+        use crate::ui::remote_workspace::SheetOutcome;
+        if self.ssh_prompt.model.is_some() {
+            return SheetOutcome::GiveBack(pending);
+        }
+        // No endpoint and no auto-supplied password: a routed connect's
+        // credentials were resolved before the route was opened, so there is no
+        // "the stored one was rejected" case to warn about here.
+        let Some(model) = PromptModel::from_prompt(pending.prompt.clone(), None, false) else {
+            // A banner, not a question. Show it and answer so the connect
+            // carries on rather than waiting out the consent timeout.
+            if let AuthPromptKind::Banner { text } = &pending.prompt {
+                self.ssh_prompt.banners.push(text.clone());
+            }
+            pending.answer(AuthResponse::Cancelled);
+            cx.notify();
+            return SheetOutcome::Raised;
+        };
+        let inputs = build_inputs(&model, window, cx);
+        let mut subs = Vec::new();
+        for input in &inputs {
+            subs.push(cx.subscribe_in(
+                input,
+                window,
+                |this, _input, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::PressEnter { .. }) {
+                        this.submit_ssh_prompt(window, cx);
+                    }
+                },
+            ));
+        }
+        if let Some(first) = inputs.first() {
+            first.update(cx, |s, cx| s.focus(window, cx));
+        }
+        // `pane_id` stays `None` so the overlay draws whatever tab is on screen:
+        // this sheet belongs to the *window's machine*, not to one pane in it.
+        self.ssh_prompt.pane = None;
+        self.ssh_prompt.pane_id = None;
+        self.ssh_prompt.request_id = 0;
+        self.ssh_prompt.model = Some(model);
+        self.ssh_prompt.inputs = inputs;
+        self.ssh_prompt.remember = false;
+        self.ssh_prompt._subs = subs;
+        self.ssh_prompt.routed_host = Some(pending.host);
+        self.ssh_prompt.routed = Some(pending);
+        cx.notify();
+        SheetOutcome::Raised
+    }
+
     /// Reply to the active prompt and clear it, then pick up any queued prompt.
     pub(crate) fn submit_ssh_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(model) = self.ssh_prompt.model.clone() else {
@@ -502,7 +584,13 @@ impl Tty7App {
         }
     }
 
-    fn respond_active(&self, response: AuthResponse, cx: &Context<Self>) {
+    fn respond_active(&mut self, response: AuthResponse, cx: &Context<Self>) {
+        // A routed prompt answers down its own channel: there is no pane, and
+        // the connect thread is parked on this reply.
+        if let Some(pending) = self.ssh_prompt.routed.take() {
+            pending.answer(response);
+            return;
+        }
         if let (Some(pane), id) = (&self.ssh_prompt.pane, self.ssh_prompt.request_id) {
             pane.read(cx).terminal.respond_auth(id, response);
         }
@@ -510,6 +598,13 @@ impl Tty7App {
 
     fn dismiss_and_advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.ssh_prompt.pane.clone();
+        // Design §10 / D7: the sheet is one machine's turn. Handing it back is
+        // what lets the next machine's queued connect ask its question, so it
+        // has to happen on every exit from a routed sheet — answered, cancelled
+        // or dismissed.
+        if let Some(host) = self.ssh_prompt.routed_host.take() {
+            crate::ui::remote_workspace::release_auth_sheet(host, cx);
+        }
         self.ssh_prompt.clear();
         // Another prompt may already be queued on the pane (e.g. a KI round after
         // a password). Pick it up.

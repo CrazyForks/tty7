@@ -48,9 +48,11 @@ const RESIZE_HANDLE_WIDTH: f32 = 8.;
 /// diff for the Changes tab and the body's scroll position.
 #[derive(Default)]
 pub(crate) struct RightPanelState {
-    /// The cwd `diff` was probed from — compared against the active pane's cwd to
-    /// decide whether the cached snapshot is still about the right repository.
-    pub(crate) diff_cwd: Option<PathBuf>,
+    /// The machine and cwd `diff` was probed from — compared against the active
+    /// pane's host and cwd to decide whether the cached snapshot is still about
+    /// the right repository. The host is half the identity: the same path on two
+    /// machines is two repositories.
+    pub(crate) diff_cwd: Option<(crate::ui::host_ops::HostId, PathBuf)>,
     /// Last completed probe. `Some(None)` and `None` are different answers:
     /// "probed, not a work tree" versus "never probed".
     pub(crate) diff: Option<Option<DiffSnapshot>>,
@@ -77,7 +79,14 @@ pub(crate) struct RightPanelState {
     /// because it can flip *without* a pane switch — a native-SSH pane you are
     /// already watching finishes connecting — and the loop reads this on each
     /// reschedule so it picks the change up on the next tick.
-    pub(crate) procs_forwards: bool,
+    /// How the Forwards band's requests reach the daemon while this poll loop
+    /// runs, or `None` when the pane on screen has nothing to forward over.
+    ///
+    /// A route rather than a `bool` because a remote workspace's forwards belong
+    /// to the *workspace*, not the pane (design §15): the pane id alone cannot
+    /// say which of the two owners to ask, and the reschedule below re-reads
+    /// this rather than carrying the decision forward.
+    pub(crate) procs_forwards: Option<crate::ui::app::ForwardRoute>,
     /// Scroll position of the shared body container (Info / Outline / Changes),
     /// owned here rather than left to gpui's element-id state so the overlay
     /// scrollbar has a handle to read the offset from and to drag.
@@ -554,14 +563,21 @@ impl Tty7App {
                 if let Some(ssh) = view.ssh_spec() {
                     rows.push(("ssh", ssh.host.clone()));
                 }
-                if view
+                // Two ways a pane has something to forward over: it *is* an
+                // SSH session, or it belongs to a remote workspace, whose
+                // forwards run on the workspace's own connection (design §15).
+                // The second arm is empty in this build — nothing binds a pane
+                // to a workspace yet — which is deliberate: the band stays
+                // empty rather than offering an add that would have nowhere to
+                // go.
+                let connected_ssh = view
                     .remote_context()
                     .is_some_and(|c| c.kind == crate::daemon::protocol::RemoteKind::NativeSsh)
                     && matches!(
                         view.ssh_phase(),
                         Some(crate::daemon::protocol::SshPhase::Connected)
-                    )
-                {
+                    );
+                if connected_ssh || view.workspace().is_some() {
                     forwards_pane = Some(view.pane_id);
                 }
             }
@@ -593,7 +609,8 @@ impl Tty7App {
         // Keep the process/port query pointed at the pane on screen, and keep it
         // ticking while this tab is the one being looked at. The same tick carries
         // the pane's forwards when it has any to carry.
-        self.sync_procs(pane_id, forwards_pane.is_some(), cx);
+        let route = forwards_pane.map(|id| self.forward_route(id, cx));
+        self.sync_procs(pane_id, route, cx);
 
         let mono = cx.theme().mono_font_family.clone();
         let mut list = v_flex().px(px(CONTENT_INSET)).py(px(2.)).gap(px(3.));
@@ -836,7 +853,7 @@ impl Tty7App {
     /// claimed a guarantee the body didn't actually make.
     fn procs(&self, pane_id: Option<u64>) -> Option<&PaneProcs> {
         (pane_id.is_some() && self.right_panel.procs_pane == pane_id)
-            .then(|| self.right_panel.procs.as_ref())?
+            .then_some(self.right_panel.procs.as_ref())?
     }
 
     /// Point the process query at `pane_id` and make sure the poll is running.
@@ -854,9 +871,14 @@ impl Tty7App {
     /// while the loop is already running — a pane you're watching on Info
     /// finishes connecting, and neither the pane id nor the generation changes,
     /// so nothing would otherwise tell the loop to start asking.
-    fn sync_procs(&mut self, pane_id: Option<u64>, forwards: bool, cx: &mut Context<Self>) {
+    fn sync_procs(
+        &mut self,
+        pane_id: Option<u64>,
+        forwards: Option<crate::ui::app::ForwardRoute>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(pane_id) = pane_id else { return };
-        self.right_panel.procs_forwards = forwards;
+        self.right_panel.procs_forwards = forwards.clone();
         if self.right_panel.procs_pane != Some(pane_id) {
             self.right_panel.procs_pane = Some(pane_id);
             // Drop the previous pane's answer rather than showing it under the new
@@ -885,7 +907,7 @@ impl Tty7App {
         &mut self,
         pane_id: u64,
         generation: u64,
-        forwards: bool,
+        forwards: Option<crate::ui::app::ForwardRoute>,
         cx: &mut Context<Self>,
     ) {
         // `procs_loading` is set by the caller (`sync_procs`) and deliberately
@@ -893,15 +915,12 @@ impl Tty7App {
         cx.spawn(async move |this, cx| {
             // Both round-trips on the one background hop, so the tick costs one
             // scheduling slot rather than two.
+            let route = forwards.clone();
             let (procs, managed) = cx
                 .background_executor()
                 .spawn(async move {
                     let procs = crate::terminal::RemoteTerminal::query_procs(pane_id);
-                    let managed = if forwards {
-                        crate::terminal::RemoteTerminal::list_forwards(pane_id)
-                    } else {
-                        Vec::new()
-                    };
+                    let managed = route.map(|r| r.list()).unwrap_or_default();
                     (procs, managed)
                 })
                 .await;
@@ -913,7 +932,7 @@ impl Tty7App {
                         return false;
                     }
                     app.right_panel.procs = Some(procs);
-                    if forwards {
+                    if forwards.is_some() {
                         app.loopback_panel.managed = managed;
                     }
                     cx.notify();
@@ -943,7 +962,7 @@ impl Tty7App {
                     // Re-read rather than carrying the flag forward: the pane may
                     // have finished connecting since this cycle started, which is
                     // the one way it changes without a pane switch to retire us.
-                    let forwards = app.right_panel.procs_forwards;
+                    let forwards = app.right_panel.procs_forwards.clone();
                     app.spawn_procs_query(pane_id, generation, forwards, cx);
                 } else {
                     app.right_panel.procs_loading = false;
@@ -1078,18 +1097,23 @@ impl Tty7App {
     /// Clicking a row opens the full overlay on that repo.
     fn render_panel_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
-        let cwd = self
+        // The pane's own host, and the cwd it resolved its git line through —
+        // so the Changes list describes the same repository the sidebar's
+        // `+N −M` does, on the same machine.
+        let target = self
             .tabs
             .get(self.active)
             .and_then(|t| t.detail_pane(window, cx))
             .and_then(|leaf| {
                 let v = leaf.read(cx);
-                v.git_status_cwd()
+                let cwd = v
+                    .git_status_cwd()
                     .map(|p| p.to_path_buf())
-                    .or_else(|| v.cwd())
+                    .or_else(|| v.host_cwd())?;
+                Some((v.host(cx)?, cwd))
             });
 
-        let Some(cwd) = cwd else {
+        let Some((host, cwd)) = target else {
             let title = self.panel_title("Changes", None, None, cx);
             return self.panel_scroll(
                 self.panel_empty(
@@ -1104,16 +1128,17 @@ impl Tty7App {
         // different repository. Refreshes ride the same git-status observer the
         // sidebar counts do (see `right_panel_refresh_changes`), which re-probes
         // *in place* — the list only blanks when the repository itself changes.
-        if self.right_panel.diff_cwd.as_ref() != Some(&cwd) {
-            self.right_panel.diff_cwd = Some(cwd.clone());
+        let key = (host.id(), cwd.clone());
+        if self.right_panel.diff_cwd.as_ref() != Some(&key) {
+            self.right_panel.diff_cwd = Some(key);
             self.right_panel.diff = None;
-            self.spawn_right_panel_diff(cwd.clone(), cx);
+            self.spawn_right_panel_diff(host.clone(), cwd.clone(), cx);
         } else if self.right_panel.diff.is_none() && !self.right_panel.diff_loading {
             // Nothing cached and nothing in flight: a probe for a previous cwd
             // landed after we had already moved on and dropped its result, so
             // no one is left to answer for this one. Without this the tab would
             // sit on "Loading…" until some unrelated event nudged it.
-            self.spawn_right_panel_diff(cwd.clone(), cx);
+            self.spawn_right_panel_diff(host.clone(), cwd.clone(), cx);
         }
 
         // Count of changed files for the header tally — computed before the title
@@ -1148,7 +1173,7 @@ impl Tty7App {
                     .map(|f| (f.path.clone(), f.added, f.removed))
                     .collect();
                 let untracked = snap.untracked.clone();
-                let focused = self.diff_overlay_focus(&cwd).map(str::to_string);
+                let focused = self.diff_overlay_focus(host.id(), &cwd).map(str::to_string);
                 // Rows inset themselves rather than the list, so the hover and
                 // selected capsules bleed a little past the text into the same
                 // 12px gutter the tab rail's rows use.
@@ -1172,6 +1197,7 @@ impl Tty7App {
                             .hover(|s| s.bg(gpui::rgb(sf.hover)))
                             .when(selected, |s| s.bg(gpui::rgb(sf.selected)))
                             .on_click({
+                                let host_id = host.id();
                                 let cwd = cwd.clone();
                                 let path = path.clone();
                                 cx.listener(move |this, _, window, cx| {
@@ -1179,6 +1205,7 @@ impl Tty7App {
                                     // so a row is a switch for "show me this diff",
                                     // not a one-way door.
                                     this.toggle_diff_overlay_at(
+                                        host_id,
                                         cwd.clone(),
                                         Some(path.clone()),
                                         window,
@@ -1251,30 +1278,32 @@ impl Tty7App {
     }
 
     /// Off-thread `git diff` for the panel, mirroring the diff overlay's probe.
-    fn spawn_right_panel_diff(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+    fn spawn_right_panel_diff(
+        &mut self,
+        host: crate::ui::host_ops::SharedHost,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         if self.right_panel.diff_loading {
             return;
         }
         self.right_panel.diff_loading = true;
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let cwd = cwd.clone();
-                    async move { git_diff::probe(&cwd) }
-                })
-                .await;
-            let _ = this.update(cx, |app, cx| {
+        let key = (host.id(), cwd.clone());
+        crate::ui::host_ops::HostOps::run(
+            host,
+            cx,
+            move |h| git_diff::probe(h, &cwd),
+            move |app, result, cx| {
                 app.right_panel.diff_loading = false;
-                // Drop the result if the panel moved on to another repo while we
-                // flew — otherwise a slow probe would overwrite a newer one.
-                if app.right_panel.diff_cwd.as_ref() == Some(&cwd) {
+                // Drop the result if the panel moved on to another repo — or
+                // another machine — while we flew; otherwise a slow probe would
+                // overwrite a newer one.
+                if app.right_panel.diff_cwd.as_ref() == Some(&key) {
                     app.right_panel.diff = Some(result);
                     cx.notify();
                 }
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// Re-probe the Changes list when the shared status cache learned something
@@ -1292,8 +1321,13 @@ impl Tty7App {
         if self.right_panel.diff_loading {
             return;
         }
-        let Some(cwd) = self.right_panel.diff_cwd.clone() else {
+        let Some((id, cwd)) = self.right_panel.diff_cwd.clone() else {
             return; // never probed — the render path owns the first one
+        };
+        // The host object itself has to come from the registry: only the id is
+        // cached, and a machine that has gone away has no diff to re-probe.
+        let Some(host) = crate::ui::host_registry::HostRegistry::get(cx, id) else {
+            return;
         };
         // `Some(None)` (probed, not a work tree) stays put: a status entry for a
         // non-repo can't appear, so there's nothing to disagree with.
@@ -1302,13 +1336,13 @@ impl Tty7App {
         };
         let Some(status) = cx
             .try_global::<crate::terminal::git_status::GitStatusCache>()
-            .and_then(|cache| cache.status_for(&cwd))
+            .and_then(|cache| cache.status_for(id, &cwd))
         else {
             return;
         };
         let stale = status.branch != snap.branch || (status.added, status.removed) != snap.totals();
         if stale {
-            self.spawn_right_panel_diff(cwd, cx);
+            self.spawn_right_panel_diff(host, cwd, cx);
         }
     }
 

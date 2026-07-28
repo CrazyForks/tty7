@@ -20,10 +20,18 @@ pub mod forward;
 pub mod known_hosts;
 pub mod session;
 pub mod sftp;
+/// Workspace-scoped control requests (design §15) — see `workspace::handle`.
+pub mod workspace;
 
 mod auth;
 mod connect;
 mod handler;
+
+/// A child process's stdio as one duplex stream. Re-exported (rather than
+/// opening `connect` as a whole) because `daemon::remote_link` wraps a
+/// `tty7-server --stdio` child in exactly the shape the `ProxyCommand` path
+/// already uses.
+pub use connect::ProcessStream;
 
 pub use broker::PromptBroker;
 pub use forward::SshForwardRegistry;
@@ -41,6 +49,8 @@ use crate::daemon::protocol::{
     LoopbackForward, LoopbackForwardId, LoopbackForwardInfo, ManagedForward, NativeSshSpec,
     SshForwardRule, SshPhase, WinSize,
 };
+use crate::daemon::remote_link::{self, RemoteEntry, RemoteLink};
+use crate::daemon::router::{RouteChannel, RouteSetup};
 use crate::daemon::shell_integration::remote;
 
 use forward::RemoteForwardTable;
@@ -57,6 +67,19 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ConnectionKey(String);
 
 impl ConnectionKey {
+    /// The key as a string, for callers that need to *name* a connection —
+    /// a log line, an error message, an installer's "which host am I writing
+    /// to". Exposed because the alternative callers reach for is peeling the
+    /// derived `Debug` output apart, which silently breaks the day anything
+    /// about the formatting changes.
+    ///
+    /// It is a connection identity, not a display name: it carries the proxy
+    /// and jump chain, and no user-facing label. Where the user has their own
+    /// name for a host, prefer that and keep this for disambiguation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     pub fn from_spec(spec: &NativeSshSpec) -> Self {
         use crate::daemon::protocol::SshProxy;
         let mut s = format!("{}@{}:{}", spec.user, spec.host, spec.port);
@@ -360,6 +383,165 @@ impl SshManager {
         Ok(())
     }
 
+    // ---- Remote workspaces: one logical stream to a remote `tty7-server` ----
+
+    /// Open one logical stream from this daemon to the `tty7-server` on `spec`'s
+    /// host, reusing (or establishing) the machine's single authenticated
+    /// connection.
+    ///
+    /// **One authentication per machine.** The connection comes from the same
+    /// [`ConnectionKey`] registry the SSH panes use, so a workspace opened
+    /// against a host the user already has a pane on costs no prompt at all, and
+    /// a second workspace on the same host costs no second prompt — each stream
+    /// is a new *channel*, never a new authentication (design §7.1). One channel
+    /// per pane, one per workspace control stream; no multiplexing of our own on
+    /// top of SSH's.
+    ///
+    /// The returned `Arc<SshConnection>` must be held for as long as the link is
+    /// used: it is the last strong reference that keeps the shared connection
+    /// (and therefore the channel) alive.
+    /// **What `setup` buys.** Everything below this line may need a user: the
+    /// authentication, the consent to write a binary onto the machine, the
+    /// discovery that the daemon already there is a different build. `setup`
+    /// carries the one client that can answer — see [`RouteSetup`].
+    pub async fn open_remote_link(
+        &self,
+        spec: &NativeSshSpec,
+        setup: &RouteSetup,
+        server_command: Option<&str>,
+    ) -> anyhow::Result<(RemoteLink, Arc<SshConnection>)> {
+        let (conn, _reused) = self.open_connection(spec, &setup.broker).await?;
+
+        // Before the first stream to a host, make sure the remote is actually
+        // serving: the right version of `tty7-server`, installed and running.
+        // Idempotent and cheap on the common path (two commands and one SFTP
+        // stat, no download, no prompt), which is what makes it safe to call
+        // before *every* link rather than once per connection.
+        //
+        // A `?` here means no link is opened at all, so "this machine has no
+        // tty7-server" arrives as a route ack with a reason. B1 deliberately
+        // left this un-stubbed rather than always-Ok for exactly that: an empty
+        // implementation would turn a missing server into an opaque channel
+        // failure much later.
+        //
+        // On a blocking thread because `Installer` is blocking start to finish
+        // and one step of it waits on a human; running it on a runtime worker
+        // would park the reactor that has to carry the answer back.
+        let installed = {
+            let install_conn = conn.clone();
+            setup
+                .blocking(move || crate::daemon::install::ensure_remote_server(&install_conn))
+                .await??
+        };
+
+        // The installed binary's **absolute** path, not the bare name. Nothing
+        // puts `~/.local/share/tty7/bin` on a non-interactive `PATH`, and the
+        // file there is `tty7-server-<version>` — so `exec tty7-server --stdio`
+        // is a `command not found` on a machine the install just succeeded on.
+        // The install pass we just ran is what knows the path, so it hands it
+        // over rather than leaving the transport to guess.
+        let base = match server_command {
+            Some(explicit) => explicit.to_string(),
+            None => format!(
+                "{} --stdio",
+                crate::daemon::install::shell_quote(&installed)
+            ),
+        };
+        let command = setup.channel.bridge_command(&base);
+
+        // A pane connection never takes the cached `direct-streamlocal` entry:
+        // that entry names the *control* socket, and the pane dialect is served
+        // on a different one. See `RouteChannel::bridge_command`.
+        let entry = match setup.channel {
+            RouteChannel::Pane => RemoteEntry::SessionExec {
+                command: command.clone(),
+            },
+            RouteChannel::Control => {
+                conn.remote_entry_or_init(|| async {
+                    let env = probe_remote_env(&conn).await;
+                    let socket = env.as_ref().and_then(remote_link::remote_control_socket);
+                    // Optimistic: `AllowStreamLocalForwarding` defaults to `yes`
+                    // and the only way to learn otherwise is to be refused,
+                    // which the demotion below turns into a permanent,
+                    // connection-wide answer.
+                    remote_link::choose_entry(socket.as_deref(), true, &command)
+                })
+                .await
+            }
+        };
+
+        if let RemoteEntry::StreamLocal { socket } = &entry {
+            match conn.open_direct_streamlocal(socket).await {
+                Ok(channel) => return Ok((RemoteLink::stream_local(channel), conn)),
+                Err(e) => {
+                    // The refusal every later stream on this connection must not
+                    // repeat: cache the fallback before taking it.
+                    log::info!(
+                        "ssh {:?}: direct-streamlocal to {socket} refused ({e}); \
+                         falling back to `{command}`",
+                        conn.key()
+                    );
+                    conn.set_remote_entry(remote_link::choose_entry(Some(socket), false, &command))
+                        .await;
+                }
+            }
+        }
+
+        let channel = conn
+            .open_session_channel()
+            .await
+            .map_err(|e| anyhow::anyhow!("open remote workspace channel failed: {e}"))?;
+        channel
+            .exec(false, command.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("exec `{command}` on the remote failed: {e}"))?;
+        Ok((RemoteLink::session_exec(channel), conn))
+    }
+
+    /// Replace the `tty7-server` running on `spec`'s host with this client's
+    /// build — design §12's "restart the service", and **it drops every pane
+    /// that server is hosting**.
+    ///
+    /// Only ever reached from a [`RouteAction::RestartServer`](crate::daemon::router::RouteAction)
+    /// header, which a client only writes after a user has answered the
+    /// keep-or-restart prompt with "Restart Server". Nothing in the connect path
+    /// calls this: an older daemon on the far side keeps serving, because it owns
+    /// live work and only its owner can decide to throw that away.
+    ///
+    /// Deliberately **not** an `ensure_remote_server` first. The mismatch that
+    /// raises the prompt is discovered by an install pass that has already put
+    /// this build's binary in place, so there is nothing left to install — and a
+    /// second pass would rediscover the very mismatch the user is answering and
+    /// relay a fresh prompt for it the moment the restart finished.
+    pub async fn restart_remote_server(
+        &self,
+        spec: &NativeSshSpec,
+        setup: &RouteSetup,
+    ) -> anyhow::Result<()> {
+        let (conn, _reused) = self.open_connection(spec, &setup.broker).await?;
+        // Blocking start to finish (SIGTERM, poll for the socket to go, launch,
+        // poll for it to answer) and it may stop to ask the user for a password
+        // on the way in — the same reason `open_remote_link` keeps the installer
+        // off the runtime's workers.
+        setup
+            .blocking(move || crate::daemon::install::restart_remote_daemon(&conn))
+            .await??;
+        Ok(())
+    }
+
+    /// [`open_remote_link`](Self::open_remote_link) for the daemon's std threads
+    /// (the router runs on one). Safe from any thread that is not itself a
+    /// runtime worker — the server's connection threads never are.
+    pub fn open_remote_link_blocking(
+        &self,
+        spec: &NativeSshSpec,
+        setup: &RouteSetup,
+        server_command: Option<&str>,
+    ) -> anyhow::Result<(RemoteLink, Arc<SshConnection>)> {
+        self.runtime
+            .block_on(self.open_remote_link(spec, setup, server_command))
+    }
+
     /// Drop a connection key's registry slot so the next `open_connection` for it
     /// establishes a fresh connection instead of upgrading a stale `Weak`. Called
     /// by the self-healing reuse path when a reused connection turns out dead.
@@ -552,6 +734,44 @@ async fn probe_remote_shell(conn: &SshConnection) -> Option<(remote::RemoteShell
     remote::parse_probe(&String::from_utf8_lossy(&out))
 }
 
+/// Read the four environment variables the remote's control socket path is
+/// derived from, on a throwaway `exec` channel.
+///
+/// `None` when the remote said nothing usable — the caller then takes the
+/// `--stdio` bridge, which resolves the path in the process that binds it, so a
+/// failed probe costs a slower transport and never a failed connection.
+///
+/// stderr is folded in for the same reason the shell probe does it: the parse is
+/// marker-based and tolerates noise, and discarding a good answer because the
+/// remote's startup files complained would be gratuitous.
+async fn probe_remote_env(conn: &SshConnection) -> Option<remote_link::RemoteEnv> {
+    let mut channel = conn.open_session_channel().await.ok()?;
+    channel
+        .exec(true, remote_link::REMOTE_ENV_PROBE)
+        .await
+        .ok()?;
+
+    let mut out: Vec<u8> = Vec::new();
+    let collect = async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    out.extend_from_slice(&data);
+                    if out.len() >= PROBE_OUTPUT_LIMIT {
+                        break;
+                    }
+                }
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+    };
+    let _ = tokio::time::timeout(PROBE_TIMEOUT, collect).await;
+
+    let env = remote_link::RemoteEnv::parse_probe(&String::from_utf8_lossy(&out));
+    (env != remote_link::RemoteEnv::default()).then_some(env)
+}
+
 /// A conservative set of PTY modes for the shell channel — an interactive TTY
 /// with canonical input, echo, and signal handling on, and standard baud codes.
 /// The remote line discipline uses these as its starting point.
@@ -619,6 +839,24 @@ mod tests {
 
         // Identical connection params → identical key (reuse).
         assert_eq!(a, ConnectionKey::from_spec(&base_spec()));
+    }
+
+    /// `as_str` is what names a connection in prompts, logs and the installer's
+    /// "which host am I writing to". It must carry the jump chain: two hosts
+    /// reached through different bastions are different connections, and a
+    /// label that collapsed them would put an install prompt on the wrong box.
+    #[test]
+    fn the_key_string_names_the_whole_chain() {
+        assert_eq!(ConnectionKey::from_spec(&base_spec()).as_str(), "u@h:22");
+
+        let mut jumped = base_spec();
+        let mut bastion = base_spec();
+        bastion.host = "bastion".into();
+        jumped.jump = Some(Box::new(bastion));
+        assert_eq!(
+            ConnectionKey::from_spec(&jumped).as_str(),
+            "u@h:22|jump:u@bastion:22"
+        );
     }
 
     #[test]

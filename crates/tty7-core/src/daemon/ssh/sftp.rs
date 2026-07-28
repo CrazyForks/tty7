@@ -375,6 +375,43 @@ impl SftpManager {
         })
     }
 
+    /// Write `bytes` to `path`, creating or truncating it. Blocks the calling
+    /// thread on the SSH runtime.
+    ///
+    /// For callers that have the bytes in memory and no local file to stream
+    /// from — the remote-server installer, which downloads a binary and pushes
+    /// it — so they get the cached session and its retry-once-on-transport-
+    /// failure behaviour instead of opening a channel of their own per write.
+    ///
+    /// Chunked rather than one giant write so a ~6 MB binary is not a single
+    /// SFTP message, and flushed *and* shut down before returning `Ok`: a
+    /// server that runs out of disk reports it on the write or the close, and
+    /// swallowing that would leave a truncated file for the caller to chmod and
+    /// rename into place as though it were whole.
+    pub fn put_bytes(
+        &self,
+        conn: &Arc<SshConnection>,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        SshManager::global().handle().block_on(async {
+            self.with_session(conn, |sftp| async move {
+                let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
+                let mut file = sftp
+                    .open_with_flags(path.to_string(), flags)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                for chunk in bytes.chunks(CHUNK) {
+                    file.write_all(chunk).await.map_err(|e| format!("{e}"))?;
+                }
+                file.flush().await.map_err(|e| format!("{e}"))?;
+                file.shutdown().await.map_err(|e| format!("{e}"))?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
     /// Run a one-shot filesystem operation.
     pub fn op(&self, conn: &Arc<SshConnection>, op: &SftpOp) -> SftpOpResult {
         let result = SshManager::global().handle().block_on(async {

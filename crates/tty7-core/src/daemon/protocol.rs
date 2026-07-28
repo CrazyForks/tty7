@@ -51,21 +51,64 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 ///
 /// ## History
 ///
+/// - **v3** — the [`control`](super::control) dialect (kinds 60-63) and
+///   [`DaemonVersion::features`]. By the rule above this is *additive* and
+///   would not earn a bump on its own: a v2 daemon meeting a control frame
+///   already reports an unknown kind. The bump buys something else — it makes
+///   "does this peer speak control?" a question that can be asked **forwards**.
+///   Without it the only probe is to open a control connection and see whether
+///   the peer drops it, which costs a round trip, logs a misleading desync
+///   error, and is indistinguishable from a genuine desync. `features` then
+///   makes this the *last* bump of its kind: further capabilities are announced
+///   as strings, not as a higher number.
 /// - **v2** — [`RemoteKind::Wsl`]. A v1 client decoding a WSL pane's
 ///   `RemoteContext` errors out and loses the pane, which only bites on a
 ///   downgrade (a v2 GUI spawns the pane, a v1 GUI later attaches to it), but
 ///   loses it silently. The handshake now catches that skew and asks.
 /// - **v1** — the dialect at the time versioning landed.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Reply to `ClientMsg::Version`: the protocol dialect the daemon speaks, plus
-/// its crate version for logs/diagnostics. Only `protocol` drives decisions.
+/// its crate version for logs/diagnostics. Only `protocol` and `features` drive
+/// decisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonVersion {
     pub protocol: u32,
     /// The daemon binary's `CARGO_PKG_VERSION`. Display only.
     #[serde(default)]
     pub build: String,
+    /// Fine-grained capability bits — see [`super::control::feature`].
+    ///
+    /// `#[serde(default)]`, so a pre-v3 daemon's reply still decodes (as an
+    /// empty list, which is the truth about it). This exists so that a
+    /// capability added after v3 does **not** need another version bump, and
+    /// therefore does not need to provoke the "Restart Daemon?" prompt for
+    /// every user whose daemon happens to predate it.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+impl DaemonVersion {
+    /// What *this* build answers with.
+    ///
+    /// A single constructor so the capability list can't drift between the
+    /// daemon's reply and anything else that claims to describe this build.
+    pub fn current() -> DaemonVersion {
+        DaemonVersion {
+            protocol: PROTOCOL_VERSION,
+            build: env!("CARGO_PKG_VERSION").to_string(),
+            // The local session daemon speaks the pane protocol only. The
+            // control dialect is served by `tty7-server`, which advertises
+            // `control` / `host-rpc` itself; claiming them here would make the
+            // GUI open a control connection this process cannot answer.
+            features: Vec::new(),
+        }
+    }
+
+    /// Whether this peer advertises `name`.
+    pub fn has_feature(&self, name: &str) -> bool {
+        self.features.iter().any(|f| f == name)
+    }
 }
 
 /// Terminal geometry shared by spawn/attach/resize. Cell pixel size travels too
@@ -106,7 +149,7 @@ pub struct ShellSpec {
 /// Whether a short `ssh` option flag consumes the following argument as its
 /// value. Used by the GUI's typed-connect parser to skip an option's value while
 /// hunting for the destination token.
-pub(crate) fn ssh_option_takes_value(flag: char) -> bool {
+pub fn ssh_option_takes_value(flag: char) -> bool {
     matches!(
         flag,
         'B' | 'b'
@@ -190,6 +233,72 @@ pub struct LoopbackForwardRequest {
     pub pane_id: u64,
     pub remote_host: String,
     pub remote_port: u16,
+}
+
+// ---------------------------------------------------------------------------
+// Workspace-scoped control requests (design §15, M7).
+//
+// A *remote workspace* has no pane on this daemon: its panes live on the remote
+// `tty7-server`, and the only thing this side owns is the `SshConnection` the
+// workspace's routed link rides. So every pane-addressed control request above
+// (`SftpList { pane_id }`, `AddForward { pane_id }`, …) is unaddressable for it.
+//
+// Rather than a parallel variant per operation, the workspace form is one
+// envelope: the *only* thing that differs is how the connection is found, and
+// the daemon resolves that once, up front. Replies reuse the existing
+// `DaemonMsg` variants verbatim, so no daemon-space kind is spent.
+// ---------------------------------------------------------------------------
+
+/// A control request that runs on a **remote workspace's** SSH connection
+/// rather than a pane's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRequest {
+    /// Which workspace the request is *attributed* to. Two workspaces on the
+    /// same machine share one `SshConnection` but own their forwards
+    /// separately, so this is not derivable from `spec`.
+    pub workspace: crate::core::session::WorkspaceId,
+    /// Names the machine. **Secret-free** ([`NativeSshSpec::without_secrets`]):
+    /// the daemon only ever *looks up* an already-authenticated connection with
+    /// this key and never connects, so nothing here needs to authenticate.
+    pub spec: Box<NativeSshSpec>,
+    /// The pane the caller is rendering the answer under, stamped into
+    /// `ManagedForward::pane_id` / `SftpJobProgress::pane_id` so the GUI's
+    /// per-pane panels can filter rows they asked for. Display only — it is
+    /// *not* what the forward is owned by, and a workspace forward outlives it.
+    pub view_pane: u64,
+    pub op: WorkspaceOp,
+}
+
+/// The operation half of a [`WorkspaceRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceOp {
+    /// ⌘/Ctrl-clicked `localhost:PORT` — ensure an on-demand local forward to
+    /// `remote_host:remote_port` and reply `LoopbackForward { local_port }`.
+    EnsureLoopback {
+        remote_host: String,
+        remote_port: u16,
+    },
+    /// Establish a managed forward owned by the workspace; replies `ForwardList`.
+    AddForward { rule: SshForwardRule },
+    /// Tear one workspace forward down by id; replies `ForwardList`.
+    RemoveForward { forward_id: u64 },
+    /// The workspace's managed forwards; replies `ForwardList`.
+    ListForwards,
+    /// Drop every forward the workspace owns (the workspace was closed). Replies
+    /// with the — now empty — `ForwardList`.
+    TeardownForwards,
+    /// List a remote directory over the workspace's SFTP session; replies
+    /// `SftpEntries`.
+    SftpList { path: String },
+    /// A one-shot SFTP operation on the workspace's session; replies
+    /// `SftpOpResult`.
+    SftpOp { op: SftpOp },
+    /// Start an upload/download on the workspace's session; replies
+    /// `SftpTransferStarted`. `spec.pane_id` is ignored in favour of `view_pane`.
+    SftpTransferStart { spec: SftpTransferSpec },
+    /// Poll the workspace's transfer jobs; replies `SftpTransferProgress`.
+    SftpTransferList,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -881,6 +990,9 @@ pub enum ClientMsg {
     /// panel's Info tab is open. Pushing it on a timer would burn that cost for
     /// every pane, forever, to feed a view that's usually closed.
     QueryProcs { pane_id: u64 },
+    /// A control request scoped to a **remote workspace's** SSH connection
+    /// instead of a pane's (design §15). See [`WorkspaceRequest`].
+    OnWorkspace(Box<WorkspaceRequest>),
     /// Ask which protocol version the daemon speaks (control connection); the
     /// daemon replies `Version`. A daemon that predates versioning doesn't know
     /// this kind and drops the connection instead of replying — the client
@@ -1021,6 +1133,15 @@ mod kind {
     /// `QueryProcs` — a pane's process tree + listening ports, for the details
     /// panel. 50 sits clear of every range above and of `VERSION`.
     pub const QUERY_PROCS: u8 = 50;
+    // 51 is taken: `daemon::router::ROUTE_KIND`, the route header that hands a
+    // connection to a remote `tty7-server`. It is defined there rather than
+    // here because this module is private and the router must not become a
+    // reason to open it — but the number is spent either way.
+    /// `OnWorkspace` — a control request on a remote workspace's SSH connection
+    /// (design §15). 52 is the next number clear of every range above, of the
+    /// router's 51, and of the retired 13; the contract's control connection
+    /// reserves 60-63, which this stays below.
+    pub const ON_WORKSPACE: u8 = 52;
 
     // Daemon -> client
     pub const SPAWNED: u8 = 1;
@@ -1205,6 +1326,7 @@ impl ClientMsg {
             ClientMsg::ListForwards { pane_id } => {
                 write_frame(w, kind::LIST_FORWARDS, &to_json(pane_id)?)
             }
+            ClientMsg::OnWorkspace(req) => write_frame(w, kind::ON_WORKSPACE, &to_json(req)?),
             ClientMsg::Version => write_frame(w, kind::VERSION, &[]),
         }
     }
@@ -1284,6 +1406,7 @@ impl ClientMsg {
             kind::LIST_FORWARDS => ClientMsg::ListForwards {
                 pane_id: from_json(&payload)?,
             },
+            kind::ON_WORKSPACE => ClientMsg::OnWorkspace(from_json(&payload)?),
             kind::VERSION => ClientMsg::Version,
             other => {
                 return Err(io::Error::new(
@@ -1775,6 +1898,12 @@ mod tests {
             DaemonMsg::Version(DaemonVersion {
                 protocol: PROTOCOL_VERSION,
                 build: "0.15.0".into(),
+                features: vec!["control".into(), "host-rpc".into()],
+            }),
+            DaemonMsg::Version(DaemonVersion {
+                protocol: PROTOCOL_VERSION,
+                build: "0.15.0".into(),
+                features: Vec::new(),
             }),
             DaemonMsg::Error("nope".into()),
         ];
@@ -2108,6 +2237,69 @@ mod tests {
         assert_eq!(clean.login_script, vec!["tmux attach".to_string()]);
     }
 
+    /// Every `WorkspaceOp` round-trips inside the `OnWorkspace` envelope. Kept
+    /// as its own test rather than folded into `client_roundtrip` so the
+    /// pane-addressed corpus there stays byte-for-byte what it was.
+    #[test]
+    fn on_workspace_roundtrip() {
+        let ws = crate::core::session::WorkspaceId::new();
+        let spec = Box::new(sample_native_spec().without_secrets());
+        let ops = vec![
+            WorkspaceOp::EnsureLoopback {
+                remote_host: "127.0.0.1".into(),
+                remote_port: 3000,
+            },
+            WorkspaceOp::AddForward {
+                rule: SshForwardRule {
+                    kind: SshForwardKind::Local,
+                    bind_host: "127.0.0.1".into(),
+                    bind_port: 0,
+                    target_host: "127.0.0.1".into(),
+                    target_port: 5432,
+                    description: Some("db".into()),
+                },
+            },
+            WorkspaceOp::RemoveForward { forward_id: 4 },
+            WorkspaceOp::ListForwards,
+            WorkspaceOp::TeardownForwards,
+            WorkspaceOp::SftpList {
+                path: "/home/me".into(),
+            },
+            WorkspaceOp::SftpOp {
+                op: SftpOp::Realpath { path: ".".into() },
+            },
+            WorkspaceOp::SftpTransferStart {
+                spec: SftpTransferSpec {
+                    pane_id: 0,
+                    kind: SftpTransferKind::Download,
+                    local: PathBuf::from("/local/f"),
+                    remote: "/remote/f".into(),
+                    recursive: false,
+                },
+            },
+            WorkspaceOp::SftpTransferList,
+        ];
+        let msgs: Vec<ClientMsg> = ops
+            .into_iter()
+            .map(|op| {
+                ClientMsg::OnWorkspace(Box::new(WorkspaceRequest {
+                    workspace: ws,
+                    spec: spec.clone(),
+                    view_pane: 12,
+                    op,
+                }))
+            })
+            .collect();
+        let mut buf = Vec::new();
+        for m in &msgs {
+            m.encode(&mut buf).unwrap();
+        }
+        let mut cursor = std::io::Cursor::new(buf);
+        for m in &msgs {
+            assert_eq!(*m, ClientMsg::read(&mut cursor).unwrap());
+        }
+    }
+
     /// The new native-SSH client/daemon message variants round-trip through the
     /// frame codec (new kind bytes included).
     #[test]
@@ -2190,5 +2382,48 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let (k, _) = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
         assert_eq!(k, kind::SPAWN_NATIVE_SSH);
+    }
+
+    /// A daemon that predates `features` answers without the field, and that
+    /// reply must still decode — as an empty capability list, which is exactly
+    /// the truth about it. If it didn't, upgrading the app while an old daemon
+    /// held live sessions would turn the version handshake into a hard failure
+    /// instead of the keep-or-restart question it is meant to be.
+    #[test]
+    fn a_version_reply_without_features_still_decodes() {
+        let legacy = br#"{"protocol":2,"build":"26.7.4"}"#;
+        let v: DaemonVersion = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(v.protocol, 2);
+        assert_eq!(v.build, "26.7.4");
+        assert!(v.features.is_empty());
+        assert!(!v.has_feature(crate::daemon::control::feature::CONTROL));
+    }
+
+    /// And the reverse skew: a *newer* daemon's extra field must not break an
+    /// older client's decode. serde ignores unknown fields by default and this
+    /// struct must never opt out of that, or every future capability becomes a
+    /// breaking change for clients that don't care about it.
+    #[test]
+    fn a_version_reply_with_unknown_fields_still_decodes() {
+        let future = br#"{"protocol":4,"build":"99.0.0","features":["control"],
+                          "something_new":{"a":1}}"#;
+        let v: DaemonVersion = serde_json::from_slice(future).unwrap();
+        assert_eq!(v.protocol, 4);
+        assert!(v.has_feature(crate::daemon::control::feature::CONTROL));
+    }
+
+    /// This build's own answer: the bumped version, and — deliberately — no
+    /// control capability, because the *local session daemon* does not serve
+    /// the control dialect. `tty7-server` does, and advertises it itself.
+    /// Claiming it here would make the GUI open a connection this process
+    /// cannot answer.
+    #[test]
+    fn the_local_daemon_does_not_claim_the_control_dialect() {
+        let v = DaemonVersion::current();
+        assert_eq!(v.protocol, 3);
+        assert!(
+            !v.has_feature(crate::daemon::control::feature::CONTROL),
+            "the session daemon must not advertise a dialect it cannot serve"
+        );
     }
 }

@@ -24,7 +24,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
 use crate::daemon::pane::DaemonPane;
-use crate::daemon::protocol::{ClientMsg, DaemonMsg, DaemonVersion, PROTOCOL_VERSION, RemoteKind};
+use crate::daemon::protocol::{ClientMsg, DaemonMsg, DaemonVersion, RemoteKind};
 use crate::daemon::ssh::SshConnection;
 use crate::daemon::transport::{self, Stream};
 
@@ -234,7 +234,23 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
     // directions are independent).
     let write_stream = read_stream.try_clone()?;
 
-    let first = ClientMsg::read(&mut read_stream)?;
+    // The opening frame decides whether this connection is *ours* at all. A
+    // route header means the rest of it belongs to a remote `tty7-server`, and
+    // this daemon becomes a byte pipe for the remainder of its life — see
+    // `daemon::router`. Read at the frame level rather than through
+    // `ClientMsg::read` because a routed connection's later bytes are not this
+    // dialect, and nothing here may assume they are.
+    let (first_kind, first_payload) = crate::daemon::protocol::read_frame(&mut read_stream)?;
+    if first_kind == crate::daemon::router::ROUTE_KIND {
+        drop(write_stream);
+        let header = crate::daemon::router::RouteHeader::decode(&first_payload)?;
+        return Ok(crate::daemon::router::RemoteRouter::route(
+            read_stream,
+            &header,
+        )?);
+    }
+
+    let first = ClientMsg::from_frame(first_kind, first_payload)?;
     match first {
         ClientMsg::Spawn { cwd, size, shell } => {
             let id = registry.alloc_id();
@@ -332,11 +348,7 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
 
         ClientMsg::Version => {
             let mut w = write_stream;
-            DaemonMsg::Version(DaemonVersion {
-                protocol: PROTOCOL_VERSION,
-                build: env!("CARGO_PKG_VERSION").to_string(),
-            })
-            .encode(&mut w)?;
+            DaemonMsg::Version(DaemonVersion::current()).encode(&mut w)?;
             Ok(())
         }
 
@@ -523,6 +535,16 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             let mut w = write_stream;
             let list = crate::daemon::ssh::SshManager::global().list_forwards(pane_id);
             DaemonMsg::ForwardList(list).encode(&mut w)?;
+            Ok(())
+        }
+
+        // A remote workspace has no pane here to address, so its forwards and
+        // SFTP go through one envelope that names the connection instead
+        // (design §15). The whole answer — including every failure — is built by
+        // `ssh::workspace::handle`, so this arm stays a pipe.
+        ClientMsg::OnWorkspace(req) => {
+            let mut w = write_stream;
+            crate::daemon::ssh::workspace::handle(&req).encode(&mut w)?;
             Ok(())
         }
 
@@ -987,8 +1009,13 @@ mod tests {
 
             // Bounded poll rather than a bare `join()`: the sender stays alive
             // for the whole wait, so only the write-failure path can finish the
-            // thread — and a regression fails in ~5 s instead of hanging.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // thread — and a regression fails in bounded time instead of
+            // hanging. The bound is generous because it is only a hang-catcher:
+            // the passing case finishes in microseconds, while a loaded machine
+            // running the whole suite in parallel can leave this thread
+            // unscheduled for seconds. A tight bound turns that into a flake
+            // that says nothing about the behaviour under test.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while !writer.is_finished() && std::time::Instant::now() < deadline {
                 thread::sleep(std::time::Duration::from_millis(5));
             }

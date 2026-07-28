@@ -3,15 +3,18 @@
 //! (see [`crate::ui::diff_overlay`]) that covers the terminal when the user
 //! clicks a tab row's git line.
 //!
-//! Same discipline as [`git_status`](crate::terminal::git_status): plain
-//! shell-outs run on a background executor by the caller, read-only via
-//! `GIT_OPTIONAL_LOCKS=0` (through the shared [`git_status::git`] helper), and
-//! never trusted to be fast — the UI shows the previous snapshot (or a loading
-//! state) until a probe lands.
+//! Same discipline as [`git_status`](crate::terminal::git_status): every
+//! invocation goes through the shared [`git_status::git`] helper — so it runs
+//! on the pane's own [`Host`], read-only via `GIT_OPTIONAL_LOCKS=0` — on a
+//! background executor, and is never trusted to be fast; the UI shows the
+//! previous snapshot (or a loading state) until a probe lands. Asking the pane's
+//! host rather than this machine is also what makes the overlay work at all for
+//! a pane whose repository lives somewhere else.
 
 use std::path::{Path, PathBuf};
 
 use crate::terminal::git_status;
+use crate::ui::host_ops::Host;
 
 /// Cap on parsed diff lines per file. A generated lockfile or vendored blob
 /// can be tens of thousands of lines; past this the file's hunks stop and the
@@ -106,28 +109,32 @@ pub struct DiffLine {
     pub text: String,
 }
 
-/// Probe the full diff snapshot for `cwd`, or `None` when it isn't inside a
-/// git work tree. Blocking (three `git` shell-outs) — call it on a background
-/// executor.
-pub fn probe(cwd: &Path) -> Option<DiffSnapshot> {
-    if !cwd.exists() {
-        return None;
-    }
+/// Probe the full diff snapshot for `cwd` on `host`, or `None` when it isn't
+/// inside a git work tree. Blocking (three `git` invocations, three round trips
+/// on a remote host) — call it through `HostOps`, never on the UI thread.
+pub fn probe(host: &dyn Host, cwd: &Path) -> Option<DiffSnapshot> {
+    // No `exists` pre-check: a vanished cwd fails the first invocation with
+    // `NotFound`, which is the same `None` one round trip cheaper.
     // Doubles as the "is this a repo" gate, same as the status probe.
-    let root = git_status::git(cwd, &["rev-parse", "--show-toplevel"])?;
+    let root = git_status::git(host, cwd, &["rev-parse", "--show-toplevel"])?;
     let root = PathBuf::from(root.trim_end_matches(['\n', '\r']));
-    let branch = git_status::branch_name(cwd)?;
+    let branch = git_status::branch_name(host, cwd)?;
     // `-M` folds a delete+add pair back into one rename entry; `--no-ext-diff`
     // keeps a configured external diff tool from replacing the parseable
     // unified format. A failed diff (e.g. racing a concurrent git write) still
     // yields a snapshot — an empty file list with the branch — rather than
     // hiding the overlay; the next refresh fills it in.
-    let files = git_status::git(cwd, &["diff", "--no-color", "--no-ext-diff", "-M", "HEAD"])
-        .map(|out| parse_unified(&out))
-        .unwrap_or_default();
+    let files = git_status::git(
+        host,
+        cwd,
+        &["diff", "--no-color", "--no-ext-diff", "-M", "HEAD"],
+    )
+    .map(|out| parse_unified(&out))
+    .unwrap_or_default();
     // `--full-name` pins paths to the repo root regardless of which
     // subdirectory the pane sits in, matching the diff's path space.
     let untracked = git_status::git(
+        host,
         cwd,
         &["ls-files", "--others", "--exclude-standard", "--full-name"],
     )

@@ -27,7 +27,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
@@ -41,6 +41,7 @@ use gpui_component::{
 };
 
 use crate::ui::app::Tty7App;
+use crate::ui::host_ops::{HostOps, MTime, WatchSub};
 
 /// Refuse to open files larger than this: the component's code editor is rated
 /// to ~50K lines, and a multi-megabyte blob is almost never what a terminal
@@ -60,7 +61,35 @@ pub(crate) struct OpenFile {
     pub(crate) dirty: bool,
     /// mtime of the content we last loaded from / saved to disk; used to drop
     /// watcher echoes of our own saves.
-    disk_mtime: Option<SystemTime>,
+    ///
+    /// [`MTime`], not `SystemTime`, and nanosecond-precise on purpose: the echo
+    /// test is mtime equality, so a coarser clock would swallow a genuine
+    /// external edit that landed in the same tick as our own write.
+    disk_mtime: Option<MTime>,
+    /// Bumped on every buffer change, so a save that lands can tell whether the
+    /// text it wrote is still the text in the buffer.
+    edit_seq: u64,
+    /// The `edit_seq` the in-flight write's snapshot was taken at, or `None`
+    /// when nothing is being written. Also the single-flight latch: a second
+    /// ⌘S while this is set queues rather than races.
+    saving: Option<u64>,
+    /// A save was asked for while one was in flight. Re-issued when that one
+    /// lands, so the last content the user asked to save is the content on disk.
+    save_pending: bool,
+    /// The user answered "Save" to a close prompt, so this buffer closes once
+    /// its write lands.
+    ///
+    /// Lives on the buffer rather than being threaded through the save call
+    /// because a save can be *queued* behind one already in flight: passing it
+    /// as an argument meant the queued request's intent was dropped and the
+    /// in-flight one's was replayed, so a close silently did nothing.
+    save_then_close: bool,
+    /// Bumped every time a reload is issued; a landing that is no longer the
+    /// newest discards itself. Two watcher batches can put two reads in flight,
+    /// and without this the older one can land last and install stale text
+    /// *marked clean* — a buffer that no longer matches disk and never
+    /// re-checks.
+    reload_seq: u64,
     /// Disk changed under unsaved edits: show the reload/keep banner instead
     /// of silently clobbering either side.
     pub(crate) conflict: bool,
@@ -129,29 +158,55 @@ impl TabCode {
 /// App-global editor infrastructure shared by every tab's panel.
 pub(crate) struct EditorPanelState {
     /// Watches the parent directories of open files (across all tabs) for
-    /// external changes. Rebuilt whenever any open set changes; `None` while
-    /// nothing is open anywhere.
-    watcher: Option<notify::RecommendedWatcher>,
-    /// Feeds changed paths from the watcher thread into the UI-side reload
-    /// loop spawned in [`EditorPanelState::new`].
-    events_tx: smol::channel::Sender<PathBuf>,
+    /// external changes.
+    ///
+    /// One long-lived subscription whose set moves with the open files, rather
+    /// than a watcher rebuilt per open — remotely, a rebuild is a round trip
+    /// and a server-side watcher recreated every time a file is opened or
+    /// closed. `Arc` because `set_dirs` is itself a host call.
+    watch: Option<Arc<WatchSub>>,
+    /// A subscription is being opened; keeps a burst of opens from asking for
+    /// one each.
+    watch_opening: bool,
+    /// A `set_dirs` is in flight, and whether the set moved again while it was.
+    ///
+    /// `set_dirs` replaces the watched set wholesale, so two of them in flight
+    /// resolve by arrival order, not issue order — and the loser strands the
+    /// watcher on a stale set *permanently*, because the caller only re-issues
+    /// when the desired set changes. Single-flight instead: one out at a time,
+    /// re-issued from the current set when it lands.
+    watch_busy: bool,
+    watch_dirty: bool,
+    /// The directories the watch spans — every open file's parent.
+    watched_dirs: HashSet<PathBuf>,
+    /// The open files themselves. The watch is per-directory, so this is what
+    /// separates "a file we care about changed" from "something else in that
+    /// directory did".
+    watched_files: HashSet<PathBuf>,
+    /// Feeds changed paths from the watch into the UI-side reload loop spawned
+    /// in [`EditorPanelState::new`].
+    events_tx: smol::channel::Sender<Vec<PathBuf>>,
 }
 
 impl EditorPanelState {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Tty7App>) -> Self {
         // The reload loop lives for the app: it debounces watcher pings and
         // routes them to `handle_external_change` on the UI thread.
-        let (tx, rx) = smol::channel::unbounded::<PathBuf>();
+        let (tx, rx) = smol::channel::unbounded::<Vec<PathBuf>>();
         cx.spawn_in(window, async move |app, cx| {
             while let Ok(first) = rx.recv().await {
                 cx.background_executor().timer(RELOAD_DEBOUNCE).await;
-                let mut changed: HashSet<PathBuf> = HashSet::from([first]);
+                let mut changed: HashSet<PathBuf> = first.into_iter().collect();
                 while let Ok(more) = rx.try_recv() {
-                    changed.insert(more);
+                    changed.extend(more);
                 }
                 let ok = app.update_in(cx, |app, window, cx| {
                     for path in changed {
-                        app.editor_handle_external_change(&path, window, cx);
+                        // The watch is on directories, so most of what arrives
+                        // is about files nobody has open.
+                        if app.editor.watched_files.contains(&path) {
+                            app.editor_handle_external_change(&path, window, cx);
+                        }
                     }
                 });
                 if ok.is_err() {
@@ -161,7 +216,12 @@ impl EditorPanelState {
         })
         .detach();
         Self {
-            watcher: None,
+            watch: None,
+            watch_opening: false,
+            watch_busy: false,
+            watch_dirty: false,
+            watched_dirs: HashSet::new(),
+            watched_files: HashSet::new(),
             events_tx: tx,
         }
     }
@@ -237,6 +297,78 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }
 
+/// What a watcher event means for one buffer holding the changed file.
+#[derive(Debug, PartialEq, Eq)]
+enum ExternalChange {
+    /// Not a change we should act on — our own write, or one we cannot yet
+    /// distinguish from our own write.
+    Ignore,
+    /// Disk moved under unsaved edits: raise the banner and let the user pick.
+    Conflict,
+    /// Clean buffer, changed file: take the new content silently.
+    Reload,
+}
+
+/// Decide what a changed file means for one buffer.
+///
+/// Pulled out of the event handler because it is the whole of the
+/// external-change contract and the only part of it worth testing directly:
+/// everything around it is GPUI plumbing.
+///
+/// `saving` is the subtle one. While our own write is in flight `disk_mtime`
+/// still names the *previous* content, so the echo test below would call our
+/// own save an external change and — on a clean buffer — reload the file out
+/// from under the write. The write's landing sets the new mtime; anything
+/// genuinely external gets reported again after it.
+fn classify_external_change(
+    saving: bool,
+    dirty: bool,
+    disk_mtime: Option<MTime>,
+    observed: Option<MTime>,
+) -> ExternalChange {
+    if saving {
+        return ExternalChange::Ignore;
+    }
+    // Our own save's echo: the mtime matches what we last wrote or loaded.
+    // `Some` on both sides deliberately — a filesystem with no mtime cannot
+    // prove an echo, and guessing "echo" there would drop real changes.
+    if observed.is_some() && observed == disk_mtime {
+        return ExternalChange::Ignore;
+    }
+    if dirty {
+        ExternalChange::Conflict
+    } else {
+        ExternalChange::Reload
+    }
+}
+
+/// What a landed write does to the buffer it wrote.
+///
+/// Separated for the same reason: this is the three-way answer that the ⌘S
+/// exemption in contract §1 turns on, and it is pure.
+#[derive(Debug, PartialEq, Eq)]
+struct SaveLanding {
+    /// The buffer still holds what reached disk, so it may be marked clean.
+    clean: bool,
+    /// Another save was asked for while this one flew; re-issue it.
+    requeue: bool,
+}
+
+/// Settle an in-flight write.
+///
+/// `wrote_seq` is the buffer's edit counter when the snapshot was taken and
+/// `current_seq` is where it is now: unequal means the user kept typing, so the
+/// bytes on disk are already stale and the buffer stays dirty.
+///
+/// A failed write never requeues — a path that cannot be written would
+/// otherwise re-issue forever, one notification per round.
+fn settle_save(ok: bool, wrote_seq: u64, current_seq: u64, pending: bool) -> SaveLanding {
+    SaveLanding {
+        clean: ok && wrote_seq == current_seq,
+        requeue: ok && pending,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tty7App: open / save / close / external reload.
 // ---------------------------------------------------------------------------
@@ -269,44 +401,102 @@ impl Tty7App {
     /// Rebuild the external-change watcher over every tab's open files.
     /// Watches each file's *parent directory* (non-recursively): editors that
     /// save via rename replace the inode, which a direct file watch loses.
-    fn editor_rebuild_watcher(&mut self) {
-        use notify::{RecursiveMode, Watcher};
-        self.editor.watcher = None;
-        let watched: HashSet<PathBuf> = self
+    fn editor_rebuild_watcher(&mut self, cx: &mut Context<Self>) {
+        let files: HashSet<PathBuf> = self
             .tabs
             .iter()
             .filter_map(|t| t.code.as_deref())
             .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
             .collect();
-        if watched.is_empty() {
-            return;
-        }
-        let dirs: HashSet<PathBuf> = watched
+        let dirs: HashSet<PathBuf> = files
             .iter()
             .filter_map(|p| p.parent().map(Path::to_path_buf))
             .collect();
-        let tx = self.editor.events_tx.clone();
-        let handler = move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else { return };
-            for p in &event.paths {
-                if watched.contains(p) {
-                    let _ = tx.try_send(p.clone());
-                }
-            }
+        self.editor.watched_files = files;
+        if dirs == self.editor.watched_dirs {
+            return;
+        }
+        self.editor.watched_dirs = dirs;
+        self.editor_watch_apply(cx);
+    }
+
+    /// Push `editor.watched_dirs` at the subscription, opening one first if
+    /// there isn't one yet.
+    ///
+    /// Split from [`editor_rebuild_watcher`](Self::editor_rebuild_watcher)
+    /// because that one returns early when the set hasn't moved — which is
+    /// right for a caller reacting to an open or a close, and wrong for the
+    /// landing below, whose whole job is to apply a set that moved while there
+    /// was nothing to apply it to.
+    fn editor_watch_apply(&mut self, cx: &mut Context<Self>) {
+        let want: Vec<PathBuf> = self.editor.watched_dirs.iter().cloned().collect();
+        let Some(host) = self.active_host(cx) else {
+            return;
         };
-        let mut watcher = match notify::recommended_watcher(handler) {
-            Ok(w) => w,
-            Err(e) => {
-                log::warn!("editor: external-change watcher unavailable: {e}");
+
+        if let Some(sub) = self.editor.watch.clone() {
+            if self.editor.watch_busy {
+                self.editor.watch_dirty = true;
                 return;
             }
-        };
-        for dir in dirs {
-            if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                log::warn!("editor: failed to watch {}: {e}", dir.display());
-            }
+            self.editor.watch_busy = true;
+            HostOps::run(
+                host,
+                cx,
+                move |_| sub.set_dirs(&want),
+                |app: &mut Self, result: std::io::Result<()>, cx| {
+                    app.editor.watch_busy = false;
+                    if let Err(e) = result {
+                        log::warn!("editor: could not update the watched set: {e}");
+                    }
+                    if std::mem::take(&mut app.editor.watch_dirty) {
+                        app.editor_watch_apply(cx);
+                    }
+                },
+            );
+            return;
         }
-        self.editor.watcher = Some(watcher);
+        if self.editor.watch_opening {
+            // The landing re-reads `watched_dirs`, so a set that moved while
+            // the subscription was opening is applied when it arrives.
+            return;
+        }
+        self.editor.watch_opening = true;
+        let opened_with = self.editor.watched_dirs.clone();
+        HostOps::run(
+            host,
+            cx,
+            {
+                let want = want.clone();
+                move |h| h.watch(&want).map(Arc::new)
+            },
+            move |app, result: std::io::Result<Arc<WatchSub>>, cx| {
+                app.editor.watch_opening = false;
+                let sub = match result {
+                    Ok(sub) => sub,
+                    Err(e) => {
+                        log::warn!("editor: external-change watcher unavailable: {e}");
+                        return;
+                    }
+                };
+                let events = sub.events().clone();
+                app.editor.watch = Some(sub);
+                cx.spawn(async move |app, cx| {
+                    while let Ok(batch) = events.recv().await {
+                        let ok = app.update(cx, |app, _cx| {
+                            let _ = app.editor.events_tx.try_send(batch);
+                        });
+                        if ok.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+                if app.editor.watched_dirs != opened_with {
+                    app.editor_watch_apply(cx);
+                }
+            },
+        );
     }
 
     /// Open `path` in the active tab's editor (activating an existing file tab
@@ -325,61 +515,104 @@ impl Tty7App {
         // file tree lives in the right panel and stays clickable even while the
         // diff overlay covers the column.
         self.raise_code_overlay();
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if let Some(code) = self.tab_code_mut()
-            && let Some(ix) = code.files.iter().position(|f| f.path == path)
-        {
-            code.visible = true;
-            // Activating always surfaces to the front of the strip: the strip
-            // is MRU-ordered and only its head fits on screen (see
-            // `render_editor_tabs`), so the active file must live there.
-            let f = code.files.remove(ix);
-            code.files.insert(0, f);
-            code.active = 0;
-            self.focus_editor(window, cx);
-            cx.notify();
+        // The already-open check runs twice: once here against the path as
+        // given, so the overwhelmingly common case (a click on a tree row,
+        // whose path is already canonical) costs nothing, and once more when
+        // the canonical path comes back, which is the one that is actually
+        // authoritative.
+        if self.editor_activate_open(path, window, cx) {
             return;
         }
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.len() > MAX_FILE_BYTES => {
-                window.push_notification(
-                    format!(
+        let Some(host) = self.active_host(cx) else {
+            return;
+        };
+        let p = path.to_path_buf();
+        HostOps::run_in(
+            host,
+            window,
+            cx,
+            // The failure arm carries the finished message rather than an
+            // error value: every one of these is phrased around the path, and
+            // the path is only settled once `canonicalize` has run out here.
+            move |h| -> Result<(PathBuf, String, Option<MTime>), String> {
+                // Canonicalize first — it decides identity, and two paths to
+                // one file must not become two buffers. A failure keeps the
+                // path as given, which is the habit this call site has always
+                // had.
+                let path = h.canonicalize(&p).unwrap_or(p);
+                let meta = match h.stat(&path) {
+                    Ok(m) => m,
+                    Err(e) => return Err(format!("Can't open {}: {e}", path.display())),
+                };
+                if meta.len > MAX_FILE_BYTES {
+                    return Err(format!(
                         "\"{}\" is too large for the editor ({} MB)",
                         path.display(),
-                        meta.len() / (1024 * 1024)
-                    ),
-                    cx,
-                );
-                return;
-            }
-            Err(e) => {
-                window.push_notification(format!("Can't open {}: {e}", path.display()), cx);
-                return;
-            }
-            Ok(_) => {}
-        }
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                window.push_notification(format!("Can't read {}: {e}", path.display()), cx);
-                return;
-            }
+                        meta.len / (1024 * 1024)
+                    ));
+                }
+                let bytes = match h.read_file(&path, MAX_FILE_BYTES) {
+                    Ok(b) => b,
+                    Err(e) => return Err(format!("Can't read {}: {e}", path.display())),
+                };
+                if looks_binary(&bytes) {
+                    return Err(format!("\"{}\" looks like a binary file", path.display()));
+                }
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| format!("\"{}\" is not valid UTF-8", path.display()))?;
+                Ok((path, text, meta.mtime))
+            },
+            move |app, opened, window, cx| match opened {
+                Ok((path, text, mtime)) => app.editor_install_file(path, text, mtime, window, cx),
+                Err(message) => window.push_notification(message, cx),
+            },
+        );
+    }
+
+    /// Bring an already-open `path` to the front, reporting whether it was
+    /// open at all.
+    fn editor_activate_open(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(code) = self.tab_code_mut() else {
+            return false;
         };
-        if looks_binary(&bytes) {
-            window.push_notification(
-                format!("\"{}\" looks like a binary file", path.display()),
-                cx,
-            );
+        let Some(ix) = code.files.iter().position(|f| f.path == *path) else {
+            return false;
+        };
+        code.visible = true;
+        // Activating always surfaces to the front of the strip: the strip
+        // is MRU-ordered and only its head fits on screen (see
+        // `render_editor_tabs`), so the active file must live there.
+        let f = code.files.remove(ix);
+        code.files.insert(0, f);
+        code.active = 0;
+        self.focus_editor(window, cx);
+        cx.notify();
+        true
+    }
+
+    /// Put a file that finished loading into the active tab.
+    fn editor_install_file(
+        &mut self,
+        path: PathBuf,
+        text: String,
+        mtime: Option<MTime>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The canonical path is the authoritative identity, and the load took
+        // long enough that the file may have been opened by another route in
+        // the meantime.
+        if self.editor_activate_open(&path, window, cx) {
             return;
         }
-        let text = match String::from_utf8(bytes) {
-            Ok(t) => t,
-            Err(_) => {
-                window.push_notification(format!("\"{}\" is not valid UTF-8", path.display()), cx);
-                return;
-            }
-        };
-        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if self.tabs.get(self.active).is_none() {
+            return;
+        }
         let language = language_for_path(&path);
         let input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -412,9 +645,11 @@ impl Tty7App {
                     else {
                         return;
                     };
-                    if !f.dirty {
-                        f.dirty = true;
-                    }
+                    f.dirty = true;
+                    // Every edit moves the buffer away from whatever an
+                    // in-flight save is writing, which is how that save knows
+                    // not to declare the buffer clean when it lands.
+                    f.edit_seq = f.edit_seq.wrapping_add(1);
                     cx.notify();
                 }
             }
@@ -433,6 +668,11 @@ impl Tty7App {
                 input,
                 dirty: false,
                 disk_mtime: mtime,
+                edit_seq: 0,
+                saving: None,
+                save_pending: false,
+                save_then_close: false,
+                reload_seq: 0,
                 conflict: false,
                 preview: false,
                 wrap: false,
@@ -442,7 +682,7 @@ impl Tty7App {
         );
         code.active = 0;
         code.visible = true;
-        self.editor_rebuild_watcher();
+        self.editor_rebuild_watcher(cx);
         self.focus_editor(window, cx);
         cx.notify();
     }
@@ -520,25 +760,136 @@ impl Tty7App {
 
     /// `EditorSave` (⌘S): write the active buffer back to its path.
     pub(crate) fn editor_save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(code) = self.tab_code_mut() else {
+        let Some(id) = self
+            .tab_code()
+            .and_then(|c| c.active_file())
+            .map(|f| f.input.entity_id())
+        else {
             return;
         };
-        let active = code.active;
-        let Some(f) = code.files.get_mut(active) else {
+        self.editor_save_file(id, false, window, cx);
+    }
+
+    /// Write one buffer back to its path, optionally closing it once the write
+    /// lands.
+    ///
+    /// The write is asynchronous (contract §1 exempts this): ⌘S no longer
+    /// blocks the UI thread, so the dirty marker clears a frame later rather
+    /// than instantly. Three things that costs us, and how each is paid:
+    ///
+    /// | Case | Handling |
+    /// |---|---|
+    /// | The user keeps typing while the write is in flight | The snapshot's `edit_seq` is compared on landing; a buffer that moved stays dirty, because it no longer matches what reached disk |
+    /// | Two ⌘S in a row | Single-flight. The second sets `save_pending` and is re-issued when the first lands, so the newest content wins and two writes never race for the same file |
+    /// | The write fails | The buffer stays dirty, `save_pending` is dropped so a failing path can't notify in a loop, and the error is shown |
+    ///
+    /// The buffer is named by the `EntityId` of its input, which is the only
+    /// identity that survives the wait. A tab index does not: closing or
+    /// reordering a *terminal* tab shifts `self.tabs` under an in-flight write,
+    /// and the landing would then either miss the buffer — stranding `saving`
+    /// set, which silently disables every later save *and* every external-change
+    /// check for that file — or find a different buffer of the same path in
+    /// another tab and settle that one instead.
+    fn editor_save_file(
+        &mut self,
+        id: gpui::EntityId,
+        then_close: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Resolved before the buffer is borrowed: the write cannot go anywhere
+        // without a machine to write to, and taking it after would hold a
+        // mutable borrow of `self` across an immutable read of it.
+        let Some(host) = self.active_host(cx) else {
             return;
         };
-        let text = f.input.read(cx).text().to_string();
-        match std::fs::write(&f.path, &text) {
-            Ok(()) => {
-                f.dirty = false;
-                f.conflict = false;
-                f.disk_mtime = std::fs::metadata(&f.path).and_then(|m| m.modified()).ok();
-                cx.notify();
-            }
-            Err(e) => {
-                window.push_notification(format!("Save failed: {e}"), cx);
-            }
+        let Some(f) = self.editor_file_mut(id) else {
+            return;
+        };
+        // Sticky, and OR-accumulated: a close asked for while a plain ⌘S is in
+        // flight must still close when that write lands.
+        f.save_then_close |= then_close;
+        if f.saving.is_some() {
+            // A write is already out for this buffer. Queue rather than race:
+            // two writes of the same file can land on disk in either order, and
+            // the loser would leave stale content behind.
+            f.save_pending = true;
+            return;
         }
+        let seq = f.edit_seq;
+        f.saving = Some(seq);
+        let text = f.input.read(cx).text().to_string();
+        let target = f.path.clone();
+        HostOps::run_in(
+            host,
+            window,
+            cx,
+            // One call, one round trip: the write answers with its own
+            // post-write metadata, so no external edit can land between the
+            // write and a follow-up `stat` and be mistaken for ours.
+            move |h| h.write_file(&target, text.as_bytes()).map(|m| m.mtime),
+            move |app, result: std::io::Result<Option<MTime>>, window, cx| {
+                let Some(f) = app.editor_file_mut(id) else {
+                    return;
+                };
+                f.saving = None;
+                let landing = settle_save(
+                    result.is_ok(),
+                    seq,
+                    f.edit_seq,
+                    std::mem::take(&mut f.save_pending),
+                );
+                match result {
+                    Ok(mtime) => {
+                        // The mtime of the bytes we just wrote, so the watcher
+                        // echo of our own save is recognised and ignored.
+                        f.disk_mtime = mtime;
+                    }
+                    Err(e) => HostOps::notify_err(window, cx, "Save failed", &e),
+                }
+                if landing.clean {
+                    f.dirty = false;
+                    f.conflict = false;
+                }
+                if landing.requeue {
+                    // `save_then_close` stays on the buffer, so the queued
+                    // round inherits it rather than the first caller's copy.
+                    app.editor_save_file(id, false, window, cx);
+                    cx.notify();
+                    return;
+                }
+                let close = app
+                    .editor_file_mut(id)
+                    .is_some_and(|f| std::mem::take(&mut f.save_then_close) && !f.dirty);
+                if close && let Some((tab_ix, ix)) = app.editor_file_position(id) {
+                    app.editor_remove_file_in(tab_ix, ix, cx);
+                }
+                cx.notify();
+            },
+        );
+        cx.notify();
+    }
+
+    /// One open buffer, by the identity of its input entity.
+    ///
+    /// Scans every tab: a file may be open in more than one, and the entity id
+    /// is what tells those buffers apart.
+    fn editor_file_mut(&mut self, id: gpui::EntityId) -> Option<&mut OpenFile> {
+        self.tabs
+            .iter_mut()
+            .filter_map(|t| t.code.as_deref_mut())
+            .flat_map(|c| c.files.iter_mut())
+            .find(|f| f.input.entity_id() == id)
+    }
+
+    /// Where a buffer sits right now, as `(tab index, file index)`. Both move,
+    /// so this is only ever valid for the duration of one UI-thread turn.
+    fn editor_file_position(&self, id: gpui::EntityId) -> Option<(usize, usize)> {
+        self.tabs.iter().enumerate().find_map(|(tab_ix, t)| {
+            let code = t.code.as_deref()?;
+            let ix = code.files.iter().position(|f| f.input.entity_id() == id)?;
+            Some((tab_ix, ix))
+        })
     }
 
     /// Close the file tab at `ix`. Dirty buffers get a native three-way prompt
@@ -564,28 +915,21 @@ impl Tty7App {
             &["Save", "Discard", "Cancel"],
             cx,
         );
+        // The prompt is awaited, so the buffer is named by its input entity
+        // rather than by an index that closing another tab would shift.
+        let id = f.input.entity_id();
         cx.spawn_in(window, async move |app, cx| {
             let Ok(choice) = answer.await else { return };
             let _ = app.update_in(cx, |app, window, cx| match choice {
-                0 => {
-                    // Save, then close. Save failure keeps the tab open.
-                    let prev_active = app.tab_code().map(|c| c.active);
-                    if let Some(code) = app.tab_code_mut() {
-                        code.active = ix;
-                    }
-                    app.editor_save_active(window, cx);
-                    if let (Some(code), Some(prev)) = (app.tab_code_mut(), prev_active) {
-                        code.active = prev;
-                    }
-                    if app
-                        .tab_code()
-                        .and_then(|c| c.files.get(ix))
-                        .is_some_and(|f| !f.dirty)
-                    {
-                        app.editor_remove_file(ix, cx);
+                // Save, then close — the close rides on the write landing (see
+                // `editor_save_file`), so a failed save keeps the tab open
+                // without the caller having to re-check anything.
+                0 => app.editor_save_file(id, true, window, cx),
+                1 => {
+                    if let Some((tab_ix, ix)) = app.editor_file_position(id) {
+                        app.editor_remove_file_in(tab_ix, ix, cx);
                     }
                 }
-                1 => app.editor_remove_file(ix, cx),
                 _ => {}
             });
         })
@@ -616,7 +960,18 @@ impl Tty7App {
     }
 
     fn editor_remove_file(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(code) = self.tab_code_mut() else {
+        self.editor_remove_file_in(self.active, ix, cx);
+    }
+
+    /// [`editor_remove_file`](Self::editor_remove_file) for a named tab — the
+    /// save-then-close path lands after an await, by which time the active tab
+    /// may not be the one the file is in.
+    fn editor_remove_file_in(&mut self, tab_ix: usize, ix: usize, cx: &mut Context<Self>) {
+        let Some(code) = self
+            .tabs
+            .get_mut(tab_ix)
+            .and_then(|t| t.code.as_deref_mut())
+        else {
             return;
         };
         if ix >= code.files.len() {
@@ -626,7 +981,7 @@ impl Tty7App {
         if code.active >= ix && code.active > 0 {
             code.active -= 1;
         }
-        self.editor_rebuild_watcher();
+        self.editor_rebuild_watcher(cx);
         cx.notify();
     }
 
@@ -639,7 +994,31 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let Some(host) = self.active_host(cx) else {
+            return;
+        };
+        let p = path.to_path_buf();
+        let landed = p.clone();
+        HostOps::run_in(
+            host,
+            window,
+            cx,
+            move |h| h.stat(&p).ok().and_then(|m| m.mtime),
+            move |app, mtime, window, cx| {
+                app.editor_apply_external_change(&landed, mtime, window, cx)
+            },
+        );
+    }
+
+    /// Decide what a changed file means for each buffer holding it, once the
+    /// host has answered with its mtime.
+    fn editor_apply_external_change(
+        &mut self,
+        path: &Path,
+        mtime: Option<MTime>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut reload: Vec<(usize, usize)> = Vec::new();
         let mut changed = false;
         for (tab_ix, tab) in self.tabs.iter_mut().enumerate() {
@@ -650,15 +1029,13 @@ impl Tty7App {
                 if f.path != *path {
                     continue;
                 }
-                // Our own save's echo: mtime matches what we just wrote.
-                if mtime.is_some() && mtime == f.disk_mtime {
-                    continue;
-                }
-                if f.dirty {
-                    f.conflict = true;
-                    changed = true;
-                } else {
-                    reload.push((tab_ix, ix));
+                match classify_external_change(f.saving.is_some(), f.dirty, f.disk_mtime, mtime) {
+                    ExternalChange::Ignore => {}
+                    ExternalChange::Conflict => {
+                        f.conflict = true;
+                        changed = true;
+                    }
+                    ExternalChange::Reload => reload.push((tab_ix, ix)),
                 }
             }
         }
@@ -688,18 +1065,59 @@ impl Tty7App {
         else {
             return;
         };
-        let Ok(text) = std::fs::read_to_string(&f.path) else {
-            f.dirty = true;
-            f.conflict = false;
-            cx.notify();
+        let target = f.path.clone();
+        let id = f.input.entity_id();
+        // Only the newest reload may install. Two watcher batches can put two
+        // reads in flight, and background completion order is unconstrained —
+        // an older answer landing last would install stale text and mark it
+        // clean, leaving a buffer that does not match disk and never rechecks.
+        f.reload_seq = f.reload_seq.wrapping_add(1);
+        let seq = f.reload_seq;
+        let Some(host) = self.active_host(cx) else {
             return;
         };
-        f.disk_mtime = std::fs::metadata(&f.path).and_then(|m| m.modified()).ok();
-        f.dirty = false;
-        f.conflict = false;
-        let input = f.input.clone();
-        input.update(cx, |input, cx| input.set_value(text, window, cx));
-        cx.notify();
+        HostOps::run_in(
+            host,
+            window,
+            cx,
+            move |h| {
+                // One hop for both, so the mtime belongs to the bytes we read
+                // rather than to whatever the file became in between.
+                let bytes = h.read_file(&target, MAX_FILE_BYTES)?;
+                let text = String::from_utf8(bytes).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "not valid UTF-8")
+                })?;
+                let mtime = h.stat(&target).ok().and_then(|m| m.mtime);
+                Ok((text, mtime))
+            },
+            move |app, result: std::io::Result<(String, Option<MTime>)>, window, cx| {
+                let Some(f) = app.editor_file_mut(id) else {
+                    return;
+                };
+                if f.reload_seq != seq {
+                    return; // a newer reload supersedes this answer
+                }
+                let Ok((text, mtime)) = result else {
+                    // A vanished (or unreadable) file keeps the buffer and
+                    // marks it dirty — saving will recreate it.
+                    f.dirty = true;
+                    f.conflict = false;
+                    cx.notify();
+                    return;
+                };
+                f.disk_mtime = mtime;
+                f.dirty = false;
+                f.conflict = false;
+                // The reload replaces the text wholesale, and `set_value`
+                // suppresses the Change event, so `edit_seq` must move by hand
+                // — otherwise a save in flight would look like it still
+                // matched the buffer.
+                f.edit_seq = f.edit_seq.wrapping_add(1);
+                let input = f.input.clone();
+                input.update(cx, |input, cx| input.set_value(text, window, cx));
+                cx.notify();
+            },
+        );
     }
 }
 
@@ -1053,5 +1471,99 @@ mod tests {
         assert!(looks_binary(b"\x7fELF\x00\x01"));
         assert!(!looks_binary("plain text\nwith lines".as_bytes()));
         assert!(!looks_binary("中文 UTF-8 内容".as_bytes()));
+    }
+
+    fn t(secs: i64, nanos: u32) -> Option<MTime> {
+        Some(MTime { secs, nanos })
+    }
+
+    /// M2 regression guard (contract §10.5): the save → external-change →
+    /// reload states still decide correctly now that the write is asynchronous.
+    #[test]
+    fn external_changes_are_told_apart_from_our_own_saves() {
+        let ours = t(100, 0);
+
+        // The echo of our own save: same mtime, nothing to do.
+        assert_eq!(
+            classify_external_change(false, false, ours, ours),
+            ExternalChange::Ignore
+        );
+
+        // A real external edit to a clean buffer reloads silently.
+        assert_eq!(
+            classify_external_change(false, false, ours, t(101, 0)),
+            ExternalChange::Reload
+        );
+
+        // The same edit under unsaved work raises the banner instead of
+        // clobbering either side.
+        assert_eq!(
+            classify_external_change(false, true, ours, t(101, 0)),
+            ExternalChange::Conflict
+        );
+
+        // Nanosecond precision is the point of `MTime`: an external write in
+        // the same second as ours must not read as an echo.
+        assert_eq!(
+            classify_external_change(false, false, t(100, 0), t(100, 1)),
+            ExternalChange::Reload
+        );
+
+        // While our own write is in flight, `disk_mtime` still names the old
+        // content — acting on it would reload the file out from under the save.
+        assert_eq!(
+            classify_external_change(true, false, ours, t(101, 0)),
+            ExternalChange::Ignore
+        );
+
+        // A filesystem with no mtime cannot prove an echo, so a change there is
+        // treated as real rather than silently dropped.
+        assert_eq!(
+            classify_external_change(false, false, None, None),
+            ExternalChange::Reload
+        );
+    }
+
+    /// M2 regression guard (contract §1, the ⌘S exemption): the three things
+    /// asynchronous saving has to get right.
+    #[test]
+    fn a_landed_save_only_cleans_a_buffer_that_did_not_move() {
+        // Nothing happened during the write: the buffer is clean.
+        assert_eq!(
+            settle_save(true, 7, 7, false),
+            SaveLanding {
+                clean: true,
+                requeue: false
+            }
+        );
+
+        // The user kept typing: what reached disk is already stale, so the
+        // buffer stays dirty and the amber dot stays up.
+        assert_eq!(
+            settle_save(true, 7, 9, false),
+            SaveLanding {
+                clean: false,
+                requeue: false
+            }
+        );
+
+        // A second ⌘S arrived mid-write: re-issue it so the newest content wins.
+        assert_eq!(
+            settle_save(true, 7, 9, true),
+            SaveLanding {
+                clean: false,
+                requeue: true
+            }
+        );
+
+        // A failed write never cleans and never re-issues — requeueing a path
+        // that cannot be written is an infinite notification loop.
+        assert_eq!(
+            settle_save(false, 7, 7, true),
+            SaveLanding {
+                clean: false,
+                requeue: false
+            }
+        );
     }
 }

@@ -30,6 +30,7 @@ pub mod input;
 mod loopback;
 pub(crate) mod marks;
 pub mod palette;
+pub(crate) mod pane_liveness;
 mod remote;
 mod reverse_search;
 pub mod search;
@@ -39,6 +40,6 @@ mod smart_select;
 mod typeahead;
 pub mod view;
 
-pub use remote::RemoteTerminal;
 pub(crate) use remote::notify_desktop;
+pub use remote::{PaneRoute, PaneWorkspace, RemoteTerminal};
 pub use size::TermSize;

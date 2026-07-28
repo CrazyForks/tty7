@@ -10,6 +10,7 @@
 //! spec (pre-resolved from the keychain by the GUI) or, failing that, from the
 //! [`PromptBroker`]. Secrets are never logged.
 
+#[cfg(unix)]
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -17,7 +18,9 @@ use russh::client::{AuthResult, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKey};
-use russh::{GssapiAuthenticator, GssapiStep, MethodKind, MethodSet};
+#[cfg(all(unix, feature = "gssapi"))]
+use russh::{GssapiAuthenticator, GssapiStep};
+use russh::{MethodKind, MethodSet};
 
 use crate::daemon::protocol::{AuthPromptKind, AuthResponse, KiPrompt, NativeSshSpec, SshAuthMode};
 
@@ -120,14 +123,15 @@ fn failed(reason: impl Into<String>) -> Outcome {
     }
 }
 
+#[cfg(all(unix, feature = "gssapi"))]
 const KRB5_DER_OID: &[u8] = b"\x06\x09\x2a\x86\x48\x86\xf7\x12\x01\x02\x02";
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 struct GssapiClient {
     ctx: libgssapi::context::ClientCtx,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 #[derive(Debug)]
 enum GssapiAuthError {
     Send(russh::SendError),
@@ -135,7 +139,7 @@ enum GssapiAuthError {
     Other(String),
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 impl std::fmt::Display for GssapiAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -146,21 +150,21 @@ impl std::fmt::Display for GssapiAuthError {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 impl From<russh::SendError> for GssapiAuthError {
     fn from(value: russh::SendError) -> Self {
         GssapiAuthError::Send(value)
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 impl From<libgssapi::error::Error> for GssapiAuthError {
     fn from(value: libgssapi::error::Error) -> Self {
         GssapiAuthError::Gssapi(value)
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 impl GssapiAuthenticator for GssapiClient {
     type Error = GssapiAuthError;
 
@@ -202,7 +206,7 @@ impl GssapiAuthenticator for GssapiClient {
 }
 
 async fn try_gssapi(handle: &mut Handle<ClientHandler>, spec: &NativeSshSpec) -> Outcome {
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "gssapi"))]
     {
         use libgssapi::context::{ClientCtx, CtxFlags};
         use libgssapi::name::Name;
@@ -272,14 +276,14 @@ async fn try_gssapi(handle: &mut Handle<ClientHandler>, spec: &NativeSshSpec) ->
             ))
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, feature = "gssapi")))]
     {
         let _ = (handle, spec);
-        failed("gssapi auth is only implemented on Unix")
+        failed("gssapi auth is not available in this build")
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 async fn gssapi_service_hosts(host: &str) -> Vec<String> {
     let host = host.to_string();
     let fallback = host.clone();
@@ -288,12 +292,23 @@ async fn gssapi_service_hosts(host: &str) -> Vec<String> {
         .unwrap_or_else(|_| vec![fallback])
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 fn gssapi_service_hosts_blocking(host: &str) -> Vec<String> {
     gssapi_service_hosts_with_lookup(host, reverse_lookup_addr)
 }
 
+/// Which host names to request a `host/<name>` Kerberos service ticket for: the
+/// host as typed, plus its reverse-DNS name when it was typed as a bare IP.
+///
+/// Deliberately gated on `unix` alone, **not** on `feature = "gssapi"`. It needs
+/// nothing from libgssapi — the caller injects the resolver — and gating it also
+/// gated its two unit tests, which then only ran because the GUI package enables
+/// `gssapi` and cargo unifies features across a `--workspace` test run. Narrowing
+/// to `cargo test -p tty7-core` (a bisect, a single-crate iteration) silently
+/// dropped them: green run, test never compiled. Without the feature the only
+/// caller is the test module below, hence the `allow`.
 #[cfg(unix)]
+#[cfg_attr(not(feature = "gssapi"), allow(dead_code))]
 fn gssapi_service_hosts_with_lookup(
     host: &str,
     reverse_lookup: impl FnOnce(IpAddr) -> Option<String>,
@@ -310,7 +325,7 @@ fn gssapi_service_hosts_with_lookup(
     out
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 fn reverse_lookup_addr(ip: IpAddr) -> Option<String> {
     match ip {
         IpAddr::V4(ip) => reverse_lookup_v4(ip),
@@ -318,7 +333,7 @@ fn reverse_lookup_addr(ip: IpAddr) -> Option<String> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 fn reverse_lookup_v4(ip: std::net::Ipv4Addr) -> Option<String> {
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     set_sockaddr_in_len(&mut addr);
@@ -332,7 +347,7 @@ fn reverse_lookup_v4(ip: std::net::Ipv4Addr) -> Option<String> {
     )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 fn reverse_lookup_v6(ip: std::net::Ipv6Addr) -> Option<String> {
     let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
     set_sockaddr_in6_len(&mut addr);
@@ -346,7 +361,7 @@ fn reverse_lookup_v6(ip: std::net::Ipv6Addr) -> Option<String> {
     )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 fn reverse_lookup_sockaddr(addr: *const libc::sockaddr, len: libc::socklen_t) -> Option<String> {
     const NI_MAXHOST_FALLBACK: usize = 1025;
     let mut host = [0 as libc::c_char; NI_MAXHOST_FALLBACK];
@@ -378,7 +393,7 @@ fn reverse_lookup_sockaddr(addr: *const libc::sockaddr, len: libc::socklen_t) ->
     target_os = "netbsd",
     target_os = "dragonfly"
 ))]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 fn set_sockaddr_in_len(addr: &mut libc::sockaddr_in) {
     addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
 }
@@ -391,7 +406,7 @@ fn set_sockaddr_in_len(addr: &mut libc::sockaddr_in) {
     target_os = "netbsd",
     target_os = "dragonfly"
 )))]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 fn set_sockaddr_in_len(_addr: &mut libc::sockaddr_in) {}
 
 #[cfg(any(
@@ -402,7 +417,7 @@ fn set_sockaddr_in_len(_addr: &mut libc::sockaddr_in) {}
     target_os = "netbsd",
     target_os = "dragonfly"
 ))]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 fn set_sockaddr_in6_len(addr: &mut libc::sockaddr_in6) {
     addr.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
 }
@@ -415,7 +430,7 @@ fn set_sockaddr_in6_len(addr: &mut libc::sockaddr_in6) {
     target_os = "netbsd",
     target_os = "dragonfly"
 )))]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gssapi"))]
 fn set_sockaddr_in6_len(_addr: &mut libc::sockaddr_in6) {}
 
 /// Try identity files (unless mode is `Agent`) then the ssh-agent (unless mode is
@@ -835,6 +850,9 @@ mod tests {
         );
     }
 
+    // `#[cfg(unix)]`, not `#[cfg(all(unix, feature = "gssapi"))]`: these exercise
+    // pure host-list logic, so they must run under a plain
+    // `cargo test -p tty7-core` too. See `gssapi_service_hosts_with_lookup`.
     #[cfg(unix)]
     #[test]
     fn gssapi_service_hosts_keep_original_host_before_reverse_dns() {

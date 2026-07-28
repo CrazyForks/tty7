@@ -24,6 +24,10 @@ actions!(
         // Until now `Workspace.name` could only ever be the derived repo name —
         // there was no way for the user to set one.
         RenameWorkspace,
+        // Open the workspace switcher: every workspace on every machine, in one
+        // panel. The title-bar chip opens the same thing, so this is the
+        // keyboard's half of a control that is otherwise mouse-only.
+        ToggleSwitcher,
         // Show the Nth workspace in the Window menu's order (see
         // `ui::windows::menu_order`). Unit actions rather than one
         // parameterized action, matching `ActivateTab1..9` — it keeps them

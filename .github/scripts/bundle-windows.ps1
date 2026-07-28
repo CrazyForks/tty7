@@ -26,6 +26,23 @@ Copy-Item "assets/completions/*.json" "$Stage/completions/"
 Copy-Item LICENSE "$Stage/LICENSE.txt"
 Copy-Item README.md "$Stage/README.md"
 
+# The Linux musl `tty7-server`, staged at server/ so a WSL distro can be handed
+# the binary this client shipped with (design §12: WSL downloads nothing). The
+# lookup path is a contract with `daemon::install::wsl` — it searches
+# <dir of tty7.exe>/server/<asset> first — so this directory name is not free to
+# change on its own. Missing is a warning, not an error, matching `server-musl`'s
+# own skip-don't-fail probe; WSL then fails at connect time with a message
+# naming the directories it searched.
+$ServerAsset = "tty7-server-x86_64-unknown-linux-musl"
+$ServerSrc = "bundled-server/$ServerAsset"
+if (Test-Path $ServerSrc) {
+    New-Item -ItemType Directory -Force -Path "$Stage/server" | Out-Null
+    Copy-Item $ServerSrc "$Stage/server/$ServerAsset"
+    Write-Host "OK bundled $ServerAsset"
+} else {
+    Write-Warning "no $ServerAsset to bundle - this build cannot serve WSL distros"
+}
+
 Compress-Archive -Path "$Stage/*" -DestinationPath "dist/$Name.zip" -Force
 
 # Installer, built from the same staged payload. ISCC is on PATH on GitHub's

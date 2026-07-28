@@ -30,6 +30,7 @@ use russh::client::Msg;
 use russh::{Channel, ChannelMsg};
 
 use crate::daemon::protocol::WinSize;
+use crate::daemon::remote_link::RemoteEntry;
 
 use super::ConnectionKey;
 use super::forward::RemoteForwardTable;
@@ -265,6 +266,17 @@ pub struct SshConnection {
     /// with no remote forwards.
     remote_forwards: RemoteForwardTable,
     alive: AtomicBool,
+    /// How this host's `tty7-server` is reached — probed once, then reused by
+    /// every remote workspace stream on this connection (design §7.1).
+    ///
+    /// Per *connection*, not per channel: deciding costs a round trip (an `exec`
+    /// to read the remote's environment, and on a host with
+    /// `AllowStreamLocalForwarding no` a rejected channel open on top), and the
+    /// answer cannot change while the connection lives. Behind a `tokio::Mutex`
+    /// held across the probe, so two workspaces opening at once produce one
+    /// probe rather than two — unlike [`super::SshManager`]'s shell-integration
+    /// cache, where a duplicated probe is merely wasted work.
+    remote_entry: tokio::sync::Mutex<Option<RemoteEntry>>,
 }
 
 impl SshConnection {
@@ -278,6 +290,7 @@ impl SshConnection {
             key,
             remote_forwards,
             alive: AtomicBool::new(true),
+            remote_entry: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -340,6 +353,66 @@ impl SshConnection {
                 0,
             )
             .await
+    }
+
+    /// Open a `direct-streamlocal@openssh.com` channel to `socket_path` on the
+    /// remote — the preferred way into a remote `tty7-server` (design §7.1).
+    ///
+    /// The remote's sshd connects the channel to that Unix socket itself, so the
+    /// far end sees an ordinary local connection and needs no extra process. The
+    /// extension is OpenSSH's, and `AllowStreamLocalForwarding` defaults to
+    /// `yes`; an administrator who set it to `no` makes this fail at channel
+    /// open, which is the signal [`RemoteEntry`] caches a fallback for.
+    ///
+    /// `socket_path` is the remote's path and is sent verbatim — no `~`, no
+    /// variables, no client-side path arithmetic (a Windows client's
+    /// `PathBuf::join` would corrupt it).
+    pub async fn open_direct_streamlocal(
+        &self,
+        socket_path: &str,
+    ) -> Result<Channel<Msg>, russh::Error> {
+        self.handle
+            .lock()
+            .await
+            .channel_open_direct_streamlocal(socket_path.to_string())
+            .await
+    }
+
+    /// This connection's cached [`RemoteEntry`], probing with `init` the first
+    /// time anyone asks.
+    ///
+    /// The lock is held across `init` on purpose: the point of the cache is that
+    /// the round trips happen once, and two workspaces opening simultaneously
+    /// against a cold connection is the *normal* case (a window restoring its
+    /// layout), not a rare race.
+    pub async fn remote_entry_or_init<F, Fut>(&self, init: F) -> RemoteEntry
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = RemoteEntry>,
+    {
+        let mut guard = self.remote_entry.lock().await;
+        if let Some(entry) = guard.as_ref() {
+            return entry.clone();
+        }
+        let entry = init().await;
+        log::debug!(
+            "ssh {:?}: remote workspace entry is {}",
+            self.key,
+            entry.kind_label()
+        );
+        *guard = Some(entry.clone());
+        entry
+    }
+
+    /// Replace the cached entry after the preferred one failed in use.
+    ///
+    /// A `direct-streamlocal` open that the server refuses is not necessarily
+    /// visible at probe time — a daemon can be restarted, a socket removed, an
+    /// administrator's `AllowStreamLocalForwarding no` applied on reload — so
+    /// the first failure demotes the connection for good rather than letting
+    /// every later stream pay the same rejected round trip.
+    pub async fn set_remote_entry(&self, entry: RemoteEntry) {
+        *self.remote_entry.lock().await = Some(entry);
     }
 
     /// Request a `tcpip-forward` binding on `bind_host:bind_port`, routing incoming

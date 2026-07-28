@@ -243,10 +243,14 @@ impl Tty7App {
                 // activating this row's tab. The cwd they probe is the same one
                 // the status resolved through, so overlay and counts always
                 // describe the same repo.
-                let git_cwd = tab
-                    .pane
-                    .focused_or_first(window, cx)
-                    .and_then(|leaf| leaf.read(cx).git_status_cwd().map(|p| p.to_path_buf()));
+                let git_cwd = tab.pane.focused_or_first(window, cx).and_then(|leaf| {
+                    let view = leaf.read(cx);
+                    let cwd = view.git_status_cwd()?.to_path_buf();
+                    // The id, not the host: opening the overlay needs no live
+                    // connection — a disconnected machine's last diff is still
+                    // worth showing, and the re-probe resolves the id itself.
+                    Some((view.host_id(), cwd))
+                });
                 let git_line = tab.git_status(Some(window), cx).map(|g| {
                     let mut line = h_flex()
                         .id(("sidebar-git", i))
@@ -271,14 +275,14 @@ impl Tty7App {
                             .flex_shrink_0()
                             .items_center()
                             .gap_1p5()
-                            .when_some(git_cwd, |counts, cwd| {
+                            .when_some(git_cwd, |counts, (host, cwd)| {
                                 counts.cursor_pointer().on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                                         // Swallow the press so the row/label
                                         // handlers don't also activate the tab.
                                         cx.stop_propagation();
-                                        this.toggle_diff_overlay(cwd.clone(), window, cx);
+                                        this.toggle_diff_overlay(host, cwd.clone(), window, cx);
                                     }),
                                 )
                             });
@@ -994,12 +998,22 @@ impl Tty7App {
                 if !grouping {
                     return None;
                 }
-                let cwd = tab
-                    .pane
-                    .first_leaf()
-                    .and_then(|leaf| leaf.read(cx).git_status_cwd().map(|p| p.to_path_buf()));
+                // The *lookup* is per machine, so a pane never resolves its
+                // repo through another host's table. The key stays a bare
+                // path, and that is correct rather than a shortcut: a tab
+                // belongs to one workspace, a workspace names one machine in
+                // `Workspace.host`, and a window shows one workspace — design
+                // §3 rules out ever mixing local and remote in one window. So
+                // the qualified key is `(workspace.host_id(), sidebar_group)`
+                // with the host half held once per workspace instead of once
+                // per tab, and two machines can't collide here without a
+                // window the model does not permit.
+                let cwd = tab.pane.first_leaf().and_then(|leaf| {
+                    let view = leaf.read(cx);
+                    Some((view.host_id(), view.git_status_cwd()?.to_path_buf()))
+                });
                 if let Some(known) =
-                    cwd.and_then(|cwd| cx.global::<GitStatusCache>().known_repo_for(&cwd))
+                    cwd.and_then(|(id, cwd)| cx.global::<GitStatusCache>().known_repo_for(id, &cwd))
                 {
                     *tab.sidebar_group.borrow_mut() = known;
                 }

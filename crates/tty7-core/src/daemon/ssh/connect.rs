@@ -82,8 +82,46 @@ impl AsyncWrite for Transport {
 pub struct ProcessStream {
     // Held so the child is reaped on drop; not otherwise read.
     _child: tokio::process::Child,
-    stdin: tokio::process::ChildStdin,
+    /// `Option` so `poll_shutdown` can *drop* it.
+    ///
+    /// This is the only way to half-close a pipe. `ChildStdin`'s own
+    /// `poll_shutdown` returns `Ready(Ok(()))` without touching the file
+    /// descriptor, so the child never sees EOF and keeps waiting for input that
+    /// will never come — a `tty7-server --stdio` bridge would hang there
+    /// forever instead of exiting. Closing the write half is a real operation
+    /// and has to be modelled as one.
+    stdin: Option<tokio::process::ChildStdin>,
     stdout: tokio::process::ChildStdout,
+}
+
+impl ProcessStream {
+    /// Assemble one from an already-spawned child and its taken pipes.
+    ///
+    /// The fields stay private — a `ProcessStream` whose `_child` did not
+    /// produce its own `stdin`/`stdout` would reap the wrong process on drop.
+    /// `daemon::remote_link` needs this to wrap a `tty7-server --stdio` child
+    /// the same way the `ProxyCommand` path wraps its own.
+    pub fn from_parts(
+        child: tokio::process::Child,
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+    ) -> ProcessStream {
+        ProcessStream {
+            _child: child,
+            stdin: Some(stdin),
+            stdout,
+        }
+    }
+
+    /// The write half, or a "already closed" error once it has been shut down.
+    fn stdin_mut(&mut self) -> std::io::Result<&mut tokio::process::ChildStdin> {
+        self.stdin.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the process stream's write half is already closed",
+            )
+        })
+    }
 }
 
 impl AsyncRead for ProcessStream {
@@ -102,13 +140,40 @@ impl AsyncWrite for ProcessStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stdin).poll_write(cx, buf)
+        match self.get_mut().stdin_mut() {
+            Ok(stdin) => Pin::new(stdin).poll_write(cx, buf),
+            Err(e) => Poll::Ready(Err(e)),
+        }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().stdin).poll_flush(cx)
+        match self.get_mut().stdin_mut() {
+            Ok(stdin) => Pin::new(stdin).poll_flush(cx),
+            // Nothing buffered can remain once the half is closed.
+            Err(_) => Poll::Ready(Ok(())),
+        }
     }
+
+    /// Flush, then **close** the write half by dropping the pipe.
+    ///
+    /// Delegating to `ChildStdin::poll_shutdown` would be a no-op — it does not
+    /// close the descriptor — so the peer would never reach EOF. Dropping is
+    /// what actually closes it, which is why `stdin` is an `Option`.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().stdin).poll_shutdown(cx)
+        let this = self.get_mut();
+        let Some(stdin) = this.stdin.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(stdin).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                this.stdin = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                this.stdin = None;
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -188,11 +253,9 @@ fn spawn_proxy_command(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("ProxyCommand stdout unavailable"))?;
-    Ok(Transport::Process(ProcessStream {
-        _child: child,
-        stdin,
-        stdout,
-    }))
+    Ok(Transport::Process(ProcessStream::from_parts(
+        child, stdin, stdout,
+    )))
 }
 
 /// Split a ProxyCommand template into argv and substitute the OpenSSH tokens

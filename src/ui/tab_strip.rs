@@ -17,9 +17,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::core::actions::{
-    NewWorkspace, OpenSettings, RenameWorkspace, SelectWorkspace1, SelectWorkspace2,
-    SelectWorkspace3, SelectWorkspace4, SelectWorkspace5, SelectWorkspace6, SelectWorkspace7,
-    SelectWorkspace8, SelectWorkspace9, StopWorkspace, TogglePalette,
+    OpenSettings, SelectWorkspace1, SelectWorkspace2, SelectWorkspace3, SelectWorkspace4,
+    SelectWorkspace5, SelectWorkspace6, SelectWorkspace7, SelectWorkspace8, SelectWorkspace9,
+    TogglePalette,
 };
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::ShellSpec;
@@ -230,29 +230,21 @@ pub(crate) fn chrome_tile_sized(
         .h(px(tile))
 }
 
-/// One workspace row in the title-bar menu, flattened for rendering.
-#[derive(Clone)]
-struct WorkspaceMenuRow {
-    id: crate::core::session::WorkspaceId,
-    name: String,
-    /// Currently shown by a window.
-    open: bool,
-    /// Shown by *this* window.
-    is_current: bool,
-    /// Has panes still running in the daemon.
-    live: bool,
-}
-
-/// Diameter of the monogram badge on a workspace row. Smaller than the
-/// title-bar chip's (which sits among 32px tiles) and a shade under the
-/// sidebar's 24px, so a menu row stays at menu height.
-const MENU_AVATAR_PX: f32 = 20.0;
-
 /// The colour of a live workspace's corner dot. The same green
 /// [`AgentStatus::Done`](crate::core::cli_agent::AgentStatus::dot_rgb) uses —
 /// deliberately *not* the brand mint, which belongs to the logo and would be
 /// the only saturated pixel in a chrome that has none.
 pub(crate) const LIVE_DOT: u32 = 0x22C55E;
+
+/// The colour of the dot on a workspace whose machine could not be asked.
+///
+/// A neutral grey from the same family as [`LIVE_DOT`], because "unknown" is a
+/// status and the app has exactly one shape for status — the corner dot. Green
+/// says running, absence says stopped (§ [`workspace_avatar`]), and this says
+/// neither: the machine is out of reach and the sessions on it are very
+/// probably fine. Deliberately *not* amber or red — nothing has gone wrong with
+/// the user's work, only with our view of it.
+pub(crate) const UNKNOWN_DOT: u32 = 0x9AA0A6;
 
 /// The monogram badge for a workspace, built in the same shape as a tab
 /// avatar: a neutral disc carrying the first letter, with liveness riding the
@@ -268,6 +260,13 @@ pub(crate) const LIVE_DOT: u32 = 0x22C55E;
 /// thing is just its mark. An "off" indicator would be a second shape invented
 /// for one list, and this app already decided that absence says it.
 ///
+/// A workspace whose machine could not be asked draws the same dot in
+/// [`UNKNOWN_DOT`] grey. It has to be visibly *not* the stopped state: pane ids
+/// are per-machine, so a box that is off or unreachable can tell us nothing
+/// about its sessions, and drawing that as a bare badge would say "your work is
+/// gone" every time a link blinks. One shape, three readings — green, grey,
+/// nothing.
+///
 /// "This is the one you are looking at" is drawn by *subtraction*: the current
 /// badge renders at full strength and every other one fades to the same 0.55
 /// an unfocused pane uses. A leading checkmark would be truer to menu
@@ -277,11 +276,17 @@ pub(crate) const LIVE_DOT: u32 = 0x22C55E;
 /// pixels in the menu on the one row that needs no introduction.
 pub(crate) fn workspace_avatar(
     name: &str,
-    live: bool,
+    live: crate::terminal::pane_liveness::Liveness,
     current: bool,
     size: f32,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    use crate::terminal::pane_liveness::Liveness;
+    let dot = match live {
+        Liveness::Alive => Some(LIVE_DOT),
+        Liveness::Unknown => Some(UNKNOWN_DOT),
+        Liveness::Stopped => None,
+    };
     let initial: String = name
         .chars()
         .next()
@@ -317,78 +322,12 @@ pub(crate) fn workspace_avatar(
                 // reason to say which row you're standing on.
                 .when(!current, |disc| disc.opacity(0.55)),
         )
-        .when(live, |badge| {
+        .children(dot.map(|rgb| {
             // Ringed in `popover`, not `background`: a menu row's fill is the
             // popover colour, and the two differ enough that a background-ringed
             // dot draws a pale halo instead of an edge.
-            badge.child(Tty7App::status_dot(LIVE_DOT, 0, size, cx.theme().popover))
-        })
-}
-
-/// Render one workspace row: the monogram badge (carrying liveness on its
-/// corner), the name, and — on hover — a single close.
-///
-/// One button, not three. The sidebar row is the most action-rich row in the
-/// app and it reveals exactly one on hover, with everything else on the
-/// right-click menu; a menu row has no reason to be busier than that. Stopping
-/// and renaming live in the menu's bottom group, where every other
-/// current-workspace command already is.
-fn workspace_menu_row(row: WorkspaceMenuRow, cx: &App) -> impl IntoElement + use<> {
-    let id = row.id;
-    // The row's own hover fill, so the button sits on an opaque patch and the
-    // name slides under it through the gradient rather than colliding with it.
-    let backing = cx.theme().accent;
-    let mut fade_from = backing;
-    fade_from.a = 0.;
-    h_flex()
-        .id(("workspace-menu-row", id.element_key() as usize))
-        .group("workspace-menu-row")
-        .relative()
-        .w_full()
-        .items_center()
-        .gap_2()
-        .child(workspace_avatar(
-            &row.name,
-            row.live,
-            row.is_current,
-            MENU_AVATAR_PX,
-            cx,
-        ))
-        // The name stays at full strength on every row: this is a list you read
-        // to pick from, and dimming seven of eight names to mark the one you're
-        // already on taxes the reading to make a point the badge already makes.
-        .child(div().flex_1().min_w_0().truncate().child(row.name))
-        .child(
-            h_flex()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .right(px(0.))
-                .items_center()
-                .opacity(0.)
-                .group_hover("workspace-menu-row", |s| s.opacity(1.))
-                .child(div().w(px(14.)).h(px(20.)).bg(linear_gradient(
-                    90.,
-                    linear_color_stop(fade_from, 0.),
-                    linear_color_stop(backing, 1.),
-                )))
-                .child(
-                    div()
-                        .bg(backing)
-                        // Swallow the press so the click doesn't also fire the
-                        // row's own "show this workspace" underneath it.
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            Button::new(("workspace-menu-delete", id.element_key() as usize))
-                                .icon(IconName::Close)
-                                .ghost()
-                                .xsmall()
-                                .on_click(move |_, window, cx| {
-                                    crate::ui::windows::confirm_and_delete(cx, window, id);
-                                }),
-                        ),
-                ),
-        )
+            Tty7App::status_dot(rgb, 0, size, cx.theme().popover)
+        }))
 }
 
 /// The `SelectWorkspace{1..9}` action for a Window-menu slot, or `None` past
@@ -431,11 +370,7 @@ impl Tty7App {
     ///
     /// While a rename is in flight the control becomes the text field, so the
     /// name is edited where it is displayed.
-    pub(crate) fn workspace_chip(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    pub(crate) fn workspace_chip(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         if let Some(rename) = self.workspace_rename.as_ref() {
             // The tile itself becomes the field — same height, same radius, and
             // the hover fill standing in for "this control is being edited".
@@ -460,6 +395,15 @@ impl Tty7App {
                 .into_any_element();
         }
 
+        // Keep the liveness cache warm from here rather than only from the menu
+        // builder. The menu is a popup: it takes its snapshot when it opens and
+        // never rebuilds, so an answer that starts arriving *at* open lands in a
+        // menu nobody is looking at any more and the first open reads `Unknown`
+        // for every remote row. Sweeping from the chip means the answers are
+        // already in by the time it is clicked. Cheap by construction — the
+        // sweep is rate-limited, and past that gate each machine is only asked
+        // once its own TTL has run out.
+        crate::terminal::pane_liveness::sweep(cx);
         let current = crate::core::session::WorkspaceStore::all(cx)
             .get(self.workspace)
             .map(|w| w.display_name())
@@ -471,20 +415,6 @@ impl Tty7App {
             .next()
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_else(|| "~".to_string());
-
-        // Same `action_context` trick as the old "⋯": `.menu(label, Action)`
-        // dispatches the real action, so a click and its shortcut travel one
-        // path and the row renders the shortcut hint for free.
-        let action_ctx = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.pane.focused_or_first(window, cx))
-            .map(|leaf| leaf.read(cx).focus_handle.clone())
-            .unwrap_or_else(|| self.home_focus.clone());
-        // The only thing the rows need from `self`. Everything else — the
-        // order, the names, which shells are still running — is read inside the
-        // menu builder below, at the moment the menu opens.
-        let current_id = self.workspace;
 
         div()
             .occlude()
@@ -509,7 +439,7 @@ impl Tty7App {
                                     .child(monogram),
                             )
                             // A chevron, unlike the toggles beside it: those do
-                            // one thing on click, this opens a menu, and the
+                            // one thing on click, this opens something, and the
                             // glyph is what says so.
                             .child(Icon::new(IconName::ChevronDown).size(px(11.))),
                     )
@@ -517,81 +447,59 @@ impl Tty7App {
                     .h(px(32.))
                     .rounded_lg()
                     .tooltip(SharedString::from(current))
-                    .dropdown_menu_with_anchor(
-                        gpui::Anchor::TopRight,
-                        move |mut menu, _window, cx| {
-                            menu = menu.min_w(px(260.)).action_context(action_ctx.clone());
-                            // Built here, not at title-bar render time. The rows
-                            // carry a liveness snapshot, and a snapshot taken when
-                            // the chip last drew is whatever happened to be true
-                            // then — a shell that exited since would still show its
-                            // dot, because nothing re-renders the title bar when a
-                            // pane dies in another window. Reading it on open costs
-                            // one daemon round-trip per menu, which is exactly when
-                            // it is worth paying for.
-                            let alive = crate::ui::app::alive_panes();
-                            let rows: Vec<WorkspaceMenuRow> = crate::ui::windows::menu_order(cx)
-                                .into_iter()
-                                .map(|(id, open)| {
-                                    let ws = crate::core::session::WorkspaceStore::all(cx).get(id);
-                                    WorkspaceMenuRow {
-                                        id,
-                                        name: ws.map(|w| w.display_name()).unwrap_or_default(),
-                                        open,
-                                        is_current: id == current_id,
-                                        live: ws
-                                            .map(|w| w.pane_ids().iter().any(|p| alive.contains(p)))
-                                            .unwrap_or(false),
-                                    }
-                                })
-                                .collect();
-                            let mut separated = false;
-                            for (i, row) in rows.iter().enumerate() {
-                                let Some(action) = select_workspace_action(i) else {
-                                    break;
-                                };
-                                // One rule between what is on screen and what is put
-                                // away, drawn once and never leading.
-                                if !row.open && !separated {
-                                    separated = true;
-                                    if i > 0 {
-                                        menu = menu.separator();
-                                    }
-                                }
-                                let row = row.clone();
-                                // Deliberately *not* `menu_element_with_check`: a
-                                // single checked item makes `PopupMenu` reserve a
-                                // left icon gutter on every row in the menu, and
-                                // seven of eight of them have nothing to put in it.
-                                // The current workspace is marked on its avatar
-                                // instead — same information, no column.
-                                menu = menu.menu_element(action, move |_window, cx| {
-                                    workspace_menu_row(row.clone(), cx)
-                                });
-                            }
-                            menu.separator()
-                                .menu("New Workspace", Box::new(NewWorkspace))
-                                // The two actions a row's single close doesn't
-                                // carry. They act on *this* window's workspace,
-                                // like every other entry below the rows — and
-                                // rename has to: the field it opens is the chip in
-                                // this title bar, so it can only ever edit the name
-                                // shown there.
-                                .menu("Rename Workspace…", Box::new(RenameWorkspace))
-                                .menu("Stop Workspace…", Box::new(StopWorkspace))
-                                // The app-level entries the "⋯" used to carry.
-                                // Folded in here so the corner has one menu rather
-                                // than two adjacent ones. Deliberately just these
-                                // two: Help/About live in the menu bar, and
-                                // duplicating them here only makes this menu
-                                // longer without making anything reachable.
-                                .separator()
-                                .menu("Command Palette…", Box::new(TogglePalette))
-                                .menu("Settings…", Box::new(OpenSettings))
-                        },
-                    ),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_switcher(window, cx);
+                    })),
             )
             .into_any_element()
+    }
+
+    /// The corner's app-level "⋯": Command Palette and Settings.
+    ///
+    /// These two lived in the chip's dropdown, folded in there so the corner had
+    /// one menu instead of two adjacent ones. That trade held while the chip
+    /// opened a list of workspace names; it stops holding now that the chip
+    /// opens a whole panel with its own search and its own per-row actions.
+    /// Hanging "Settings…" off the bottom of *that* stitches two different
+    /// altitudes together — one answers "which workspace am I going to", the
+    /// other "how is this app configured".
+    ///
+    /// Deliberately just these two. Help/About live in the menu bar, and
+    /// duplicating them here only makes the menu longer without making anything
+    /// reachable — but on Windows and Linux there is no menu bar to fall back
+    /// to, which is why the pair needs a home inside the window at all.
+    pub(crate) fn app_menu_tile(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        // `.menu(label, Action)` dispatches the real action, so a click and its
+        // shortcut travel one path and the row renders the hint for free — but
+        // only if the menu knows which focus handle to dispatch into.
+        let action_ctx = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.pane.focused_or_first(window, cx))
+            .map(|leaf| leaf.read(cx).focus_handle.clone())
+            .unwrap_or_else(|| self.home_focus.clone());
+        div().occlude().flex_shrink_0().child(
+            chrome_tile(
+                Button::new("titlebar-app-menu").icon(IconName::Ellipsis),
+                false,
+                cx,
+            )
+            .rounded_lg()
+            .tooltip("More")
+            .dropdown_menu_with_anchor(
+                gpui::Anchor::TopRight,
+                move |menu, _window, _cx| {
+                    menu.min_w(px(200.))
+                        .action_context(action_ctx.clone())
+                        .menu("Command Palette…", Box::new(TogglePalette))
+                        .menu("Settings…", Box::new(OpenSettings))
+                },
+            ),
+        )
     }
 
     /// The window's right-corner chrome: the detail-panel toggle and the overflow
@@ -653,7 +561,8 @@ impl Tty7App {
                     })),
                 ),
             )
-            .child(self.workspace_chip(window, cx))
+            .child(self.app_menu_tile(window, cx))
+            .child(self.workspace_chip(cx))
     }
 
     /// The detail panel's tab tiles — icon-only, one per view. Lives here beside
@@ -993,12 +902,11 @@ impl Tty7App {
 
         // Worktree: an isolated checkout of this tab's repo on a fresh branch,
         // opened as a new tab — parallel-agent fuel. Only offered when the
-        // tab's cwd actually sits in a git repository (a filesystem-only
-        // probe, cheap enough at open time); outside one the entry would be
-        // pure noise.
-        let in_repo = cwd
-            .as_deref()
-            .is_some_and(crate::core::worktree::is_inside_repo);
+        // tab's cwd actually sits in a git repository; outside one the entry
+        // would be pure noise. Read from the git-status cache rather than
+        // probed here: a menu is built synchronously, and asking the pane's
+        // host is a blocking call (a round trip, if that host is remote).
+        let in_repo = this.tab_is_in_repo(index, window, cx);
         if in_repo {
             menu = menu
                 .separator()

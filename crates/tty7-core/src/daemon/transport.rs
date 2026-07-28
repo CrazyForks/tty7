@@ -77,14 +77,42 @@ mod imp_unix {
         if inline.as_os_str().as_bytes().len() <= MAX_SOCKET_PATH_BYTES {
             return inline;
         }
-        // Prefer $XDG_RUNTIME_DIR (user-private, 0700 — the norm on Linux);
-        // otherwise the OS temp dir, which is per-user on macOS.
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
         let hash = fnv1a64(config_dir.as_os_str().as_bytes());
-        base.join(format!("tty7-{hash:016x}.sock"))
+        let name = format!("tty7-{hash:016x}.sock");
+        let xdg = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from);
+        pick_fallback_socket(xdg.as_deref(), &std::env::temp_dir(), &name)
+    }
+
+    /// The fallback path, given the two candidate bases. Split out from
+    /// [`socket_path_for`] so it is testable without mutating the environment
+    /// (which is `unsafe` in edition 2024 and races every other test).
+    ///
+    /// Preference order is unchanged — `$XDG_RUNTIME_DIR` (user-private, 0700,
+    /// the norm on Linux) before the OS temp dir (per-user on macOS) — so every
+    /// path that works today is returned byte-for-byte as before and a live
+    /// daemon is never orphaned. What is new is the length check: the "short"
+    /// hashed name is only short *relative to the config dir*, and a deep
+    /// `$XDG_RUNTIME_DIR` overruns `sun_path` just as readily. Without this,
+    /// `bind` failed with "path must be shorter than SUN_LEN" and the daemon
+    /// died at startup with no hint that the runtime dir was the cause.
+    ///
+    /// If neither base fits, return the preferred one anyway: `bind` then
+    /// reports the real path it rejected, which is a far better diagnostic than
+    /// silently landing somewhere the peer will not look.
+    pub(super) fn pick_fallback_socket(xdg: Option<&Path>, temp: &Path, name: &str) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt as _;
+        let fits = |p: &PathBuf| p.as_os_str().as_bytes().len() <= MAX_SOCKET_PATH_BYTES;
+        let preferred = xdg.unwrap_or(temp).join(name);
+        if fits(&preferred) {
+            return preferred;
+        }
+        let temp_path = temp.join(name);
+        if fits(&temp_path) {
+            return temp_path;
+        }
+        preferred
     }
 
     /// Path of the Unix-domain socket for this process's config dir. `None` only
@@ -198,6 +226,7 @@ mod imp_unix {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// Pin the process config dir so the socket lives under a temp dir, never the
     /// real `~/.config`. First-call-wins; every IO test computes the same path.
@@ -287,6 +316,47 @@ mod tests {
         let _client = UnixStream::connect(&path).expect("connect fallback socket");
         drop(listener);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A long `$XDG_RUNTIME_DIR` must not produce an over-long fallback. The
+    /// hashed name is short relative to the *config dir*, not in absolute
+    /// terms, so preferring the runtime dir unconditionally overran `sun_path`
+    /// and killed the daemon at `bind` with no hint at the cause.
+    #[test]
+    fn a_long_runtime_dir_falls_through_to_the_temp_dir() {
+        let name = "tty7-0123456789abcdef.sock";
+        let long_xdg = PathBuf::from(format!("/run/user/1000/{}", "d".repeat(90)));
+        let temp = PathBuf::from("/tmp");
+
+        let picked = imp_unix::pick_fallback_socket(Some(&long_xdg), &temp, name);
+        assert_eq!(picked, temp.join(name), "falls through to the temp dir");
+
+        // The preference itself is untouched when the runtime dir does fit —
+        // changing that would orphan every live daemon on a normal machine.
+        let short_xdg = PathBuf::from("/run/user/1000");
+        assert_eq!(
+            imp_unix::pick_fallback_socket(Some(&short_xdg), &temp, name),
+            short_xdg.join(name),
+            "$XDG_RUNTIME_DIR still wins whenever it fits",
+        );
+        assert_eq!(
+            imp_unix::pick_fallback_socket(None, &temp, name),
+            temp.join(name),
+            "no runtime dir means the temp dir, as before",
+        );
+    }
+
+    /// Neither base fits: return the preferred one so `bind` names the path it
+    /// actually rejected, rather than silently landing where no peer looks.
+    #[test]
+    fn an_unusable_pair_of_bases_still_reports_the_preferred_path() {
+        let name = "tty7-0123456789abcdef.sock";
+        let long_xdg = PathBuf::from(format!("/run/{}", "d".repeat(90)));
+        let long_temp = PathBuf::from(format!("/tmp/{}", "t".repeat(90)));
+        assert_eq!(
+            imp_unix::pick_fallback_socket(Some(&long_xdg), &long_temp, name),
+            long_xdg.join(name),
+        );
     }
 }
 

@@ -44,7 +44,8 @@ use crate::daemon::protocol::{
     AuthPromptKind, AuthResponse, ClientMsg, DaemonMsg, KnownHostEntry, KnownHostId,
     LoopbackForward, LoopbackForwardId, LoopbackForwardInfo, LoopbackForwardRequest,
     ManagedForward, NativeSshSpec, PaneProcs, RemoteContext, SftpEntry, SftpJobProgress, SftpOp,
-    SftpOpResult, SftpTransferSpec, ShellSpec, SshForwardRule, SshPhase, WinSize,
+    SftpOpResult, SftpTransferSpec, ShellSpec, SshForwardRule, SshPhase, WinSize, WorkspaceOp,
+    WorkspaceRequest,
 };
 use crate::daemon::transport::{self, Stream};
 
@@ -136,6 +137,159 @@ struct ReaderSignals {
     marks: crate::terminal::marks::Marks,
 }
 
+/// The remote workspace a pane belongs to, and how the local daemon reaches its
+/// machine (design §15).
+///
+/// A pane of a remote workspace runs on the *remote* `tty7-server`, so nothing
+/// about it is addressable here by `pane_id`. This is what a pane carries
+/// instead, and it is the input to every workspace-scoped request: the id says
+/// what a forward is *owned* by, the spec says which connection it runs *on*.
+/// The two are separate because several workspaces on one machine share one
+/// connection but must not share forwards.
+///
+/// `None` on a `TerminalView` means "not a remote-workspace pane" — a local pane
+/// or an SSH pane — and every path here falls back to the pane-addressed one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneWorkspace {
+    /// Identity of the workspace on its machine.
+    pub workspace: crate::core::session::WorkspaceId,
+    /// How the machine is reached. Read for the WSL special case, which shares
+    /// `localhost` with the Windows host and so needs no forward at all.
+    pub target: crate::core::session::RemoteTarget,
+    /// Names the connection for the daemon's lookup. **Secret-free**
+    /// ([`NativeSshSpec::without_secrets`]) — the daemon only matches it against
+    /// an already-authenticated connection, so no credential needs to ride here.
+    ///
+    /// `None` for WSL, which has no SSH connection and needs none.
+    pub spec: Option<Box<NativeSshSpec>>,
+}
+
+impl PaneWorkspace {
+    /// Whether this workspace shares `localhost` with the client, so a
+    /// `localhost:PORT` link resolves without any forward (design §15's WSL
+    /// exception).
+    pub fn shares_localhost(&self) -> bool {
+        matches!(self.target, crate::core::session::RemoteTarget::Wsl { .. })
+    }
+
+    /// The route header a pane of this workspace opens its connection with.
+    ///
+    /// **`channel: Pane`, not the default `Control`.** A remote `tty7-server`
+    /// listens twice, and the two dialects are not interchangeable: a pane sent
+    /// to the control socket gets an `InvalidData` on its first `Spawn`, which
+    /// is how "the window opens but nothing runs in it" looked before this
+    /// existed.
+    ///
+    /// The spec travels secret-free, which is deliberate and is what
+    /// [`PaneWorkspace::spec`] documents: the daemon matches it against the
+    /// connection it already authenticated for this machine's control stream.
+    /// If that connection is gone the daemon re-authenticates, and the router's
+    /// setup relay is what carries the prompt back here.
+    pub fn route_header(&self) -> anyhow::Result<crate::daemon::router::RouteHeader> {
+        use crate::core::session::RemoteTarget;
+        use crate::daemon::router::RouteHeader;
+        let header = match (&self.target, &self.spec) {
+            (RemoteTarget::Wsl { distro }, _) => RouteHeader::wsl(distro.clone()),
+            // Like WSL, this target carries its own address and needs no spec.
+            //
+            // `--pane` is added *here* rather than by the router: `LocalStdio`
+            // runs the argv verbatim (there is no shell command line for
+            // `RouteChannel::bridge_command` to rewrite), so the caller is the
+            // only one that can pick the dialect. Same choice the SSH path makes
+            // one layer down, made explicit.
+            (RemoteTarget::LocalStdio { program, args }, _) => {
+                let mut argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                if !argv.contains(&"--pane") {
+                    argv.push("--pane");
+                }
+                RouteHeader::local_stdio(program.clone(), &argv)
+            }
+            (_, Some(spec)) => RouteHeader::ssh((**spec).clone()),
+            (target, None) => {
+                return Err(anyhow::anyhow!(
+                    "this workspace has no SSH connection details ({target:?}), so its panes \
+                     cannot be routed"
+                ));
+            }
+        };
+        Ok(header.for_pane())
+    }
+}
+
+/// Where a pane's daemon connection lands.
+///
+/// A pane is the *only* thing in tty7 that can be on a different machine from
+/// the window showing it, and this is the whole of how it says so. The transport
+/// underneath is identical either way — the same local socket, the same
+/// `try_clone`, the same reader thread — because the local daemon forwards a
+/// routed connection byte for byte (design §6).
+#[derive(Clone, Debug, Default)]
+pub enum PaneRoute {
+    /// This machine's daemon. Every pane before remote workspaces existed, and
+    /// still every pane of a local window: **not one byte on the wire changes**
+    /// for these, because [`connect_routed`] writes nothing extra.
+    #[default]
+    Local,
+    /// A remote workspace's machine. The connection opens with a route header
+    /// and does not carry a `ClientMsg` until the daemon has acked it.
+    Remote(Box<crate::daemon::router::RouteHeader>),
+    /// A pane that belongs to a remote workspace whose machine cannot be
+    /// addressed — no SSH details on file for it.
+    ///
+    /// **Not `Local`.** Falling back to the local daemon would send this pane's
+    /// `Kill { pane_id }` to a daemon where that id names somebody else's pane,
+    /// so a route that cannot be built has to fail rather than land somewhere.
+    /// Every connection through this variant returns the reason.
+    Unroutable(String),
+}
+
+impl PaneRoute {
+    /// The route a pane of `workspace` takes; [`PaneRoute::Local`] when the pane
+    /// belongs to no remote workspace.
+    ///
+    /// Infallible on purpose: the callers that need a route most are the ones
+    /// with nowhere to put an error (a close, a restore probe), and for those
+    /// [`PaneRoute::Unroutable`] is the safe answer rather than the local
+    /// daemon. The reason still surfaces — at connect time, from the one place
+    /// that has somewhere to report it.
+    pub fn for_workspace(workspace: Option<&PaneWorkspace>) -> PaneRoute {
+        match workspace {
+            None => PaneRoute::Local,
+            Some(ws) => match ws.route_header() {
+                Ok(header) => PaneRoute::Remote(Box::new(header)),
+                Err(e) => PaneRoute::Unroutable(e.to_string()),
+            },
+        }
+    }
+
+    /// The header this route prefixes its connection with, or `None` when it
+    /// prefixes nothing.
+    ///
+    /// The single place that decides whether a connection carries an extra
+    /// frame, so "a local pane's wire bytes are unchanged" is one assertion
+    /// rather than a reading of [`connect_routed`].
+    pub fn header(&self) -> Option<&crate::daemon::router::RouteHeader> {
+        match self {
+            PaneRoute::Remote(header) => Some(header),
+            PaneRoute::Local | PaneRoute::Unroutable(_) => None,
+        }
+    }
+
+    /// Whether this pane's failures are the *local* daemon's to answer for.
+    ///
+    /// The distinction is not cosmetic. On a routed pane the local daemon is a
+    /// byte forwarder: a connection that drops mid-`Spawn` says the far end
+    /// failed, and the local daemon is fine. Recovery paths that restart it —
+    /// which drains and kills every pane it hosts — would then let one
+    /// unreachable remote destroy all of the user's local sessions.
+    ///
+    /// `Unroutable` counts as not-local for the same reason: nothing was ever
+    /// asked of the local daemon, so nothing about it is worth restarting.
+    pub fn is_local(&self) -> bool {
+        matches!(self, PaneRoute::Local)
+    }
+}
+
 /// A terminal whose PTY lives in the daemon. Mirrors `backend::Terminal`'s public
 /// surface so the view can treat the two interchangeably.
 pub struct RemoteTerminal {
@@ -216,6 +370,18 @@ pub struct RemoteTerminal {
     /// panel's Outline. Positions are grid rows, so they can only be taken here
     /// on the client — the daemon has no grid.
     marks: crate::terminal::marks::Marks,
+    /// Which machine this pane's connection landed on. Kept so the *other*
+    /// operations a pane needs — `Kill`, a `List` at restore — go to the same
+    /// daemon the pane lives in. A remote pane's id means nothing here, and
+    /// sending `Kill { pane_id }` to the local daemon would name whichever local
+    /// pane happened to be allocated the same number.
+    route: PaneRoute,
+    /// The event sink the reader thread publishes through, kept so a
+    /// [`relink`](Self::relink) can start a *new* reader against the *same*
+    /// channel. The view subscribes to `events` once, at construction, and
+    /// never again — a relink that handed the daemon a fresh channel would
+    /// leave the pane on screen and permanently deaf.
+    proxy: EventProxy,
     reader_thread: Option<JoinHandle<()>>,
 }
 
@@ -232,9 +398,28 @@ impl RemoteTerminal {
         cwd: Option<PathBuf>,
         shell: Option<ShellSpec>,
     ) -> anyhow::Result<(Self, u64)> {
+        Self::spawn_on(&PaneRoute::Local, size, cell_w, cell_h, cwd, shell)
+    }
+
+    /// [`spawn`](Self::spawn) onto a particular machine.
+    ///
+    /// The retry ladder below is about the **local** daemon — the one this
+    /// process starts and owns — so it applies unchanged to a routed pane: a
+    /// route header cannot be written to a socket nobody is listening on either.
+    /// What it deliberately does *not* do is restart anything on the far side; a
+    /// remote daemon that is missing or mismatched is `install`'s business, and
+    /// it has already run by the time the ack arrives.
+    pub fn spawn_on(
+        route: &PaneRoute,
+        size: TermSize,
+        cell_w: u16,
+        cell_h: u16,
+        cwd: Option<PathBuf>,
+        shell: Option<ShellSpec>,
+    ) -> anyhow::Result<(Self, u64)> {
         let retry_cwd = cwd.clone();
         let retry_shell = shell.clone();
-        match Self::spawn_once(size, cell_w, cell_h, cwd, shell) {
+        match Self::spawn_once(route, size, cell_w, cell_h, cwd, shell) {
             Ok(term) => Ok(term),
             Err(first_err) if daemon_not_listening(&first_err) => {
                 // Nothing is on the socket: the daemon died (crash, OOM, a stray
@@ -246,7 +431,7 @@ impl RemoteTerminal {
                         "daemon not running ({first_err}); starting one failed: {start_err}"
                     ));
                 }
-                Self::spawn_once(size, cell_w, cell_h, retry_cwd, retry_shell).map_err(
+                Self::spawn_once(route, size, cell_w, cell_h, retry_cwd, retry_shell).map_err(
                     |second_err| {
                         anyhow::anyhow!(
                             "daemon not running ({first_err}); started one but Spawn still failed: {second_err}"
@@ -254,7 +439,16 @@ impl RemoteTerminal {
                     },
                 )
             }
-            Err(first_err) if daemon_disconnected_before_spawn_reply(&first_err) => {
+            // **Local panes only.** On a routed pane the connection this reads
+            // as "disconnected" belongs to the *remote* — the local daemon is
+            // only forwarding bytes across it, and it is fine. Restarting it
+            // would not fix anything on the far side, and `restart` drains and
+            // kills every pane it hosts: one unreachable remote would take out
+            // all of the user's local sessions. Report the far end's failure
+            // instead.
+            Err(first_err)
+                if route.is_local() && daemon_disconnected_before_spawn_reply(&first_err) =>
+            {
                 // A live-but-old daemon can accept the connection, panic while
                 // handling Spawn, and close before replying. Restart once so an
                 // upgraded GUI cuts over cleanly instead of crashing on a stale
@@ -264,7 +458,7 @@ impl RemoteTerminal {
                         "daemon disconnected before Spawn reply ({first_err}); restart failed: {restart_err}"
                     ));
                 }
-                Self::spawn_once(size, cell_w, cell_h, retry_cwd, retry_shell).map_err(|second_err| {
+                Self::spawn_once(route, size, cell_w, cell_h, retry_cwd, retry_shell).map_err(|second_err| {
                     anyhow::anyhow!(
                         "daemon disconnected before Spawn reply ({first_err}); restarted daemon but Spawn still failed: {second_err}"
                     )
@@ -275,13 +469,14 @@ impl RemoteTerminal {
     }
 
     fn spawn_once(
+        route: &PaneRoute,
         size: TermSize,
         cell_w: u16,
         cell_h: u16,
         cwd: Option<PathBuf>,
         shell: Option<ShellSpec>,
     ) -> anyhow::Result<(Self, u64)> {
-        let mut stream = connect()?;
+        let mut stream = connect_routed(route)?;
         let win = win_size(size, cell_w, cell_h);
 
         // Ask the daemon to create the pane, then read its assigned id back. The
@@ -305,7 +500,8 @@ impl RemoteTerminal {
             }
         };
 
-        let term = Self::from_stream(stream, size)?;
+        let mut term = Self::from_stream(stream, size)?;
+        term.route = route.clone();
         Ok((term, pane_id))
     }
 
@@ -314,14 +510,149 @@ impl RemoteTerminal {
     /// that the reader thread replays to rebuild the current screen + scrollback,
     /// followed by live `Output`.
     pub fn attach(size: TermSize, cell_w: u16, cell_h: u16, pane_id: u64) -> anyhow::Result<Self> {
-        let mut stream = connect()?;
+        Self::attach_on(&PaneRoute::Local, size, cell_w, cell_h, pane_id)
+    }
+
+    /// [`attach`](Self::attach) on a particular machine. A remote workspace's
+    /// pane ids are the *remote* daemon's, so a reattach has to take the same
+    /// route the spawn did or it would find a stranger's pane — or, far more
+    /// likely, none.
+    pub fn attach_on(
+        route: &PaneRoute,
+        size: TermSize,
+        cell_w: u16,
+        cell_h: u16,
+        pane_id: u64,
+    ) -> anyhow::Result<Self> {
+        let mut stream = connect_routed(route)?;
         let win = win_size(size, cell_w, cell_h);
 
         // Unlike Spawn there's no synchronous reply to wait for here: the Snapshot
         // arrives as the first framed message and is handled uniformly by the
         // reader thread (advance + Wakeup), so the screen rebuilds asynchronously.
         ClientMsg::Attach { pane_id, size: win }.encode(&mut stream)?;
-        Self::from_stream(stream, size)
+        let mut term = Self::from_stream(stream, size)?;
+        term.route = route.clone();
+        Ok(term)
+    }
+
+    // ── Design §10's pane half of a reconnect ────────────────────────────────
+    //
+    // For one pane: **reopen the channel, `Attach`, take the replay, resize to
+    // this client's geometry.** It happens *in place* — the same `Term`, the
+    // same event channel, the same shared signals the view already holds
+    // handles to. Building a fresh `RemoteTerminal` and swapping it into the
+    // view would look simpler and would silently break the pane: the view's
+    // event pump subscribes to `events` once, at construction, and would go on
+    // listening to the dead terminal's channel for ever.
+
+    /// The **blocking** half of a relink: reach the machine and re-`Attach`.
+    ///
+    /// Split from [`adopt_relink`](Self::adopt_relink) because this is a
+    /// network round trip — an SSH connect on a cold machine, possibly with a
+    /// password sheet in the middle — and the terminal it is for is a gpui
+    /// entity that can only be touched on the UI thread. So the wait happens on
+    /// a background task and only the cheap swap runs where the view lives.
+    pub fn open_relink(
+        route: &PaneRoute,
+        pane_id: u64,
+        size: TermSize,
+        cell_w: u16,
+        cell_h: u16,
+    ) -> anyhow::Result<Stream> {
+        let mut stream = connect_routed(route)?;
+        ClientMsg::Attach {
+            pane_id,
+            size: win_size(size, cell_w, cell_h),
+        }
+        .encode(&mut stream)?;
+        Ok(stream)
+    }
+
+    /// The **cheap** half: adopt an already-attached stream from
+    /// [`open_relink`](Self::open_relink) as this pane's link.
+    ///
+    /// # Why the grid is reset first
+    ///
+    /// The daemon answers `Attach` by replaying its `ReplayRing` from the
+    /// start. Advancing that onto a grid that still holds the pre-disconnect
+    /// screen would append a second copy of everything. So the mirror is reset
+    /// and the machine's own record becomes the whole truth — which is also the
+    /// honest presentation of the replay boundary (design §10): the ring holds
+    /// 8 MiB, a pane that outran it comes back with the daemon's current grid
+    /// and **the middle is genuinely gone**. Nothing here interpolates it, and
+    /// nothing upstream may imply it will fill in later.
+    pub fn adopt_relink(
+        &mut self,
+        stream: Stream,
+        route: &PaneRoute,
+        size: TermSize,
+        cell_w: u16,
+        cell_h: u16,
+    ) -> anyhow::Result<()> {
+        // Retire the old link first. No `Detach`: this path exists because the
+        // socket is already gone, and on the one case where it is not (a
+        // deliberate re-attach) the server treats a closed stream as a detach
+        // anyway.
+        if let Ok(writer) = self.writer.lock() {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+        // The retired reader has been joined, so everything it will ever emit is
+        // already in the channel — including its `Exit`. Left there it would be
+        // delivered *after* the swap and put "process exited" on a pane that is
+        // demonstrably alive. Dropping the rest of that backlog is right for the
+        // same reason the grid is reset below: it describes a screen the replay
+        // is about to redraw from the machine's own record.
+        while self.events.try_recv().is_ok() {}
+
+        let read_half = stream.try_clone()?;
+
+        // The dead link set these on its way out (`teardown`). A pane that is
+        // being re-attached is by definition not finished, so they go back —
+        // except `child_exited`, which records that the *shell* ended and is
+        // still true no matter how many times the client reconnects.
+        self.exited_flag.store(false, Ordering::SeqCst);
+        self.exited = false;
+        {
+            use alacritty_terminal::vte::ansi::Handler as _;
+            let mut term = self.term.lock();
+            term.reset_state();
+        }
+
+        let reader = Self::spawn_reader(
+            self.term.clone(),
+            self.proxy.clone(),
+            read_half,
+            ReaderSignals {
+                cwd: self.cwd.clone(),
+                shell: self.shell_state.clone(),
+                remote: self.remote_context.clone(),
+                agent: self.agent.clone(),
+                agent_session: self.agent_session.clone(),
+                exited: self.exited_flag.clone(),
+                child_exited: self.child_exited.clone(),
+                zle_reading: self.zle_reading.clone(),
+                shell_vi_mode: self.shell_vi_mode.clone(),
+                auth: self.auth_prompts.clone(),
+                phase: self.ssh_phase.clone(),
+                marks: self.marks.clone(),
+            },
+        );
+        if let Ok(mut writer) = self.writer.lock() {
+            *writer = stream;
+        }
+        self.reader_thread = Some(reader);
+        self.route = route.clone();
+        // Design §10's last step: "以新客户端的尺寸 Resize". `Attach` carries a
+        // size but deliberately does not resize the PTY, so the geometry only
+        // becomes real when this frame lands — and `synced_size = false` is what
+        // lets it through when the size happens to equal the last one.
+        self.synced_size = false;
+        self.resize(size, cell_w, cell_h);
+        Ok(())
     }
 
     /// Shared tail of `spawn`/`attach`: build the local `Term`, split the socket
@@ -363,7 +694,7 @@ impl RemoteTerminal {
 
         let reader_thread = Self::spawn_reader(
             term.clone(),
-            proxy,
+            proxy.clone(),
             read_half,
             ReaderSignals {
                 cwd: cwd.clone(),
@@ -403,8 +734,32 @@ impl RemoteTerminal {
             agent,
             agent_session,
             marks,
+            // Overwritten by the routed constructors; `from_stream` itself is
+            // handed a stream whose destination it cannot see.
+            route: PaneRoute::Local,
+            proxy,
             reader_thread: Some(reader_thread),
         })
+    }
+
+    /// Close this pane's link, leaving the pane running on its machine.
+    ///
+    /// The same two frames `Drop` sends, without dropping: design §10's
+    /// takeover needs the client to *stop being attached* while the view stays
+    /// on screen in its read-only state.
+    pub fn detach_link(&mut self) {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = ClientMsg::Detach.encode(&mut *writer);
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+        }
+        // The reader observes the close and runs its own teardown, so the pane
+        // lands in exactly the state a dropped network link leaves it in — which
+        // is the state design §10 wants after a takeover, reached by the code
+        // path that is already exercised every time a connection fails.
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+        self.poll_exited();
     }
 
     pub fn apply_user_config(&self, user_config: &crate::core::config::Config) {
@@ -1035,15 +1390,38 @@ impl RemoteTerminal {
     /// error (no daemon, refused, malformed reply) so restore degrades to
     /// all-fresh.
     pub fn list_panes() -> Vec<crate::daemon::protocol::PaneInfo> {
-        fn query() -> anyhow::Result<Vec<crate::daemon::protocol::PaneInfo>> {
-            let mut stream = connect()?;
-            ClientMsg::List.encode(&mut stream)?;
-            match DaemonMsg::read(&mut stream)? {
-                DaemonMsg::PaneList(list) => Ok(list),
-                other => Err(anyhow::anyhow!("unexpected reply to List: {other:?}")),
-            }
+        Self::list_panes_on(&PaneRoute::Local)
+    }
+
+    /// [`list_panes`](Self::list_panes) on a particular machine. A remote
+    /// workspace restores from the *remote* daemon's registry; asking the local
+    /// one would report every saved leaf as dead and respawn the lot, silently
+    /// abandoning whatever was still running there — the precise failure remote
+    /// workspaces exist to prevent.
+    pub fn list_panes_on(route: &PaneRoute) -> Vec<crate::daemon::protocol::PaneInfo> {
+        Self::try_list_panes_on(route).unwrap_or_default()
+    }
+
+    /// [`list_panes_on`](Self::list_panes_on) with the failure kept.
+    ///
+    /// Swallowing the error into an empty list is right for *restore*, where
+    /// "no answer" and "nothing alive" lead to the same action (spawn fresh).
+    /// It is wrong for anything that **shows** liveness: on this machine an
+    /// unreachable daemon really does mean no pane is running, but a routed
+    /// `List` that failed says nothing about the remote's registry — the panes
+    /// are very probably still there, we just could not ask. A picker that
+    /// renders that as "stopped" tells the user their sessions are gone every
+    /// time the link hiccups, so the two cases have to stay distinguishable
+    /// this far up (see [`crate::terminal::pane_liveness`]).
+    pub fn try_list_panes_on(
+        route: &PaneRoute,
+    ) -> anyhow::Result<Vec<crate::daemon::protocol::PaneInfo>> {
+        let mut stream = connect_routed(route)?;
+        ClientMsg::List.encode(&mut stream)?;
+        match DaemonMsg::read(&mut stream)? {
+            DaemonMsg::PaneList(list) => Ok(list),
+            other => Err(anyhow::anyhow!("unexpected reply to List: {other:?}")),
         }
-        query().unwrap_or_default()
     }
 
     /// Tell the daemon to terminate a pane's child and forget it, over a
@@ -1052,7 +1430,16 @@ impl RemoteTerminal {
     /// and kept alive for restore). Best-effort: a missing daemon means there's
     /// nothing to kill anyway.
     pub fn kill_pane(pane_id: u64) {
-        if let Ok(mut stream) = connect() {
+        Self::kill_pane_on(&PaneRoute::Local, pane_id)
+    }
+
+    /// [`kill_pane`](Self::kill_pane) on a particular machine.
+    ///
+    /// Routing this one is not an optimisation. Pane ids are per-daemon, so
+    /// `Kill { pane_id }` sent to the wrong daemon does not fail — it succeeds
+    /// against a stranger.
+    pub fn kill_pane_on(route: &PaneRoute, pane_id: u64) {
+        if let Ok(mut stream) = connect_routed(route) {
             let _ = ClientMsg::Kill { pane_id }.encode(&mut stream);
             // Give the daemon a moment to read the frame before the connection
             // closes; a tiny blocking read of EOF is enough to order it.
@@ -1411,6 +1798,58 @@ impl RemoteTerminal {
         query(pane_id).unwrap_or_default()
     }
 
+    // ── Remote workspaces (design §15) ───────────────────────────────────────
+
+    /// Send one workspace-scoped request and return the daemon's reply.
+    ///
+    /// The counterpart of the `pane_id`-addressed helpers above for a pane that
+    /// lives on a *remote workspace*: there is no pane on the local daemon to
+    /// name, so the request carries the workspace and a secret-free spec naming
+    /// its machine, and the daemon resolves the connection the workspace already
+    /// authenticated (`ssh::workspace::handle`).
+    ///
+    /// `DaemonMsg::Error` is surfaced as an `Err` so callers can show it — a
+    /// disconnected workspace has to be *reported*, not silently treated as an
+    /// empty list.
+    pub fn on_workspace(req: WorkspaceRequest) -> anyhow::Result<DaemonMsg> {
+        let mut stream = connect()?;
+        ClientMsg::OnWorkspace(Box::new(req)).encode(&mut stream)?;
+        match DaemonMsg::read(&mut stream)? {
+            DaemonMsg::Error(msg) => Err(anyhow::anyhow!(msg)),
+            reply => Ok(reply),
+        }
+    }
+
+    /// [`on_workspace`](Self::on_workspace) for the calls whose only sane failure
+    /// mode is "show nothing": a list the panel is about to render.
+    pub fn on_workspace_forwards(req: WorkspaceRequest) -> Vec<ManagedForward> {
+        match Self::on_workspace(req) {
+            Ok(DaemonMsg::ForwardList(list)) => list,
+            Ok(other) => {
+                log::warn!("unexpected reply to a workspace forward request: {other:?}");
+                Vec::new()
+            }
+            Err(e) => {
+                log::warn!("workspace forward request failed: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Build a [`WorkspaceRequest`] for `op` against `ws`, as seen from `view_pane`.
+    pub fn workspace_request(
+        ws: &PaneWorkspace,
+        view_pane: u64,
+        op: WorkspaceOp,
+    ) -> Option<WorkspaceRequest> {
+        Some(WorkspaceRequest {
+            workspace: ws.workspace,
+            spec: ws.spec.clone()?,
+            view_pane,
+            op,
+        })
+    }
+
     /// A pane's process tree and listening ports, for the details panel. One-shot
     /// over a short-lived control connection, like the forward queries — this is
     /// polled only while the panel is open, so it never rides the pane's hot
@@ -1648,6 +2087,45 @@ fn connect() -> anyhow::Result<Stream> {
     })
 }
 
+/// Open a pane connection and, when the pane is a remote workspace's, hand it to
+/// the daemon's router before a single `ClientMsg` goes out.
+///
+/// **A local pane takes the identical path it always did.** `PaneRoute::Local`
+/// is `connect()` and nothing else — no extra frame, no extra round trip, no
+/// behaviour to regress. Every remote-specific step is inside the `Remote` arm.
+///
+/// The routed arm blocks for as long as the setup takes, including any question
+/// the daemon relays back (a password, install consent). Callers are already on
+/// a background thread for the plain `connect()`, and this is the same wait a
+/// pane on a cold SSH host has always had.
+fn connect_routed(route: &PaneRoute) -> anyhow::Result<Stream> {
+    if let PaneRoute::Unroutable(reason) = route {
+        return Err(anyhow::anyhow!("{reason}"));
+    }
+    let Some(header) = route.header() else {
+        return connect();
+    };
+
+    // WSL installs from the GUI process, never from the daemon: consent has to
+    // be raised where it can be answered, and this machine *is* the machine
+    // (see `install::wsl::ensure_wsl_server`'s own doc). The daemon's call a
+    // moment later finds the binary in place and asks nobody.
+    if let crate::daemon::router::RouteTarget::Wsl { distro } = &header.target {
+        crate::daemon::install::wsl::ensure_wsl_server(distro)
+            .map_err(|e| anyhow::anyhow!("prepare tty7-server in WSL `{distro}`: {e}"))?;
+    }
+
+    let mut stream = connect()?;
+    let ack = crate::daemon::router::negotiate(&mut stream, header)
+        .map_err(|e| anyhow::anyhow!("route this pane to {}: {e}", header.describe()))?;
+    log::debug!(
+        "pane routed to {} over {}",
+        header.describe(),
+        ack.link.as_deref().unwrap_or("?")
+    );
+    Ok(stream)
+}
+
 fn terminal_config_from_user(user_config: &crate::core::config::Config) -> Config {
     Config {
         scrolling_history: user_config.scrollback_limit,
@@ -1691,6 +2169,149 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
+
+    // -----------------------------------------------------------------------
+    // Routing: a local pane must not change, a remote pane must not be local.
+    // -----------------------------------------------------------------------
+
+    fn ssh_workspace() -> PaneWorkspace {
+        PaneWorkspace {
+            workspace: crate::core::session::WorkspaceId::new(),
+            target: crate::core::session::RemoteTarget::Direct {
+                user: "me".into(),
+                host: "build-box".into(),
+                port: 22,
+            },
+            spec: Some(Box::new(
+                serde_json::from_str(
+                    r#"{"host":"build-box","port":22,"user":"me","auth_mode":"auto"}"#,
+                )
+                .unwrap(),
+            )),
+        }
+    }
+
+    /// **A local pane writes no extra byte.** The whole compatibility promise of
+    /// this milestone in one assertion: `header()` is the only thing that puts a
+    /// frame in front of a connection, and a pane with no workspace has none —
+    /// so `connect_routed` is a bare `connect()` and the daemon's `handle_conn`
+    /// sees the same opening `Spawn` it always did.
+    #[test]
+    fn a_local_pane_prefixes_nothing() {
+        assert!(PaneRoute::Local.header().is_none());
+        assert!(PaneRoute::for_workspace(None).header().is_none());
+        assert!(matches!(PaneRoute::for_workspace(None), PaneRoute::Local));
+        assert!(matches!(PaneRoute::default(), PaneRoute::Local));
+    }
+
+    /// A remote workspace's pane routes to its machine, on the **pane** channel.
+    ///
+    /// The channel is the load-bearing half: a header that defaulted to
+    /// `Control` would reach the remote's control socket, where the first
+    /// `Spawn` is an unknown frame.
+    #[test]
+    fn a_remote_pane_routes_to_its_machine_on_the_pane_channel() {
+        let route = PaneRoute::for_workspace(Some(&ssh_workspace()));
+        let header = route.header().expect("a remote pane is routed");
+        assert_eq!(
+            header.channel,
+            crate::daemon::router::RouteChannel::Pane,
+            "a pane must not be sent to the control socket"
+        );
+        assert_eq!(header.describe(), "ssh me@build-box:22");
+    }
+
+    /// WSL routes by distro and carries no spec, because there is no connection
+    /// to name (design §7.3).
+    #[test]
+    fn a_wsl_workspace_routes_by_distro() {
+        let ws = PaneWorkspace {
+            workspace: crate::core::session::WorkspaceId::new(),
+            target: crate::core::session::RemoteTarget::Wsl {
+                distro: "Ubuntu-22.04".into(),
+            },
+            spec: None,
+        };
+        let route = PaneRoute::for_workspace(Some(&ws));
+        let header = route.header().expect("WSL is routed");
+        assert_eq!(header.describe(), "wsl Ubuntu-22.04");
+        assert_eq!(header.channel, crate::daemon::router::RouteChannel::Pane);
+    }
+
+    /// A `--stdio` workspace on this computer routes to a child process and,
+    /// crucially, asks it for the **pane** dialect.
+    ///
+    /// `LocalStdio` runs its argv verbatim — there is no remote shell command
+    /// line for the router's `bridge_command` to rewrite — so the `--pane` flag
+    /// has to be added here. Without it the pane lands on the control socket
+    /// and its first `Spawn` comes back `InvalidData`, which is exactly what
+    /// "the window opens but nothing runs in it" looked like.
+    #[test]
+    fn a_local_stdio_workspace_routes_to_a_child_process_on_the_pane_dialect() {
+        let ws = PaneWorkspace {
+            workspace: crate::core::session::WorkspaceId::new(),
+            target: crate::core::session::RemoteTarget::LocalStdio {
+                program: "/tmp/tty7-server".into(),
+                args: vec!["--stdio".into()],
+            },
+            spec: None,
+        };
+        let route = PaneRoute::for_workspace(Some(&ws));
+        let header = route.header().expect("a local child is routable");
+        assert_eq!(header.channel, crate::daemon::router::RouteChannel::Pane);
+        match &header.target {
+            crate::daemon::router::RouteTarget::LocalStdio { program, args } => {
+                assert_eq!(program, "/tmp/tty7-server");
+                assert_eq!(args, &vec!["--stdio".to_string(), "--pane".to_string()]);
+            }
+            other => panic!("wrong target: {other:?}"),
+        }
+    }
+
+    /// **A workspace that cannot be routed does not fall back to local.**
+    ///
+    /// Pane ids are per-daemon, so a remote pane whose route is missing must not
+    /// address the local daemon: `Kill { pane_id }` there would name a stranger's
+    /// pane and succeed.
+    #[test]
+    fn an_unroutable_workspace_is_not_treated_as_local() {
+        let ws = PaneWorkspace {
+            workspace: crate::core::session::WorkspaceId::new(),
+            target: crate::core::session::RemoteTarget::Alias {
+                alias: "build-box".into(),
+            },
+            spec: None,
+        };
+        let route = PaneRoute::for_workspace(Some(&ws));
+        assert!(matches!(route, PaneRoute::Unroutable(_)));
+        assert!(route.header().is_none(), "nothing to route to");
+        let err = connect_routed(&route).expect_err("must not reach the local daemon");
+        assert!(err.to_string().contains("cannot be routed"), "{err}");
+    }
+
+    /// **Only a local pane may make the local daemon restart.**
+    ///
+    /// `spawn`'s recovery path reads "the connection dropped before the `Spawn`
+    /// reply" as a stale local daemon and restarts it — which drains and kills
+    /// every pane it hosts. On a routed pane that same symptom means the *far
+    /// end* failed while the local daemon was faithfully forwarding bytes, so
+    /// acting on it would let one unreachable remote destroy every local
+    /// session the user had open. Observed for real: a remote whose
+    /// `tty7-server` could not be exec'd took the local daemon down with it.
+    #[test]
+    fn only_a_local_pane_may_restart_the_local_daemon() {
+        assert!(PaneRoute::Local.is_local());
+        assert!(PaneRoute::for_workspace(None).is_local());
+
+        assert!(
+            !PaneRoute::for_workspace(Some(&ssh_workspace())).is_local(),
+            "a routed pane's disconnect is the remote's failure, not the local daemon's"
+        );
+        assert!(
+            !PaneRoute::Unroutable("no ssh details".into()).is_local(),
+            "nothing was ever asked of the local daemon"
+        );
+    }
 
     #[test]
     fn kitty_keyboard_negotiation_reports_the_requested_mode() {

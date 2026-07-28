@@ -1,0 +1,1262 @@
+//! "Connect to Host": the client half of a remote workspace (design §10, §12).
+//!
+//! This module is everything between *the user picked a machine* and *the window
+//! is bound to a workspace on it*. It has no gpui views of its own — the home
+//! page renders the panels (`ui::home`) and `Tty7App` owns the state
+//! (`ui::app`) — because every step here is blocking work that has to happen off
+//! the UI thread, and keeping it out of the render path is what makes that
+//! obvious.
+//!
+//! ## The five steps
+//!
+//! | | Step | Here |
+//! |---|---|---|
+//! | 1 | List the machines the user already configured | [`available_hosts`] |
+//! | 2 | Resolve one into a self-contained SSH spec | [`spec_for`] |
+//! | 3 | Open a routed control connection through the local daemon | [`connect_blocking`] |
+//! | 4 | Read the machine's own workspace list | [`rows_from_list`] |
+//! | 5 | Hold the connection for the workspaces bound to it | [`RemoteConnections`] |
+//!
+//! ## Machines are configured once
+//!
+//! Design §2: a remote workspace reuses an SSH configuration that already
+//! exists — a saved profile or a `~/.ssh/config` alias — with its keys, its jump
+//! host and its `ProxyCommand` already set up. There is deliberately no host
+//! *editor* here; [`available_hosts`] only reads, and [`spec_for`] hands the
+//! resolution straight to `ui::ssh_connect`, which is the same code the SSH-pane
+//! entry points use. A machine reachable as an SSH pane is reachable as a
+//! workspace, with nothing to configure twice and nothing to keep in step.
+//!
+//! ## The connection is routed, not direct
+//!
+//! Design D3: the GUI never speaks SSH. It opens the same local daemon socket it
+//! always did and prefixes one `RouteHeader` frame; the daemon opens the SSH
+//! channel and copies bytes. So the sequence in [`connect_blocking`] is
+//! *local socket → route header → route ack → control hello*, and only the last
+//! of those is a conversation with the remote machine.
+
+use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use gpui::{App, Global};
+use serde_json::Value;
+
+use crate::core::config::Config;
+use crate::core::session::{RemoteTarget, WorkspaceId};
+use crate::daemon::control::{ControlHello, ControlRequest, ReplyOk};
+use crate::daemon::install::{
+    InstallConfirm, InstallDecision, InstallRequest, MismatchedRemoteDaemon,
+};
+use crate::daemon::protocol::{AuthPromptKind, AuthResponse, NativeSshSpec};
+use crate::daemon::router::RouteHeader;
+use tty7_core::host::remote::RemoteHost;
+use tty7_core::host::{Host as _, HostId};
+
+// ---------------------------------------------------------------------------
+// 1. What there is to connect to
+// ---------------------------------------------------------------------------
+
+/// One machine the user has already configured, ready to be offered.
+///
+/// `label` is the name they gave it; `detail` is the endpoint, so two profiles
+/// pointing at the same box are told apart by the line that actually differs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostChoice {
+    pub target: RemoteTarget,
+    pub label: String,
+    pub detail: String,
+}
+
+/// Every machine tty7 already knows how to reach, saved profiles first and
+/// `~/.ssh/config` aliases after.
+///
+/// Profiles come first because they are the ones the user built deliberately;
+/// the config aliases are a long tail that is often machine-generated. An alias
+/// whose name matches a profile is dropped rather than listed twice — the
+/// profile carries strictly more (credentials, forwards), so it is the better
+/// of the two rows and the duplicate would only make the list longer.
+pub fn available_hosts(cx: &App) -> Vec<HostChoice> {
+    let mut out: Vec<HostChoice> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    out.extend(local_stdio_host());
+
+    for profile in &cx.global::<Config>().ssh_profiles {
+        let target = RemoteTarget::Profile { id: profile.id };
+        seen.push(profile.name.clone());
+        out.push(HostChoice {
+            detail: endpoint_label(&profile.user, &profile.host, profile.port),
+            label: if profile.name.trim().is_empty() {
+                profile.host.clone()
+            } else {
+                profile.name.clone()
+            },
+            target,
+        });
+    }
+
+    for imported in crate::core::ssh_config::import_profiles() {
+        let alias = imported.profile.name.clone();
+        if alias.trim().is_empty() || seen.iter().any(|s| s == &alias) {
+            continue;
+        }
+        out.push(HostChoice {
+            detail: endpoint_label(
+                &imported.profile.user,
+                &imported.profile.host,
+                imported.profile.port,
+            ),
+            label: alias,
+            target: RemoteTarget::Alias {
+                alias: imported.profile.name,
+            },
+        });
+    }
+    out
+}
+
+/// The machines matching `query`, best match first.
+///
+/// A `~/.ssh/config` with fifty `Host` blocks is normal, and a list that long
+/// is not something anyone reads — it is something they search. So the picker
+/// filters instead of scrolling to the letter `w`.
+///
+/// An empty query keeps [`available_hosts`]'s own order (profiles first, then
+/// aliases): that order is deliberate, and a score has nothing to add to it. A
+/// non-empty one is the palette's fuzzy match over the name, falling back to the
+/// endpoint at a penalty — an alias is how the user thinks of a box, but
+/// "the one on 10.0.0.4" is a real way to look for one too.
+pub fn filter_hosts(hosts: &[HostChoice], query: &str) -> Vec<HostChoice> {
+    let query = query.trim();
+    if query.is_empty() {
+        return hosts.to_vec();
+    }
+    let mut scored: Vec<(i32, &HostChoice)> = hosts
+        .iter()
+        .filter_map(|host| host_score(query, host).map(|score| (score, host)))
+        .collect();
+    // Stable, so machines that score the same stay in the order above.
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().map(|(_, host)| host.clone()).collect()
+}
+
+/// How well `host` answers `query`: its name, or its endpoint at a penalty
+/// (`-3`, the same one the command palette puts on a subtitle match).
+fn host_score(query: &str, host: &HostChoice) -> Option<i32> {
+    let label = crate::ui::palette::fuzzy_score(query, &host.label);
+    let detail = crate::ui::palette::fuzzy_score(query, &host.detail).map(|score| score - 3);
+    label.into_iter().chain(detail).max()
+}
+
+/// The environment variable that stands a machine up on this computer.
+///
+/// Set it to a `tty7-server` binary and the picker grows one extra row that
+/// routes through [`RemoteTarget::LocalStdio`] — a real remote workspace, with a
+/// real server process, a real control handshake and real routed panes, and no
+/// sshd anywhere. It is the only way to exercise the whole path by hand, and
+/// the same seam `crates/tty7-server/tests/routed_pane.rs` uses.
+///
+/// Deliberately an environment variable and not a setting: it is a developer's
+/// tool, and a row in Settings would be a feature nobody outside this repo
+/// should ever see.
+pub const LOCAL_STDIO_ENV: &str = "TTY7_LOCAL_STDIO_SERVER";
+
+/// The dev-only "machine on this computer" row, when the environment asks for
+/// one. Empty in every normal run, which is why nothing downstream needs to
+/// know it exists.
+fn local_stdio_host() -> Option<HostChoice> {
+    let program = std::env::var(LOCAL_STDIO_ENV)
+        .ok()
+        .filter(|p| !p.is_empty())?;
+    let target = RemoteTarget::LocalStdio {
+        program: program.clone(),
+        args: vec!["--stdio".to_string()],
+    };
+    Some(HostChoice {
+        label: format!("{target}"),
+        detail: format!("{program} --stdio (this computer)"),
+        target,
+    })
+}
+
+/// `user@host` — with the port only when it isn't the default, which is the
+/// convention every other endpoint line in the app follows.
+fn endpoint_label(user: &str, host: &str, port: u16) -> String {
+    let base = if user.is_empty() {
+        host.to_string()
+    } else {
+        format!("{user}@{host}")
+    };
+    if port == 22 {
+        base
+    } else {
+        format!("{base}:{port}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Resolving a choice into a spec
+// ---------------------------------------------------------------------------
+
+/// Resolve a [`RemoteTarget`] into the self-contained spec the daemon needs —
+/// secrets, jump chain and all — through the same path an SSH pane uses.
+///
+/// `Err` is a user-facing sentence: a target can name a profile that has since
+/// been deleted or an alias that is no longer in `~/.ssh/config`, and a
+/// workspace pointing at one has to say so rather than fail as a connect error
+/// much later.
+pub fn spec_for(target: &RemoteTarget, cx: &App) -> Result<NativeSshSpec, String> {
+    let cfg = cx.global::<Config>();
+    match target {
+        RemoteTarget::Profile { id } => {
+            let profile = cfg
+                .ssh_profiles
+                .iter()
+                .find(|p| p.id == *id)
+                .ok_or_else(|| "that saved SSH profile no longer exists".to_string())?;
+            Ok(crate::ui::ssh_connect::build_native_ssh_spec(
+                profile,
+                &cfg.ssh_profiles,
+                &crate::core::keychain::OsCredentialStore,
+                cfg.verify_host_keys,
+            ))
+        }
+        RemoteTarget::Alias { alias } => {
+            let resolved = crate::core::ssh_config::resolve_alias_to_profile(alias)
+                .ok_or_else(|| format!("`{alias}` is no longer in ~/.ssh/config"))?;
+            Ok(crate::ui::ssh_connect::native_spec_from_transient_profile(
+                &resolved.profile,
+                resolved.proxy_jump,
+                &crate::core::keychain::OsCredentialStore,
+                cfg.verify_host_keys,
+                &crate::ui::ssh_connect::config_alias_resolver,
+            ))
+        }
+        RemoteTarget::Direct { user, host, port } => {
+            let mut profile = crate::core::ssh_profile::SshProfile::new(host.clone());
+            profile.host = host.clone();
+            profile.user = user.clone();
+            profile.port = *port;
+            Ok(crate::ui::ssh_connect::build_native_ssh_spec(
+                &profile,
+                &cfg.ssh_profiles,
+                &crate::core::keychain::OsCredentialStore,
+                cfg.verify_host_keys,
+            ))
+        }
+        // M8. Named here so the match is total and the message is honest rather
+        // than a silent connect that never arrives.
+        RemoteTarget::Wsl { .. } => {
+            Err("WSL workspaces aren't available in this build yet".to_string())
+        }
+        // Both of these address their machine directly; there is no SSH
+        // connection to describe, which is exactly what `Err` means to
+        // [`crate::terminal::PaneWorkspace::route_header`] — it reads the target
+        // instead.
+        RemoteTarget::LocalStdio { .. } => {
+            Err("a local --stdio workspace has no SSH connection".to_string())
+        }
+    }
+}
+
+/// The route header a *control* connection to `target` opens with.
+///
+/// The workspace-level twin of
+/// [`PaneWorkspace::route_header`](crate::terminal::PaneWorkspace::route_header),
+/// and it has to agree with it: the control stream and the pane streams of one
+/// workspace must resolve to the same machine, or the window lists one box's
+/// files while its terminals run on another.
+pub fn control_route(target: &RemoteTarget, cx: &App) -> Result<RouteHeader, String> {
+    let header = match target {
+        RemoteTarget::LocalStdio { program, args } => RouteHeader::local_stdio(
+            program.clone(),
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        ),
+        RemoteTarget::Wsl { distro } => RouteHeader::wsl(distro.clone()),
+        _ => spec_for(target, cx).map(RouteHeader::ssh)?,
+    };
+    // Every header this client writes teaches [`RouteOrigins`] one machine, so a
+    // question the daemon relays back about it can be attributed without the
+    // daemon having to know this client's names for things.
+    note_origin(&header.target, target);
+    Ok(header)
+}
+
+// ---------------------------------------------------------------------------
+// 3. Connecting
+// ---------------------------------------------------------------------------
+
+/// A machine that answered: its host object, and the workspaces it says it has.
+pub struct Connected {
+    pub host: Arc<RemoteHost>,
+    /// The remote's `$HOME` — where a *new* workspace starts (design §10). The
+    /// remote's, never this client's.
+    pub home: PathBuf,
+    pub rows: Vec<RemoteWorkspaceRow>,
+}
+
+/// Reach `target` and read its workspace list. **Blocking**; call from a
+/// background task.
+///
+/// The four hops, in order, each with its own failure sentence — a connect that
+/// fails has to say *which* of them gave up, because "local daemon isn't
+/// running" and "that machine refused the connection" want completely different
+/// things from the user:
+///
+/// 1. the local daemon is running (`spawn::ensure_running`)
+/// 2. a local socket to it, carrying a [`RouteHeader`]
+/// 3. the daemon's [`RouteAck`] — the SSH connect and channel open happened here
+/// 4. the control handshake with the remote `tty7-server`
+pub fn connect_blocking(
+    target: &RemoteTarget,
+    header: RouteHeader,
+    label: &str,
+) -> Result<Connected, String> {
+    // Which machine a relayed question belongs to travels on the header itself
+    // (`RouteTarget::origin_key`), so nothing about this thread has to be true
+    // for [`GuiRouteAuth`] to name the right host.
+    note_origin(&header.target, target);
+    crate::daemon::spawn::ensure_running()
+        .map_err(|e| format!("tty7's local daemon could not be started: {e}"))?;
+
+    let stream = crate::daemon::transport::connect()
+        .map_err(|e| format!("could not reach tty7's local daemon: {e}"))?;
+
+    // `negotiate` writes the header and then *answers* — install consent, an
+    // auth prompt, a build-mismatch notice — until the daemon acks. Those
+    // questions are raised in the daemon process, which has the connection but
+    // no user; this is the end of the socket that has one. Before the relay
+    // existed a host needing any of them simply failed here.
+    //
+    // The ack carries the daemon's own reason when the SSH side failed — a
+    // refused connection, a rejected key, an unreachable jump host. Passing it
+    // through verbatim is the whole point of the ack existing.
+    let mut stream = stream;
+    crate::daemon::router::negotiate(&mut stream, &header)
+        .map_err(|e| format!("could not reach {label}: {e}"))?;
+
+    let hello = ControlHello::host_rpc(new_session_token(), client_hostname());
+    let host = handshake(stream, &target.connection_key(), &hello)
+        .map_err(|e| format!("{label} answered, but not as a tty7 server: {e}"))?;
+
+    let rows = list_workspaces(&host)
+        .map_err(|e| format!("connected to {label}, but its workspace list failed: {e}"))?;
+    let home = host.home();
+    Ok(Connected { host, home, rows })
+}
+
+/// The control handshake over the routed stream. Split out only because the
+/// transport type differs per platform (a Unix socket here, a token-checked
+/// loopback socket on Windows) and both need their shutdown wired so dropping
+/// the host actually closes the link.
+#[cfg(unix)]
+fn handshake(
+    stream: crate::daemon::transport::Stream,
+    connection_key: &str,
+    hello: &ControlHello,
+) -> io::Result<Arc<RemoteHost>> {
+    RemoteHost::over_unix(stream, connection_key, hello)
+}
+
+#[cfg(windows)]
+fn handshake(
+    stream: crate::daemon::transport::Stream,
+    connection_key: &str,
+    hello: &ControlHello,
+) -> io::Result<Arc<RemoteHost>> {
+    RemoteHost::over_tcp(stream, connection_key, hello)
+}
+
+/// Ask a connected machine for its workspaces.
+pub fn list_workspaces(host: &Arc<RemoteHost>) -> io::Result<Vec<RemoteWorkspaceRow>> {
+    match host.client().call(ControlRequest::WorkspaceList)? {
+        ReplyOk::Json(Value::Array(list)) => Ok(rows_from_list(&list)),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the server answered a workspace list with {other:?}"),
+        )),
+    }
+}
+
+/// A one-off session token. Design §10's takeover (M6) decides between two
+/// clients by this plus the hostname; until then it is only carried.
+fn new_session_token() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// This computer's name, as the remote should show it in a takeover notice.
+///
+/// Memoized: it cannot change while the process runs, and the lookup shells out.
+/// A machine that will not say its name is not an error — `"a tty7 client"` is a
+/// worse label but a perfectly serviceable one, and failing a connect over it
+/// would be absurd.
+fn client_hostname() -> String {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "a tty7 client".to_string())
+    })
+    .clone()
+}
+
+// ---------------------------------------------------------------------------
+// 4. Reading the remote's workspace records
+// ---------------------------------------------------------------------------
+
+/// One workspace as the remote machine describes it, flattened for the picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteWorkspaceRow {
+    pub id: WorkspaceId,
+    /// Already resolved through `Workspace::display_name`'s rules, so a record
+    /// with no user-set name still reads as its repo or directory.
+    pub name: String,
+    pub panes: usize,
+    pub last_active: u64,
+    /// The raw record, kept so opening the row can `apply_remote_json` it
+    /// without a second round trip.
+    pub record: Value,
+}
+
+/// Turn a `WorkspaceList` payload into picker rows, newest first.
+///
+/// Records the client cannot decode are **skipped, not fatal**: the list is
+/// written by whichever tty7 last touched that machine, and one record from a
+/// newer build must not make every other workspace on the box unreachable.
+pub fn rows_from_list(list: &[Value]) -> Vec<RemoteWorkspaceRow> {
+    let mut rows: Vec<RemoteWorkspaceRow> = list
+        .iter()
+        .filter_map(|record| {
+            // The remote record is the remote-owned half of a `Workspace`, so it
+            // decodes by merging onto a blank one — which is also what gives us
+            // `display_name` and `pane_count` for free rather than reimplemented.
+            let mut workspace = crate::core::session::Workspace::default();
+            workspace.apply_remote_json(record).ok()?;
+            let id: WorkspaceId = serde_json::from_value(record.get("id")?.clone()).ok()?;
+            Some(RemoteWorkspaceRow {
+                id,
+                name: workspace.display_name(),
+                panes: workspace.pane_count(),
+                last_active: workspace.last_active,
+                record: record.clone(),
+            })
+        })
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.last_active));
+    rows
+}
+
+// ---------------------------------------------------------------------------
+// 5. Holding the connections
+// ---------------------------------------------------------------------------
+
+/// The live remote machines, by [`HostId`].
+///
+/// One entry per *machine*, not per workspace — the same granularity the SSH
+/// connection is pooled at and the same one [`crate::ui::host_registry`] uses,
+/// so two windows on one box share a connection, a host object and a git-status
+/// cache. This table holds the concrete [`RemoteHost`] because pushing a layout
+/// needs its control client; `HostRegistry` holds the same object erased to
+/// `dyn Host` for the panels.
+#[derive(Default)]
+pub struct RemoteConnections {
+    hosts: HashMap<HostId, Arc<RemoteHost>>,
+}
+
+impl Global for RemoteConnections {}
+
+impl RemoteConnections {
+    /// The connection to `id`, if this process has one.
+    pub fn get(cx: &mut App, id: HostId) -> Option<Arc<RemoteHost>> {
+        cx.default_global::<RemoteConnections>()
+            .hosts
+            .get(&id)
+            .cloned()
+    }
+
+    /// Record a connection, and register the same object with the host registry
+    /// so the file tree / git / editor reach it the way they reach any host.
+    pub fn insert(cx: &mut App, host: Arc<RemoteHost>) {
+        let id = host.id();
+        crate::ui::host_registry::HostRegistry::insert(cx, Arc::clone(&host).into_shared());
+        cx.default_global::<RemoteConnections>()
+            .hosts
+            .insert(id, host);
+    }
+
+    /// Drop a machine's connection once nothing is using it.
+    pub fn remove(cx: &mut App, id: HostId) {
+        cx.default_global::<RemoteConnections>().hosts.remove(&id);
+        crate::ui::host_registry::HostRegistry::remove(cx, id);
+    }
+
+    /// Machines currently connected. Diagnostics and teardown.
+    pub fn len(cx: &mut App) -> usize {
+        cx.default_global::<RemoteConnections>().hosts.len()
+    }
+}
+
+/// Push a workspace's layout to the machine that owns it (design §10: the
+/// remote's `workspaces.json` is the authority). Blocking.
+pub fn put_remote_layout(host: &Arc<RemoteHost>, key: String, record: Value) -> io::Result<()> {
+    host.client()
+        .call(ControlRequest::WorkspacePut {
+            id: key,
+            json: record,
+        })
+        .map(|_| ())
+}
+
+/// Pull one workspace's authoritative record from the machine that owns it.
+/// Blocking.
+///
+/// The read side of design §10's split, and what a
+/// [`ControlEvent::WorkspaceChanged`](crate::daemon::control::ControlEvent)
+/// asks for: the event says only *that* a record moved, so the record itself is
+/// fetched rather than carried. `ErrorKind::NotFound` is a real answer — the
+/// workspace was deleted on the far side — and is deliberately distinguishable
+/// from an empty one.
+pub fn get_remote_layout(host: &Arc<RemoteHost>, key: String) -> io::Result<Value> {
+    match host
+        .client()
+        .call(ControlRequest::WorkspaceGet { id: key })?
+    {
+        ReplyOk::Json(record) => Ok(record),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the server answered a workspace record with {other:?}"),
+        )),
+    }
+}
+
+/// Forget a workspace on the machine that owns it. Blocking.
+pub fn delete_remote_workspace(host: &Arc<RemoteHost>, key: String) -> io::Result<()> {
+    host.client()
+        .call(ControlRequest::WorkspaceDelete { id: key })
+        .map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// 6. Install consent (design §12, §16)
+// ---------------------------------------------------------------------------
+
+/// The prompt shown before tty7 writes a binary onto someone else's machine.
+///
+/// Every field of [`InstallRequest`] appears, because the point of asking is
+/// that the user can actually judge the answer: *what* is being written, *where*
+/// it lands, *how big* it is, *where it came from*, and the checksum they can
+/// verify by hand. A prompt that said only "install the server?" would be a
+/// consent ritual rather than consent.
+pub fn install_detail(request: &InstallRequest) -> String {
+    format!(
+        "tty7 will write its server binary to {machine} so this machine can host \
+         workspaces there. Nothing else on {machine} is touched, and no sudo is used.\n\
+         \n\
+         Path\u{2003}{path}\n\
+         Version\u{2003}{version} ({asset})\n\
+         Size\u{2003}{size}\n\
+         From\u{2003}{url}\n\
+         SHA-256\u{2003}{sha}\n\
+         \n\
+         Later upgrades on this machine install silently.",
+        machine = request.host,
+        path = request.remote_path,
+        version = request.version,
+        asset = request.asset,
+        size = human_bytes(request.size_bytes),
+        url = request.source_url,
+        sha = request.sha256,
+    )
+}
+
+/// The prompt's title. Names the machine, because a user with several open
+/// windows needs to know which one is asking.
+pub fn install_title(request: &InstallRequest) -> String {
+    format!("Install tty7's server on \u{201c}{}\u{201d}?", request.host)
+}
+
+/// Bytes as the user thinks of them. Binary units with one decimal, matching the
+/// download sizes shown elsewhere in the app.
+fn human_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let n = n as f64;
+    if n < KIB {
+        return format!("{} bytes", n as u64);
+    }
+    let units = ["KiB", "MiB", "GiB"];
+    let mut value = n / KIB;
+    for (i, unit) in units.iter().enumerate() {
+        if value < KIB || i == units.len() - 1 {
+            return format!("{value:.1} {unit}");
+        }
+        value /= KIB;
+    }
+    unreachable!("the loop returns on its last iteration")
+}
+
+/// How long a blocked installer waits for the user before giving up.
+///
+/// Generous — a prompt can sit behind another window — but finite, because the
+/// thread parked on it is holding an SSH connect open. Timing out **declines**:
+/// that is the same answer [`crate::daemon::install::DenyInstall`] gives, and an
+/// unanswered question is not consent.
+const CONSENT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// One install waiting on an answer.
+pub struct PendingInstall {
+    pub request: InstallRequest,
+    reply: std::sync::mpsc::SyncSender<InstallDecision>,
+}
+
+impl PendingInstall {
+    /// Answer it. Dropping a `PendingInstall` without answering leaves the
+    /// installer to time out and decline, which is the safe direction.
+    pub fn answer(self, decision: InstallDecision) {
+        let _ = self.reply.send(decision);
+    }
+}
+
+static MAILBOX: Mutex<Vec<PendingInstall>> = Mutex::new(Vec::new());
+
+/// The consent handler the GUI registers at startup ([`register`]).
+///
+/// `confirm` is called on whichever thread is doing the install, which is never
+/// the UI thread, so it parks the request in [`MAILBOX`] and blocks. The GUI
+/// picks it up with [`take_pending_install`] while a connect is in flight and
+/// answers it.
+pub struct GuiInstallConfirm;
+
+impl InstallConfirm for GuiInstallConfirm {
+    fn confirm(&self, request: &InstallRequest) -> InstallDecision {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let Ok(mut mailbox) = MAILBOX.lock() else {
+                return InstallDecision::Decline;
+            };
+            mailbox.push(PendingInstall {
+                request: request.clone(),
+                reply: tx,
+            });
+        }
+        rx.recv_timeout(CONSENT_TIMEOUT)
+            .unwrap_or(InstallDecision::Decline)
+    }
+}
+
+/// Install the GUI's consent handler. Called once at startup; without it the
+/// process-wide default declines every install, which is deliberate — a tty7
+/// with no UI attached must not decide on the user's behalf that writing to
+/// their servers is fine.
+pub fn register(cx: &mut App) {
+    crate::daemon::install::set_install_confirm(Arc::new(GuiInstallConfirm));
+    crate::daemon::router::set_route_auth_responder(Arc::new(GuiRouteAuth));
+    // Touch the globals so the first connect isn't also the first allocation of
+    // the table it writes into, on a thread that is holding a socket open.
+    let _ = RemoteConnections::len(cx);
+}
+
+/// The oldest install waiting for an answer, if any.
+pub fn take_pending_install() -> Option<PendingInstall> {
+    MAILBOX.lock().ok()?.pop()
+}
+
+// ---------------------------------------------------------------------------
+// 6b. Auth prompts on a routed connection
+// ---------------------------------------------------------------------------
+
+/// One interactive SSH question waiting on an answer.
+///
+/// The same mailbox shape as [`PendingInstall`], and for the same reason: the
+/// question is raised on a background thread holding a connect open, and only
+/// the UI thread can put a sheet in front of a person.
+///
+/// **Why a routed connection needs its own mailbox at all.** A native-SSH
+/// *pane*'s prompts ride that pane's own stream and land in its
+/// `TerminalView` — `RemoteTerminal::take_auth_prompt`. A remote workspace's
+/// connect has no pane and no view yet; the prompt arrives during the route
+/// setup, before anything exists to render it.
+pub struct PendingAuth {
+    /// Which machine is asking.
+    ///
+    /// Without it the queue in `ui::remote_workspace` could only be a global
+    /// "one at a time" latch: a prompt would have no owner, so a sheet could
+    /// not say which box wants the password, and two machines asking at once
+    /// could not be told apart. Resolved from the target on the connection's own
+    /// [`RouteHeader`] (see [`RouteOrigins`]).
+    pub host: HostId,
+    pub prompt: AuthPromptKind,
+    reply: std::sync::mpsc::SyncSender<AuthResponse>,
+}
+
+impl PendingAuth {
+    /// Answer it. Dropping one unanswered lets the connect time out and cancel,
+    /// which fails the auth step cleanly rather than hanging.
+    pub fn answer(self, response: AuthResponse) {
+        let _ = self.reply.send(response);
+    }
+}
+
+static AUTH_MAILBOX: Mutex<Vec<PendingAuth>> = Mutex::new(Vec::new());
+
+/// One machine, under both names it has: the router's
+/// ([`RouteTarget::origin_key`]) and this client's ([`HostId`] /
+/// [`RemoteTarget`]).
+struct RouteOrigin {
+    key: String,
+    target: RemoteTarget,
+    host: HostId,
+}
+
+/// Every machine this client has written a [`RouteHeader`] for.
+///
+/// **Why a table and not the connecting thread.** A question raised while a
+/// routed connection is being set up has to be attributed to a machine: the
+/// sheet names it, the start-up queue is keyed by it (design §10, D7), and
+/// `raise_auth_sheet` finds a window with it. That used to be read off a
+/// thread-local set by [`connect_blocking`], which held for the workspace
+/// connect and quietly did not for a pane's — `connect_routed` lives in
+/// `terminal::` and cannot reach `ui::`, so it set nothing and every routed pane
+/// prompt was attributed to no machine at all.
+///
+/// The router names the machine on the header instead, and this maps that name
+/// back to the id this client files it under. Both directions are needed
+/// because neither side can compute the other's: the daemon has no idea a
+/// machine is "the `build` alias" or "profile 7f3…", and the client cannot
+/// re-derive a saved profile from the endpoint the daemon knows it by.
+///
+/// A plain static rather than a gpui `Global`: it is read on whichever
+/// background thread is holding the connect open, which is never the UI thread.
+/// Entries are never removed — one per machine addressed in a session, and a
+/// machine's identity does not stop being true.
+static ORIGINS: Mutex<Vec<RouteOrigin>> = Mutex::new(Vec::new());
+
+/// Record that `target` is the machine the router calls `route.origin_key()`.
+///
+/// Called from every place this client turns a [`RemoteTarget`] into a route
+/// header, which is the only moment both names are in hand at once.
+pub fn note_origin(route: &crate::daemon::router::RouteTarget, target: &RemoteTarget) {
+    let key = route.origin_key();
+    let Ok(mut origins) = ORIGINS.lock() else {
+        return;
+    };
+    let host = target.host_id();
+    match origins.iter_mut().find(|o| o.key == key) {
+        // Last writer wins. Two saved profiles can differ only in credentials
+        // and so share an endpoint — and therefore a key — in which case
+        // "whichever the user most recently addressed" is the best available
+        // answer to which of them a prompt is for. It is the *machine* that is
+        // certain here, and the machine is what the sheet and the queue need.
+        Some(existing) => {
+            existing.target = target.clone();
+            existing.host = host;
+        }
+        None => origins.push(RouteOrigin {
+            key,
+            target: target.clone(),
+            host,
+        }),
+    }
+}
+
+/// This client's id for the machine the router names `key`, if it has one.
+pub fn origin_host(key: &str) -> Option<HostId> {
+    let origins = ORIGINS.lock().ok()?;
+    origins.iter().find(|o| o.key == key).map(|o| o.host)
+}
+
+/// This client's target for the machine the router names `key`.
+///
+/// The mismatch prompt's route back: [`MismatchedRemoteDaemon::host`] is a
+/// daemon-side connection label, which is the same string
+/// [`RouteTarget::origin_key`](crate::daemon::router::RouteTarget::origin_key)
+/// produces for an SSH machine — so this is how "restart the server on *that*
+/// box" turns back into a header this client can write.
+pub fn origin_target(key: &str) -> Option<RemoteTarget> {
+    let origins = ORIGINS.lock().ok()?;
+    origins
+        .iter()
+        .find(|o| o.key == key)
+        .map(|o| o.target.clone())
+}
+
+/// The routed-auth handler the GUI registers at startup ([`register`]).
+pub struct GuiRouteAuth;
+
+impl crate::daemon::router::RouteAuthResponder for GuiRouteAuth {
+    fn respond(
+        &self,
+        machine: &crate::daemon::router::RouteTarget,
+        prompt: &AuthPromptKind,
+    ) -> AuthResponse {
+        let key = machine.origin_key();
+        // A machine this client has never written a header for cannot raise a
+        // prompt — every routed connection starts with one. If one ever does,
+        // it is attributed to an id derived from the router's own name for it
+        // rather than dropped: an entry under a key no window matches still gets
+        // answered (and times out cleanly); a lost one hangs a connect.
+        let host = origin_host(&key).unwrap_or_else(|| HostId::from_connection_key(&key));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let Ok(mut mailbox) = AUTH_MAILBOX.lock() else {
+                return AuthResponse::Cancelled;
+            };
+            mailbox.push(PendingAuth {
+                host,
+                prompt: prompt.clone(),
+                reply: tx,
+            });
+        }
+        rx.recv_timeout(CONSENT_TIMEOUT)
+            .unwrap_or(AuthResponse::Cancelled)
+    }
+}
+
+/// The oldest routed auth prompt waiting for an answer, if any.
+///
+/// Polled by the connect watcher beside [`take_pending_install`]. While nothing
+/// polls it the prompts time out and cancel — byte-for-byte the behaviour this
+/// path had before the relay, so wiring the sheet is an improvement and never a
+/// regression.
+pub fn take_pending_auth() -> Option<PendingAuth> {
+    AUTH_MAILBOX.lock().ok()?.pop()
+}
+
+// ---------------------------------------------------------------------------
+// 7. Remote daemon version skew (design §12)
+// ---------------------------------------------------------------------------
+
+/// The keep-or-restart question for a remote `tty7-server` at a different build.
+///
+/// The local analogue is `Tty7App::prompt_daemon_version_mismatch`, and the
+/// trade is identical: the running daemon owns every live pane on that machine,
+/// so restarting it throws that work away, while keeping it means talking an
+/// older dialect. The one thing that differs is whose machine it is, which is
+/// why the title names the host.
+pub fn mismatch_detail(m: &MismatchedRemoteDaemon) -> String {
+    let running = match (&m.running_version, &m.running_exe) {
+        (Some(v), Some(exe)) => format!("{v} (from {exe})"),
+        (Some(v), None) => v.clone(),
+        (None, Some(exe)) => format!("an unknown build (from {exe})"),
+        (None, None) => "an unknown build".to_string(),
+    };
+    format!(
+        "{host} is already serving tty7 sessions from {running}, but this client is {wanted}.\n\
+         \n\
+         Keep Sessions\u{2003}everything running on {host} stays up, over the older protocol.\n\
+         Restart Server\u{2003}starts {wanted} there and ends every session it is hosting.",
+        host = m.host,
+        wanted = m.wanted_version,
+    )
+}
+
+/// The prompt's title.
+pub fn mismatch_title(m: &MismatchedRemoteDaemon) -> String {
+    format!("Restart tty7's server on \u{201c}{}\u{201d}?", m.host)
+}
+
+/// The machine a mismatch record is about, as this client knows it.
+///
+/// `None` when the record names a machine no header in this session addressed —
+/// which cannot happen for a mismatch (it is discovered *while* opening a routed
+/// connection this client asked for), and which the caller turns into a refusal
+/// rather than a guess.
+pub fn mismatch_target(m: &MismatchedRemoteDaemon) -> Option<RemoteTarget> {
+    origin_target(&m.host)
+}
+
+/// Carry out design §12's "Restart Server": stop the `tty7-server` on the
+/// machine `header` names and start this client's build. **Blocking**, and
+/// **every pane that server hosts dies** — only ever call this with the user's
+/// explicit answer behind it.
+///
+/// The connection is a setup window and nothing else: the daemon acks and both
+/// ends close. Reconnecting afterwards is the supervisor's job, not this one's.
+pub fn restart_server_blocking(header: RouteHeader, label: &str) -> Result<(), String> {
+    crate::daemon::spawn::ensure_running()
+        .map_err(|e| format!("tty7's local daemon could not be started: {e}"))?;
+    let mut stream = crate::daemon::transport::connect()
+        .map_err(|e| format!("could not reach tty7's local daemon: {e}"))?;
+    let ack = crate::daemon::router::negotiate(&mut stream, &header)
+        .map_err(|e| format!("could not restart tty7's server on {label}: {e}"))?;
+    // An older local daemon does not know the action and forwards the
+    // connection instead — a link, not a restart. Saying nothing happened is the
+    // only honest answer; the alternative is a "done" over a server still
+    // running the old build.
+    if !ack.performed(crate::daemon::router::RouteAction::RestartServer) {
+        return Err(format!(
+            "this machine's tty7 daemon is an older build and cannot restart the server on \
+             {label}. Quit tty7 (which stops the daemon) and open it again, then retry."
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> InstallRequest {
+        InstallRequest {
+            host: "me@build-box:22".into(),
+            version: "0.9.1".into(),
+            asset: "tty7-server-x86_64-unknown-linux-musl",
+            source_url: "https://example.invalid/v0.9.1/tty7-server".into(),
+            remote_path: "/home/me/.local/share/tty7/bin/tty7-server-0.9.1".into(),
+            size_bytes: 9_437_184,
+            sha256: "abc123".into(),
+        }
+    }
+
+    /// §12 is explicit that the confirmation says *what* is written, *where*,
+    /// *how big* and *where from*. A field silently dropped from the prompt
+    /// would turn an informed decision back into a blind one, so every one of
+    /// them is pinned here rather than eyeballed.
+    #[test]
+    fn the_install_prompt_states_every_field_of_the_request() {
+        let request = request();
+        let detail = install_detail(&request);
+        for needle in [
+            request.remote_path.as_str(),
+            request.version.as_str(),
+            request.asset,
+            request.source_url.as_str(),
+            request.sha256.as_str(),
+        ] {
+            assert!(
+                detail.contains(needle),
+                "{needle:?} missing from:\n{detail}"
+            );
+        }
+        // The size is shown in units, not raw bytes.
+        assert!(detail.contains("9.0 MiB"), "{detail}");
+        // And the title names the machine, so a user with several windows open
+        // knows which one is asking.
+        assert!(install_title(&request).contains("me@build-box:22"));
+    }
+
+    #[test]
+    fn human_bytes_reads_in_binary_units() {
+        assert_eq!(human_bytes(512), "512 bytes");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1_572_864), "1.5 MiB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    /// An unanswered consent request must not read as approval — the default
+    /// everywhere in the install path is to decline, and a dropped prompt is
+    /// exactly the case where nobody said yes.
+    #[test]
+    fn an_unanswered_install_request_declines() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let pending = PendingInstall {
+            request: request(),
+            reply: tx,
+        };
+        drop(pending);
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn answering_an_install_request_delivers_the_decision() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        PendingInstall {
+            request: request(),
+            reply: tx,
+        }
+        .answer(InstallDecision::Approve);
+        assert_eq!(rx.recv().unwrap(), InstallDecision::Approve);
+    }
+
+    /// The handler parks the request rather than deciding, so the GUI can pick
+    /// it up; and the mailbox hands it back exactly once.
+    #[test]
+    fn the_gui_handler_parks_the_request_for_the_ui_to_answer() {
+        // Drain anything a sibling test left behind — the mailbox is process-wide.
+        while take_pending_install().is_some() {}
+        let handle = std::thread::spawn(|| GuiInstallConfirm.confirm(&request()));
+        let pending = loop {
+            if let Some(p) = take_pending_install() {
+                break p;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(pending.request.host, "me@build-box:22");
+        assert!(take_pending_install().is_none(), "handed out twice");
+        pending.answer(InstallDecision::Approve);
+        assert_eq!(handle.join().unwrap(), InstallDecision::Approve);
+    }
+
+    fn native_spec(user: &str, host: &str, port: u16) -> NativeSshSpec {
+        let mut profile = crate::core::ssh_profile::SshProfile::new(host.to_string());
+        profile.user = user.to_string();
+        profile.port = port;
+        crate::ui::ssh_connect::build_native_ssh_spec(
+            &profile,
+            &[],
+            &crate::core::keychain::InMemoryCredentialStore::new(),
+            false,
+        )
+    }
+
+    /// **A routed auth prompt knows which machine asked.**
+    ///
+    /// The attribution rides the connection's own [`RouteHeader`] — the router
+    /// names the machine, [`RouteOrigins`] maps that name back to this client's
+    /// id. Without the host the start-up queue could only be a global "one at a
+    /// time" latch: no sheet could name the box, and two machines asking at once
+    /// could not be told apart.
+    ///
+    /// Answered **on another thread than the one that noted the origin**, which
+    /// is the point: the mechanism this replaced could only work when the two
+    /// were the same thread, and on the pane path they never are.
+    #[test]
+    fn a_routed_auth_prompt_carries_the_machine_that_raised_it() {
+        while take_pending_auth().is_some() {}
+        let target = RemoteTarget::direct("me", "build-box", 22);
+        let route =
+            crate::daemon::router::RouteTarget::Ssh(Box::new(native_spec("me", "build-box", 22)));
+        note_origin(&route, &target);
+
+        let handle = std::thread::spawn(move || {
+            use crate::daemon::router::RouteAuthResponder as _;
+            GuiRouteAuth.respond(
+                &route,
+                &AuthPromptKind::Password {
+                    user: "me".into(),
+                    host: "build-box".into(),
+                },
+            )
+        });
+        let pending = loop {
+            if let Some(p) = take_pending_auth() {
+                break p;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(pending.host, target.host_id());
+        pending.answer(AuthResponse::Secret("hunter2".into()));
+        assert_eq!(
+            handle.join().unwrap(),
+            AuthResponse::Secret("hunter2".into())
+        );
+    }
+
+    /// **Both routed paths land on the same machine.** A workspace's control
+    /// connection and one of its panes are built from the same SSH spec but by
+    /// different code on different threads (`connect_blocking` and
+    /// `connect_routed`), and a prompt raised on either has to name the one
+    /// machine — the queue, the sheet and the window lookup are all keyed by it.
+    ///
+    /// The pane header differs from the control one (`--pane`, `channel: Pane`)
+    /// and must *not* look like a second machine, which is what the shared
+    /// origin key buys.
+    #[test]
+    fn a_pane_and_its_workspace_resolve_to_the_same_machine() {
+        use crate::daemon::router::{RouteHeader, RouteTarget as RT};
+
+        let target = RemoteTarget::direct("me", "twin-box", 22);
+        let control = RouteHeader::ssh(native_spec("me", "twin-box", 22));
+        let pane = RouteHeader::ssh(native_spec("me", "twin-box", 22)).for_pane();
+        note_origin(&control.target, &target);
+        assert_eq!(
+            origin_host(&pane.target.origin_key()),
+            Some(target.host_id()),
+            "a pane's header names the machine its workspace's does"
+        );
+
+        // And a `--stdio` machine's two headers agree too, though the pane's
+        // argv carries `--pane` and the control one does not.
+        let local = RemoteTarget::LocalStdio {
+            program: "/opt/tty7-server".into(),
+            args: vec!["--stdio".into()],
+        };
+        let control = RT::LocalStdio {
+            program: "/opt/tty7-server".into(),
+            args: vec!["--stdio".into()],
+        };
+        let pane = RT::LocalStdio {
+            program: "/opt/tty7-server".into(),
+            args: vec!["--stdio".into(), "--pane".into()],
+        };
+        note_origin(&control, &local);
+        assert_eq!(origin_host(&pane.origin_key()), Some(local.host_id()));
+    }
+
+    /// The mismatch prompt's way home: the daemon labels a mismatch with the
+    /// connection key, which is the same string the router names the machine
+    /// by — so "restart the server on *that* box" resolves to a target this
+    /// client can build a header from. Without it the restart has nowhere to go.
+    #[test]
+    fn a_mismatch_record_resolves_back_to_the_machine_it_is_about() {
+        let target = RemoteTarget::direct("me", "skew-box", 2222);
+        let spec = native_spec("me", "skew-box", 2222);
+        let label = crate::daemon::ssh::ConnectionKey::from_spec(&spec)
+            .as_str()
+            .to_string();
+        note_origin(
+            &crate::daemon::router::RouteTarget::Ssh(Box::new(spec)),
+            &target,
+        );
+
+        let mismatch = MismatchedRemoteDaemon {
+            host: label,
+            running_version: Some("0.8.0".into()),
+            running_exe: None,
+            wanted_version: "0.9.1".into(),
+        };
+        assert_eq!(mismatch_target(&mismatch), Some(target));
+
+        // A machine this client never addressed answers `None` rather than a
+        // guess — the restart refuses instead of acting on the wrong box.
+        assert_eq!(
+            mismatch_target(&MismatchedRemoteDaemon {
+                host: "me@never-seen:22".into(),
+                ..mismatch
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn the_mismatch_prompt_names_the_host_and_both_versions() {
+        let m = MismatchedRemoteDaemon {
+            host: "me@build-box:22".into(),
+            running_version: Some("0.8.0".into()),
+            running_exe: Some("/home/me/.local/share/tty7/bin/tty7-server-0.8.0".into()),
+            wanted_version: "0.9.1".into(),
+        };
+        let detail = mismatch_detail(&m);
+        assert!(detail.contains("0.8.0"), "{detail}");
+        assert!(detail.contains("0.9.1"), "{detail}");
+        assert!(detail.contains("me@build-box:22"), "{detail}");
+        assert!(mismatch_title(&m).contains("me@build-box:22"));
+
+        // A daemon whose build could not be read still produces a usable prompt.
+        let unknown = MismatchedRemoteDaemon {
+            running_version: None,
+            running_exe: None,
+            ..m
+        };
+        assert!(mismatch_detail(&unknown).contains("an unknown build"));
+    }
+
+    #[test]
+    fn endpoint_labels_hide_the_default_port() {
+        assert_eq!(endpoint_label("me", "box.local", 22), "me@box.local");
+        assert_eq!(endpoint_label("me", "box.local", 2222), "me@box.local:2222");
+        assert_eq!(endpoint_label("", "box.local", 22), "box.local");
+    }
+
+    /// The picker's rows come from records the *remote* wrote, so they have to
+    /// survive a record this build cannot read: one bad entry may not hide the
+    /// rest of the machine's workspaces.
+    #[test]
+    fn rows_skip_undecodable_records_and_sort_newest_first() {
+        let older = WorkspaceId::new();
+        let newer = WorkspaceId::new();
+        let list = vec![
+            serde_json::json!({
+                "id": older.to_string(),
+                "name": "api",
+                "session": { "tabs": [] },
+                "last_active": 100,
+            }),
+            // No `id` at all — unreadable, and skipped rather than fatal.
+            serde_json::json!({ "name": "broken" }),
+            serde_json::json!({
+                "id": newer.to_string(),
+                "name": "web",
+                "session": { "tabs": [] },
+                "last_active": 500,
+            }),
+        ];
+        let rows = rows_from_list(&list);
+        assert_eq!(rows.len(), 2, "the undecodable record is skipped");
+        assert_eq!(rows[0].id, newer, "newest first");
+        assert_eq!(rows[0].name, "web");
+        assert_eq!(rows[1].id, older);
+    }
+
+    /// A record with no user-set name falls back to the same derived name a
+    /// local workspace would get, rather than showing a raw uuid.
+    #[test]
+    fn rows_derive_a_name_when_the_record_has_none() {
+        let id = WorkspaceId::new();
+        let list = vec![serde_json::json!({
+            "id": id.to_string(),
+            "session": {
+                "tabs": [{
+                    "pane": { "Leaf": { "cwd": "/srv/checkout" } }
+                }]
+            },
+            "last_active": 1,
+        })];
+        let rows = rows_from_list(&list);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "checkout");
+        assert_eq!(rows[0].panes, 1);
+    }
+
+    fn host(label: &str, detail: &str) -> HostChoice {
+        HostChoice {
+            target: RemoteTarget::Alias {
+                alias: label.to_string(),
+            },
+            label: label.to_string(),
+            detail: detail.to_string(),
+        }
+    }
+
+    /// An empty query is not a search: it must hand back the list exactly as
+    /// [`available_hosts`] built it (profiles first, aliases after), because
+    /// that order carries information a score cannot reproduce.
+    #[test]
+    fn an_empty_query_keeps_every_machine_in_order() {
+        let hosts = vec![
+            host("gate2jup", "root@18.143.92.244"),
+            host("aws-xy", "root@52.199.113.213"),
+        ];
+        let all = filter_hosts(&hosts, "   ");
+        assert_eq!(all, hosts);
+    }
+
+    /// The two things a user types: the name they gave the box, and the address
+    /// they remember it by. Both find it; a name match outranks an address one.
+    #[test]
+    fn a_query_matches_the_name_or_the_endpoint() {
+        let hosts = vec![
+            host("gate2jup", "root@18.143.92.244"),
+            host("aws-xy", "root@52.199.113.213"),
+            host("orb", "default@127.0.0.1:32222"),
+        ];
+
+        let by_name = filter_hosts(&hosts, "jup");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].label, "gate2jup");
+
+        let by_address = filter_hosts(&hosts, "52.199");
+        assert_eq!(by_address.len(), 1);
+        assert_eq!(by_address[0].label, "aws-xy");
+
+        // "or" is in `orb`'s name and in the other two's `root@` — the machine
+        // actually called that comes first.
+        let mixed = filter_hosts(&hosts, "or");
+        assert_eq!(mixed[0].label, "orb", "a name match beats an endpoint one");
+    }
+
+    /// A query nothing answers filters everything out rather than falling back
+    /// to the full list — the panel's empty state says so, and a silent "here
+    /// is everything" would read as the search being broken.
+    #[test]
+    fn a_query_nothing_matches_returns_nothing() {
+        let hosts = vec![host("gate2jup", "root@18.143.92.244")];
+        assert!(filter_hosts(&hosts, "zzz").is_empty());
+    }
+}

@@ -836,12 +836,12 @@ mod tests {
     #[gpui::test]
     fn effective_preset_follows_the_cached_system_appearance(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            cx.set_global(Config {
+            cx.set_global(Config(crate::core::config::CoreConfig {
                 theme_follow_system: true,
                 theme_preset_light: "light-slot".into(),
                 theme_preset_dark: "dark-slot".into(),
-                ..Config::default()
-            });
+                ..Default::default()
+            }));
 
             cx.set_global(SystemAppearance { dark: false });
             assert!(!system_dark(cx));

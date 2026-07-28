@@ -618,6 +618,7 @@ mod tests {
             DaemonMsg::Version(DaemonVersion {
                 protocol: PROTOCOL_VERSION,
                 build: "test".into(),
+                features: Vec::new(),
             })
             .encode(&mut daemon)
             .unwrap();

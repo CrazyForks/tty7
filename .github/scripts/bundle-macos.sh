@@ -12,7 +12,15 @@ set -euo pipefail
 
 TARGET="$1"
 ARCH="$2"
-VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+# Anchored on `= "` because the root manifest's `[package]` section leads with
+# `version.workspace = true` — a bare `^version` match grabs that line, finds no
+# quotes to substitute, and passes it through as the "version", which then lands
+# in CFBundleVersion and the .dmg filename. Guard against a silent recurrence.
+VERSION="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+  echo "bundle-macos: could not read a version from Cargo.toml (got '$VERSION')" >&2
+  exit 1
+fi
 APP="dist/tty7.app"
 
 rm -rf dist
