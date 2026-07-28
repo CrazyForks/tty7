@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left the gpui fork on 0.45, so the tree compiled two resvg/usvg/tiny-skia
   stacks. The fork now pins 0.47 too, re-unifying its stack with the one tty7
   uses for the tray icon. gpui-component still carries its own 0.45.1 until
-  that fork catches up.
+  that fork catches up. (#237)
 
 ### Fixed
 
