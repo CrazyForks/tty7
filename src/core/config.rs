@@ -1095,6 +1095,25 @@ mod tests {
         assert!(!newer.confirm_window_close);
     }
 
+    /// Also opt-*out*: every config written before the switch existed predates
+    /// the choice, and those users have been looking at dimmed panes all along —
+    /// defaulting to `false` would silently change how every split tab looks on
+    /// upgrade. And once someone does turn it off, the `false` has to survive a
+    /// save/load cycle, or the effect they opted out of returns on next launch.
+    #[test]
+    fn dim_inactive_panes_defaults_on_and_round_trips() {
+        assert!(Config::default().dim_inactive_panes);
+
+        let old: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        assert!(old.dim_inactive_panes);
+
+        let off: Config = serde_json::from_str(r#"{"dim_inactive_panes": false}"#).unwrap();
+        assert!(!off.dim_inactive_panes);
+        let json = serde_json::to_string(&off).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(!back.dim_inactive_panes);
+    }
+
     #[test]
     fn theme_follow_system_defaults_and_round_trips() {
         // Old configs (no follow-system keys) must land on off + the built-in
