@@ -490,16 +490,49 @@ enum RowSeg {
     /// drawing, accented Latin, …) that may route to a fallback face whose
     /// advance isn't the cell width.
     Solo { col: usize },
-    /// A base plus the combining marks stacked on it, shaped as one string so
-    /// the marks reach the shaper. Never batched with neighbours: the marks add
+    /// A base with everything that has to shape alongside it — the combining
+    /// marks stacked on it, and a following SARA AM — as one string, so the
+    /// shaper sees the whole cluster. Never batched with neighbours: marks add
     /// characters without adding columns, which is exactly the correspondence
     /// `force_width` relies on in a [`RowSeg::Run`] or [`RowSeg::Wide`].
+    ///
+    /// An absorbed SARA AM takes the base's style rather than its own. Unlike
+    /// a [`RowSeg::Run`], the cluster can't break on a style change: split off,
+    /// SARA AM has no base to reorder its nikhahit onto and renders as a dotted
+    /// circle. A recoloured vowel beats a broken one.
     Cluster {
         col: usize,
-        /// Columns the base occupies — 2 once the grid marked it wide.
+        /// Columns the whole cluster occupies — 2 for a wide base, or for a
+        /// narrow base that absorbed a following SARA AM.
         cells: usize,
         text: String,
+        /// Whether `cells == 2` because the *base* is wide, rather than because
+        /// a spacing character joined it. The two need opposite pinning: a wide
+        /// base is one glyph across two columns, an absorbed SARA AM is two
+        /// glyphs of one column each.
+        wide_base: bool,
     },
+}
+
+/// Append a cell's character followed by any combining marks riding on it.
+fn push_cell(text: &mut String, cell: &RenderCell) {
+    text.push(cell.c);
+    text.extend(cell.marks.iter().flat_map(|marks| marks.iter()));
+}
+
+/// SARA AM (Thai U+0E33, Lao U+0EB3) is `Lo` and owns a column, but it is not
+/// atomic to the shaper: the Thai shaper decomposes it into NIKHAHIT + SARA AA
+/// and moves the nikhahit backwards over any above-base marks onto the base
+/// consonant. Shaped in a run of its own it has no base to reorder onto, and
+/// comes out as a dotted circle.
+fn is_sara_am(c: char) -> bool {
+    matches!(c, '\u{0E33}' | '\u{0EB3}')
+}
+
+/// Does `col` hold a SARA AM that should join the preceding cell's cluster?
+fn sara_am_at(row: &[RenderCell], col: usize) -> Option<&RenderCell> {
+    row.get(col)
+        .filter(|cell| !cell.spacer && is_sara_am(cell.c))
 }
 
 /// Split one grid row into paintable segments.
@@ -530,15 +563,26 @@ fn segment_row(row: &[RenderCell]) -> Vec<RowSeg> {
         // Combining marks come first: they can sit on an ASCII base too, and
         // either way the whole cluster has to reach the shaper in one string.
         if let Some(marks) = &cell.marks {
-            let cells = if col + 1 < row.len() && row[col + 1].spacer {
-                2
-            } else {
-                1
-            };
+            let wide_base = col + 1 < row.len() && row[col + 1].spacer;
+            let mut cells = if wide_base { 2 } else { 1 };
             let mut text = String::with_capacity(1 + marks.len());
-            text.push(cell.c);
-            text.extend(marks.iter());
-            segs.push(RowSeg::Cluster { col, cells, text });
+            push_cell(&mut text, cell);
+            // A wide base already owns both columns, so only a narrow one has a
+            // column spare for SARA AM to join it in. A SARA AM is not itself a
+            // base to absorb onto — two in a row stay separate.
+            if !wide_base
+                && !is_sara_am(cell.c)
+                && let Some(am) = sara_am_at(row, col + 1)
+            {
+                push_cell(&mut text, am);
+                cells = 2;
+            }
+            segs.push(RowSeg::Cluster {
+                col,
+                cells,
+                text,
+                wide_base,
+            });
             col += cells;
             continue;
         }
@@ -569,6 +613,23 @@ fn segment_row(row: &[RenderCell]) -> Vec<RowSeg> {
                     cells: col - start,
                     text,
                 });
+            } else if !is_sara_am(cell.c)
+                && let Some(am) = sara_am_at(row, col + 1)
+            {
+                // An unmarked base still has to shape with its SARA AM. A
+                // baseless SARA AM is not a base for the next one: absorbing
+                // there would pin the second one's glyphs outside the cluster's
+                // clip, so two in a row stay separate and both stay visible.
+                let mut text = String::with_capacity(2);
+                push_cell(&mut text, cell);
+                push_cell(&mut text, am);
+                segs.push(RowSeg::Cluster {
+                    col,
+                    cells: 2,
+                    text,
+                    wide_base: false,
+                });
+                col += 2;
             } else {
                 segs.push(RowSeg::Solo { col });
                 col += 1;
@@ -904,11 +965,22 @@ fn paint_glyphs(
                 // Same pinning as the batched runs, just for one base: two
                 // columns get `force_width` so a fallback emoji face can't
                 // drift, one column paints at the origin like `Solo`.
-                RowSeg::Cluster { col, cells, text } => (
+                // Two columns pin per *base glyph*, and which that is depends
+                // on why the cluster is two cells wide: a wide base is one
+                // glyph spanning both, an absorbed SARA AM is two glyphs of one
+                // column each. `force_width` classifies by advance, so the
+                // marks ride their base under either. One column paints at the
+                // origin like `Solo`.
+                RowSeg::Cluster {
+                    col,
+                    cells,
+                    text,
+                    wide_base,
+                } => (
                     col,
                     cells,
                     SharedString::from(text),
-                    (cells == 2).then(|| geom.cell_width * 2.),
+                    (cells == 2).then(|| geom.cell_width * if wide_base { 2. } else { 1. }),
                     cells == 1,
                 ),
             };
@@ -2228,6 +2300,16 @@ mod tests {
             col,
             cells,
             text: text.to_string(),
+            wide_base: false,
+        }
+    }
+
+    fn wide_cluster(col: usize, cells: usize, text: &str) -> RowSeg {
+        RowSeg::Cluster {
+            col,
+            cells,
+            text: text.to_string(),
+            wide_base: true,
         }
     }
 
@@ -2246,7 +2328,7 @@ mod tests {
         // spacer too (❤ + U+FE0F).
         let mut row = wide_cells("\u{2764}");
         row[0].marks = Some(Box::from(['\u{FE0F}']));
-        assert_eq!(segment_row(&row), [cluster(0, 2, "\u{2764}\u{FE0F}")]);
+        assert_eq!(segment_row(&row), [wide_cluster(0, 2, "\u{2764}\u{FE0F}")]);
 
         // Several marks on one base: an above-base vowel and a tone mark both
         // sit on the consonant (ที่ = ท U+0E17 + ◌ี U+0E35 + ◌่ U+0E48).
@@ -2255,6 +2337,58 @@ mod tests {
         assert_eq!(
             segment_row(&row),
             [cluster(0, 1, "\u{0E17}\u{0E35}\u{0E48}"), run(1, 1, "a")]
+        );
+    }
+
+    /// SARA AM (U+0E33) is the awkward Thai vowel: `Lo`, width 1, so the grid
+    /// gives it its own column — but the shaper decomposes it into NIKHAHIT +
+    /// SARA AA and reorders the nikhahit backwards onto the base consonant.
+    /// Shaped in its own run it has no base to reorder onto and comes out as a
+    /// dotted circle, so it has to join the preceding cell's cluster.
+    #[test]
+    fn segment_row_absorbs_sara_am_into_its_base() {
+        // น + ้ (tone) + ำ — the base already carries a mark.
+        let mut row = vec![cell('\u{0E19}'), cell('\u{0E33}'), cell('a')];
+        row[0].marks = Some(Box::from(['\u{0E49}']));
+        assert_eq!(
+            segment_row(&row),
+            [cluster(0, 2, "\u{0E19}\u{0E49}\u{0E33}"), run(2, 1, "a")]
+        );
+
+        // ก + ำ — an unmarked base still has to shape with it.
+        let row = vec![cell('\u{0E01}'), cell('\u{0E33}')];
+        assert_eq!(segment_row(&row), [cluster(0, 2, "\u{0E01}\u{0E33}")]);
+
+        // Lao SARA AM (U+0EB3) takes the same shaper path.
+        let row = vec![cell('\u{0E81}'), cell('\u{0EB3}')];
+        assert_eq!(segment_row(&row), [cluster(0, 2, "\u{0E81}\u{0EB3}")]);
+
+        // A style change does not break the cluster, unlike a `Run` or `Wide`
+        // batch: split off, the vowel has no base and paints a dotted circle,
+        // so it takes the base's style instead.
+        let mut row = vec![cell('\u{0E01}'), cell('\u{0E33}')];
+        row[1].fg = gpui::red();
+        assert_eq!(segment_row(&row), [cluster(0, 2, "\u{0E01}\u{0E33}")]);
+    }
+
+    /// With nothing to attach to, SARA AM paints alone — a dotted circle is the
+    /// shaper's honest answer for an orphaned mark, and inventing a base would
+    /// be worse.
+    #[test]
+    fn segment_row_leaves_a_baseless_sara_am_alone() {
+        let row = vec![cell('\u{0E33}'), cell('a')];
+        assert_eq!(segment_row(&row), [RowSeg::Solo { col: 0 }, run(1, 1, "a")]);
+
+        // A blank before it is not a base either.
+        let row = vec![cell(' '), cell('\u{0E33}')];
+        assert_eq!(segment_row(&row), [RowSeg::Solo { col: 1 }]);
+
+        // Nor is another SARA AM: absorbing would pin the second one's glyphs
+        // past the cluster's two-cell clip and swallow it entirely.
+        let row = vec![cell('\u{0E33}'), cell('\u{0E33}')];
+        assert_eq!(
+            segment_row(&row),
+            [RowSeg::Solo { col: 0 }, RowSeg::Solo { col: 1 }]
         );
     }
 
@@ -2277,7 +2411,7 @@ mod tests {
             segment_row(&row),
             [
                 wide(0, 2, "你"),
-                cluster(2, 2, "好\u{FE0F}"),
+                wide_cluster(2, 2, "好\u{FE0F}"),
                 wide(4, 2, "世"),
             ]
         );
