@@ -41,7 +41,7 @@ Native builds for each platform on [**Releases**](https://github.com/l0ng-ai/tty
 | | |
 |---|---|
 | **Input** | ghost suggestions from history · explained tab completion · syntax highlighting · multi-line editing · click places the caret · <kbd>⌃ R</kbd> fuzzy history |
-| **Window** | tabs & splits · <kbd>⌘ P</kbd> palette · <kbd>⌘ F</kbd> scrollback search · eight themes · IME |
+| **Window** | tabs & splits · <kbd>⌘ P</kbd> palette · <kbd>⌘ F</kbd> scrollback search · nine themes · IME |
 | **Coding agents** | per-pane agent detection (~17 CLIs): status dot, notifications, branch + diff, resume after reboot, tray icon that signals "needs your input" |
 | **SSH** | native russh stack: profiles with keychain secrets, SFTP panel, port forwarding, jump hosts |
 
