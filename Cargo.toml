@@ -152,10 +152,11 @@ memchr = "2"
 
 # System tray / menu bar status item (`ui::tray`). Rasterizes the bundled SVG
 # logo into the tray bitmap at runtime — gpui's own SVG path only yields a
-# tinted alpha mask, not raw RGBA. Pinned to the exact version already in the
-# tree via gpui (0.45.x), so this adds no new native code; default features off
-# drops the text/font machinery our icon SVGs don't use.
-resvg = { version = "0.45", default-features = false }
+# tinted alpha mask, not raw RGBA. NOTE: gpui/gpui-component still pin 0.45.x,
+# so until the fork catches up this compiles a second resvg/usvg/tiny-skia
+# stack (no type conflicts — only `image::RgbaImage` crosses the boundary);
+# default features off drops the text/font machinery our icon SVGs don't use.
+resvg = { version = "0.47", default-features = false }
 
 # The tray icon itself, macOS + Windows: tauri's `tray-icon` (NSStatusItem /
 # Shell_NotifyIcon via objc2 / windows-sys, both already in the tree). Linux is
@@ -319,12 +320,21 @@ lto = "thin"
 codegen-units = 1
 
 # ---- gpui fork ------------------------------------------------------------
-# Our `tty7` branch (cut from the pinned upstream rev, one commit on top) carries
-# a single patch: `prefers_ime_for_printable_keys` takes the keystroke, so an
-# input handler can answer per key instead of per view. tty7 needs it for
-# Option-as-Meta — macOS routes ⌥-chords to the IME whenever a CJK input source
-# is active, and without the keystroke there is no way to decline just those
-# chords (see `terminal::input::prefers_ime_for_printable_keys`, issue #177).
+# Our `tty7` branch (cut from the pinned upstream rev, two commits on top) carries:
+#
+# 1. `prefers_ime_for_printable_keys` takes the keystroke, so an input handler can
+#    answer per key instead of per view. tty7 needs it for Option-as-Meta — macOS
+#    routes ⌥-chords to the IME whenever a CJK input source is active, and without
+#    the keystroke there is no way to decline just those chords (see
+#    `terminal::input::prefers_ime_for_printable_keys`, issue #177).
+#
+# 2. gpui's Windows backend rasterizes a font-fallback run with the face
+#    DirectWrite actually shaped it with, instead of re-deriving one from the
+#    face's family/weight/style. The round trip mapped DirectWrite's italic to
+#    oblique, so italic CJK — which every pane reaches through the fallback chain,
+#    Hack having no CJK — drew a *different* face's outlines at the shaped glyph
+#    indices. Every character rendered as an unrelated character, one for one,
+#    which reads as mojibake rather than as a font bug.
 #
 # Patching by source rather than editing the `gpui`/`gpui_platform` pins above is
 # deliberate: `gpui-component` declares its own `gpui` from the upstream URL, and
