@@ -307,13 +307,6 @@ pub struct Config {
     /// second, so toggling it (Settings or a `config.json` edit) applies live.
     #[serde(default = "default_true")]
     pub show_tray_icon: bool,
-    /// Whether the user has already been told, once, that closing a window puts
-    /// its workspace away rather than ending it. ⌘W is muscle memory and the
-    /// result is off-screen, so the first time it happens deserves one line
-    /// pointing at the title bar's workspace menu — and never again. Set to
-    /// `true` by that hint; there is no UI to reset it (nor a reason to).
-    #[serde(default)]
-    pub workspace_detach_hint_seen: bool,
     /// Ask before closing the *last* window (the close that also quits the app).
     /// On by default, which is the behavior every build so far has had.
     ///
@@ -759,7 +752,6 @@ impl Default for Config {
             notify_threshold_secs: default_notify_threshold_secs(),
             restore_session: true,
             show_tray_icon: true,
-            workspace_detach_hint_seen: false,
             confirm_window_close: true,
             // Visual flash preserves the pre-config behavior (the bell always
             // flashed); opting into None/Audible is a deliberate change.

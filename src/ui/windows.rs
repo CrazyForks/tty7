@@ -19,7 +19,7 @@ use gpui::{
     AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Bounds, Global, Styled as _,
     TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, point, px, size,
 };
-use gpui_component::{Root, TitleBar, WindowExt as _};
+use gpui_component::{Root, TitleBar};
 
 use crate::core::config::{Config, StartupMode};
 use crate::core::session::{WorkspaceId, WorkspaceStore};
@@ -228,35 +228,6 @@ pub fn open_with(cx: &mut App, workspace: Option<WorkspaceId>, fresh: FreshStart
     let id = app.read(cx).workspace;
     WindowRegistry::register(cx, id, handle.into(), app.downgrade());
     refresh_menu(cx);
-}
-
-/// Tell the user *once* that closing a window put its workspace away rather
-/// than ending it, and where to find it again.
-///
-/// ⌘W is muscle memory and its result is off-screen, so the very first time it
-/// detaches real work the user deserves a pointer — and never again after that.
-/// Shown on whichever window survives; with none left (the app is quitting)
-/// there is nowhere to put it and nothing to come back to yet, so it waits for
-/// a later detach.
-pub fn hint_detached(cx: &mut App, name: &str) {
-    if cx.global::<Config>().workspace_detach_hint_seen {
-        return;
-    }
-    let Some(target) = WindowRegistry::most_recent(cx) else {
-        return;
-    };
-    let Some(handle) = WindowRegistry::window_for(cx, target) else {
-        return;
-    };
-    cx.global_mut::<Config>().workspace_detach_hint_seen = true;
-    cx.global::<Config>().save();
-    // The title bar's workspace menu, not the macOS Window menu: Windows and
-    // Linux have no menu bar, and the corner chip lists workspaces everywhere.
-    let message =
-        format!("“{name}” is still running — reopen it from the workspace menu in the title bar");
-    let _ = handle.update(cx, |_, window, cx| {
-        window.push_notification(message, cx);
-    });
 }
 
 /// Rebuild the menu bar so the Window menu reflects the current workspace set.

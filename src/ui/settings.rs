@@ -39,6 +39,7 @@ use crate::ui::app::{
     FONT_SIZE_STEP, LINE_HEIGHT_STEP, TILE_GLYPH_LINE, TILE_SIZE, TITLE_BAR_HEIGHT, ThemeEdit,
     Tty7App,
 };
+use crate::ui::host_ops::HostId;
 use crate::ui::presets;
 
 /// Which section of the settings panel is currently selected in the sidebar.
@@ -512,19 +513,59 @@ pub(crate) struct SettingsState {
     /// edit form); `None` shows the empty state (the "pick a profile" hint plus
     /// the two global security toggles).
     pub(crate) ssh_detail: SshDetail,
-    /// Install state of each agent's hook integration (Agents section), in
-    /// [`crate::core::agent_hooks::HookAgent::ALL`] order. Cached — captured
-    /// when the panel opens, re-read when the section is selected, and updated
-    /// after each install/uninstall — so rendering never touches the agents'
-    /// config files.
-    pub(crate) agent_hooks_states: Vec<(
-        crate::core::agent_hooks::HookAgent,
-        crate::core::agent_hooks::HooksState,
-    )>,
+    /// Which machine the Agents section is showing and acting on.
+    /// [`HostId::LOCAL`] until the user picks one of the connected remotes.
+    pub(crate) agent_hooks_host: HostId,
+    /// Install state of each agent's hook integration on
+    /// [`Self::agent_hooks_host`]. Cached — captured when the panel opens,
+    /// re-read when the section or the machine is selected, and updated after
+    /// each install/uninstall — because reading it is a file read per agent,
+    /// and on a remote machine that is a round trip per agent.
+    pub(crate) agent_hooks_states: AgentHooksView,
+    /// Discriminates the load whose answer is allowed to land. Switching
+    /// machines while a read is in flight would otherwise let the old
+    /// machine's rows arrive under the new machine's name.
+    pub(crate) agent_hooks_seq: u64,
     /// Outcome of the last Agents-section hook action (install summary or
     /// error), shown under that agent's row. Replaced by the next action.
     pub(crate) agent_hooks_note: Option<(crate::core::agent_hooks::HookAgent, String)>,
     pub(crate) _subs: Vec<Subscription>,
+}
+
+/// What Settings → Agents has to show for the machine it is pointed at.
+///
+/// Three states rather than a `Vec` that is empty when it doesn't know: reading
+/// a remote machine's install state is a round trip per agent, so "still asking"
+/// and "asked, nothing installed" are genuinely different answers and rendering
+/// them the same is how a page silently lies for a second.
+#[derive(Clone)]
+pub(crate) enum AgentHooksView {
+    /// The read is in flight.
+    Loading,
+    /// One row per hook-capable agent, in
+    /// [`crate::core::agent_hooks::HookAgent::ALL`] order.
+    Ready(Vec<AgentHookRow>),
+    /// The machine can't be acted on, and the sentence says which hop gave up
+    /// (design §17: a failure is a resting state, not a blank).
+    Unavailable(String),
+}
+
+/// One agent's row, as read off a particular machine.
+#[derive(Clone)]
+pub(crate) struct AgentHookRow {
+    pub(crate) agent: crate::core::agent_hooks::HookAgent,
+    pub(crate) state: crate::core::agent_hooks::HooksState,
+    /// The file the integration lives in *on that machine*, `~`-abbreviated.
+    /// Resolved in the background with the rest of the read — it depends on the
+    /// machine's own home directory and separator, which render cannot ask for.
+    pub(crate) target: String,
+}
+
+/// One entry in the Agents section's machine picker.
+#[derive(Clone)]
+pub(crate) struct AgentHooksMachine {
+    pub(crate) host: HostId,
+    pub(crate) label: String,
 }
 
 /// The theme choice a picker card / the picker panel targets. `Manual` is the
@@ -916,21 +957,32 @@ impl Tty7App {
                     .child(
                         h_flex()
                             .items_center()
-                            .gap_1()
+                            // Laid out to land on the nav rows below it rather than
+                            // on the header's own inset: a `SidebarMenuItem` is
+                            // `p_2` + a 16px icon + `gap_x_2`, so its label starts
+                            // 32px into the rail. Matching that takes all three of
+                            // these — the magnifier at the rows' 16px (not `small`,
+                            // which is 14 and left the glyph reading a size below
+                            // the column it heads), the same 8px gap after it, and
+                            // `pl_0` on the input, which otherwise adds `input_px`
+                            // (12px at the default size) whether or not it draws a
+                            // box. Without them the placeholder sat 6px right of
+                            // every label under it.
+                            .gap_2()
                             // Stock magnifier, not tty7's: this page's glyphs run at
                             // 16px, where the detail panel's redraw reads thin and
                             // its handle stubby. See `assets::STOCK_PREFIX`.
                             .child(
                                 Icon::empty()
                                     .path("stock/icons/search.svg")
-                                    .small()
+                                    .size(px(16.))
                                     .text_color(header_muted),
                             )
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .child(Input::new(&search).appearance(false)),
+                                    .child(Input::new(&search).appearance(false).pl_0()),
                             ),
                     ),
             )
@@ -3337,17 +3389,27 @@ impl Tty7App {
             .into_any_element()
     }
 
-    /// Agents section: one row per hook-capable agent — install state + actions
-    /// per row, copy kept terse.
+    /// Agents section: a machine picker, then one row per hook-capable agent on
+    /// that machine — install state + actions per row, copy kept terse.
+    ///
+    /// The picker is first because everything under it is *about* the chosen
+    /// machine: the paths, the states, and what Install writes. An agent running
+    /// in a remote workspace's pane runs on the remote box and reads that box's
+    /// `~/.claude/settings.json`, so installing here and expecting status there
+    /// was the whole gap this page closes.
     fn render_settings_agents(&self, cx: &mut Context<Self>) -> AnyElement {
         use crate::core::agent_hooks::HooksState;
 
         let theme = cx.theme();
         let (foreground, muted_fg) = (theme.foreground, theme.muted_foreground);
         let (success, warning) = (theme.success, theme.warning);
-        let (states, note) = match self.active_settings() {
-            Some(s) => (s.agent_hooks_states.clone(), s.agent_hooks_note.clone()),
-            None => (Vec::new(), None),
+        let (view, note, selected_host) = match self.active_settings() {
+            Some(s) => (
+                s.agent_hooks_states.clone(),
+                s.agent_hooks_note.clone(),
+                s.agent_hooks_host,
+            ),
+            None => (AgentHooksView::Loading, None, HostId::LOCAL),
         };
 
         let mut page = v_flex().child(self.section_intro(
@@ -3356,82 +3418,189 @@ impl Tty7App {
              (working / waiting / done) in the tab bar. Only active inside tty7.",
             cx,
         ));
-        for (i, (agent, state)) in states.into_iter().enumerate() {
-            // Status: a colored dot + one word; the dot is the only color on
-            // the page, so state reads at a glance.
-            let (dot_color, status_text) = match state {
-                HooksState::NotInstalled => (muted_fg, "Not installed"),
-                HooksState::Installed => (success, "Installed"),
-                HooksState::Outdated => (warning, "Outdated"),
-            };
-            // The primary action reads as what it will *do* from this state.
-            let primary_label = match state {
-                HooksState::NotInstalled => "Install",
-                HooksState::Installed => "Reinstall",
-                HooksState::Outdated => "Update",
-            };
-            let row_note = note
-                .as_ref()
-                .filter(|(for_agent, _)| *for_agent == agent)
-                .map(|(_, text)| text.clone());
 
-            // items_end: the whole stack shares the row's right edge, so
-            // status, buttons, and note line up across every agent row.
-            let control = v_flex()
-                .gap_2()
-                .items_end()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(div().size_2().rounded_full().bg(dot_color))
-                        .child(div().text_sm().text_color(foreground).child(status_text)),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new(("agent-hooks-install", i))
-                                .label(primary_label)
-                                .small()
-                                .on_click(cx.listener(move |this, _, _w, cx| {
-                                    this.settings_install_agent_hooks(agent, cx)
-                                })),
-                        )
-                        .when(state != HooksState::NotInstalled, |row| {
-                            row.child(
-                                Button::new(("agent-hooks-uninstall", i))
-                                    .label("Uninstall")
-                                    .small()
-                                    .on_click(cx.listener(move |this, _, _w, cx| {
-                                        this.settings_uninstall_agent_hooks(agent, cx)
-                                    })),
-                            )
-                        }),
-                )
-                // Width-capped so a long note (error text) wraps instead of
-                // inflating the shrink-proof control column and crushing the
-                // label to zero width.
-                .when_some(row_note, |col, text| {
-                    col.child(
+        page = page.children(self.agent_hooks_machine_picker(selected_host, cx));
+
+        match view {
+            // A spinner would be four agents' worth of motion for a read that is
+            // usually instant; the page just says what it is doing and keeps its
+            // shape, so nothing jumps when the rows arrive.
+            AgentHooksView::Loading => {
+                return page
+                    .child(
                         div()
-                            .max_w_80()
-                            .text_xs()
-                            .text_right()
+                            .py_4()
+                            .text_sm()
                             .text_color(muted_fg)
-                            .child(text),
+                            .child("Reading this machine's agent config…"),
                     )
-                })
-                .into_any_element();
+                    .into_any_element();
+            }
+            // §17: a resting state that says which hop gave up and what to do
+            // next, rather than rows that would silently write nowhere.
+            AgentHooksView::Unavailable(reason) => {
+                return page
+                    .child(div().py_4().text_sm().text_color(warning).child(reason))
+                    .into_any_element();
+            }
+            AgentHooksView::Ready(rows) => {
+                for (i, row) in rows.into_iter().enumerate() {
+                    let agent = row.agent;
+                    // Status: a colored dot + one word; the dot is the only color
+                    // on the page, so state reads at a glance.
+                    let (dot_color, status_text) = match row.state {
+                        HooksState::NotInstalled => (muted_fg, "Not installed"),
+                        HooksState::Installed => (success, "Installed"),
+                        HooksState::Outdated => (warning, "Outdated"),
+                    };
+                    // The primary action reads as what it will *do* from this
+                    // state.
+                    let primary_label = match row.state {
+                        HooksState::NotInstalled => "Install",
+                        HooksState::Installed => "Reinstall",
+                        HooksState::Outdated => "Update",
+                    };
+                    let row_note = note
+                        .as_ref()
+                        .filter(|(for_agent, _)| *for_agent == agent)
+                        .map(|(_, text)| text.clone());
 
-            page = page.child(self.settings_row(
-                agent.display_name(),
-                agent.target_display(),
-                control,
-                cx,
-            ));
+                    // items_end: the whole stack shares the row's right edge, so
+                    // status, buttons, and note line up across every agent row.
+                    let control = v_flex()
+                        .gap_2()
+                        .items_end()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(div().size_2().rounded_full().bg(dot_color))
+                                .child(div().text_sm().text_color(foreground).child(status_text)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new(("agent-hooks-install", i))
+                                        .label(primary_label)
+                                        .small()
+                                        .on_click(cx.listener(move |this, _, _w, cx| {
+                                            this.settings_install_agent_hooks(agent, cx)
+                                        })),
+                                )
+                                .when(row.state != HooksState::NotInstalled, |r| {
+                                    r.child(
+                                        Button::new(("agent-hooks-uninstall", i))
+                                            .label("Uninstall")
+                                            .small()
+                                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                                this.settings_uninstall_agent_hooks(agent, cx)
+                                            })),
+                                    )
+                                }),
+                        )
+                        // Width-capped so a long note (error text) wraps instead
+                        // of inflating the shrink-proof control column and
+                        // crushing the label to zero width.
+                        .when_some(row_note, |col, text| {
+                            col.child(
+                                div()
+                                    .max_w_80()
+                                    .text_xs()
+                                    .text_right()
+                                    .text_color(muted_fg)
+                                    .child(text),
+                            )
+                        })
+                        .into_any_element();
+
+                    page = page.child(self.settings_row(
+                        agent.display_name(),
+                        row.target,
+                        control,
+                        cx,
+                    ));
+                }
+            }
         }
         page.into_any_element()
+    }
+
+    /// The Agents section's machine picker: this computer plus every connected
+    /// remote, one chosen at a time.
+    ///
+    /// `None` when this computer is the only machine there is — a picker with a
+    /// single choice is a control that asks a question with one answer, and the
+    /// page below it already says where the files go.
+    ///
+    /// Hand-rolled rather than [`Self::segmented`] because the options are
+    /// machines, not a fixed `&'static [&'static str]` — but it reads off the
+    /// same interaction ladder, so it is the same control the rest of the sheet
+    /// speaks.
+    fn agent_hooks_machine_picker(&self, selected: HostId, cx: &mut Context<Self>) -> Option<Div> {
+        let sf = cx.global::<presets::Surfaces>().window;
+        let border = cx.theme().border;
+        let muted_fg = cx.theme().muted_foreground;
+        let machines = self.agent_hooks_machines(cx);
+        let offline = self.agent_hooks_offline_count(cx);
+        if machines.len() < 2 && offline == 0 {
+            return None;
+        }
+
+        Some(
+            v_flex()
+                .gap_2()
+                .mb_4()
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .children(machines.into_iter().map(|machine| {
+                            let active = machine.host == selected;
+                            let host = machine.host;
+                            h_flex()
+                                .id(("agent-hooks-machine", host.0 as usize))
+                                .h(px(24.))
+                                .px_2p5()
+                                .items_center()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(border)
+                                .bg(rgb(sf.base))
+                                .text_sm()
+                                .cursor_pointer()
+                                // Both channels, every time: the fill locates the
+                                // selection, the label colour and weight say it is
+                                // the one — and keep saying it on a translucent
+                                // window, where the fill washes over the desktop.
+                                .when(active, |s| {
+                                    s.bg(rgb(sf.selected))
+                                        .text_color(rgb(sf.text_selected))
+                                        .font_weight(FontWeight::MEDIUM)
+                                })
+                                .when(!active, |s| {
+                                    s.text_color(rgb(sf.text_resting))
+                                        .hover(|h| h.bg(rgb(sf.hover)))
+                                })
+                                .active(|s| s.bg(rgb(sf.pressed)))
+                                .child(machine.label)
+                                .on_click(cx.listener(move |this, _, _w, cx| {
+                                    this.select_agent_hooks_host(host, cx)
+                                }))
+                        })),
+                )
+                // A saved machine that isn't connected is absent from the row above,
+                // and an absence explains nothing. Say the count and the next move
+                // rather than listing fifty `~/.ssh/config` aliases, most of which
+                // are git transports that could never host a workspace anyway.
+                .when(offline > 0, |col| {
+                    col.child(div().text_xs().text_color(muted_fg).child(format!(
+                        "{offline} more saved machine{} not connected — open a workspace on one to \
+                     install its hooks there.",
+                        if offline == 1 { " is" } else { "s are" }
+                    )))
+                }),
+        )
     }
 
     /// Window & Tabs section: the app window's lifecycle and tab placement.

@@ -14,11 +14,24 @@
 //! Emission is gated on the `TTY7` environment variable (injected into every
 //! shell tty7 spawns), so hooks installed globally stay silent when an agent
 //! runs in another terminal.
+//!
+//! # Installing on a machine that isn't this one
+//!
+//! An agent running in a remote workspace's pane is running on the *remote*
+//! machine, reading that machine's `~/.claude/settings.json` and spawning
+//! processes from that machine's disk. So every installer here takes a
+//! [`HookTarget`] — the three facts that differ between machines: where `~` is,
+//! which filesystem to write through, and which executable answers
+//! `agent-hook`. Locally that is this binary; remotely it is the
+//! `tty7-server-<version>` the installer published there, which carries the
+//! same emitter for exactly this reason (`crates/tty7-server/src/main.rs`).
 
+use std::io;
 use std::io::{IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
 
 use crate::core::cli_agent::AGENT_EVENT_SENTINEL;
+use crate::host::Host;
 
 /// The env var tty7 sets in every spawned shell; the hook emitter refuses to
 /// write escape sequences into terminals that aren't tty7.
@@ -393,45 +406,27 @@ impl HookAgent {
         }
     }
 
-    /// The file the integration installs into, `~`-abbreviated for display.
-    pub fn target_display(self) -> String {
-        match self.target_path() {
-            Some(p) => abbreviate_home(&p),
-            None => "~ (home directory unresolved)".to_string(),
-        }
+    /// The file the integration installs into on `target`'s machine,
+    /// `~`-abbreviated for display.
+    pub fn target_display(self, target: &HookTarget) -> String {
+        target.abbreviate_home(&self.target_path(target))
     }
 
-    /// The file this agent's integration lives in.
-    fn target_path(self) -> Option<PathBuf> {
+    /// The file this agent's integration lives in, on `target`'s machine.
+    ///
+    /// Built with [`Host::join`] rather than `PathBuf::join`: a Windows client
+    /// installing onto a Linux box would otherwise write `/home/me\.claude`.
+    fn target_path(self, target: &HookTarget) -> PathBuf {
         match self {
-            HookAgent::Claude => claude_settings_path(),
-            HookAgent::Codex => Some(home_dir()?.join(".codex").join("hooks.json")),
-            HookAgent::Copilot => Some(
-                home_dir()?
-                    .join(".copilot")
-                    .join("hooks")
-                    .join(OWNED_FILE_STEM_JSON),
+            HookAgent::Claude => target.claude_settings_path(),
+            HookAgent::Codex => target.under_home(&[".codex", "hooks.json"]),
+            HookAgent::Copilot => target.under_home(&[".copilot", "hooks", OWNED_FILE_STEM_JSON]),
+            HookAgent::OpenCode => target.under(
+                &target.xdg_config_dir(),
+                &["opencode", "plugins", OWNED_FILE_STEM_JS],
             ),
-            HookAgent::OpenCode => Some(
-                xdg_config_dir()?
-                    .join("opencode")
-                    .join("plugins")
-                    .join(OWNED_FILE_STEM_JS),
-            ),
-            HookAgent::Pi => Some(
-                home_dir()?
-                    .join(".pi")
-                    .join("agent")
-                    .join("extensions")
-                    .join("tty7")
-                    .join("index.ts"),
-            ),
-            HookAgent::Grok => Some(
-                home_dir()?
-                    .join(".grok")
-                    .join("hooks")
-                    .join(OWNED_FILE_STEM_JSON),
-            ),
+            HookAgent::Pi => target.under_home(&[".pi", "agent", "extensions", "tty7", "index.ts"]),
+            HookAgent::Grok => target.under_home(&[".grok", "hooks", OWNED_FILE_STEM_JSON]),
         }
     }
 
@@ -440,6 +435,161 @@ impl HookAgent {
     /// generated command and file embeds `agent-hook <slug>` verbatim.
     fn marker(self) -> String {
         format!("agent-hook {}", self.slug())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The machine an integration is installed on.
+// ---------------------------------------------------------------------------
+
+/// Cap on how much of an agent's config file we will read. Real ones are a few
+/// kilobytes; the limit is enforced on the *host* (see [`Host::read_file`]), so
+/// a pathological file never crosses the wire only to be discarded.
+const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Which machine an install acts on, and everything about it that differs from
+/// every other machine: its filesystem, its `$HOME`, and the absolute path of
+/// the binary its hooks will invoke.
+///
+/// Borrowed rather than owning an `Arc<dyn Host>` because the whole lifetime of
+/// one of these is a single background task — the caller already holds the host
+/// and is not free to call it from anywhere else anyway.
+pub struct HookTarget<'a> {
+    host: &'a dyn Host,
+    home: PathBuf,
+    exe: PathBuf,
+}
+
+impl<'a> HookTarget<'a> {
+    /// This computer: `$HOME` (or `%USERPROFILE%`) and the running binary.
+    ///
+    /// `None` when the home directory cannot be resolved — the one condition
+    /// under which there is no file to install into and nothing worth
+    /// guessing.
+    pub fn local(host: &'a dyn Host) -> Option<HookTarget<'a>> {
+        Some(HookTarget {
+            host,
+            home: home_dir()?,
+            exe: std::env::current_exe().ok()?,
+        })
+    }
+
+    /// A remote machine: the `$HOME` its handshake reported, and the
+    /// `tty7-server-<version>` this client published into it.
+    ///
+    /// The *installed* binary, not the one the running daemon was launched
+    /// from. The two can differ — a user who kept an older daemon alive rather
+    /// than restart their sessions — and it doesn't matter here: the emitter is
+    /// a one-shot child of the agent that writes an escape sequence to its own
+    /// tty and exits. It never talks to the daemon, so the binary only has to
+    /// exist, and the one this client installed is the one it can prove does.
+    pub fn remote(host: &'a dyn Host, home: PathBuf) -> HookTarget<'a> {
+        let binary = crate::daemon::install::asset::remote_paths(
+            &home.to_string_lossy(),
+            crate::daemon::install::client_version(),
+        )
+        .binary;
+        HookTarget {
+            host,
+            home,
+            exe: PathBuf::from(binary),
+        }
+    }
+
+    /// Whether this is this computer. Gates the three things that are only true
+    /// here: our own environment variables, atomic writes, and running the
+    /// `codex` CLI.
+    fn is_local(&self) -> bool {
+        self.host.id().is_local()
+    }
+
+    /// `base` + each of `parts`, in the host's own separator.
+    fn under(&self, base: &Path, parts: &[&str]) -> PathBuf {
+        let mut p = base.to_path_buf();
+        for part in parts {
+            p = self.host.join(&p, part);
+        }
+        p
+    }
+
+    /// [`under`](Self::under), rooted at the machine's home directory.
+    fn under_home(&self, parts: &[&str]) -> PathBuf {
+        self.under(&self.home, parts)
+    }
+
+    /// Claude Code's user settings file: `$CLAUDE_CONFIG_DIR/settings.json`,
+    /// defaulting to `~/.claude/settings.json`.
+    ///
+    /// The override is honored **only on this computer**. `CLAUDE_CONFIG_DIR`
+    /// is read out of *our* process's environment, and the agent on the far end
+    /// reads its own login shell's — which we cannot see from here. Guessing
+    /// with this machine's value would install into a directory the remote
+    /// Claude never opens, and the row would then say "Installed" forever.
+    fn claude_settings_path(&self) -> PathBuf {
+        if self.is_local()
+            && let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty())
+        {
+            return PathBuf::from(dir).join("settings.json");
+        }
+        self.under_home(&[".claude", "settings.json"])
+    }
+
+    /// `$XDG_CONFIG_HOME`, defaulting to `~/.config` (OpenCode's config root).
+    /// Local-only override, for the reason in [`claude_settings_path`].
+    fn xdg_config_dir(&self) -> PathBuf {
+        if self.is_local()
+            && let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty())
+        {
+            return PathBuf::from(dir);
+        }
+        self.under_home(&[".config"])
+    }
+
+    /// The hook command line written into an agent's config — the emitter's
+    /// binary by absolute path, so it works regardless of PATH. Quoted because
+    /// macOS app paths ("/Applications/…") can carry spaces. `event` is one of
+    /// tty7's kebab-case sentinel events, passed straight through by the
+    /// emitter.
+    fn hook_command(&self, agent: HookAgent, event: &str) -> String {
+        format!(
+            "\"{}\" agent-hook {} {event}",
+            self.exe.display(),
+            agent.slug()
+        )
+    }
+
+    /// Read a config file whole, as text.
+    fn read(&self, p: &Path) -> io::Result<String> {
+        let bytes = self.host.read_file(p, MAX_CONFIG_BYTES)?;
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Write `bytes` to `p`, creating its parent chain first.
+    ///
+    /// Local writes stay [`crate::core::config::write_atomic`]: a hooks file
+    /// left truncated by a crash mid-save is an agent that refuses to start,
+    /// and that guarantee predates this function. There is no atomic form to
+    /// keep over the wire — [`Host::write_file`] truncates and writes, and
+    /// [`Host::rename`] refuses to overwrite — so a remote install carries the
+    /// same window every remote save in the app already carries.
+    fn write(&self, p: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        if let Some(parent) = p.parent() {
+            self.host.create_dir(parent, true)?;
+        }
+        if self.is_local() {
+            crate::core::config::write_atomic(p, bytes)?;
+        } else {
+            self.host.write_file(p, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Abbreviate the machine's home-directory prefix to `~` for display.
+    fn abbreviate_home(&self, path: &Path) -> String {
+        match path.strip_prefix(&self.home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
+        }
     }
 }
 
@@ -457,45 +607,55 @@ pub enum HooksState {
     Outdated,
 }
 
-/// Read one agent's install state from disk. An unreadable or malformed
-/// target reports `NotInstalled` — the same "nothing usable there" answer the
-/// installer would start from.
-pub fn hooks_state(agent: HookAgent) -> HooksState {
-    let Some(path) = agent.target_path() else {
-        return HooksState::NotInstalled;
-    };
+/// Read one agent's install state off `target`'s machine. An unreadable or
+/// malformed file reports `NotInstalled` — the same "nothing usable there"
+/// answer the installer would start from.
+///
+/// **Blocking**, and on a remote target that means a round trip per agent: call
+/// it from a background task (`ui::host_ops::HostOps`), never from render.
+pub fn hooks_state(target: &HookTarget, agent: HookAgent) -> HooksState {
+    let path = agent.target_path(target);
     match agent {
-        HookAgent::Claude => hook_map_state(&path, agent, CLAUDE_HOOK_EVENTS),
-        HookAgent::Codex => hook_map_state(&path, agent, CODEX_HOOK_EVENTS),
+        HookAgent::Claude => hook_map_state(target, &path, agent, CLAUDE_HOOK_EVENTS),
+        HookAgent::Codex => hook_map_state(target, &path, agent, CODEX_HOOK_EVENTS),
         HookAgent::Copilot | HookAgent::OpenCode | HookAgent::Pi | HookAgent::Grok => {
-            let Some(expected) = owned_file_content(agent) else {
+            let Some(expected) = owned_file_content(target, agent) else {
                 return HooksState::NotInstalled;
             };
-            owned_file_state(&path, &expected, &agent.marker())
+            owned_file_state(target, &path, &expected, &agent.marker())
         }
     }
 }
 
-/// Install (or rewrite in place) one agent's tty7 hooks. Idempotent: existing
-/// tty7 entries/files are replaced, never duplicated, and anything
-/// user-authored is left untouched. Returns a terse summary meant for the
-/// settings row's note line — the row already shows the agent and target
+/// Install (or rewrite in place) one agent's tty7 hooks on `target`'s machine.
+/// Idempotent: existing tty7 entries/files are replaced, never duplicated, and
+/// anything user-authored is left untouched. Returns a terse summary meant for
+/// the settings row's note line — the row already shows the agent and target
 /// path, so the summary never repeats them.
-pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
-    let path = agent
-        .target_path()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?;
+pub fn install_hooks(target: &HookTarget, agent: HookAgent) -> anyhow::Result<String> {
+    let path = agent.target_path(target);
     match agent {
         HookAgent::Claude => {
-            hook_map_install(&path, agent, CLAUDE_HOOK_EVENTS)?;
+            hook_map_install(target, &path, agent, CLAUDE_HOOK_EVENTS)?;
             Ok("Installed".to_string())
         }
         HookAgent::Codex => {
-            hook_map_install(&path, agent, CODEX_HOOK_EVENTS)?;
+            hook_map_install(target, &path, agent, CODEX_HOOK_EVENTS)?;
             // Codex only reads hooks.json once the hooks feature flag is on.
             // Best-effort: the file install above is complete and correct
             // either way, so a missing codex binary downgrades to advice
             // instead of failing the install.
+            //
+            // Remote machines always get the advice: `Host` carries files and
+            // git, not arbitrary commands, so there is no way from here to run
+            // a CLI over there — and inventing one to flip a feature flag would
+            // be a far larger hole than the flag is worth.
+            if !target.is_local() {
+                return Ok(
+                    "Installed — run `codex features enable hooks` once on that machine"
+                        .to_string(),
+                );
+            }
             Ok(match enable_codex_hooks_feature() {
                 Ok(()) => "Installed".to_string(),
                 Err(e) => format!(
@@ -504,51 +664,44 @@ pub fn install_hooks(agent: HookAgent) -> anyhow::Result<String> {
             })
         }
         HookAgent::Copilot | HookAgent::OpenCode | HookAgent::Pi | HookAgent::Grok => {
-            let content = owned_file_content(agent)
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve tty7's own executable path"))?;
-            owned_file_install(&path, &content, &agent.marker())?;
+            let content = owned_file_content(target, agent)
+                .ok_or_else(|| anyhow::anyhow!("{agent:?} has no owned file"))?;
+            owned_file_install(target, &path, &content, &agent.marker())?;
             Ok("Installed".to_string())
         }
     }
 }
 
-/// Remove one agent's tty7 hooks, leaving user-authored hooks and settings
-/// untouched. Ownership-guarded: only entries/files carrying the tty7 marker
-/// are ever removed.
-pub fn uninstall_hooks(agent: HookAgent) -> anyhow::Result<String> {
-    let path = agent
-        .target_path()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?;
+/// Remove one agent's tty7 hooks from `target`'s machine, leaving user-authored
+/// hooks and settings untouched. Ownership-guarded: only entries/files carrying
+/// the tty7 marker are ever removed.
+pub fn uninstall_hooks(target: &HookTarget, agent: HookAgent) -> anyhow::Result<String> {
+    let path = agent.target_path(target);
     match agent {
-        HookAgent::Claude | HookAgent::Codex => hook_map_uninstall(&path, agent),
+        HookAgent::Claude | HookAgent::Codex => hook_map_uninstall(target, &path, agent),
         HookAgent::Copilot | HookAgent::OpenCode | HookAgent::Pi | HookAgent::Grok => {
-            owned_file_uninstall(&path, &agent.marker())
+            owned_file_uninstall(target, &path, &agent.marker())
         }
     }
 }
 
-/// Startup keeper: rewrite any integration that is installed but stale (see
-/// [`HooksState::Outdated`]) so hooks keep pointing at a real tty7 after the
-/// app moves or updates. Release builds only — a debug build auto-claiming
-/// the hooks would steal them from the installed app on every dev launch
-/// (installing *from* a dev build stays possible, just explicit). Returns how
-/// many integrations were refreshed.
-pub fn refresh_hooks_at_launch() -> usize {
-    if cfg!(debug_assertions) {
-        return 0;
-    }
+/// Rewrite every integration on `target`'s machine that is installed but stale
+/// (see [`HooksState::Outdated`]), so hooks keep pointing at a binary that
+/// exists. Only ever touches entries tty7 already owns; a machine with no
+/// integration installed is left alone. Returns how many were refreshed.
+pub fn refresh_hooks(target: &HookTarget) -> usize {
     let mut refreshed = 0;
     for agent in HookAgent::ALL {
-        if hooks_state(agent) != HooksState::Outdated {
+        if hooks_state(target, agent) != HooksState::Outdated {
             continue;
         }
-        match install_hooks(agent) {
+        match install_hooks(target, agent) {
             Ok(summary) => {
                 refreshed += 1;
                 log::info!(
                     "refreshed stale {} hooks at {}: {summary}",
                     agent.display_name(),
-                    agent.target_display()
+                    agent.target_display(target)
                 );
             }
             Err(e) => log::warn!(
@@ -560,18 +713,52 @@ pub fn refresh_hooks_at_launch() -> usize {
     refreshed
 }
 
+/// [`refresh_hooks`] for a machine that has just answered a handshake.
+///
+/// A remote install writes the server binary's absolute path into the agent's
+/// config, and that path carries the version (`…/bin/tty7-server-26.7.5`). So a
+/// tty7 upgrade leaves every hook on every remote machine pointing at a file
+/// that no longer exists — exactly the staleness
+/// [`refresh_hooks_at_launch`] heals here, arriving by a different route. The
+/// handshake is the trigger because it is the only moment we are certain which
+/// binary is over there.
+///
+/// **Blocking**: one config read per agent, over the control connection.
+pub fn refresh_remote_hooks(host: &dyn Host, home: PathBuf) -> usize {
+    // `RemoteTarget::LocalStdio` — the dev seam that stands a "remote" server up
+    // on this very computer — reports *this* machine's `$HOME`, and therefore
+    // shares its hook files. Rewriting those to point at whatever binary
+    // `TTY7_LOCAL_STDIO_SERVER` happens to name would silently break the user's
+    // real local integration on every dev launch. One machine, one set of
+    // hooks: if the home is ours, the local refresh already owns them.
+    if home_dir().is_some_and(|ours| ours == home) {
+        return 0;
+    }
+    refresh_hooks(&HookTarget::remote(host, home))
+}
+
+/// Startup keeper for *this computer*: the app moving or updating leaves every
+/// installed hook pointing at the old absolute path.
+///
+/// Release builds only — a debug build auto-claiming the hooks would steal them
+/// from the installed app on every dev launch (installing *from* a dev build
+/// stays possible, just explicit). The remote counterpart has no such rule and
+/// no such trigger; see [`refresh_hooks`] and its caller in
+/// `ui::remote_connect`.
+pub fn refresh_hooks_at_launch() -> usize {
+    if cfg!(debug_assertions) {
+        return 0;
+    }
+    let host = crate::host::local::LocalHost::new();
+    let Some(target) = HookTarget::local(&*host) else {
+        return 0;
+    };
+    refresh_hooks(&target)
+}
+
 // ---------------------------------------------------------------------------
 // Shared: paths and the hook command line.
 // ---------------------------------------------------------------------------
-
-/// Claude Code's user settings file: `$CLAUDE_CONFIG_DIR/settings.json`,
-/// defaulting to `~/.claude/settings.json`.
-fn claude_settings_path() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir).join("settings.json"));
-    }
-    Some(home_dir()?.join(".claude").join("settings.json"))
-}
 
 fn home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
@@ -582,37 +769,6 @@ fn home_dir() -> Option<PathBuf> {
     {
         std::env::var_os("USERPROFILE").map(PathBuf::from)
     }
-}
-
-/// `$XDG_CONFIG_HOME`, defaulting to `~/.config` (OpenCode's config root).
-fn xdg_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
-    Some(home_dir()?.join(".config"))
-}
-
-/// Abbreviate the user's home-directory prefix to `~` for display.
-fn abbreviate_home(path: &Path) -> String {
-    if let Some(home) = home_dir()
-        && let Ok(rest) = path.strip_prefix(&home)
-    {
-        return format!("~/{}", rest.display());
-    }
-    path.display().to_string()
-}
-
-/// The hook command line written into an agent's config — this binary, by
-/// absolute path, so it works regardless of PATH. Quoted because macOS app
-/// paths ("/Applications/…") can carry spaces. `event` is one of tty7's
-/// kebab-case sentinel events, passed straight through by the emitter.
-fn hook_command(agent: HookAgent, event: &str) -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    Some(format!(
-        "\"{}\" agent-hook {} {event}",
-        exe.display(),
-        agent.slug()
-    ))
 }
 
 /// Owned-file names, shared by path resolution and tests.
@@ -682,8 +838,13 @@ const GROK_HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[
     ("SessionEnd", "session-end", None),
 ];
 
-fn hook_map_state(path: &Path, agent: HookAgent, events: &[(&str, &str)]) -> HooksState {
-    let Ok(text) = std::fs::read_to_string(path) else {
+fn hook_map_state(
+    target: &HookTarget,
+    path: &Path,
+    agent: HookAgent,
+    events: &[(&str, &str)],
+) -> HooksState {
+    let Ok(text) = target.read(path) else {
         return HooksState::NotInstalled;
     };
     let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -700,7 +861,7 @@ fn hook_map_state(path: &Path, agent: HookAgent, events: &[(&str, &str)]) -> Hoo
         match ours {
             Some(cmd) => {
                 any = true;
-                if Some(cmd) != hook_command(agent, tty7_event).as_deref() {
+                if cmd != target.hook_command(agent, tty7_event) {
                     complete = false;
                 }
             }
@@ -718,15 +879,20 @@ fn hook_map_state(path: &Path, agent: HookAgent, events: &[(&str, &str)]) -> Hoo
 /// else. Idempotent: entries carrying the agent's marker are rewritten in
 /// place (e.g. after the binary moved); user-defined hooks on the same events
 /// are left untouched.
-fn hook_map_install(path: &Path, agent: HookAgent, events: &[(&str, &str)]) -> anyhow::Result<()> {
-    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
+fn hook_map_install(
+    target: &HookTarget,
+    path: &Path,
+    agent: HookAgent,
+    events: &[(&str, &str)],
+) -> anyhow::Result<()> {
+    let mut root: serde_json::Value = match target.read(path) {
         Ok(text) => serde_json::from_str(&text).map_err(|e| {
             anyhow::anyhow!(
                 "{} is not valid JSON ({e}); not touching it",
                 path.display()
             )
         })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
     };
     if !root.is_object() {
@@ -750,8 +916,7 @@ fn hook_map_install(path: &Path, agent: HookAgent, events: &[(&str, &str)]) -> a
 
     let marker = agent.marker();
     for (hook_event, tty7_event) in events {
-        let command = hook_command(agent, tty7_event)
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve tty7's own executable path"))?;
+        let command = target.hook_command(agent, tty7_event);
         let entries = hooks
             .as_object_mut()
             .unwrap()
@@ -767,21 +932,21 @@ fn hook_map_install(path: &Path, agent: HookAgent, events: &[(&str, &str)]) -> a
         }));
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::core::config::write_atomic(path, serde_json::to_string_pretty(&root)?.as_bytes())?;
-    Ok(())
+    target.write(path, serde_json::to_string_pretty(&root)?.as_bytes())
 }
 
 /// Remove every tty7 hook entry from the file, leaving user-defined hooks and
 /// all other settings untouched. Sweeps *all* hook events (not just the ones
 /// we currently subscribe to) so entries left by an older tty7 with a
 /// different event set are cleaned up too.
-fn hook_map_uninstall(path: &Path, agent: HookAgent) -> anyhow::Result<String> {
-    let text = match std::fs::read_to_string(path) {
+fn hook_map_uninstall(
+    target: &HookTarget,
+    path: &Path,
+    agent: HookAgent,
+) -> anyhow::Result<String> {
+    let text = match target.read(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Ok("Nothing installed; nothing to remove".to_string());
         }
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
@@ -809,7 +974,7 @@ fn hook_map_uninstall(path: &Path, agent: HookAgent) -> anyhow::Result<String> {
     if removed == 0 {
         return Ok("No tty7 hooks found; nothing to remove".to_string());
     }
-    crate::core::config::write_atomic(path, serde_json::to_string_pretty(&root)?.as_bytes())?;
+    target.write(path, serde_json::to_string_pretty(&root)?.as_bytes())?;
     Ok("Removed".to_string())
 }
 
@@ -861,20 +1026,20 @@ fn enable_codex_hooks_feature() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// The exact file content for an owned-file agent, deterministic so state
-/// detection can byte-compare (drift ⇒ `Outdated`). `None` when tty7's own
-/// executable path can't resolve.
-fn owned_file_content(agent: HookAgent) -> Option<String> {
+/// detection can byte-compare (drift ⇒ `Outdated`). `None` for the two agents
+/// that take a merged hooks map instead of a file of their own.
+fn owned_file_content(target: &HookTarget, agent: HookAgent) -> Option<String> {
     match agent {
-        HookAgent::Copilot => copilot_hooks_json(),
-        HookAgent::OpenCode => opencode_plugin_js(),
-        HookAgent::Pi => pi_extension_ts(),
-        HookAgent::Grok => grok_hooks_json(),
+        HookAgent::Copilot => copilot_hooks_json(target),
+        HookAgent::OpenCode => opencode_plugin_js(target),
+        HookAgent::Pi => pi_extension_ts(target),
+        HookAgent::Grok => grok_hooks_json(target),
         HookAgent::Claude | HookAgent::Codex => None,
     }
 }
 
-fn owned_file_state(path: &Path, expected: &str, marker: &str) -> HooksState {
-    let Ok(contents) = std::fs::read_to_string(path) else {
+fn owned_file_state(target: &HookTarget, path: &Path, expected: &str, marker: &str) -> HooksState {
+    let Ok(contents) = target.read(path) else {
         return HooksState::NotInstalled;
     };
     if contents == expected {
@@ -888,10 +1053,15 @@ fn owned_file_state(path: &Path, expected: &str, marker: &str) -> HooksState {
     }
 }
 
-fn owned_file_install(path: &Path, content: &str, marker: &str) -> anyhow::Result<()> {
+fn owned_file_install(
+    target: &HookTarget,
+    path: &Path,
+    content: &str,
+    marker: &str,
+) -> anyhow::Result<()> {
     // Refuse to clobber a user-authored file at the managed path, symmetric
     // with uninstall's ownership guard.
-    if let Ok(existing) = std::fs::read_to_string(path)
+    if let Ok(existing) = target.read(path)
         && !existing.contains(marker)
     {
         return Err(anyhow::anyhow!(
@@ -899,17 +1069,13 @@ fn owned_file_install(path: &Path, content: &str, marker: &str) -> anyhow::Resul
             path.display()
         ));
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::core::config::write_atomic(path, content.as_bytes())?;
-    Ok(())
+    target.write(path, content.as_bytes())
 }
 
-fn owned_file_uninstall(path: &Path, marker: &str) -> anyhow::Result<String> {
-    let contents = match std::fs::read_to_string(path) {
+fn owned_file_uninstall(target: &HookTarget, path: &Path, marker: &str) -> anyhow::Result<String> {
+    let contents = match target.read(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Ok("Nothing installed; nothing to remove".to_string());
         }
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
@@ -920,14 +1086,14 @@ fn owned_file_uninstall(path: &Path, marker: &str) -> anyhow::Result<String> {
             path.display()
         ));
     }
-    std::fs::remove_file(path)?;
+    target.host.remove(path, false)?;
     // Pi's extension lives in its own directory; sweep it if now empty so
     // uninstall leaves no husk (ignore failure — a non-empty dir is the
     // user's).
     if let Some(parent) = path.parent()
         && parent.file_name().is_some_and(|n| n == "tty7")
     {
-        let _ = std::fs::remove_dir(parent);
+        let _ = target.host.remove(parent, false);
     }
     Ok("Removed".to_string())
 }
@@ -937,19 +1103,22 @@ fn owned_file_uninstall(path: &Path, marker: &str) -> anyhow::Result<String> {
 /// the user's. Event names are Copilot's camelCase vocabulary; each runs the
 /// emitter with the sentinel event it maps onto. `notification` is passed
 /// through and filtered in the emitter (see [`effective_event`]).
-fn copilot_hooks_json() -> Option<String> {
-    let cmd = |event: &str| hook_command(HookAgent::Copilot, event);
+fn copilot_hooks_json(target: &HookTarget) -> Option<String> {
     let hook = |event: &str, timeout: u32| {
-        Some(serde_json::json!([{ "type": "command", "bash": cmd(event)?, "timeoutSec": timeout }]))
+        serde_json::json!([{
+            "type": "command",
+            "bash": target.hook_command(HookAgent::Copilot, event),
+            "timeoutSec": timeout,
+        }])
     };
     let root = serde_json::json!({
         "version": 1,
         "hooks": {
-            "sessionStart": hook("session-start", 5)?,
-            "userPromptSubmitted": hook("prompt-submit", 5)?,
-            "agentStop": hook("stop", 10)?,
-            "sessionEnd": hook("session-end", 5)?,
-            "notification": hook("notification", 5)?,
+            "sessionStart": hook("session-start", 5),
+            "userPromptSubmitted": hook("prompt-submit", 5),
+            "agentStop": hook("stop", 10),
+            "sessionEnd": hook("session-end", 5),
+            "notification": hook("notification", 5),
         }
     });
     serde_json::to_string_pretty(&root).ok()
@@ -962,13 +1131,13 @@ fn copilot_hooks_json() -> Option<String> {
 /// mirrors them deliberately — so this is the same wiring as
 /// [`CLAUDE_HOOK_EVENTS`] in owned-file form; see [`GROK_HOOK_EVENTS`] for the
 /// table and why `Notification` carries a matcher.
-fn grok_hooks_json() -> Option<String> {
+fn grok_hooks_json(target: &HookTarget) -> Option<String> {
     let mut hooks = serde_json::Map::new();
     for (event, sentinel, matcher) in GROK_HOOK_EVENTS {
         let mut group = serde_json::json!({
             "hooks": [{
                 "type": "command",
-                "command": hook_command(HookAgent::Grok, sentinel)?,
+                "command": target.hook_command(HookAgent::Grok, sentinel),
                 "timeout": GROK_HOOK_TIMEOUT_SECS,
             }]
         });
@@ -985,12 +1154,12 @@ fn grok_hooks_json() -> Option<String> {
 /// from that directory — so the plugin bridges its events onto the same
 /// emitter every other agent's hooks run. Inert outside tty7 (both the JS
 /// guard and the emitter check `TTY7`).
-fn opencode_plugin_js() -> Option<String> {
+fn opencode_plugin_js(target: &HookTarget) -> Option<String> {
     // The command prefix as a JS string literal (JSON string escaping is
     // valid JS), completed with the event name at call time.
     let prefix = serde_json::to_string(&format!(
         "{} ",
-        hook_command(HookAgent::OpenCode, "")?.trim_end()
+        target.hook_command(HookAgent::OpenCode, "").trim_end()
     ))
     .ok()?;
     Some(format!(
@@ -1032,8 +1201,8 @@ export const Tty7Presence = async ({{ $ }}) => {{
 /// extensions from per-directory `index.ts` files; this one forwards Pi's
 /// lifecycle events to the emitter. Inert outside tty7 (both the TS guard and
 /// the emitter check `TTY7`).
-fn pi_extension_ts() -> Option<String> {
-    let exe = serde_json::to_string(&std::env::current_exe().ok()?.display().to_string()).ok()?;
+fn pi_extension_ts(target: &HookTarget) -> Option<String> {
+    let exe = serde_json::to_string(&target.exe.display().to_string()).ok()?;
     Some(format!(
         r#"/* tty7 agent-hook pi bridge — generated by tty7, do not edit. */
 import type {{ ExtensionAPI }} from "@mariozechner/pi-coding-agent";
@@ -1235,11 +1404,192 @@ mod tests {
         assert!(marker_command(&serde_json::json!({}), "agent-hook claude").is_none());
     }
 
+    // -----------------------------------------------------------------------
+    // Two machines
+    // -----------------------------------------------------------------------
+
+    /// This computer's host object.
+    fn local_host() -> crate::host::SharedHost {
+        crate::host::local::LocalHost::new()
+    }
+
+    /// A stand-in for a Linux box: a real filesystem (so the bytes land
+    /// somewhere a test can read) behind a *remote* [`HostId`] and a POSIX
+    /// separator, which is what the path arithmetic and the write path key on.
+    ///
+    /// Delegation rather than a stub for the same reason `host::server`'s
+    /// `SlowGit` delegates: the installer has to really write, and a stub would
+    /// only prove it calls methods.
+    struct FakeRemote(crate::host::SharedHost);
+
+    impl FakeRemote {
+        fn shared() -> crate::host::SharedHost {
+            std::sync::Arc::new(FakeRemote(local_host()))
+        }
+    }
+
+    impl Host for FakeRemote {
+        fn id(&self) -> crate::host::HostId {
+            crate::host::HostId::from_connection_key("ssh-direct:me@box:22")
+        }
+        fn separator(&self) -> char {
+            '/'
+        }
+        fn is_absolute(&self, p: &Path) -> bool {
+            p.to_string_lossy().starts_with('/')
+        }
+        fn read_dir(&self, dir: &Path, root: Option<&Path>) -> io::Result<Vec<crate::host::Entry>> {
+            self.0.read_dir(dir, root)
+        }
+        fn stat(&self, p: &Path) -> io::Result<crate::host::Meta> {
+            self.0.stat(p)
+        }
+        fn read_file(&self, p: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+            self.0.read_file(p, max_bytes)
+        }
+        fn canonicalize(&self, p: &Path) -> io::Result<PathBuf> {
+            self.0.canonicalize(p)
+        }
+        fn search(
+            &self,
+            roots: &[PathBuf],
+            query: &str,
+            limit: usize,
+            max_dirs: usize,
+            show_hidden: bool,
+        ) -> io::Result<Vec<crate::host::SearchHit>> {
+            self.0.search(roots, query, limit, max_dirs, show_hidden)
+        }
+        fn write_file(&self, p: &Path, bytes: &[u8]) -> io::Result<crate::host::Meta> {
+            self.0.write_file(p, bytes)
+        }
+        fn create_file_new(&self, p: &Path) -> io::Result<()> {
+            self.0.create_file_new(p)
+        }
+        fn create_dir(&self, p: &Path, recursive: bool) -> io::Result<()> {
+            self.0.create_dir(p, recursive)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.0.rename(from, to)
+        }
+        fn remove(&self, p: &Path, recursive: bool) -> io::Result<()> {
+            self.0.remove(p, recursive)
+        }
+        fn repo_root(&self, p: &Path) -> io::Result<Option<PathBuf>> {
+            self.0.repo_root(p)
+        }
+        fn git(&self, cwd: &Path, args: &[&str]) -> io::Result<crate::host::Output> {
+            self.0.git(cwd, args)
+        }
+        fn watch(&self, dirs: &[PathBuf]) -> io::Result<crate::host::WatchSub> {
+            self.0.watch(dirs)
+        }
+    }
+
     #[test]
     fn hook_command_quotes_the_exe_path() {
-        let cmd = hook_command(HookAgent::Claude, "stop").expect("current_exe resolves in tests");
+        let host = local_host();
+        let target = HookTarget::local(&*host).expect("home resolves in tests");
+        let cmd = target.hook_command(HookAgent::Claude, "stop");
         assert!(cmd.starts_with('"'));
         assert!(cmd.ends_with("agent-hook claude stop"));
+    }
+
+    /// Every path an install touches on a remote machine is built with *that*
+    /// machine's separator and *that* machine's home — never `PathBuf::join`,
+    /// which on a Windows client talking to Linux would write `/home/me\.claude`
+    /// and install into a directory the agent never opens.
+    #[test]
+    fn remote_paths_are_built_in_the_remote_machine_s_spelling() {
+        let host = FakeRemote::shared();
+        let target = HookTarget::remote(&*host, PathBuf::from("/home/me"));
+
+        for (agent, expected) in [
+            (HookAgent::Claude, "/home/me/.claude/settings.json"),
+            (HookAgent::Codex, "/home/me/.codex/hooks.json"),
+            (HookAgent::Copilot, "/home/me/.copilot/hooks/tty7.json"),
+            (
+                HookAgent::OpenCode,
+                "/home/me/.config/opencode/plugins/tty7.js",
+            ),
+            (HookAgent::Pi, "/home/me/.pi/agent/extensions/tty7/index.ts"),
+            (HookAgent::Grok, "/home/me/.grok/hooks/tty7.json"),
+        ] {
+            assert_eq!(
+                agent.target_path(&target),
+                PathBuf::from(expected),
+                "{agent:?} target path"
+            );
+            assert_eq!(
+                agent.target_display(&target),
+                expected.replacen("/home/me/", "~/", 1),
+                "{agent:?} display path"
+            );
+        }
+    }
+
+    /// The hook a remote machine runs is the binary that lives *there*. The
+    /// local exe path is meaningless over there, and the version is in the
+    /// server binary's filename — which is what makes a server upgrade leave
+    /// hooks pointing at a path that no longer exists (see [`refresh_hooks`]).
+    #[test]
+    fn the_hook_command_names_the_binary_on_that_machine() {
+        let host = FakeRemote::shared();
+        let target = HookTarget::remote(&*host, PathBuf::from("/home/me"));
+        let version = crate::daemon::install::client_version();
+        assert_eq!(
+            target.hook_command(HookAgent::Claude, "stop"),
+            format!(
+                "\"/home/me/.local/share/tty7/bin/tty7-server-{version}\" agent-hook claude stop"
+            )
+        );
+
+        // And locally it is still this process's own executable.
+        let local = local_host();
+        let here = HookTarget::local(&*local).expect("home resolves in tests");
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(
+            here.hook_command(HookAgent::Claude, "stop"),
+            format!("\"{}\" agent-hook claude stop", exe.display())
+        );
+    }
+
+    /// A full install → state → uninstall round trip through a *non-local*
+    /// host: the write goes through [`Host::write_file`] rather than
+    /// `write_atomic`, and the state read back has to agree with what was
+    /// written. Rooted at a scratch "home" so nothing real is touched.
+    #[test]
+    fn a_remote_install_round_trips_through_the_host() {
+        let dir = std::env::temp_dir().join(format!("tty7-remote-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let host = FakeRemote::shared();
+        let target = HookTarget::remote(&*host, dir.clone());
+
+        for agent in [HookAgent::Claude, HookAgent::Grok] {
+            assert_eq!(hooks_state(&target, agent), HooksState::NotInstalled);
+            install_hooks(&target, agent).expect("install succeeds");
+            assert_eq!(hooks_state(&target, agent), HooksState::Installed);
+            // The file really is there, under the remote-shaped path.
+            let path = agent.target_path(&target);
+            assert!(std::fs::read_to_string(&path).unwrap().contains(&format!(
+                "tty7-server-{}",
+                crate::daemon::install::client_version()
+            )));
+            uninstall_hooks(&target, agent).expect("uninstall succeeds");
+            assert_eq!(hooks_state(&target, agent), HooksState::NotInstalled);
+        }
+
+        // Codex cannot have its feature flag flipped from here — `Host` carries
+        // files and git, not commands — so the install says so instead of
+        // claiming a wiring that isn't live yet.
+        let summary = install_hooks(&target, HookAgent::Codex).expect("codex install succeeds");
+        assert!(
+            summary.contains("codex features enable hooks"),
+            "remote codex install has to hand the flag back to the user: {summary}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Owned-file content sanity: valid/parseable where applicable, and every
@@ -1252,8 +1602,10 @@ mod tests {
         let exe_raw = std::env::current_exe().unwrap().display().to_string();
         let exe_json = serde_json::to_string(&exe_raw).unwrap();
         let exe = exe_json.trim_matches('"').to_string();
+        let host = local_host();
+        let target = HookTarget::local(&*host).expect("home resolves in tests");
 
-        let copilot = copilot_hooks_json().expect("copilot content builds");
+        let copilot = copilot_hooks_json(&target).expect("copilot content builds");
         let parsed: serde_json::Value = serde_json::from_str(&copilot).expect("valid JSON");
         for event in [
             "sessionStart",
@@ -1271,17 +1623,17 @@ mod tests {
         }
         assert!(copilot.contains(&exe));
 
-        let opencode = opencode_plugin_js().expect("opencode content builds");
+        let opencode = opencode_plugin_js(&target).expect("opencode content builds");
         assert!(opencode.contains("agent-hook opencode"));
         assert!(opencode.contains(&exe));
         assert!(opencode.contains(r#"process.env["TTY7"]"#));
 
-        let pi = pi_extension_ts().expect("pi content builds");
+        let pi = pi_extension_ts(&target).expect("pi content builds");
         assert!(pi.contains("agent-hook pi"));
         assert!(pi.contains(&exe));
         assert!(pi.contains(r#"process.env["TTY7"]"#));
 
-        let grok = grok_hooks_json().expect("grok content builds");
+        let grok = grok_hooks_json(&target).expect("grok content builds");
         let parsed: serde_json::Value = serde_json::from_str(&grok).expect("valid JSON");
         for (event, sentinel, matcher) in GROK_HOOK_EVENTS {
             let group = &parsed["hooks"][*event][0];
@@ -1312,15 +1664,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tty7.json");
         let marker = "agent-hook copilot";
-        let content = copilot_hooks_json().unwrap();
+        let host = local_host();
+        let t = HookTarget::local(&*host).expect("home resolves in tests");
+        let content = copilot_hooks_json(&t).unwrap();
 
         assert_eq!(
-            owned_file_state(&path, &content, marker),
+            owned_file_state(&t, &path, &content, marker),
             HooksState::NotInstalled
         );
-        owned_file_install(&path, &content, marker).expect("fresh install succeeds");
+        owned_file_install(&t, &path, &content, marker).expect("fresh install succeeds");
         assert_eq!(
-            owned_file_state(&path, &content, marker),
+            owned_file_state(&t, &path, &content, marker),
             HooksState::Installed
         );
 
@@ -1328,26 +1682,26 @@ mod tests {
         // Outdated, and a reinstall heals it.
         std::fs::write(&path, content.replace(marker, "agent-hook copilot --old")).unwrap();
         assert_eq!(
-            owned_file_state(&path, &content, marker),
+            owned_file_state(&t, &path, &content, marker),
             HooksState::Outdated
         );
-        owned_file_install(&path, &content, marker).expect("reinstall over our own file");
+        owned_file_install(&t, &path, &content, marker).expect("reinstall over our own file");
         assert_eq!(
-            owned_file_state(&path, &content, marker),
+            owned_file_state(&t, &path, &content, marker),
             HooksState::Installed
         );
 
         // A user-authored file at the managed path is never clobbered or
         // deleted.
         std::fs::write(&path, "// my own hooks, hands off").unwrap();
-        assert!(owned_file_install(&path, &content, marker).is_err());
-        assert!(owned_file_uninstall(&path, marker).is_err());
+        assert!(owned_file_install(&t, &path, &content, marker).is_err());
+        assert!(owned_file_uninstall(&t, &path, marker).is_err());
 
         // Restore ours, then uninstall removes it; a second uninstall no-ops.
         std::fs::write(&path, &content).unwrap();
-        owned_file_uninstall(&path, marker).expect("uninstall succeeds");
+        owned_file_uninstall(&t, &path, marker).expect("uninstall succeeds");
         assert!(!path.exists());
-        owned_file_uninstall(&path, marker).expect("uninstall is idempotent");
+        owned_file_uninstall(&t, &path, marker).expect("uninstall is idempotent");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1378,12 +1732,25 @@ mod tests {
         // SAFETY: test-only env mutation; no other test reads this var.
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };
 
-        assert_eq!(hooks_state(HookAgent::Claude), HooksState::NotInstalled);
-        install_hooks(HookAgent::Claude).expect("install succeeds");
-        assert_eq!(hooks_state(HookAgent::Claude), HooksState::Installed);
+        let host = local_host();
+        let t = HookTarget::local(&*host).expect("home resolves in tests");
+        // The override is ours, not the far machine's: a remote target must
+        // keep resolving to its own `~/.claude`, or an install would land in a
+        // directory the remote Claude never opens. Asserted here because this
+        // is the one test that owns the env var.
+        let remote_host = FakeRemote::shared();
+        let remote = HookTarget::remote(&*remote_host, PathBuf::from("/home/me"));
+        assert_eq!(
+            HookAgent::Claude.target_path(&remote),
+            PathBuf::from("/home/me/.claude/settings.json")
+        );
+
+        assert_eq!(hooks_state(&t, HookAgent::Claude), HooksState::NotInstalled);
+        install_hooks(&t, HookAgent::Claude).expect("install succeeds");
+        assert_eq!(hooks_state(&t, HookAgent::Claude), HooksState::Installed);
 
         // Install again: no duplicates.
-        install_hooks(HookAgent::Claude).expect("re-install succeeds");
+        install_hooks(&t, HookAgent::Claude).expect("re-install succeeds");
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         // User settings and user hooks survive.
@@ -1421,14 +1788,14 @@ mod tests {
             healthy.replace("agent-hook claude stop", "agent-hook claude stop --stale"),
         )
         .unwrap();
-        assert_eq!(hooks_state(HookAgent::Claude), HooksState::Outdated);
-        install_hooks(HookAgent::Claude).expect("reinstall over an outdated entry succeeds");
-        assert_eq!(hooks_state(HookAgent::Claude), HooksState::Installed);
+        assert_eq!(hooks_state(&t, HookAgent::Claude), HooksState::Outdated);
+        install_hooks(&t, HookAgent::Claude).expect("reinstall over an outdated entry succeeds");
+        assert_eq!(hooks_state(&t, HookAgent::Claude), HooksState::Installed);
 
         // Uninstall removes exactly our entries: the user's Stop hook and their
         // other settings survive, and the emptied event keys are dropped.
-        uninstall_hooks(HookAgent::Claude).expect("uninstall succeeds");
-        assert_eq!(hooks_state(HookAgent::Claude), HooksState::NotInstalled);
+        uninstall_hooks(&t, HookAgent::Claude).expect("uninstall succeeds");
+        assert_eq!(hooks_state(&t, HookAgent::Claude), HooksState::NotInstalled);
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(root["model"], "opus");
@@ -1443,7 +1810,7 @@ mod tests {
             "an event list that held only the tty7 hook is dropped"
         );
         // Nothing left to remove: a second uninstall is a no-op, not an error.
-        uninstall_hooks(HookAgent::Claude).expect("uninstall is idempotent");
+        uninstall_hooks(&t, HookAgent::Claude).expect("uninstall is idempotent");
 
         // SAFETY: restore for any later test relying on the default path.
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };

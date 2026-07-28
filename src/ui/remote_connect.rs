@@ -345,7 +345,35 @@ pub fn connect_blocking(
     let rows = list_workspaces(&host)
         .map_err(|e| format!("connected to {label}, but its workspace list failed: {e}"))?;
     let home = host.home();
+    refresh_agent_hooks_once(&host, &home);
     Ok(Connected { host, home, rows })
+}
+
+/// Machines whose agent hooks this process has already looked at.
+static HOOKS_REFRESHED: Mutex<Vec<HostId>> = Mutex::new(Vec::new());
+
+/// Heal this machine's stale tty7 agent hooks — the ones pointing at a
+/// `tty7-server-<version>` an upgrade replaced (see
+/// [`crate::core::agent_hooks::refresh_remote_hooks`]).
+///
+/// Off the connect's own thread, and once per machine per run: it is a config
+/// read per agent over the control connection, and a reconnect — which happens
+/// on a backoff loop — must not wait on six round trips to a box that may be an
+/// ocean away. The hooks are for panes that do not exist yet at this point in
+/// the connect, so nothing is racing it.
+fn refresh_agent_hooks_once(host: &Arc<RemoteHost>, home: &std::path::Path) {
+    let id = host.id();
+    match HOOKS_REFRESHED.lock() {
+        Ok(mut seen) if !seen.contains(&id) => seen.push(id),
+        _ => return,
+    }
+    let (host, home) = (Arc::clone(host), home.to_path_buf());
+    std::thread::spawn(move || {
+        let refreshed = crate::core::agent_hooks::refresh_remote_hooks(&*host, home);
+        if refreshed > 0 {
+            log::info!("refreshed {refreshed} stale agent hook integration(s) on {id:?}");
+        }
+    });
 }
 
 /// The control handshake over the routed stream. Split out only because the

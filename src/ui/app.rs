@@ -1263,27 +1263,15 @@ impl Tty7App {
         // An empty workspace has nothing to come back to, so it is dropped
         // outright instead of accumulating as a blank row in the picker —
         // every `New Workspace` the user closes without using would leave one.
-        let name = if self.tabs.is_empty() {
+        if self.tabs.is_empty() {
             WorkspaceStore::remove(cx, self.workspace);
-            String::new()
         } else {
             WorkspaceStore::close_window(cx, self.workspace);
-            // Read after the update so the name reflects what was just stored.
-            WorkspaceStore::all(cx)
-                .get(self.workspace)
-                .map(|w| w.display_name())
-                .unwrap_or_default()
-        };
+        }
         crate::ui::windows::WindowRegistry::unregister(cx, self.workspace);
         // The workspace just moved from "on screen" to "detached" — the Window
         // menu is the only place that says so.
         crate::ui::windows::refresh_menu(cx);
-        // ...and the first time that happens, say it out loud once. Only for a
-        // workspace with something in it: putting away an empty window teaches
-        // nothing (and it was dropped outright above).
-        if !name.is_empty() {
-            crate::ui::windows::hint_detached(cx, &name);
-        }
     }
 
     /// Design §15's other half: a workspace's forwards belong to the workspace,
@@ -4366,7 +4354,9 @@ impl Tty7App {
             rebinding_note: None,
             ssh_form: None,
             ssh_detail: crate::ui::settings::SshDetail::None,
-            agent_hooks_states: Self::agent_hooks_snapshot(),
+            agent_hooks_host: crate::ui::host_ops::HostId::LOCAL,
+            agent_hooks_states: crate::ui::settings::AgentHooksView::Loading,
+            agent_hooks_seq: 0,
             agent_hooks_note: None,
             _subs: subs,
         });
@@ -4383,6 +4373,7 @@ impl Tty7App {
         }
         // Build the color editor if we opened straight onto an editable theme.
         self.rebuild_theme_editor(window, cx);
+        self.ensure_agent_hooks_loaded(cx);
         cx.notify();
     }
 
@@ -5125,33 +5116,206 @@ impl Tty7App {
             // Entering Agents re-reads the hook install states, so edits made
             // behind the panel's back (another tty7, a hand edit) show up.
             if target == SettingsSection::Agents {
-                s.agent_hooks_states = Self::agent_hooks_snapshot();
+                s.agent_hooks_states = crate::ui::settings::AgentHooksView::Loading;
             }
         }
+        self.ensure_agent_hooks_loaded(cx);
         cx.notify();
     }
 
-    /// Every hook-capable agent paired with its current on-disk install state,
-    /// in the order the Agents section lists them.
-    fn agent_hooks_snapshot() -> Vec<(
-        crate::core::agent_hooks::HookAgent,
-        crate::core::agent_hooks::HooksState,
-    )> {
-        crate::core::agent_hooks::HookAgent::ALL
-            .into_iter()
-            .map(|agent| (agent, crate::core::agent_hooks::hooks_state(agent)))
-            .collect()
+    /// Read the Agents page's rows, but only when that is the page on screen.
+    ///
+    /// Gated on the section because the read is a config file per agent — on a
+    /// remote machine, a round trip per agent — and opening Settings on
+    /// Appearance has no business paying for six of those.
+    fn ensure_agent_hooks_loaded(&mut self, cx: &mut Context<Self>) {
+        if self
+            .active_settings()
+            .is_some_and(|s| s.section == SettingsSection::Agents)
+        {
+            self.load_agent_hooks_states(cx);
+        }
     }
 
-    /// Settings → Agents: install (or rewrite in place) one agent's hooks,
-    /// then fold the outcome back into the panel — status row + note line.
+    /// The machines the Agents section offers: this computer, then every remote
+    /// machine this process is connected to right now.
+    ///
+    /// Only connected ones, because a hook install *is* a write to that
+    /// machine's disk — there is nothing to offer without a link. The ones that
+    /// are configured but offline are named under the picker instead of being
+    /// silently dropped from it.
+    pub(crate) fn agent_hooks_machines(
+        &self,
+        cx: &mut App,
+    ) -> Vec<crate::ui::settings::AgentHooksMachine> {
+        use crate::ui::settings::AgentHooksMachine;
+        let mut out = vec![AgentHooksMachine {
+            host: crate::ui::host_ops::HostId::LOCAL,
+            label: "This Computer".to_string(),
+        }];
+        // The label is the name the user gave the box; `HostId` alone is a
+        // hash. `available_hosts` is the same lookup the workspace switcher
+        // does for exactly this reason.
+        let configured = crate::ui::remote_connect::available_hosts(cx);
+        for id in crate::ui::host_registry::HostRegistry::ids(cx) {
+            if id.is_local() {
+                continue;
+            }
+            let label = configured
+                .iter()
+                .find(|h| h.target.host_id() == id)
+                .map(|h| h.label.clone())
+                .unwrap_or_else(|| "Remote machine".to_string());
+            out.push(AgentHooksMachine { host: id, label });
+        }
+        out
+    }
+
+    /// How many machines the Agents picker cannot offer because nothing is
+    /// connected to them.
+    ///
+    /// Saved SSH profiles only — not the `~/.ssh/config` aliases
+    /// [`available_hosts`](crate::ui::remote_connect::available_hosts) also
+    /// returns. A config with fifty `Host` blocks is normal and most of them are
+    /// git transports that could never host a workspace; counting those would
+    /// turn a helpful footnote into "50 machines aren't connected".
+    pub(crate) fn agent_hooks_offline_count(&self, cx: &mut App) -> usize {
+        let connected = crate::ui::host_registry::HostRegistry::ids(cx);
+        cx.global::<Config>()
+            .ssh_profiles
+            .iter()
+            .filter(|p| {
+                !connected
+                    .contains(&crate::core::session::RemoteTarget::Profile { id: p.id }.host_id())
+            })
+            .count()
+    }
+
+    /// Point the Agents section at another machine and read its state.
+    pub(crate) fn select_agent_hooks_host(
+        &mut self,
+        host: crate::ui::host_ops::HostId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(s) = self.settings.as_mut() {
+            if s.agent_hooks_host == host {
+                return;
+            }
+            s.agent_hooks_host = host;
+            // The note belonged to the machine we just left.
+            s.agent_hooks_note = None;
+            s.agent_hooks_states = crate::ui::settings::AgentHooksView::Loading;
+        }
+        self.load_agent_hooks_states(cx);
+        cx.notify();
+    }
+
+    /// Read every hook-capable agent's install state off the selected machine,
+    /// in the background, and land the rows when they arrive.
+    ///
+    /// Background because a `Host` call blocks and on a remote machine that is a
+    /// round trip *per agent* — six of them, on a link that may be an ocean
+    /// wide. Doing it inline is the window freeze this codebase has already
+    /// fixed twice.
+    fn load_agent_hooks_states(&mut self, cx: &mut Context<Self>) {
+        use crate::core::agent_hooks::{HookAgent, HookTarget};
+        use crate::ui::settings::{AgentHookRow, AgentHooksView};
+
+        let Some(host_id) = self.settings.as_ref().map(|s| s.agent_hooks_host) else {
+            return;
+        };
+        let seq = match self.settings.as_mut() {
+            Some(s) => {
+                s.agent_hooks_seq += 1;
+                s.agent_hooks_seq
+            }
+            None => return,
+        };
+        let Some((host, home)) = self.agent_hooks_link(host_id, cx) else {
+            if let Some(s) = self.settings.as_mut() {
+                s.agent_hooks_states =
+                    AgentHooksView::Unavailable(Self::AGENT_HOOKS_OFFLINE.into());
+            }
+            cx.notify();
+            return;
+        };
+
+        crate::ui::host_ops::HostOps::run(
+            host,
+            cx,
+            move |h| {
+                let target = match &home {
+                    Some(home) => HookTarget::remote(h, home.clone()),
+                    None => HookTarget::local(h)?,
+                };
+                Some(
+                    HookAgent::ALL
+                        .into_iter()
+                        .map(|agent| AgentHookRow {
+                            agent,
+                            state: crate::core::agent_hooks::hooks_state(&target, agent),
+                            target: agent.target_display(&target),
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            },
+            move |this, rows, cx| {
+                if let Some(s) = this.settings.as_mut()
+                    && s.agent_hooks_seq == seq
+                {
+                    s.agent_hooks_states = match rows {
+                        Some(rows) => AgentHooksView::Ready(rows),
+                        None => AgentHooksView::Unavailable(
+                            "tty7 could not work out this computer's home directory, so there is \
+                             nowhere to install to."
+                                .into(),
+                        ),
+                    };
+                    cx.notify();
+                }
+            },
+        );
+    }
+
+    /// What the Agents section says when the machine it is pointed at has no
+    /// live connection. One string, because the picker's footnote and the
+    /// rows' resting state have to agree.
+    const AGENT_HOOKS_OFFLINE: &'static str = concat!(
+        "Not connected to this machine, so its agent config can't be read or ",
+        "written. Open a workspace on it and come back."
+    );
+
+    /// The host object and remote home for the machine the Agents section is
+    /// pointed at, or `None` when it is a remote that is no longer connected.
+    ///
+    /// `None` for the home means "this computer" — the local target reads its
+    /// own environment, which is the one place `$CLAUDE_CONFIG_DIR` and
+    /// `$XDG_CONFIG_HOME` are ours to honor.
+    fn agent_hooks_link(
+        &self,
+        host_id: crate::ui::host_ops::HostId,
+        cx: &mut App,
+    ) -> Option<(crate::ui::host_ops::SharedHost, Option<std::path::PathBuf>)> {
+        let host = crate::ui::host_registry::HostRegistry::get(cx, host_id)?;
+        if host_id.is_local() {
+            return Some((host, None));
+        }
+        if !host.is_connected() {
+            return None;
+        }
+        let home = crate::ui::remote_connect::RemoteConnections::home(cx, host_id)?;
+        Some((host, Some(home)))
+    }
+
+    /// Settings → Agents: install (or rewrite in place) one agent's hooks on the
+    /// selected machine, then fold the outcome back into the panel — status row
+    /// + note line.
     pub(crate) fn settings_install_agent_hooks(
         &mut self,
         agent: crate::core::agent_hooks::HookAgent,
         cx: &mut Context<Self>,
     ) {
-        let result = crate::core::agent_hooks::install_hooks(agent);
-        self.finish_agent_hooks_action(agent, result, cx);
+        self.run_agent_hooks_action(agent, true, cx);
     }
 
     /// Settings → Agents: remove one agent's tty7 hooks (user hooks survive).
@@ -5160,30 +5324,68 @@ impl Tty7App {
         agent: crate::core::agent_hooks::HookAgent,
         cx: &mut Context<Self>,
     ) {
-        let result = crate::core::agent_hooks::uninstall_hooks(agent);
-        self.finish_agent_hooks_action(agent, result, cx);
+        self.run_agent_hooks_action(agent, false, cx);
     }
 
-    /// Shared tail of the Agents-section hook actions: re-read the on-disk
-    /// states (the ground truth, whatever the action just did) and surface the
-    /// action's own summary or error as the note under that agent's row.
-    fn finish_agent_hooks_action(
+    /// Install or uninstall one agent's hooks on the selected machine, then
+    /// re-read that machine's states — the ground truth, whatever the action
+    /// just did — and surface the action's own summary or error as the note
+    /// under its row.
+    ///
+    /// Writing is a `Host` call too, so it takes the same background trip as the
+    /// read: an install into `~/.claude/settings.json` on a remote box is a read
+    /// and a write over the control connection.
+    fn run_agent_hooks_action(
         &mut self,
         agent: crate::core::agent_hooks::HookAgent,
-        result: anyhow::Result<String>,
+        install: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(s) = self.settings.as_mut() {
-            s.agent_hooks_states = Self::agent_hooks_snapshot();
-            s.agent_hooks_note = Some((
-                agent,
-                match result {
-                    Ok(summary) => summary,
-                    Err(e) => format!("Failed: {e}"),
-                },
-            ));
-        }
-        cx.notify();
+        use crate::core::agent_hooks::HookTarget;
+
+        let Some(host_id) = self.settings.as_ref().map(|s| s.agent_hooks_host) else {
+            return;
+        };
+        let Some((host, home)) = self.agent_hooks_link(host_id, cx) else {
+            if let Some(s) = self.settings.as_mut() {
+                s.agent_hooks_note = Some((agent, Self::AGENT_HOOKS_OFFLINE.to_string()));
+                s.agent_hooks_states = crate::ui::settings::AgentHooksView::Unavailable(
+                    Self::AGENT_HOOKS_OFFLINE.into(),
+                );
+            }
+            cx.notify();
+            return;
+        };
+
+        crate::ui::host_ops::HostOps::run(
+            host,
+            cx,
+            move |h| {
+                let target = match &home {
+                    Some(home) => HookTarget::remote(h, home.clone()),
+                    None => HookTarget::local(h)
+                        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?,
+                };
+                if install {
+                    crate::core::agent_hooks::install_hooks(&target, agent)
+                } else {
+                    crate::core::agent_hooks::uninstall_hooks(&target, agent)
+                }
+            },
+            move |this, result, cx| {
+                if let Some(s) = this.settings.as_mut() {
+                    s.agent_hooks_note = Some((
+                        agent,
+                        match result {
+                            Ok(summary) => summary,
+                            Err(e) => format!("Failed: {e}"),
+                        },
+                    ));
+                }
+                this.load_agent_hooks_states(cx);
+                cx.notify();
+            },
+        );
     }
 
     /// Keep the settings selection on a section that has search hits: if the
