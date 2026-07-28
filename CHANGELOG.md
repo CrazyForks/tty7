@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — ssh forwards environment variables solely by agreement between client and
   server, so a remote host still sees whatever it sets for itself. (#212)
 
+- **Inactive panes only fade if you want them to** — a split tab dims every pane
+  but the focused one so the active terminal reads as foreground. That is the
+  right default, but it is not free: at 55% opacity a dim theme's comment color
+  or a long-running build's output in the pane you are *watching* rather than
+  typing into gets harder to read, and some people track panes by cursor alone
+  and never needed the cue. Settings → Appearance → Transparency now carries a
+  "Dim inactive panes" switch. On by default, so nothing changes for anyone who
+  was happy; off renders every pane at full opacity. (#214)
+
 ## [26.7.5] - 2026-07-27
 
 ### Added
