@@ -7,15 +7,19 @@ use gpui::{App, Global, KeyBinding, Keystroke, NoAction};
 
 use crate::core::actions::*;
 use crate::core::config::Config;
-use crate::terminal::view::{ClearScrollback, FindInTerminal, FindNext, FindPrevious};
+use crate::terminal::view::{
+    ClearScrollback, FindInTerminal, FindNext, FindPrevious, InsertNewline,
+};
 use crate::ui::theme::set_menus;
 
 /// The set of keystrokes currently installed for app actions, remembered so a
 /// later [`rebind`] can neutralize them with `NoAction` bindings instead of
 /// clearing the whole keymap (which would also wipe gpui-component's own input /
-/// list / menu bindings). Stored as a GPUI global.
+/// list / menu bindings). Each entry carries the key context its binding was
+/// installed in (see [`action_context`]) so the `NoAction` can be scoped the
+/// same way. Stored as a GPUI global.
 #[derive(Default)]
-struct BoundKeystrokes(Vec<String>);
+struct BoundKeystrokes(Vec<(String, Option<&'static str>)>);
 impl Global for BoundKeystrokes {}
 
 /// Install the application menu bar, keybindings, and global actions.
@@ -53,12 +57,19 @@ pub fn rebind(cx: &mut App) {
         .unwrap_or_default();
     let effective = effective_bindings(cx);
 
-    // Neutralize each old keystroke (global NoAction is enabled in every
-    // context, so it also suppresses the Terminal-scoped ClearScrollback).
+    // Neutralize each old keystroke with a `NoAction` in the same context its
+    // binding was installed in. The scope matters: GPUI's `binding_enabled`
+    // gives a *context-less* binding the maximum match depth (`contexts.len()`),
+    // so a global `NoAction` outranks every context-scoped binding on that
+    // chord — and a matched `NoAction` discards the rest of the matches — which
+    // would kill bindings we never installed (gpui-component's own Input-scoped
+    // `shift-enter` while the search field has focus). Scoped the same way, the
+    // `NoAction` still suppresses our own old binding: that one sits at the
+    // same depth with a lower index, and index breaks the tie.
     let mut bindings: Vec<KeyBinding> = previous
         .iter()
-        .filter(|k| keystroke_is_valid(k))
-        .map(|k| KeyBinding::new(k, NoAction {}, None))
+        .filter(|(k, _)| keystroke_is_valid(k))
+        .map(|(k, ctx)| KeyBinding::new(k, NoAction {}, *ctx))
         .collect();
     bindings.extend(action_bindings(&effective));
     cx.bind_keys(bindings);
@@ -74,10 +85,65 @@ pub fn rebind(cx: &mut App) {
     set_menus(cx);
 }
 
+/// `InsertNewline`'s primary default: Windows Terminal's chord for a soft
+/// newline in the prompt editor, and the one the table in [`default_bindings`]
+/// carries.
+const INSERT_NEWLINE_DEFAULT: &str = "shift-enter";
+
+/// `InsertNewline`'s second default: iTerm2's chord for the same gesture. Both
+/// have inserted a newline since the multi-line editor landed, and both must
+/// keep doing so — but a binding spec can't express alternatives (whitespace in
+/// a spec means a *sequence*, `ctrl-b n`-style), and the effective table holds
+/// exactly one keystroke per action. So this chord is installed alongside the
+/// table's, and only while `InsertNewline` still sits on its primary default:
+/// rebinding the action in Settings or `config.json` retires both old chords,
+/// which is what a user who moves the binding expects.
+///
+/// Only these two. GPUI matches a binding on exact modifier equality
+/// (`Keystroke::should_match`), so Shift+Alt+Enter — which the old hardcoded
+/// `(m.shift || m.alt)` test happened to catch — maps to no action and submits
+/// like any other Enter. That matches the reference: Warp's key table is a
+/// `(ctrl, alt, shift, key)` tuple whose newline arms are exactly Shift+Enter,
+/// Alt+Enter and Ctrl+J, so its `(false, true, true, "enter")` falls through
+/// too, and its GUI compares whole keystrokes for equality just as gpui does.
+const INSERT_NEWLINE_ALT_DEFAULT: &str = "alt-enter";
+
+/// The extra keystroke an effective table installs beyond its one-per-action
+/// rows — today only [`INSERT_NEWLINE_ALT_DEFAULT`]. `None` once the action has
+/// been rebound off its default.
+fn extra_keystrokes(effective: &[(String, String)]) -> Vec<(&'static str, &'static str)> {
+    let on_default = effective
+        .iter()
+        .any(|(a, k)| a == "InsertNewline" && k == INSERT_NEWLINE_DEFAULT);
+    if on_default {
+        vec![("InsertNewline", INSERT_NEWLINE_ALT_DEFAULT)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The extra `(action, keystroke)` pairs the current effective table installs
+/// beyond its one-row-per-action rows. [`effective_bindings`] stays one row per
+/// action because Settings renders from it, so anything that has to reason
+/// about which chords are actually *live* — conflict detection when the user
+/// records a shortcut — must consult this alongside it, or it would miss the
+/// extra chord and silently drop it.
+pub(crate) fn extra_bindings(cx: &App) -> Vec<(String, String)> {
+    extra_keystrokes(&effective_bindings(cx))
+        .into_iter()
+        .map(|(a, k)| (a.to_string(), k.to_string()))
+        .collect()
+}
+
 /// Build the `KeyBinding`s for an effective table, skipping unbound rows (empty
 /// keystroke) and any that fail validation.
 fn action_bindings(effective: &[(String, String)]) -> Vec<KeyBinding> {
     let mut bindings = Vec::new();
+    for (action, key) in extra_keystrokes(effective) {
+        if let Some(b) = make_binding(action, key) {
+            bindings.push(b);
+        }
+    }
     for (action, key) in effective {
         if key.is_empty() {
             continue; // an action with no assigned key
@@ -94,13 +160,17 @@ fn action_bindings(effective: &[(String, String)]) -> Vec<KeyBinding> {
     bindings
 }
 
-/// The valid, non-empty keystrokes an effective table actually installs — the
-/// list [`rebind`] remembers so it can suppress them on the next change.
-fn bound_keystrokes(effective: &[(String, String)]) -> Vec<String> {
+/// The valid, non-empty keystrokes an effective table actually installs, each
+/// paired with the key context it is installed in — the list [`rebind`]
+/// remembers so it can suppress them, in that same context, on the next change.
+fn bound_keystrokes(effective: &[(String, String)]) -> Vec<(String, Option<&'static str>)> {
+    let extras = extra_keystrokes(effective);
     effective
         .iter()
+        .map(|(a, k)| (a.as_str(), k.as_str()))
+        .chain(extras.iter().map(|(a, k)| (*a, *k)))
         .filter(|(_, k)| !k.is_empty() && keystroke_is_valid(k))
-        .map(|(_, k)| k.clone())
+        .map(|(a, k)| (k.to_string(), action_context(a)))
         .collect()
 }
 
@@ -243,6 +313,11 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         ),
         // Like Terminal.app / iTerm2 / Ghostty ⌘K: wipe the screen + scrollback.
         ("ClearScrollback", "secondary-k"),
+        // Soft newline in the prompt editor: author a multi-line command without
+        // submitting it. Shift+Enter is Windows Terminal's chord and the primary
+        // default; Alt+Enter (iTerm2's) is installed alongside it — see
+        // `INSERT_NEWLINE_ALT_DEFAULT` for why it can't live in this table.
+        ("InsertNewline", INSERT_NEWLINE_DEFAULT),
         ("OpenSettings", "secondary-,"),
         // Help → Keyboard Shortcuts, on the ⌘/ that editors and browsers use for
         // "show me the shortcuts". Off macOS `secondary-/` is Ctrl+/, which some
@@ -541,6 +616,24 @@ fn keystroke_is_valid(s: &str) -> bool {
     any
 }
 
+/// The key context an action's binding is installed in, or `None` for a global
+/// one. The single source of truth for that decision: [`make_binding`] builds
+/// the binding with it and [`bound_keystrokes`] records it, so the `NoAction`
+/// [`rebind`] later uses to retire a chord lands in the same scope as the
+/// binding it retires.
+///
+/// Terminal-scoped means the handler lives on the terminal surface, so the
+/// "Terminal" context keeps the chord inert on the settings / home pages
+/// instead of binding a dead global chord there.
+fn action_context(action: &str) -> Option<&'static str> {
+    match action {
+        "FindInTerminal" | "FindNext" | "FindPrevious" | "ClearScrollback" | "InsertNewline" => {
+            Some("Terminal")
+        }
+        _ => None,
+    }
+}
+
 /// Build a `KeyBinding` for a known action name + (already-validated) keystroke.
 /// Returns `None` for an unrecognized action name.
 fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
@@ -615,16 +708,13 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
         "ShowRightPanelOutline" => KeyBinding::new(keystroke, ShowRightPanelOutline, None),
         "ShowRightPanelChanges" => KeyBinding::new(keystroke, ShowRightPanelChanges, None),
         "ShowRightPanelFiles" => KeyBinding::new(keystroke, ShowRightPanelFiles, None),
-        // Terminal-scoped (the handler lives on the terminal surface): the "Terminal"
-        // context keeps ⌘K inert in the settings tab / home page instead of binding a
-        // dead global chord there.
-        // Terminal-scoped like ClearScrollback: the handlers live on the terminal
-        // surface, so the "Terminal" context keeps these inert on the settings /
-        // home pages instead of binding a dead global chord there.
-        "FindInTerminal" => KeyBinding::new(keystroke, FindInTerminal, Some("Terminal")),
-        "FindNext" => KeyBinding::new(keystroke, FindNext, Some("Terminal")),
-        "FindPrevious" => KeyBinding::new(keystroke, FindPrevious, Some("Terminal")),
-        "ClearScrollback" => KeyBinding::new(keystroke, ClearScrollback, Some("Terminal")),
+        // Terminal-scoped — see `action_context`, which owns that decision so the
+        // context here and the one `rebind` neutralizes with can't drift apart.
+        "FindInTerminal" => KeyBinding::new(keystroke, FindInTerminal, action_context(action)),
+        "FindNext" => KeyBinding::new(keystroke, FindNext, action_context(action)),
+        "FindPrevious" => KeyBinding::new(keystroke, FindPrevious, action_context(action)),
+        "ClearScrollback" => KeyBinding::new(keystroke, ClearScrollback, action_context(action)),
+        "InsertNewline" => KeyBinding::new(keystroke, InsertNewline, action_context(action)),
         "OpenSettings" => KeyBinding::new(keystroke, OpenSettings, None),
         "ShowKeyboardShortcuts" => KeyBinding::new(keystroke, ShowKeyboardShortcuts, None),
         "About" => KeyBinding::new(keystroke, About, None),
@@ -731,6 +821,134 @@ mod tests {
                 make_binding(&action, &key).is_some(),
                 "tmux preset action {action} has no make_binding arm"
             );
+        }
+    }
+
+    #[test]
+    fn insert_newline_ships_both_default_chords() {
+        // Shift+Enter and Alt+Enter have both inserted a soft newline since the
+        // multi-line editor landed; exposing the gesture as an action must not
+        // cost either one. Shift+Enter is the table row, Alt+Enter the extra.
+        let effective: Vec<(String, String)> = default_bindings()
+            .into_iter()
+            .map(|(a, k)| (a.to_string(), k.to_string()))
+            .collect();
+        assert_eq!(
+            effective
+                .iter()
+                .find(|(a, _)| a == "InsertNewline")
+                .map(|(_, k)| k.as_str()),
+            Some("shift-enter")
+        );
+        assert_eq!(
+            extra_keystrokes(&effective),
+            vec![("InsertNewline", "alt-enter")]
+        );
+        // Both are real, installable bindings, and both are remembered so a
+        // later `rebind` can neutralize them.
+        for key in ["shift-enter", "alt-enter"] {
+            assert!(keystroke_is_valid(key), "{key} does not parse");
+            assert!(make_binding("InsertNewline", key).is_some());
+            assert!(
+                bound_keystrokes(&effective).iter().any(|(k, _)| k == key),
+                "{key} is not remembered as installed"
+            );
+        }
+        assert_eq!(key_tokens("shift-enter"), vec![SHIFT, "⏎"]);
+    }
+
+    #[test]
+    fn rebinding_insert_newline_retires_both_default_chords() {
+        // Move the action off its default and the second chord goes with it —
+        // otherwise Alt+Enter would keep inserting newlines behind the user's
+        // back after they deliberately moved the binding.
+        let effective = vec![("InsertNewline".to_string(), "ctrl-o".to_string())];
+        assert!(extra_keystrokes(&effective).is_empty());
+        assert_eq!(
+            bound_keystrokes(&effective),
+            vec![("ctrl-o".to_string(), Some("Terminal"))]
+        );
+
+        // Unbinding it entirely (an empty override) installs nothing at all.
+        let unbound = vec![("InsertNewline".to_string(), String::new())];
+        assert!(extra_keystrokes(&unbound).is_empty());
+        assert!(action_bindings(&unbound).is_empty());
+    }
+
+    #[test]
+    fn bound_keystrokes_remember_the_context_each_binding_was_installed_in() {
+        // `rebind` retires an old chord with a `NoAction`, and a context-less
+        // one gets GPUI's *maximum* match depth — it would outrank, and discard,
+        // deeper bindings on that chord that we never installed (gpui-component
+        // binds `shift-enter` in its own "Input" context, which is what steps to
+        // the previous match in the terminal's search field). So each remembered
+        // keystroke carries the scope its binding actually had.
+        let effective = vec![
+            ("InsertNewline".to_string(), "shift-enter".to_string()),
+            ("NewTab".to_string(), "secondary-t".to_string()),
+        ];
+        assert_eq!(
+            bound_keystrokes(&effective),
+            vec![
+                ("shift-enter".to_string(), Some("Terminal")),
+                ("secondary-t".to_string(), None),
+                // The extra chord is scoped by its action, like any other row.
+                ("alt-enter".to_string(), Some("Terminal")),
+            ]
+        );
+    }
+
+    #[test]
+    fn action_context_matches_the_scope_make_binding_installs() {
+        // The two must agree for every action, or `rebind` would neutralize a
+        // chord in a scope the binding never had — leaving the old binding live
+        // (too narrow) or shadowing unrelated ones (too wide).
+        let extra_actions = extra_keystrokes(
+            &default_bindings()
+                .into_iter()
+                .map(|(a, k)| (a.to_string(), k.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        let actions = default_bindings()
+            .into_iter()
+            .map(|(a, _)| a)
+            .chain(extra_actions.into_iter().map(|(a, _)| a));
+        for action in actions {
+            let binding =
+                make_binding(action, "f13").unwrap_or_else(|| panic!("no arm for {action}"));
+            let installed = binding.predicate().map(|p| p.to_string());
+            assert_eq!(
+                installed.as_deref(),
+                action_context(action),
+                "{action} is installed in a different context than `action_context` reports"
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_enter_chords_are_distinct_from_insert_newline() {
+        // The window bindings the reporter called out (#182) must stay put:
+        // ⌘⏎ / ⌘⇧⏎ are different keystrokes from the bare ⇧⏎ and ⌥⏎.
+        let defaults = default_bindings();
+        let key_of = |action: &str| {
+            defaults
+                .iter()
+                .find(|(a, _)| *a == action)
+                .map(|(_, k)| *k)
+                .unwrap()
+        };
+        assert_eq!(key_of("ToggleFullscreen"), "secondary-enter");
+        assert_eq!(key_of("ToggleMaximizePane"), "secondary-shift-enter");
+        for window_chord in ["secondary-enter", "secondary-shift-enter"] {
+            assert_ne!(window_chord, INSERT_NEWLINE_DEFAULT);
+            assert_ne!(window_chord, INSERT_NEWLINE_ALT_DEFAULT);
+        }
+        // Modifier matching is exact, so the three-key chord is nobody's: it
+        // inserts nothing and submits, as it does in Warp. Spelled out here so
+        // a future reader doesn't "restore" it as a missing default.
+        for chord in [INSERT_NEWLINE_DEFAULT, INSERT_NEWLINE_ALT_DEFAULT] {
+            assert_ne!(chord, "shift-alt-enter");
+            assert_ne!(chord, "alt-shift-enter");
         }
     }
 

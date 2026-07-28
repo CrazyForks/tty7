@@ -58,6 +58,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session" means: paste it into `codex resume`, a bug report, or another tool.
   (#211)
 
+### Changed
+
+- **The prompt editor's soft newline is now a rebindable action** — `Shift+Enter`
+  and `Alt+Enter` have inserted a literal newline into the command editor since
+  the multi-line prompt editor landed, but the chords were hardcoded in the key
+  handler: there was no `InsertNewline` to name in `keybindings`, and no way to
+  move the gesture to a chord of your own. The behaviour is unchanged out of the
+  box — both chords still insert, plain `Enter` still submits the whole buffer —
+  but it now runs through an `InsertNewline` action, so it appears in Settings →
+  Keybindings and can be rebound like anything else, and rebinding it retires
+  both defaults. Only the prompt editor answers it; with a full-screen program on
+  the pane the chord reaches the application exactly as before. `⌘⏎` fullscreen
+  and `⌘⇧⏎` pane zoom are untouched.
+
+  Two smaller behaviour changes come with it, both aligning on what other
+  terminals do. With a completion menu open, the newline chords now insert a
+  newline and close the menu instead of accepting the highlighted candidate —
+  plain `Enter` remains the key that accepts it. And `Shift+Alt+Enter`, which
+  the old modifier test caught by accident, now submits like any other `Enter`:
+  keybindings match modifiers exactly, and no terminal treats that three-key
+  chord as a newline. (#182)
+
 ### Fixed
 
 - **Rounded UI controls no longer square off their corners**
