@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the gpui fork on resvg 0.47, the gpui-component fork still declared its
   own `resvg = "0.45.1"`, keeping a legacy resvg/usvg/tiny-skia 0.45/0.11
   stack in the tree. That fork now pins 0.47 as well, so the whole build
-  compiles a single resvg stack.
+  compiles a single resvg stack. (#238)
 
 ### Fixed
 
