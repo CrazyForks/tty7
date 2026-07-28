@@ -146,6 +146,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Appearance,
+            title: "Dim inactive panes",
+            keywords: "fade unfocused inactive split pane focus opacity highlight active dimming",
+        },
+        SearchEntry {
+            section: Appearance,
             title: "Font size",
             keywords: "typography text bigger smaller zoom",
         },
@@ -1518,10 +1523,12 @@ impl Tty7App {
             .into_any_element()
     }
 
-    /// Window section (Appearance): global opacity slider + blur switch that
-    /// apply to every theme. Both are config *overrides* — until touched they
-    /// follow the active theme's own `opacity`/`blur`, and "Follow theme"
-    /// clears them back to that state.
+    /// Window section (Appearance): the global opacity slider and blur switch
+    /// that apply to every theme, then the inactive-pane dimming switch. The
+    /// first two are config *overrides* — until touched they follow the active
+    /// theme's own `opacity`/`blur`, and "Follow theme" clears them back to that
+    /// state; the dimming switch is a plain flag no theme carries a value for,
+    /// so it sits below that button and "Follow theme" leaves it alone.
     fn render_window_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(slider) = self
             .active_settings()
@@ -1578,12 +1585,6 @@ impl Tty7App {
                 blur_switch,
                 cx,
             ))
-            .child(self.settings_row(
-                "Dim inactive panes",
-                "Fade unfocused panes in a split so the active one stands out.",
-                dim_switch,
-                cx,
-            ))
             // Only offered while an override is active; otherwise the values
             // already follow the theme and the button would be a no-op.
             .when(overridden, |this| {
@@ -1598,6 +1599,14 @@ impl Tty7App {
                     ),
                 )
             })
+            // Below "Follow theme", which resets the two rows above it and not
+            // this one — a plain setting with no theme value behind it.
+            .child(self.settings_row(
+                "Dim inactive panes",
+                "Fade unfocused panes in a split so the active one stands out.",
+                dim_switch,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -4623,6 +4632,7 @@ mod tests {
             "Sidebar grouping",
             "Tab completion",
             "History search",
+            "Dim inactive panes",
         ] {
             assert!(
                 settings_search_entries().iter().any(|e| e.title == title),
