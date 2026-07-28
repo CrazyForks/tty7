@@ -648,7 +648,24 @@ mod gpui_tests {
         // The pane goes away before either answer can land — a tab closed
         // while its probe was in flight.
         drop(pane);
-        cx.background_executor.run_until_parked();
+
+        // Pumped rather than parked once: a `Host` call runs on `HostOps`' own
+        // thread pool, not on gpui's executor, so `run_until_parked` has
+        // nothing to wait for until the answer has already crossed back. The
+        // deadline is generous because what is being timed is a closure that
+        // returns a constant.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while detached.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Both were submitted together, so the detached one landing means the
+        // view-scoped one has had its chance too. A few more turns, in case it
+        // is merely slower.
+        for _ in 0..20 {
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
 
         assert_eq!(
             detached.load(Ordering::SeqCst),
