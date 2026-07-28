@@ -28,13 +28,25 @@ use std::rc::Rc;
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::PaneProcs;
 use crate::terminal::git_diff::{self, DiffSnapshot};
-use crate::ui::app::{CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App, tile_trailing_inset_sm};
+use crate::ui::app::{
+    CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App, tile_trailing_inset,
+    tile_trailing_inset_sm,
+};
 use crate::ui::scrollbar::with_vertical_scrollbar;
 
 /// Bounds for the panel's width, mirroring the rail's: a floor so the tree never
 /// becomes an ellipsis parade, and a ceiling as a fraction of the window so a
 /// persisted value can't swallow the terminal.
-pub(crate) const MIN_WIDTH: f32 = 200.;
+///
+/// The floor is also what has to seat the panel's top row on macOS, which is the
+/// binding constraint: four chrome tiles, the panel toggle and the "⋯" — six
+/// 32px boxes, five 2px gaps and the two glyph-aligned insets — need **214px**.
+/// A tighter floor doesn't make the panel narrower, it makes that row overflow;
+/// the alternative (shrinking the tabs to body scale) was tried and reads as the
+/// panel's own navigation being demoted below the two buttons beside it. 216
+/// leaves the row a hair of slack and is still narrower than any window this
+/// panel is usable in.
+pub(crate) const MIN_WIDTH: f32 = 216.;
 pub(crate) const MAX_WIDTH_RATIO: f32 = 0.5;
 
 /// Width (px) of the resize handle's invisible hit-area, centered on the panel's
@@ -246,11 +258,11 @@ impl Tty7App {
                         .on_double_click(|_, window, _| window.titlebar_double_click())
                         .items_center()
                         .gap(px(2.))
-                        // `_sm` because the tabs are body-scale tiles now
-                        // (`right_panel_tabs`): the leading inset has to line the
-                        // *glyph* up on `CONTENT_INSET`, and a 24px tile holds its
-                        // glyph a different distance inside the box than a 32px one.
-                        .pl(px(crate::ui::app::tile_trailing_inset_sm()))
+                        // Chrome scale, like the corner controls this row ends
+                        // with (`right_panel_tabs`): the leading inset lines the
+                        // *glyph* up on `CONTENT_INSET`, so it subtracts the
+                        // 32px tile's own padding rather than a 24px one's.
+                        .pl(px(tile_trailing_inset()))
                         .children(self.right_panel_tabs(cx))
                         .child(div().flex_1())
                         // The panel is what reaches the window's right edge while
@@ -410,10 +422,12 @@ impl Tty7App {
             .items_center()
             .pl(px(CONTENT_INSET))
             // Trailing tiles align on the glyph like every other control in the
-            // window; a label-only header just takes the plain inset. `_SM` covers
-            // both tile cases now — the tab tiles are body-scale too.
+            // window; a label-only header just takes the plain inset. `_SM` for a
+            // tab's own control, whose glyph sits a different distance inside its
+            // box than the chrome-scale tab tiles do.
             .pr(px(match (&tabs, has_trailing) {
-                (Some(_), _) | (None, true) => tile_trailing_inset_sm(),
+                (Some(_), _) => tile_trailing_inset(),
+                (None, true) => tile_trailing_inset_sm(),
                 (None, false) => CONTENT_INSET,
             }))
             // The line that separates the header from the tab's content. Only

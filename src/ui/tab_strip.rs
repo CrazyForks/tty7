@@ -624,16 +624,22 @@ impl Tty7App {
     /// The detail panel's tab tiles — icon-only, one per view. Lives here beside
     /// the rest of the chrome tiles so all of them share one styling helper.
     ///
-    /// Body scale ([`TILE_SIZE_SM`]), not chrome scale. Two reasons, and the
-    /// second is why it changed: these tiles live *inside* a panel, which is what
-    /// that constant is for; and the row they sit in also carries the window's
-    /// own chrome at its trailing edge, so drawing both at 32px made seven
-    /// identical squares out of controls belonging to three different layers.
-    /// One size step is what separates "the panel's own tabs" from "the window's
-    /// buttons" without adding a rule or a divider. It also buys back the 32px
-    /// that made the row overflow a 200px-wide panel.
+    /// **Chrome scale**, like everything else in that row. These were briefly
+    /// dropped to body scale ([`TILE_SIZE_SM`]) to buy width back after the row
+    /// overflowed a 200px panel — the tiles live inside a panel, and one size
+    /// step separates them from the window chrome beside them without spending a
+    /// divider on it. Both arguments hold; neither survives what it looks like.
+    /// A 24px tile carrying an 11px glyph next to a 32px one carrying a 13px
+    /// glyph doesn't read as a layer below, it reads as shrunk — the panel's
+    /// primary navigation, drawn smaller than the two buttons in the corner.
+    ///
+    /// The width the shrink was buying is bought by [`MIN_WIDTH`] instead: the
+    /// row needs 214px at this scale, so the panel's floor is what has to move.
+    /// That is the honest place for the constraint anyway — the tiles are as big
+    /// as they are, and the panel is as narrow as it can afford to be.
     ///
     /// [`TILE_SIZE_SM`]: crate::ui::app::TILE_SIZE_SM
+    /// [`MIN_WIDTH`]: crate::ui::right_panel::MIN_WIDTH
     pub(crate) fn right_panel_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let active_tab = self.right_panel_tab;
         // Changed-file count, carried in the Changes tooltip. It used to be a
@@ -681,17 +687,12 @@ impl Tty7App {
                 .occlude()
                 .flex_shrink_0()
                 .child(
-                    chrome_tile_sized(
+                    chrome_tile(
                         Button::new(("right-panel-tab", tab as usize)).icon(icon),
-                        crate::ui::app::TILE_SIZE_SM,
-                        crate::ui::app::TILE_GLYPH_SM,
                         active_tab == tab,
                         cx,
                     )
-                    // `rounded_md` against the chrome tiles' `rounded_lg`: the
-                    // corner radius tracks the box, or a 24px tile reads as a
-                    // 32px one with its sides shaved off.
-                    .rounded_md()
+                    .rounded_lg()
                     .tooltip(match (tab, changed) {
                         (RightPanelTab::Changes, Some(n)) => {
                             SharedString::from(format!("{label} · {n}"))
