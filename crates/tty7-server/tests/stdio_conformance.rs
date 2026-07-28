@@ -22,6 +22,11 @@
 //! isolation: no case can be explained by another's leftover state, a hung
 //! server fails exactly one case, and a crash names the behaviour that caused it.
 
+// Unix-only: every case here is a `--stdio` child, and `--stdio` is refused on
+// Windows by design — a Windows machine is reached over its own transport, not
+// by shipping a server onto it (contract §8).
+#![cfg(unix)]
+
 use std::io;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
