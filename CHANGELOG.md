@@ -39,8 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **One fewer duplicate SVG stack in the build** — the resvg 0.47 bump (#227)
   left the gpui fork on 0.45, so the tree compiled two resvg/usvg/tiny-skia
   stacks. The fork now pins 0.47 too, re-unifying its stack with the one tty7
-  uses for the tray icon. gpui-component still carries its own 0.45.1 until
-  that fork catches up. (#237)
+  uses for the tray icon. (#237)
+
+- **The last duplicate SVG stack is gone** — after #227 and #237 unified tty7
+  and the gpui fork on resvg 0.47, the gpui-component fork still declared its
+  own `resvg = "0.45.1"`, keeping a legacy resvg/usvg/tiny-skia 0.45/0.11
+  stack in the tree. That fork now pins 0.47 as well, so the whole build
+  compiles a single resvg stack. (#238)
 
 ### Fixed
 
