@@ -5,6 +5,25 @@ All notable changes to tty7 are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Pi is a first-class agent, not a fallback one** — Pi panes drew the generic
+  robot glyph every unbranded agent shares, so a Pi tab was indistinguishable
+  from an Aider or Qwen one in the sidebar, the tab chip and the tray menu. They
+  now carry their own avatar on the existing sky accent, status dot unchanged.
+  The mark is Pi's own, from pi.dev, rescaled to tty7's 24x24 icon grid — its
+  `prefers-color-scheme` stylesheet dropped, since these avatars are tinted by
+  the app. Restoring a Pi pane also resumes its conversation now: the tty7
+  extension reports Pi's session id, and the resume command is
+  `pi --session <id>` (Pi's `--resume` is a boolean that only opens the
+  interactive picker), with `--session` / `--session-id` / `--fork` /
+  `--resume` / `-r` / `--continue` / `-c` stripped off the replayed launch
+  flags so the restored id wins. A pane launched with `--no-session` is not
+  resumed at all — that pane never wrote a session to disk, and reopening one
+  would override the choice to keep it ephemeral. (#225)
+
 ## [26.7.6] - 2026-07-28
 
 ### Added
