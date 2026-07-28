@@ -53,7 +53,7 @@ use crate::daemon::control::{
     WireErrorKind, feature,
 };
 use crate::daemon::duplex::{Duplex, Halves};
-use crate::host::{Host, SharedHost, WatchSub};
+use crate::host::{Host, SearchHit, SharedHost, WatchSub};
 
 /// Ceiling on threads one connection's pool will grow to.
 ///
@@ -648,6 +648,31 @@ fn run_job(conn: &Arc<Conn>, req_id: u64, req: ControlRequest, blob: Vec<u8>) {
 // Dispatch
 // ---------------------------------------------------------------------------
 
+/// Drop the hits whose paths this wire cannot carry.
+///
+/// `SearchHit::path` is the one `PathBuf` that crosses the control dialect —
+/// every path in `ControlRequest` is a `String` for exactly this reason — and
+/// `serde` refuses to serialize a `Path` that is not UTF-8 rather than
+/// converting it lossily. So one Latin-1 filename under the search roots makes
+/// the *whole* reply unencodable: before this, the client saw no reply at all
+/// and waited out its 20-second search deadline, on that keystroke and on every
+/// one after it.
+///
+/// Dropped rather than converted lossily, because the lossy form is a path that
+/// does not open — the client would be offering the user a hit it cannot act
+/// on. `LocalHost` keeps full fidelity; this is the wire's limit, applied at the
+/// wire.
+fn drop_unsendable_hits(hits: &mut Vec<SearchHit>) {
+    let before = hits.len();
+    hits.retain(|hit| hit.path.to_str().is_some());
+    if hits.len() != before {
+        log::debug!(
+            "search dropped {} hit(s) whose paths are not UTF-8",
+            before - hits.len()
+        );
+    }
+}
+
 /// One request against the host. `Ok` carries the reply value and, for the
 /// methods that have one, the bulk bytes that ride the frame's blob.
 fn run_request(
@@ -693,13 +718,14 @@ fn run_request(
             show_hidden,
         } => {
             let roots: Vec<PathBuf> = roots.iter().map(|r| p(r)).collect();
-            let hits = h.search(
+            let mut hits = h.search(
                 &roots,
                 &query,
                 clamp_usize(limit),
                 clamp_usize(max_dirs),
                 show_hidden,
             )?;
+            drop_unsendable_hits(&mut hits);
             (ReplyOk::Hits(hits), Vec::new())
         }
 
@@ -927,8 +953,28 @@ impl Conn {
         } else {
             ControlServerMsg::Response { req_id, reply }
         };
-        if let Err(e) = self.sink.send(&msg) {
-            log::debug!("control reply {req_id} could not be written: {e}");
+        // Encoded before anything is written, so a reply this server cannot put
+        // on the wire — a `SearchHit` whose path is not UTF-8, a `WorkspaceList`
+        // grown past `MAX_FRAME` — becomes an error the client *receives*.
+        // Dropping it instead leaves the client waiting out the request's whole
+        // deadline (20s for a search, and again on the next keystroke) for a
+        // reply that was never coming.
+        match msg.to_frame() {
+            Ok((k, payload)) => {
+                if let Err(e) = self.sink.send_frame(k, &payload) {
+                    log::debug!("control reply {req_id} could not be written: {e}");
+                }
+            }
+            Err(e) => {
+                log::warn!("control reply {req_id} could not be encoded: {e}");
+                let excuse = ControlServerMsg::Response {
+                    req_id,
+                    reply: ControlReply::Err(WireError::from_io(&e)),
+                };
+                if let Err(e) = self.sink.send(&excuse) {
+                    log::debug!("control error reply {req_id} could not be written: {e}");
+                }
+            }
         }
     }
 
@@ -1065,11 +1111,21 @@ impl Sink {
     }
 
     fn send(&self, msg: &ControlServerMsg) -> io::Result<()> {
+        let (k, payload) = msg.to_frame()?;
+        self.send_frame(k, &payload)
+    }
+
+    /// The write half of [`Sink::send`], for callers that already encoded.
+    ///
+    /// Split so that "this reply cannot be encoded" and "this link is gone" are
+    /// distinguishable: only the second may have put bytes on the wire, and only
+    /// the first leaves the connection well enough to answer on.
+    fn send_frame(&self, k: u8, payload: &[u8]) -> io::Result<()> {
         let mut slot = self.out.lock().unwrap_or_else(|e| e.into_inner());
         let w = slot.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "control connection is closed")
         })?;
-        msg.encode(w).and_then(|()| w.flush())
+        crate::daemon::protocol::write_frame(&mut *w, k, payload).and_then(|()| w.flush())
     }
 
     /// Drop the write half at teardown, so a worker that finishes afterwards
@@ -1315,16 +1371,32 @@ mod sock {
 
     /// Bind the control socket, replacing a stale one.
     ///
-    /// Permissions are the access boundary — a Unix socket has no other. The
-    /// directory goes to 0700 and the socket to 0600 *before* anything can
-    /// connect, so there is no window in which another user on the box could
-    /// reach a server that answers `ReadFile` for arbitrary paths.
+    /// Permissions are the access boundary — a Unix socket has no other, and
+    /// what is behind it is `ReadFile`/`WriteFile`/`Git` on arbitrary paths as
+    /// this user. So the socket has to be 0600 from the first instant its final
+    /// name exists, which `bind` alone cannot give: `bind` creates the node at
+    /// `0777 & ~umask`, and a `chmod` on the next line is a window. Under a
+    /// `umask 002` — the default wherever user-private groups are configured —
+    /// that window is group-connectable.
+    ///
+    /// So the umask is tightened across the `bind` itself. Not a staging
+    /// directory and a rename, which would also close the window: the staging
+    /// path is longer than the final one, and `sun_path` is the one budget here
+    /// with no room to spend — [`socket_path_in`] already falls back to a hashed
+    /// name to stay under it.
     pub fn bind_control_socket(path: &Path) -> io::Result<UnixListener> {
-        if let Some(parent) = path.parent() {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        // `create_dir_all` and *only then* a chmod, on a directory that did not
+        // exist a moment ago: `path` can be `$TTY7_CONTROL_SOCK` or the hashed
+        // fallback, whose parent is `$XDG_RUNTIME_DIR` or `/tmp` — directories
+        // this process does not own and must not re-permission. Tightening
+        // `/tmp` to 0700 would lock every other user out of it, sticky bit and
+        // all, with nothing linking the breakage back to tty7.
+        if !parent.exists() {
             std::fs::create_dir_all(parent)?;
-            // Best effort: a pre-existing `$XDG_RUNTIME_DIR` we do not own is
-            // already 0700 by the platform's own rules, and failing here would
-            // refuse to start over a permission we did not need to change.
+            // Ours by construction, since it did not exist above. Best effort:
+            // losing the race to another tty7 starting at the same instant
+            // leaves the directory correct anyway.
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
 
@@ -1347,9 +1419,39 @@ mod sock {
             }
         }
 
-        let listener = UnixListener::bind(path)?;
+        let listener = bind_private(path)?;
+        // Belt and braces on two counts: it narrows the 0700 the umask below
+        // yields to the 0600 a socket actually needs, and it covers a
+        // filesystem that ignores the umask entirely (some FUSE mounts,
+        // anything with a default ACL) — which would otherwise leave the socket
+        // wide open with nothing to notice it.
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(listener)
+    }
+
+    /// `bind`, with the umask tightened so the node is created owner-only
+    /// rather than created at `0777 & ~umask` and fixed up afterwards.
+    ///
+    /// `0o077`, not `0o177`: the umask is process-global for the length of the
+    /// `bind`, and a *directory* another thread creates in that window would
+    /// come out without its owner-execute bit and be unusable — the test suite
+    /// found this the hard way. Masking only the group and other bits leaves
+    /// anything created alongside it working while still giving the socket no
+    /// group or world access, which is the whole property: connecting to a Unix
+    /// socket needs write permission on it.
+    pub(super) fn bind_private(path: &Path) -> io::Result<UnixListener> {
+        // Serializes tty7's own binds against each other, so two of them cannot
+        // interleave their save/restore and leave the umask tightened.
+        static UMASK: Mutex<()> = Mutex::new(());
+        let _held = UMASK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SAFETY: `umask` is always successful and has no preconditions; the
+        // only hazard is the process-global effect, which the lock and the
+        // immediate restore below bound.
+        let previous = unsafe { libc::umask(0o077) };
+        let bound = UnixListener::bind(path);
+        unsafe { libc::umask(previous) };
+        bound
     }
 
     /// Serve control connections on `listener` until it fails, one thread per
@@ -1536,7 +1638,7 @@ mod tests {
     use crate::daemon::control::{ControlHello, MTime, feature};
     use crate::host::local::LocalHost;
     use crate::host::remote::RemoteHost;
-    use crate::host::{Entry, HostId, Meta, Output, SearchHit};
+    use crate::host::{Entry, HostId, Meta, Output};
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
@@ -2323,6 +2425,91 @@ mod tests {
             "a control socket is the access boundary; it must not be group- or world-reachable"
         );
         drop(listener);
+    }
+
+    /// A directory that was already there is left alone. `$TTY7_CONTROL_SOCK`
+    /// and the hashed fallback both put the socket straight into
+    /// `$XDG_RUNTIME_DIR` or `/tmp`; tightening one of those to 0700 would lock
+    /// every other user out of it — sticky bit and all, if this is running as
+    /// root — with nothing linking the breakage back to tty7.
+    #[test]
+    fn binding_does_not_re_permission_a_directory_it_did_not_create() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+        let listener = bind_control_socket(&shared.join("s.sock")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+            0o1777,
+            "a directory tty7 did not create must keep its own permissions"
+        );
+        drop(listener);
+    }
+
+    /// Owner-only comes from the umask the bind runs under, not from a `chmod`
+    /// after the fact. A socket that spends even one syscall at `0777 & ~umask`
+    /// is one another user on the box can connect to, and what is behind it is
+    /// `ReadFile` on arbitrary paths as this user.
+    #[test]
+    fn a_bind_is_owner_only_under_a_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("permissive.sock");
+
+        // SAFETY: `umask` has no preconditions. It is process-global, so an
+        // unrelated test creating a file in this window sees `0` rather than
+        // the developer's umask — more permissive, which nothing asserts on.
+        let previous = unsafe { libc::umask(0) };
+        let bound = sock::bind_private(&path);
+        unsafe { libc::umask(previous) };
+
+        let listener = bound.unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+            0,
+            "bind left a window in which another user could connect"
+        );
+        drop(listener);
+    }
+
+    /// One filename this wire cannot carry must not cost the whole search.
+    ///
+    /// Not driven through a real file: APFS rejects a non-UTF-8 name outright
+    /// (`EILSEQ`), so the case cannot be staged on the machine most of this is
+    /// developed on. The filter is the whole behaviour, so the filter is what
+    /// is pinned — `to_frame_refuses_what_cannot_be_sent_without_writing_it`
+    /// covers the other half, that such a hit really would fail to encode.
+    #[test]
+    fn a_filename_that_is_not_utf8_costs_only_its_own_hit() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let hit = |name: &str, path: &Path| SearchHit {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+            is_dir: false,
+            ignored: false,
+        };
+        let mut hits = vec![
+            hit("plain-needle.rs", Path::new("/home/me/plain-needle.rs")),
+            // `café-needle.rs` in Latin-1: a lone 0xe9 is not valid UTF-8.
+            hit(
+                "caf\u{fffd}-needle.rs",
+                Path::new(OsStr::from_bytes(b"/home/me/caf\xe9-needle.rs")),
+            ),
+            hit("other-needle.rs", Path::new("/home/me/other-needle.rs")),
+        ];
+
+        drop_unsendable_hits(&mut hits);
+        let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["plain-needle.rs", "other-needle.rs"],
+            "the representable hits must survive their neighbour"
+        );
     }
 
     /// A whole conformance-shaped exchange over a real listener, proving the

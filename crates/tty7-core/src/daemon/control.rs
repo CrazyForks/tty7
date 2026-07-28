@@ -76,7 +76,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::protocol::{read_frame, write_frame};
+use super::protocol::{MAX_FRAME, read_frame, write_frame};
 
 /// The control dialect's own version, negotiated in [`ControlHello`] and
 /// independent of [`crate::daemon::protocol::PROTOCOL_VERSION`]: the pane
@@ -777,24 +777,49 @@ pub enum ControlClientMsg {
 impl ControlClientMsg {
     /// Encode and write this message as one frame.
     pub fn encode<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        match self {
-            ControlClientMsg::Hello(hello) => write_frame(w, kind::HELLO, &to_json(hello)?),
+        let (k, payload) = self.to_frame()?;
+        write_frame(w, k, &payload)
+    }
+
+    /// The frame this message *would* write, without writing it.
+    ///
+    /// Split out so a caller can tell "this message cannot be encoded" from
+    /// "the link failed". Everything fallible here happens with the wire
+    /// untouched, and the difference matters: marking the connection dead over
+    /// a local serialization failure puts the workspace into `Reconnecting`
+    /// over a request the server never saw.
+    pub fn to_frame(&self) -> io::Result<(u8, Vec<u8>)> {
+        let (k, payload) = match self {
+            ControlClientMsg::Hello(hello) => (kind::HELLO, to_json(hello)?),
             ControlClientMsg::Request { req_id, req } => {
                 require_nonzero(*req_id, "CONTROL_REQUEST")?;
-                let body = encode_body(*req_id, &to_json(req)?, &[])?;
-                write_frame(w, kind::REQUEST, &body)
+                (kind::REQUEST, encode_body(*req_id, &to_json(req)?, &[])?)
             }
             ControlClientMsg::RequestBlob { req_id, req, blob } => {
                 require_nonzero(*req_id, "CONTROL_REQUEST_BLOB")?;
-                let body = encode_body(*req_id, &to_json(req)?, blob)?;
-                write_frame(w, kind::REQUEST_BLOB, &body)
+                (
+                    kind::REQUEST_BLOB,
+                    encode_body(*req_id, &to_json(req)?, blob)?,
+                )
             }
             ControlClientMsg::Cancel { req_id } => {
                 require_nonzero(*req_id, "CONTROL_CANCEL")?;
-                let body = encode_body(*req_id, &[], &[])?;
-                write_frame(w, kind::CANCEL, &body)
+                (kind::CANCEL, encode_body(*req_id, &[], &[])?)
             }
+        };
+        // See `ControlServerMsg::to_frame`: reaching the verdict here rather
+        // than inside `write_frame` is what keeps "too big" a failure with the
+        // wire untouched.
+        if payload.len() > MAX_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "control frame of {} bytes exceeds the {MAX_FRAME}-byte limit",
+                    payload.len()
+                ),
+            ));
         }
+        Ok((k, payload))
     }
 
     /// Decode one already-read frame.
@@ -858,12 +883,24 @@ pub enum ControlServerMsg {
 impl ControlServerMsg {
     /// Encode and write this message as one frame.
     pub fn encode<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        match self {
-            ControlServerMsg::HelloOk(ok) => write_frame(w, kind::HELLO_OK, &to_json(ok)?),
+        let (k, payload) = self.to_frame()?;
+        write_frame(w, k, &payload)
+    }
+
+    /// The frame this message *would* write, without writing it.
+    ///
+    /// The server's half of the same split as
+    /// [`ControlClientMsg::to_frame`], and it earns its keep in the same way:
+    /// a reply that cannot be encoded — a `SearchHit` path that is not UTF-8, a
+    /// payload past [`MAX_FRAME`] — leaves the wire untouched, so the server can
+    /// still answer the request with the error instead of dropping the reply and
+    /// leaving the client to wait out its deadline.
+    pub fn to_frame(&self) -> io::Result<(u8, Vec<u8>)> {
+        let (k, payload) = match self {
+            ControlServerMsg::HelloOk(ok) => (kind::HELLO_OK, to_json(ok)?),
             ControlServerMsg::Response { req_id, reply } => {
                 require_nonzero(*req_id, "CONTROL_RESPONSE")?;
-                let body = encode_body(*req_id, &to_json(reply)?, &[])?;
-                write_frame(w, kind::RESPONSE, &body)
+                (kind::RESPONSE, encode_body(*req_id, &to_json(reply)?, &[])?)
             }
             ControlServerMsg::ResponseBlob {
                 req_id,
@@ -871,14 +908,26 @@ impl ControlServerMsg {
                 blob,
             } => {
                 require_nonzero(*req_id, "CONTROL_RESPONSE_BLOB")?;
-                let body = encode_body(*req_id, &to_json(reply)?, blob)?;
-                write_frame(w, kind::RESPONSE_BLOB, &body)
+                (
+                    kind::RESPONSE_BLOB,
+                    encode_body(*req_id, &to_json(reply)?, blob)?,
+                )
             }
-            ControlServerMsg::Event(event) => {
-                let body = encode_body(0, &to_json(event)?, &[])?;
-                write_frame(w, kind::EVENT, &body)
-            }
+            ControlServerMsg::Event(event) => (kind::EVENT, encode_body(0, &to_json(event)?, &[])?),
+        };
+        // Checked here rather than left to `write_frame`, so that "too big to
+        // send" is a verdict reached with nothing written — which is what lets
+        // the caller answer with an error instead of going silent.
+        if payload.len() > MAX_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "control frame of {} bytes exceeds the {MAX_FRAME}-byte limit",
+                    payload.len()
+                ),
+            ));
         }
+        Ok((k, payload))
     }
 
     /// Decode one already-read frame.
@@ -1348,11 +1397,19 @@ impl ClientInner {
     }
 
     fn send(&self, msg: &ControlClientMsg) -> io::Result<()> {
+        // Encoded before the writer is even locked, and before anything is
+        // concluded about the link. A message that cannot be serialized, or a
+        // payload past `MAX_FRAME`, fails with the wire untouched — the server
+        // never saw the request, so the connection is exactly as healthy as it
+        // was and must not be marked dead. Only a failure *after* bytes could
+        // have gone out leaves the stream in a state worth giving up on.
+        let (k, payload) = msg.to_frame()?;
+
         let mut w = self
             .writer
             .lock()
             .map_err(|_| io::Error::other("control writer was poisoned"))?;
-        let r = msg.encode(&mut *w).and_then(|()| w.flush());
+        let r = write_frame(&mut *w, k, &payload).and_then(|()| w.flush());
         if r.is_err() {
             self.connected.store(false, Ordering::Release);
         }
@@ -1387,12 +1444,17 @@ impl ClientInner {
             log::trace!("control reply for unknown req_id {req_id}; dropping");
             return;
         };
-        drop(pending);
+        // Under the `pending` lock, which is the one `forget` takes first.
+        // Inserting after releasing it loses the race with a caller that times
+        // out in the gap: its `forget` clears a `blobs` entry that does not
+        // exist yet, this insert lands with nobody left to take it, and a whole
+        // file's contents stay in the map for the life of the connection.
         if !blob.is_empty()
             && let Ok(mut blobs) = self.blobs.lock()
         {
             blobs.insert(req_id, blob);
         }
+        drop(pending);
         // Capacity 1 and one reply per id, so this cannot block; it can only
         // fail if the caller already gave up between the table lookup and here.
         let _ = tx.try_send(reply);
@@ -1484,6 +1546,125 @@ mod tests {
                 nanos: 123_456_789,
             }),
             readonly: false,
+        }
+    }
+
+    /// A bare `ClientInner` with no link behind it — enough for the side-table
+    /// bookkeeping, which is all `deliver`/`forget` touch.
+    fn detached_inner() -> Arc<ClientInner> {
+        Arc::new(ClientInner {
+            writer: Mutex::new(Box::new(Cursor::new(Vec::new()))),
+            next_req_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            blobs: Mutex::new(HashMap::new()),
+            connected: AtomicBool::new(true),
+            last_inbound: Mutex::new(Instant::now()),
+            hello: ControlHelloOk {
+                control_version: CONTROL_VERSION,
+                protocol_version: 0,
+                build: "test".into(),
+                separator: '/',
+                home: "/home/me".into(),
+                features: Vec::new(),
+            },
+            shutdown: None,
+            reader_done: Mutex::new(false),
+            reader_exit: Condvar::new(),
+        })
+    }
+
+    /// `to_frame` reaches every "cannot be sent" verdict with the wire
+    /// untouched. That is what lets the server answer such a reply with an
+    /// error instead of dropping it, and the client keep its link on a local
+    /// encode failure — both of which are silent hangs otherwise.
+    #[test]
+    fn to_frame_refuses_what_cannot_be_sent_without_writing_it() {
+        // A path that is not UTF-8: `serde` errors on `Path` rather than
+        // converting lossily, so this is the shape a `SearchHit` takes when the
+        // server has a Latin-1 filename under the search roots.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        let latin1 = ControlServerMsg::Response {
+            req_id: 1,
+            reply: ControlReply::Ok(ReplyOk::Hits(vec![SearchHit {
+                name: "caf?.rs".into(),
+                path: PathBuf::from(OsStr::from_bytes(b"/tmp/caf\xe9.rs")),
+                is_dir: false,
+                ignored: false,
+            }])),
+        };
+        assert!(
+            latin1.to_frame().is_err(),
+            "a non-UTF-8 path must not encode"
+        );
+
+        // And the size verdict, which `write_frame` would otherwise reach only
+        // after the writer was locked.
+        let huge = ControlServerMsg::ResponseBlob {
+            req_id: 1,
+            reply: ControlReply::Ok(ReplyOk::Meta(meta())),
+            blob: vec![0u8; MAX_FRAME + 1],
+        };
+        let err = huge
+            .to_frame()
+            .expect_err("an oversize reply must not encode");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A message that cannot be put on the wire is not a dead link. `send`
+    /// fails before the writer is even locked, so the server never saw the
+    /// request and the connection is exactly as healthy as it was — marking it
+    /// dead would drop the workspace into `Reconnecting` and, since
+    /// `is_connected` never returns to true, keep it there.
+    #[test]
+    fn a_frame_too_large_to_send_does_not_condemn_the_link() {
+        let inner = detached_inner();
+        let oversize = ControlClientMsg::RequestBlob {
+            req_id: 1,
+            req: ControlRequest::WriteFile {
+                path: "/home/me/huge.bin".into(),
+            },
+            blob: vec![0u8; MAX_FRAME + 1],
+        };
+
+        let err = inner
+            .send(&oversize)
+            .expect_err("an oversize frame must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            inner.connected.load(Ordering::Acquire),
+            "a local encode failure marked the connection dead"
+        );
+
+        // And the link still works for a message that does fit.
+        inner.send(&ControlClientMsg::Cancel { req_id: 1 }).unwrap();
+    }
+
+    /// A caller giving up at the same instant its reply lands must not leave
+    /// the blob behind. `deliver` and `forget` both touch two tables, and if
+    /// the blob goes in after the `pending` lock is released, `forget` clears
+    /// an entry that does not exist yet and the bytes — a whole file, up to the
+    /// editor's limit — are retained for the life of the connection.
+    ///
+    /// Hammered rather than interleaved by hand: there is no seam to inject at,
+    /// so this leans on repetition to hit the window. It fails intermittently
+    /// against the insert-after-unlock ordering and never against the fix.
+    #[test]
+    fn a_blob_racing_its_callers_timeout_is_not_retained() {
+        for req_id in 1..2_000u64 {
+            let inner = detached_inner();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+            inner.pending.lock().unwrap().insert(req_id, tx);
+
+            let giving_up = Arc::clone(&inner);
+            let t = std::thread::spawn(move || giving_up.forget(req_id));
+            inner.deliver(req_id, ControlReply::Ok(ReplyOk::Unit), vec![7u8; 64]);
+            t.join().unwrap();
+
+            assert!(
+                inner.blobs.lock().unwrap().is_empty(),
+                "a blob outlived the request it belonged to (req_id {req_id})"
+            );
         }
     }
 
