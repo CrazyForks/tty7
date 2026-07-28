@@ -5214,7 +5214,7 @@ impl Render for Tty7App {
             .get(self.active)
             .and_then(|t| t.pane.focused_or_first(window, cx))
             .and_then(|leaf| self.render_ssh_status_strip(&leaf, cx));
-        // Render the active tab's pane tree; show focus rings only when split.
+        // Render the active tab's pane tree.
         let body = match self.tabs.get(self.active) {
             // Zero tabs: the window's own face — the home page (see `ui::home`).
             None => self.render_home(cx).into_any_element(),
