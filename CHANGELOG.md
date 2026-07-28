@@ -5,6 +5,23 @@ All notable changes to tty7 are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Italic CJK rendered as unrelated CJK on Windows** — every character came out
+  as a different character, one for one, consistently, so it read as a broken
+  locale or a mangled encoding. It was neither. Hack, the bundled default, has no
+  CJK, so those cells are shaped by the font-fallback chain; gpui's Windows
+  backend then threw away the face DirectWrite shaped with and looked a fresh one
+  up by family, weight and style. That round trip mapped DirectWrite's *italic*
+  to *oblique* — the two are numbered the other way around in the API — and a
+  family with no oblique face resolved to its upright one. The glyph indices were
+  right; the outlines they were pointing into belonged to a different face. Fixed
+  in our gpui fork by rasterizing the face DirectWrite actually chose, which also
+  closes a latent use-after-free in the same cache: it keyed fonts by a raw
+  pointer to a face nothing held a reference to.
+
 ## [26.7.5] - 2026-07-27
 
 ### Added
