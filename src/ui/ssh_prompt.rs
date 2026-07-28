@@ -618,7 +618,7 @@ impl Tty7App {
             let waiting = self
                 .tabs
                 .iter()
-                .flat_map(|t| t.pane.leaves())
+                .flat_map(|t| t.pane.terminals())
                 .find(|l| l.read(cx).terminal.has_pending_auth());
             if let Some(view) = waiting {
                 self.on_auth_prompt_ready(view, window, cx);

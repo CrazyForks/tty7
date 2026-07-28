@@ -352,7 +352,7 @@ impl Tty7App {
     /// Diameter of the workspace avatar. Sized to the rail's row glyphs rather
     /// than to a chrome tile: this control is the head of the tab list, so it
     /// reads down the column instead of across a row of buttons.
-    const AVATAR_PX: f32 = 20.0;
+    pub(crate) const AVATAR_PX: f32 = 20.0;
 
     /// The rail's head: which workspace this window is on, plus the menu that
     /// owns everything workspace-scoped — and the app-level entries the "⋯"
@@ -431,6 +431,21 @@ impl Tty7App {
         div()
             .occlude()
             .w_full()
+            // Right-click does nothing here — and *looked* like it did. A
+            // `Button` focuses on any mouse-down and gpui-component draws a
+            // 1.5px ring on a focused one, so a right-click left the chip
+            // wearing a bright ring for a menu that never opened (a left click
+            // hides the same ring by handing focus to the switcher's search
+            // field, which is why only right-click showed it).
+            //
+            // Swallowed in the *capture* phase so the button never sees the
+            // press at all: a bubble-phase listener runs after the button has
+            // already taken focus.
+            .capture_any_mouse_down(|ev: &gpui::MouseDownEvent, _window, cx| {
+                if ev.button == MouseButton::Right {
+                    cx.stop_propagation();
+                }
+            })
             .child(
                 Button::new("rail-workspace-head")
                     .custom(chrome_tile_variant(cx))

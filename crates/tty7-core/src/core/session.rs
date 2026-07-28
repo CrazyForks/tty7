@@ -647,11 +647,39 @@ impl Workspaces {
         self.workspaces.iter_mut().find(|w| w.id == id)
     }
 
-    /// The workspaces to reopen at launch, in their saved order. Empty when
-    /// the user quit with every window closed — launch then shows one window on
-    /// the picker rather than guessing.
+    /// The workspaces that had a window at the last quit, in their saved order.
+    ///
+    /// Note that launch does **not** restore all of these — see
+    /// [`workspace_to_restore`](Self::workspace_to_restore). They are still the
+    /// set that matters here, because every one of them is holding live daemon
+    /// panes and none of them may be forgotten.
     pub fn open_workspaces(&self) -> impl Iterator<Item = &Workspace> {
         self.workspaces.iter().filter(|w| w.open)
+    }
+
+    /// The one workspace launch comes up on: whichever the user was last in.
+    ///
+    /// Deliberately one, not all of them. Restoring every window that existed
+    /// at quit means a four-window session costs four windows, four daemon
+    /// attaches and four layout restores before the user has said what they
+    /// want to do — and in practice they came back for *one* of them. The
+    /// others are not lost by any measure that matters: their panes never
+    /// stopped running in the daemon, and the switcher lists them a click away.
+    ///
+    /// [`active`](Self::active) is the answer whenever it is still open, since
+    /// it is written on every focus change and so names the window that had the
+    /// user's attention last. `last_active` is the fallback for a store written
+    /// by a build that did not track focus, or one whose active workspace was
+    /// closed before quitting.
+    pub fn workspace_to_restore(&self) -> Option<WorkspaceId> {
+        let focused = self
+            .active
+            .filter(|id| self.get(*id).is_some_and(|w| w.open));
+        focused.or_else(|| {
+            self.open_workspaces()
+                .max_by_key(|w| w.last_active)
+                .map(|w| w.id)
+        })
     }
 
     /// Closed workspaces for the home-page picker, most recently active first.
@@ -1668,5 +1696,65 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![newer_id, older_id]
         );
+    }
+
+    /// Launch restores exactly one window, and it is the one the user was in.
+    ///
+    /// Pinned because the two inputs disagree on purpose: `active` is written on
+    /// every focus change, so it is the truth even when some *other* window saw
+    /// more recent activity (an agent finishing a build touches `last_active`
+    /// without anybody looking at it).
+    #[test]
+    fn launch_restores_the_focused_workspace_not_the_most_recently_touched() {
+        let mut focused = workspace(vec![]);
+        focused.open = true;
+        focused.last_active = 100;
+        let mut busier = workspace(vec![]);
+        busier.open = true;
+        busier.last_active = 900;
+        let (focused_id, busier_id) = (focused.id, busier.id);
+
+        let all = Workspaces {
+            active: Some(focused_id),
+            workspaces: vec![focused, busier],
+        };
+        assert_eq!(all.workspace_to_restore(), Some(focused_id));
+        assert_eq!(
+            all.open_workspaces().count(),
+            2,
+            "the others stay open in the store — launch detaches them, this does not"
+        );
+
+        // No focus recorded (or it named a workspace that was closed first):
+        // recency is the fallback, not a coin toss.
+        let all = Workspaces {
+            active: None,
+            ..all
+        };
+        assert_eq!(all.workspace_to_restore(), Some(busier_id));
+
+        // `active` pointing at a *detached* workspace must not resurrect it —
+        // the user closed that window on purpose.
+        let mut closed = workspace(vec![]);
+        closed.open = false;
+        let closed_id = closed.id;
+        let mut open_one = workspace(vec![]);
+        open_one.open = true;
+        let open_id = open_one.id;
+        let all = Workspaces {
+            active: Some(closed_id),
+            workspaces: vec![closed, open_one],
+        };
+        assert_eq!(all.workspace_to_restore(), Some(open_id));
+
+        // Nothing open at all: launch has no workspace to come up on and shows
+        // the home page instead of inventing one.
+        let mut none_open = workspace(vec![]);
+        none_open.open = false;
+        let all = Workspaces {
+            active: None,
+            workspaces: vec![none_open],
+        };
+        assert_eq!(all.workspace_to_restore(), None);
     }
 }

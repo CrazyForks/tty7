@@ -431,7 +431,10 @@ impl Tty7App {
     /// the one window showing it (design §2 — one window, one workspace, one
     /// machine), so there is no second place to look.
     pub(crate) fn panes(&self) -> Vec<gpui::Entity<crate::terminal::view::TerminalView>> {
-        self.tabs.iter().flat_map(|tab| tab.pane.leaves()).collect()
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.pane.terminals())
+            .collect()
     }
 
     /// This window's connection state (design §10's state machine).
@@ -561,11 +564,10 @@ impl Tty7App {
                     choice.target.host_id(),
                     crate::ui::switcher::HostSnapshot {
                         target: choice.target.clone(),
-                        home: home.clone(),
                         rows: rows.clone(),
                     },
                 );
-                remote_connect::RemoteConnections::insert(cx, connected.host);
+                remote_connect::RemoteConnections::insert(cx, connected.host, home.clone());
                 self.prompt_remote_daemon_mismatch_later(cx);
                 // Nothing left to *show* about the attempt: the machine is now
                 // in `RemoteConnections` and its group in the switcher fills
@@ -1506,7 +1508,11 @@ fn finish_attempt(
             // The remote's record is the authority for the layout (design §10),
             // so what came back with the connect replaces what this client had.
             let rows = connected.rows.clone();
-            remote_connect::RemoteConnections::insert(cx, connected.host);
+            // The home too, not just the connection: this is the path a machine
+            // comes back on after a restart or a dropped link, and dropping it
+            // here is what left "New Workspace" missing on a machine the panel
+            // was quite happily calling connected.
+            remote_connect::RemoteConnections::insert(cx, connected.host, connected.home);
             for (id, key) in workspaces_on(cx, host) {
                 if let Some(row) = rows.iter().find(|r| r.id.to_string() == key) {
                     WorkspaceStore::apply_remote(cx, id, &row.record);

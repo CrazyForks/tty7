@@ -1294,7 +1294,13 @@ impl Render for PaletteView {
     /// input and the filtered, scrollable, keyboard-driven rows.
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (background, border, popover) = (theme.background, theme.border, theme.popover);
+        let (border, popover) = (theme.border, theme.popover);
+        // The scrim is the shared one (see `presets::Surfaces::scrim`), the same
+        // dim the workspace switcher opens over. What it replaces was a wash of
+        // the window's *own* colour, which barely moved the window — so a card
+        // lifted 5% off it landed at nearly the same value, and both overlays
+        // read as a hole in the screen rather than a card over it.
+        let scrim = crate::ui::presets::scrim_fill(cx);
 
         // The list viewport holds exactly `PALETTE_VISIBLE_ROWS` fixed-height
         // rows plus the list's own 4px top padding (`py_1` below, which scrolls
@@ -1333,7 +1339,7 @@ impl Render for PaletteView {
             .items_start()
             .justify_center()
             .pt(px(120.))
-            .bg(background.opacity(0.45))
+            .bg(scrim)
             // ⌘⏎ or → on a highlighted profile / quick-connect row opens its
             // editor instead of connecting (PRD §6.2 ①). Captured on the scrim
             // (an ancestor of the focused search box) so it fires before the list

@@ -32,7 +32,7 @@ use crate::terminal::view::{ChildExited, TerminalView};
 use crate::ui::palette::{
     ChromeState, Command, CommandGroup, CommandKind, PaletteEvent, PaletteView,
 };
-use crate::ui::pane::{CloseOutcome, Dir, Pane};
+use crate::ui::pane::{CloseOutcome, Dir, Pane, PaneSlot};
 use crate::ui::presets::Fill;
 use crate::ui::settings::{
     Recording, SettingsSection, SettingsState, ThemeEditor, humanize_action,
@@ -350,7 +350,7 @@ impl Tab {
 
     /// The pane to focus when this tab becomes active: the last-focused leaf if
     /// it still exists, otherwise the first leaf.
-    fn focus_target(&self) -> Option<Entity<TerminalView>> {
+    fn focus_target(&self) -> Option<crate::ui::pane::PaneSlot> {
         match self.last_focused {
             Some(id) => self.pane.leaf_matching_or_first(|l| l.entity_id() == id),
             None => self.pane.first_leaf(),
@@ -372,6 +372,7 @@ impl Tab {
         self.pane
             .focused_leaf(window, cx)
             .or_else(|| self.focus_target())
+            .and_then(|slot| slot.terminal().cloned())
     }
 
     /// The title used to derive the tab label: the pane the tab is working in.
@@ -389,7 +390,9 @@ impl Tab {
                 .or_else(|| self.focus_target()),
             None => self.focus_target(),
         };
-        leaf.map(|l| l.read(cx).title.clone()).unwrap_or_default()
+        leaf.and_then(|l| l.terminal().cloned())
+            .map(|l| l.read(cx).title.clone())
+            .unwrap_or_default()
     }
 
     /// The git snapshot (branch + working-tree diff) of the tab's label-driving
@@ -405,7 +408,7 @@ impl Tab {
     ) -> Option<crate::terminal::git_status::GitStatus> {
         let leaf = match window {
             Some(window) => self.pane.focused_or_first(window, cx),
-            None => self.pane.first_leaf(),
+            None => self.pane.first_leaf().and_then(|s| s.terminal().cloned()),
         }?;
         leaf.read(cx).git_status(cx)
     }
@@ -416,7 +419,7 @@ impl Tab {
     /// brand mark.
     pub(crate) fn agent(&self, cx: &App) -> Option<crate::core::cli_agent::CLIAgent> {
         self.pane
-            .leaves()
+            .terminals()
             .into_iter()
             .find_map(|l| l.read(cx).agent())
     }
@@ -436,7 +439,7 @@ impl Tab {
             AgentStatus::Idle => 0,
         };
         self.pane
-            .leaves()
+            .terminals()
             .into_iter()
             .filter(|l| l.read(cx).agent().is_some())
             .map(|l| {
@@ -460,7 +463,7 @@ impl Tab {
             return 0;
         }
         self.pane
-            .leaves()
+            .terminals()
             .into_iter()
             .filter(|l| {
                 let v = l.read(cx);
@@ -1294,7 +1297,7 @@ impl Tty7App {
         let Some(route) = self
             .tabs
             .iter()
-            .flat_map(|tab| tab.pane.leaves())
+            .flat_map(|tab| tab.pane.terminals())
             .find_map(|leaf| {
                 let view = leaf.read(cx);
                 let workspace = view.workspace().cloned()?;
@@ -1512,7 +1515,7 @@ impl Tty7App {
         use crate::core::cli_agent::AgentStatus;
         let mut agents = Vec::new();
         for tab in &self.tabs {
-            for leaf in tab.pane.leaves() {
+            for leaf in tab.pane.terminals() {
                 let view = leaf.read(cx);
                 let Some(agent) = view.agent() else { continue };
                 let status = view
@@ -1756,7 +1759,7 @@ impl Tty7App {
         self.font_size = size;
         let px_size = px(size);
         for tab in &self.tabs {
-            for leaf in tab.pane.leaves() {
+            for leaf in tab.pane.terminals() {
                 leaf.update(cx, |v, cx| {
                     v.font_size = px_size;
                     cx.notify();
@@ -1789,7 +1792,7 @@ impl Tty7App {
         let mul = mul.clamp(LINE_HEIGHT_MIN, LINE_HEIGHT_MAX);
         self.line_height = mul;
         for tab in &self.tabs {
-            for leaf in tab.pane.leaves() {
+            for leaf in tab.pane.terminals() {
                 leaf.update(cx, |v, cx| {
                     v.line_height_mul = mul;
                     cx.notify();
@@ -2254,7 +2257,7 @@ impl Tty7App {
             .map(crate::core::config::gpui_font_features);
         self.font_features = gpui_features.clone();
         for tab in &self.tabs {
-            for leaf in tab.pane.leaves() {
+            for leaf in tab.pane.terminals() {
                 let features = gpui_features.clone();
                 leaf.update(cx, |v, cx| v.set_font_features(features, cx));
             }
@@ -2267,7 +2270,7 @@ impl Tty7App {
 
     fn apply_terminal_config_to_panes(&self, config: &Config, cx: &mut Context<Self>) {
         for tab in &self.tabs {
-            for leaf in tab.pane.leaves() {
+            for leaf in tab.pane.terminals() {
                 leaf.update(cx, |v, cx| {
                     v.terminal.apply_user_config(config);
                     cx.notify();
@@ -2337,7 +2340,7 @@ impl Tty7App {
         let workspace = self
             .tabs
             .iter()
-            .flat_map(|tab| tab.pane.leaves())
+            .flat_map(|tab| tab.pane.terminals())
             .find_map(|leaf| {
                 let view = leaf.read(cx);
                 (view.pane_id == pane_id).then(|| view.workspace().cloned())?
@@ -2626,7 +2629,7 @@ impl Tty7App {
         // force every pane's cursor back on so it doesn't stick invisible.
         if !on {
             for tab in &self.tabs {
-                for leaf in tab.pane.leaves() {
+                for leaf in tab.pane.terminals() {
                     leaf.update(cx, |v, cx| {
                         v.cursor_visible = true;
                         cx.notify();
@@ -2774,7 +2777,7 @@ impl Tty7App {
     pub(crate) fn set_mouse_reporting(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.mouse_reporting = on);
         for tab in &self.tabs {
-            for leaf in tab.pane.leaves() {
+            for leaf in tab.pane.terminals() {
                 leaf.update(cx, |v, cx| {
                     v.report_mouse = on;
                     cx.notify();
@@ -2867,7 +2870,7 @@ impl Tty7App {
             return;
         }
         if let Some(leaf) = tab.focus_target() {
-            let handle = leaf.read(cx).focus_handle.clone();
+            let handle = leaf.focus_handle(cx);
             window.focus(&handle, cx);
         }
     }
@@ -2885,9 +2888,69 @@ impl Tty7App {
         }
     }
 
-    fn focus_leaf(&self, leaf: &Entity<TerminalView>, window: &mut Window, cx: &mut App) {
-        let handle = leaf.read(cx).focus_handle.clone();
+    fn focus_leaf(&self, leaf: &PaneSlot, window: &mut Window, cx: &mut App) {
+        let handle = leaf.focus_handle(cx);
         window.focus(&handle, cx);
+    }
+
+    /// Put a finished (or failed) remote pane back into the tree.
+    ///
+    /// `slot_id` is the *placeholder's* id, which is what the tree still holds:
+    /// the terminal that just arrived has an identity of its own and has never
+    /// been in the tree.
+    fn land_pane(
+        &mut self,
+        slot_id: gpui::EntityId,
+        pending: &Entity<crate::ui::pending_pane::PendingPane>,
+        parts: Result<crate::terminal::view::ShellParts, String>,
+        font_size: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let parts = match parts {
+            Ok(parts) => parts,
+            // §17: the slot keeps its place and says what went wrong. It does
+            // not collapse the split under the user, and it does not close the
+            // tab — both would throw away a layout because a network blinked.
+            Err(reason) => {
+                pending.update(cx, |p, cx| p.fail(reason, cx));
+                return;
+            }
+        };
+        // The pane or its tab may have been closed while the connect was in the
+        // air. Checked *before* the view is built, because the answer decides
+        // whether to build one at all — and because the pane on the other
+        // machine is real and running either way, so a slot that is gone means
+        // killing it rather than leaking it. Nothing on this client can reach
+        // it any more, and closing the slot is the user saying they do not want
+        // it (unlike a quit, where panes are deliberately detached and kept).
+        let still_there = self
+            .tabs
+            .iter()
+            .any(|tab| tab.pane.leaves().iter().any(|l| l.entity_id() == slot_id));
+        if !still_there {
+            log::info!(
+                "pane {} arrived after its slot closed; killing it",
+                parts.pane_id
+            );
+            let route = crate::terminal::PaneRoute::for_workspace(parts.workspace.as_ref());
+            kill_pane_off_thread(route, parts.pane_id, cx);
+            return;
+        }
+        // Whether the user was sitting on this pane while it connected. Read
+        // before the swap, since the placeholder leaves the tree in it.
+        let was_focused = pending.read(cx).focus_handle.contains_focused(window, cx);
+        let view = build_terminal_view(parts, font_size, window, cx);
+        let slot = PaneSlot::Ready(view.clone());
+        self.tabs
+            .iter_mut()
+            .any(|tab| tab.pane.replace_leaf(slot_id, slot.clone()));
+        if was_focused {
+            self.focus_leaf(&slot, window, cx);
+        }
+        // The pane has a real `pane_id` now, which is what restore matches on.
+        self.save_session(cx);
+        cx.notify();
     }
 
     /// Ask every pane in the window to re-probe its git status. Called when the
@@ -2903,7 +2966,7 @@ impl Tty7App {
     /// subdirectories they happen to sit in, which would be the same full-repo
     /// `git diff` asked several times over.
     fn refresh_git_status_all(&mut self, cx: &mut Context<Self>) {
-        for leaf in self.tabs.iter().flat_map(|tab| tab.pane.leaves()) {
+        for leaf in self.tabs.iter().flat_map(|tab| tab.pane.terminals()) {
             leaf.update(cx, |view, cx| view.refresh_git_status_now(cx));
         }
     }
@@ -2999,7 +3062,8 @@ impl Tty7App {
         self.remember_active_pane(window, cx);
         self.maximized = None;
         let insert_at = self.new_tab_insert_at(cx);
-        self.tabs.insert(insert_at, Tab::new(Pane::leaf(view)));
+        self.tabs
+            .insert(insert_at, Tab::new(Pane::leaf(PaneSlot::Ready(view))));
         self.active = insert_at;
         self.focus_active(window, cx);
         self.save_session(cx);
@@ -3027,12 +3091,15 @@ impl Tty7App {
         };
         // Swap the fresh leaf into the dead one's position across every tab.
         for tab in &mut self.tabs {
-            if tab.pane.replace_leaf(dead, fresh.clone()) {
+            if tab
+                .pane
+                .replace_leaf(dead.entity_id(), PaneSlot::Ready(fresh.clone()))
+            {
                 break;
             }
         }
         self.maximized = None;
-        self.focus_leaf(&fresh, window, cx);
+        self.focus_leaf(&PaneSlot::Ready(fresh), window, cx);
         self.save_session(cx);
         cx.notify();
     }
@@ -3067,7 +3134,7 @@ impl Tty7App {
         let new = if let Some(spec) = ssh_spec {
             let resolved = crate::ui::ssh_connect::resolve_persisted_ssh_spec(spec, cx);
             match new_terminal_native(self.font_size, cwd, resolved, window, cx) {
-                Ok(view) => view,
+                Ok(view) => PaneSlot::Ready(view),
                 Err(e) => {
                     log::error!("native SSH split spawn failed: {e}");
                     window.push_notification(format!("SSH connection failed: {e}"), cx);
@@ -3094,7 +3161,7 @@ impl Tty7App {
             }
         };
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            if tab.pane.split_leaf(&target, axis, new.clone()) {
+            if tab.pane.split_leaf(target.entity_id(), axis, new.clone()) {
                 self.maximized = None;
                 self.focus_leaf(&new, window, cx);
                 self.save_session(cx);
@@ -3121,7 +3188,11 @@ impl Tty7App {
             tab.pane
                 .leaves()
                 .into_iter()
-                .find(|l| l.read(cx).focus_handle.contains_focused(window, cx))
+                .find(|l| l.contains_focused(window, cx))
+                // A pane still connecting has no daemon pane to kill; the
+                // spawn that is in the air for it is handled where it lands
+                // (`land_pane` finds no slot and kills it there).
+                .and_then(|l| l.terminal().cloned())
         });
         let outcome = match self.tabs.get_mut(self.active) {
             Some(tab) => tab.pane.close_focused(window, cx),
@@ -3148,10 +3219,7 @@ impl Tty7App {
             }
             CloseOutcome::Collapsed => {
                 if let Some(leaf) = &focused {
-                    crate::terminal::RemoteTerminal::kill_pane_on(
-                        &leaf.read(cx).pane_route(),
-                        leaf.read(cx).pane_id,
-                    );
+                    kill_pane_off_thread(leaf.read(cx).pane_route(), leaf.read(cx).pane_id, cx);
                 }
                 self.focus_active(window, cx);
                 self.save_session(cx);
@@ -3190,7 +3258,7 @@ impl Tty7App {
             cx.notify();
             return;
         }
-        match self.tabs[index].pane.close_leaf(&view) {
+        match self.tabs[index].pane.close_leaf(view.entity_id()) {
             // The exited pane was the tab's only leaf: close the whole tab
             // (which snapshots it for reopen and kills its daemon panes).
             CloseOutcome::RemoveSelf => self.close_tab(index, window, cx),
@@ -3198,10 +3266,7 @@ impl Tty7App {
             // tab we failed to locate the leaf in.
             CloseOutcome::NotFound => {}
             CloseOutcome::Collapsed => {
-                crate::terminal::RemoteTerminal::kill_pane_on(
-                    &view.read(cx).pane_route(),
-                    view.read(cx).pane_id,
-                );
+                kill_pane_off_thread(view.read(cx).pane_route(), view.read(cx).pane_id, cx);
                 if index == self.active {
                     self.maximized = None;
                     self.focus_active(window, cx);
@@ -3226,7 +3291,7 @@ impl Tty7App {
         self.maximized = None;
         let current = leaves
             .iter()
-            .position(|l| l.read(cx).focus_handle.contains_focused(window, cx))
+            .position(|l| l.contains_focused(window, cx))
             .unwrap_or(0);
         let next = if forward {
             (current + 1) % leaves.len()
@@ -3396,11 +3461,8 @@ impl Tty7App {
         // *quitting* the app, where panes are detached and kept alive so the
         // next launch can re-attach. Reopen-closed-tab then spawns fresh in the
         // saved cwd, just like before the daemon split.
-        for leaf in self.tabs[index].pane.leaves() {
-            crate::terminal::RemoteTerminal::kill_pane_on(
-                &leaf.read(cx).pane_route(),
-                leaf.read(cx).pane_id,
-            );
+        for leaf in self.tabs[index].pane.terminals() {
+            kill_pane_off_thread(leaf.read(cx).pane_route(), leaf.read(cx).pane_id, cx);
         }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -3444,7 +3506,7 @@ impl Tty7App {
         let open_cwds: Vec<std::path::PathBuf> = self
             .tabs
             .iter()
-            .flat_map(|tab| tab.pane.leaves())
+            .flat_map(|tab| tab.pane.terminals())
             .filter_map(|leaf| {
                 let view = leaf.read(cx);
                 (view.host_id() == id).then(|| view.host_cwd())?
@@ -3570,8 +3632,9 @@ impl Tty7App {
             return;
         };
         let refocus = (index == self.active).then(|| tab.focus_target()).flatten();
-        for leaf in tab.pane.leaves() {
-            let refocus_incoming = refocus.as_ref() == Some(&leaf);
+        for leaf in tab.pane.terminals() {
+            let refocus_incoming =
+                refocus.as_ref().map(|s| s.entity_id()) == Some(leaf.entity_id());
             leaf.update(cx, |view, cx| {
                 if view.agent_session().map(|s| s.status) == Some(AgentStatus::Done) {
                     view.mark_agent_result_unread(refocus_incoming);
@@ -4124,7 +4187,7 @@ impl Tty7App {
     pub(crate) fn agent_target_leaf(&self, cx: &App) -> Option<Entity<TerminalView>> {
         let runs_agent = |leaf: &Entity<TerminalView>| leaf.read(cx).agent().is_some();
         if let Some(tab) = self.tabs.get(self.active)
-            && let Some(leaf) = tab.pane.leaves().into_iter().find(runs_agent)
+            && let Some(leaf) = tab.pane.terminals().into_iter().find(runs_agent)
         {
             return Some(leaf);
         }
@@ -4132,7 +4195,7 @@ impl Tty7App {
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != self.active)
-            .flat_map(|(_, t)| t.pane.leaves())
+            .flat_map(|(_, t)| t.pane.terminals())
             .find(runs_agent)
     }
 
@@ -4150,7 +4213,7 @@ impl Tty7App {
         if let Some(i) = self
             .tabs
             .iter()
-            .position(|t| t.pane.leaves().contains(&target))
+            .position(|t| t.pane.terminals().contains(&target))
         {
             self.activate(i, window, cx);
         }
@@ -4658,7 +4721,7 @@ impl Tty7App {
     fn commit_font_family(&mut self, family: String, cx: &mut Context<Self>) {
         self.font_family = family.clone();
         for tab in &self.tabs {
-            for leaf in tab.pane.leaves() {
+            for leaf in tab.pane.terminals() {
                 let family = family.clone();
                 leaf.update(cx, |v, cx| v.set_font_family(family, cx));
             }
@@ -4675,7 +4738,7 @@ impl Tty7App {
     fn commit_font_family_emphasis(&mut self, bold: bool, name: String, cx: &mut Context<Self>) {
         let family = (name != crate::ui::settings::FONT_DEFAULT_LABEL).then_some(name);
         for tab in &self.tabs {
-            for leaf in tab.pane.leaves() {
+            for leaf in tab.pane.terminals() {
                 let family = family.clone();
                 leaf.update(cx, |v, cx| {
                     if bold {
@@ -4749,7 +4812,7 @@ impl Tty7App {
             self.font_size = font_size;
             let px_size = px(font_size);
             for tab in &self.tabs {
-                for leaf in tab.pane.leaves() {
+                for leaf in tab.pane.terminals() {
                     leaf.update(cx, |v, cx| {
                         v.font_size = px_size;
                         cx.notify();
@@ -4760,7 +4823,7 @@ impl Tty7App {
         if line_height != self.line_height {
             self.line_height = line_height;
             for tab in &self.tabs {
-                for leaf in tab.pane.leaves() {
+                for leaf in tab.pane.terminals() {
                     leaf.update(cx, |v, cx| {
                         v.line_height_mul = line_height;
                         cx.notify();
@@ -4771,7 +4834,7 @@ impl Tty7App {
         if font_family != self.font_family {
             self.font_family = font_family.clone();
             for tab in &self.tabs {
-                for leaf in tab.pane.leaves() {
+                for leaf in tab.pane.terminals() {
                     let family = font_family.clone();
                     leaf.update(cx, |v, cx| v.set_font_family(family, cx));
                 }
@@ -4780,7 +4843,7 @@ impl Tty7App {
         if font_features != self.font_features {
             self.font_features = font_features.clone();
             for tab in &self.tabs {
-                for leaf in tab.pane.leaves() {
+                for leaf in tab.pane.terminals() {
                     let features = font_features.clone();
                     leaf.update(cx, |v, cx| v.set_font_features(features, cx));
                 }
@@ -4793,7 +4856,7 @@ impl Tty7App {
         if bold != self.font_family_bold {
             self.font_family_bold = bold.clone();
             for tab in &self.tabs {
-                for leaf in tab.pane.leaves() {
+                for leaf in tab.pane.terminals() {
                     let bold = bold.clone();
                     leaf.update(cx, |v, cx| v.set_font_family_bold(bold, cx));
                 }
@@ -4802,7 +4865,7 @@ impl Tty7App {
         if italic != self.font_family_italic {
             self.font_family_italic = italic.clone();
             for tab in &self.tabs {
-                for leaf in tab.pane.leaves() {
+                for leaf in tab.pane.terminals() {
                     let italic = italic.clone();
                     leaf.update(cx, |v, cx| v.set_font_family_italic(italic, cx));
                 }
@@ -4813,7 +4876,7 @@ impl Tty7App {
         // unrelated config edit doesn't churn panes that already agree.
         let report_mouse = cx.global::<Config>().mouse_reporting;
         for tab in &self.tabs {
-            for leaf in tab.pane.leaves() {
+            for leaf in tab.pane.terminals() {
                 leaf.update(cx, |v, cx| {
                     if v.report_mouse != report_mouse {
                         v.report_mouse = report_mouse;
@@ -4921,7 +4984,9 @@ impl Tty7App {
     pub(crate) fn tab_ssh_dot(&self, tab: &Tab, cx: &App) -> Option<u32> {
         use crate::daemon::protocol::SshPhase;
         let leaf = tab.pane.first_leaf()?;
-        let v = leaf.read(cx);
+        // No dot for a pane still connecting: the SSH phase it would report is
+        // the *pane's* SSH, and it has none yet.
+        let v = leaf.terminal()?.read(cx);
         if let Some(phase) = v.ssh_phase() {
             // Native pane.
             let rgb = if v.ssh_disconnected() {
@@ -4971,7 +5036,12 @@ impl Tty7App {
     pub(crate) fn tab_has_warn_ssh(&self, index: usize, cx: &App) -> bool {
         self.tabs
             .get(index)
-            .map(|t| t.pane.leaves().iter().any(|l| self.leaf_is_warn_ssh(l, cx)))
+            .map(|t| {
+                t.pane
+                    .terminals()
+                    .iter()
+                    .any(|l| self.leaf_is_warn_ssh(l, cx))
+            })
             .unwrap_or(false)
     }
 
@@ -6238,7 +6308,22 @@ fn tab_to_session(tab: &Tab, cx: &App) -> SessionTab {
 /// leaf's current cwd and each split's axis + ratio. Used when saving.
 fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
     match pane {
-        Pane::Leaf(view) => {
+        // A pane still connecting has no terminal to interrogate — but it does
+        // know which pane it is trying to re-attach to, and that is the whole
+        // of what restore needs. Quitting mid-connect therefore comes back to
+        // the same pane rather than dropping it from the layout.
+        Pane::Leaf(PaneSlot::Connecting(pending)) => {
+            let spawn = &pending.read(cx).spawn;
+            SessionPane::Leaf {
+                cwd: spawn.working_directory.clone(),
+                pane_id: spawn.restore_pane,
+                ssh_spec: None,
+                agent: None,
+                agent_session_id: None,
+                agent_launch_argv: None,
+            }
+        }
+        Pane::Leaf(PaneSlot::Ready(view)) => {
             let view = view.read(cx);
             SessionPane::Leaf {
                 // A restored pane whose daemon pane is gone respawns through
@@ -6304,6 +6389,16 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
 /// [`pane_liveness`](crate::terminal::pane_liveness), which cannot spell the
 /// question without naming a machine.
 pub(crate) fn alive_panes_on(route: &crate::terminal::PaneRoute) -> std::collections::HashSet<u64> {
+    // **Local routes only.** This is a *blocking* `List`, and every caller is on
+    // the UI thread — which is fine against a socket on this machine and is a
+    // multi-second window freeze against one that has to open an SSH channel
+    // first. A remote workspace answers the same question per pane instead, in
+    // the background half of its spawn: `start_pane_spawn` tries the attach and
+    // falls back to a fresh pane when the id is gone, which is exactly what
+    // this set was being consulted for.
+    if !matches!(route, crate::terminal::PaneRoute::Local) {
+        return std::collections::HashSet::new();
+    }
     crate::terminal::RemoteTerminal::list_panes_on(route)
         .into_iter()
         .filter(|p| p.alive)
@@ -6405,7 +6500,14 @@ fn session_to_pane(
             // lives in a different one must not be looked up in it.
             let same_daemon =
                 leaf_shares_the_window_daemon(workspace.is_some(), ssh_spec.is_some());
-            let restore = (*pane_id).filter(|id| same_daemon && alive.contains(id));
+            let restore = match workspace.is_some() {
+                // A remote leaf keeps its id unconditionally: `alive` is empty
+                // for a remote route by construction (see `alive_panes_on`), and
+                // the attempt to attach happens off the UI thread, where a dead
+                // id costs one failed round trip and falls back to a spawn.
+                true => (*pane_id).filter(|_| same_daemon),
+                false => (*pane_id).filter(|id| same_daemon && alive.contains(id)),
+            };
             // A *dead* native-SSH leaf (spec persisted, pane no longer alive)
             // reconnects rather than dropping back to a local shell (FR-C2/E4):
             // re-resolve secrets from the profile when it names one, else reuse
@@ -6414,7 +6516,7 @@ fn session_to_pane(
                 if let Some(spec) = ssh_spec.clone() {
                     let resolved = crate::ui::ssh_connect::resolve_persisted_ssh_spec(spec, cx);
                     match new_terminal_native(font_size, cwd.clone(), resolved, window, cx) {
-                        Ok(view) => return Some(Pane::leaf(view)),
+                        Ok(view) => return Some(Pane::leaf(PaneSlot::Ready(view))),
                         // Keep restore alive: fall through to a local shell in
                         // this slot rather than aborting startup.
                         Err(e) => log::error!("restoring native SSH pane failed: {e}"),
@@ -6448,8 +6550,13 @@ fn session_to_pane(
                 && cx.global::<Config>().restore_agent_sessions
                 && let (Some(agent), Some(id)) = (agent, agent_session_id)
                 && let Some(cmd) = agent.resume_command(id, agent_launch_argv.as_deref())
+                // A pane whose terminal has not arrived yet cannot be sent a
+                // resume command. It does not need one either: `restore_pane`
+                // travelled with the spawn, so what lands is the *same* agent
+                // pane, still running its conversation.
+                && let Some(terminal) = view.terminal()
             {
-                view.read(cx).run_command_line(&cmd);
+                terminal.read(cx).run_command_line(&cmd);
             }
             Some(Pane::leaf(view))
         }
@@ -6491,9 +6598,123 @@ fn new_terminal(
     shell: Option<ShellSpec>,
     window: &mut Window,
     cx: &mut Context<Tty7App>,
-) -> anyhow::Result<Entity<TerminalView>> {
-    let parts =
-        TerminalView::spawn_shell_terminal_in(workspace, working_directory, restore_pane, shell)?;
+) -> anyhow::Result<PaneSlot> {
+    // The fork this whole `PaneSlot` business exists for. `PaneRoute` is the
+    // same value that decides whether the connection carries a route header at
+    // all, so "does this pane talk to another computer" is asked once, here.
+    //
+    // A local pane keeps the synchronous path — not for lack of generality, but
+    // because it is ready in well under a millisecond and routing it through a
+    // placeholder would paint one frame of a spinner on every ⌘T. See
+    // `ui::pending_pane` for the whole argument.
+    if matches!(
+        crate::terminal::PaneRoute::for_workspace(workspace.as_ref()),
+        crate::terminal::PaneRoute::Local
+    ) {
+        let parts = TerminalView::spawn_shell_terminal_in(
+            workspace,
+            working_directory,
+            restore_pane,
+            shell,
+        )?;
+        return Ok(PaneSlot::Ready(build_terminal_view(
+            parts, font_size, window, cx,
+        )));
+    }
+
+    // Everything else waits on another machine, so it waits *in the tree*.
+    let spawn = crate::ui::pending_pane::PendingSpawn {
+        workspace,
+        working_directory,
+        restore_pane,
+        shell,
+        font_size,
+    };
+    // The machine as the user knows it. `RemoteTarget`'s `Display` is the same
+    // label the switcher's rows carry, so "Connecting to gpu-01…" names the row
+    // that was clicked.
+    let machine = spawn
+        .workspace
+        .as_ref()
+        .map(|w| w.target.to_string())
+        .unwrap_or_else(|| "the daemon".to_string());
+    let pending = cx.new(|cx| crate::ui::pending_pane::PendingPane::new(machine, spawn, cx));
+    cx.subscribe_in(
+        &pending,
+        window,
+        |_app, pending, _: &crate::ui::pending_pane::RetryRequested, window, cx| {
+            start_pane_spawn(pending.clone(), window, cx);
+        },
+    )
+    .detach();
+    start_pane_spawn(pending.clone(), window, cx);
+    Ok(PaneSlot::Connecting(pending))
+}
+
+/// Run (or re-run) the blocking half of a pending pane's spawn, off the UI
+/// thread, and land the result back in the tree.
+fn start_pane_spawn(
+    pending: Entity<crate::ui::pending_pane::PendingPane>,
+    window: &mut Window,
+    cx: &mut Context<Tty7App>,
+) {
+    let spawn = pending.read(cx).spawn.clone();
+    let slot_id = pending.entity_id();
+    let font_size = spawn.font_size;
+    cx.spawn_in(window, async move |this, cx| {
+        let parts = cx
+            .background_executor()
+            .spawn(async move {
+                let attempt = |restore| {
+                    TerminalView::spawn_shell_terminal_in(
+                        spawn.workspace.clone(),
+                        spawn.working_directory.clone(),
+                        restore,
+                        spawn.shell.clone(),
+                    )
+                };
+                match spawn.restore_pane {
+                    // Restore, on a machine nobody asked "which panes are still
+                    // alive?" — because asking is itself a routed round trip and
+                    // the UI thread is where that question used to be asked from
+                    // (`alive_panes_on`). Trying the attach *is* the question,
+                    // and a failed one costs one round trip on a connection this
+                    // pane needed open anyway.
+                    //
+                    // Falling back to a fresh pane rather than surfacing the
+                    // error: an id that is gone is the ordinary case after the
+                    // remote's daemon has restarted, and a pane the user cannot
+                    // get back is not worth a slot that only offers "Try Again".
+                    Some(id) => attempt(Some(id)).or_else(|e| {
+                        log::info!("pane {id} is gone on its machine ({e:#}); spawning fresh");
+                        attempt(None)
+                    }),
+                    None => attempt(None),
+                }
+                // Flattened to a string here rather than carried as an
+                // `anyhow::Error`: the chain is not `Send` across this await in
+                // a form worth keeping, and what the pane shows is the rendered
+                // message anyway.
+                .map_err(|e| format!("{e:#}"))
+            })
+            .await;
+        let _ = this.update_in(cx, |app, window, cx| {
+            app.land_pane(slot_id, &pending, parts, font_size, window, cx);
+        });
+    })
+    .detach();
+}
+
+/// Wire the per-pane subscriptions every pane needs around a freshly built
+/// terminal. Shared by the synchronous local path and the async remote one, so
+/// a pane that arrived late is wired identically to one that was there from the
+/// first frame.
+fn build_terminal_view(
+    parts: crate::terminal::view::ShellParts,
+    font_size: f32,
+    window: &mut Window,
+    cx: &mut Context<Tty7App>,
+) -> Entity<TerminalView> {
     let view = cx.new(|cx| {
         let mut view = TerminalView::from_shell_parts(parts, window, cx);
         // Inherit the current global font size so new panes match existing ones.
@@ -6521,7 +6742,21 @@ fn new_terminal(
     )
     .detach();
     watch_pane_focus(&view, window, cx);
-    Ok(view)
+    view
+}
+
+/// Kill a daemon pane without blocking the window.
+///
+/// `kill_pane_on` opens a connection down the pane's route and writes one
+/// frame — which against a *remote* route means the daemon opening an SSH
+/// channel first, so doing it inline froze the window every time a remote pane
+/// or tab was closed. Fire-and-forget by nature (a missing daemon means there
+/// is nothing to kill anyway), so there is nothing to wait for and nothing to
+/// report.
+fn kill_pane_off_thread(route: crate::terminal::PaneRoute, pane_id: u64, cx: &mut App) {
+    cx.background_executor()
+        .spawn(async move { crate::terminal::RemoteTerminal::kill_pane_on(&route, pane_id) })
+        .detach();
 }
 
 /// Re-render the app whenever `view` takes focus. Nothing else does this: a

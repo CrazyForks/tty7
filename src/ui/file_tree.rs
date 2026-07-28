@@ -812,7 +812,7 @@ impl Tty7App {
             return; // that machine is gone; the tree keeps what it has
         };
         let leaves = match self.tabs.get(self.active) {
-            Some(tab) => tab.pane.leaves(),
+            Some(tab) => tab.pane.terminals(),
             None => Vec::new(),
         };
         // Only panes on the window's own machine contribute. They all are, by

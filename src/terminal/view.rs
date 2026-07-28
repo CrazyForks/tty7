@@ -99,7 +99,10 @@ pub struct NativeSshParts {
 /// [`TerminalView::from_shell_parts`].
 pub struct ShellParts {
     terminal: RemoteTerminal,
-    pane_id: u64,
+    /// The daemon's id for this pane. Readable so a pane that arrived after its
+    /// slot was closed can be killed rather than leaked (see
+    /// `ui::app::Tty7App::land_pane`).
+    pub(crate) pane_id: u64,
     /// The explicit shell pick this pane was spawned with, if any; `None` for a
     /// re-attached pane (the pick isn't persisted).
     shell_spec: Option<ShellSpec>,
@@ -111,7 +114,10 @@ pub struct ShellParts {
     /// two must not be able to disagree: the route is chosen before the pane
     /// exists, and a view that thought it was somewhere else would send its
     /// `Kill` and its restore `List` to the wrong daemon.
-    workspace: Option<crate::terminal::PaneWorkspace>,
+    ///
+    /// Readable for the same reason as `pane_id` above: killing an orphaned
+    /// pane has to dial the machine it actually landed on.
+    pub(crate) workspace: Option<crate::terminal::PaneWorkspace>,
 }
 
 /// See `TerminalView::drag_scroll`.

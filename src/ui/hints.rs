@@ -88,7 +88,7 @@ impl Tty7App {
     /// `TerminalView::link_modifier_down`).
     pub(crate) fn set_link_modifier(&mut self, down: bool, cx: &mut Context<Self>) {
         for tab in &self.tabs {
-            for leaf in tab.pane.leaves() {
+            for leaf in tab.pane.terminals() {
                 leaf.update(cx, |view, cx| {
                     view.refresh_link_hover(down, cx);
                 });

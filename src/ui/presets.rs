@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 
 use alacritty_terminal::vte::ansi::Rgb;
-use gpui::{App, Global};
+use gpui::{App, Global, Hsla};
 use serde::Deserialize;
 
 use crate::terminal::palette::ActivePalette;
@@ -222,6 +222,21 @@ pub struct Surface {
     pub text_selected: u32,
 }
 
+/// The dim a full-window overlay paints over everything behind it.
+///
+/// Deliberately *not* a [`Surface`]: nothing sits on a scrim, it is a veil. Its
+/// only job is to push the window far enough down that the card floating above
+/// it reads as a separate plane.
+#[derive(Debug, Clone, Copy)]
+pub struct Scrim {
+    /// Near-black, but mixed from the theme's own background so a warm theme
+    /// dims warm rather than going slate.
+    pub ink: u32,
+    /// How much of it lands. Lighter on light themes, where the alpha that
+    /// reads as a dim on charcoal reads as a bruise on paper.
+    pub alpha: f32,
+}
+
 /// Every surface the shell actually paints interactive rows on, published as a
 /// GPUI global by `apply_theme` so a render pass can read the ladder without
 /// re-resolving (and cloning) the theme registry every frame.
@@ -238,9 +253,23 @@ pub struct Surfaces {
     pub sidebar: Surface,
     /// Elevated surfaces: menus, dropdowns, the command palette.
     pub popover: Surface,
+    /// The dim behind a full-window overlay card (the command palette, the
+    /// workspace switcher). Those two paint on `popover` like every other
+    /// elevated surface; only the ground under them is special.
+    pub scrim: Scrim,
 }
 
 impl Global for Surfaces {}
+
+/// The active theme's overlay scrim, ready to hand to `.bg()`.
+///
+/// A free function rather than a `Surfaces` method so the two call sites read
+/// the same either way round — both of them want the fill, neither wants the
+/// ink and the alpha separately.
+pub fn scrim_fill(cx: &App) -> Hsla {
+    let s = cx.global::<Surfaces>().scrim;
+    Hsla::from(gpui::rgb(s.ink)).opacity(s.alpha)
+}
 
 /// The active theme's contrast-conditioned accent (see [`legible_accent`]),
 /// published so a render pass can reach it without cloning the theme registry.
@@ -354,6 +383,15 @@ impl Theme {
             window: self.surface(m.background),
             sidebar,
             popover: self.surface(m.popover),
+            scrim: Scrim {
+                ink: mix(m.background, 0x000000, 0.82),
+                // Lighter on light themes: the alpha that reads as a dim over
+                // charcoal reads as a bruise over paper.
+                alpha: match self.dark {
+                    true => 0.55,
+                    false => 0.30,
+                },
+            },
         }
     }
 

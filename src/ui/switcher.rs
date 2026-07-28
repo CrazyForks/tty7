@@ -53,17 +53,67 @@ use crate::ui::app::Tty7App;
 use crate::ui::remote_connect::{self, HostChoice, RemoteWorkspaceRow};
 use crate::ui::remote_workspace::ConnectFlow;
 
-/// Card width. Wider than the old home-page panel (360px) because a row now
-/// carries a machine's worth of context — name, path, age — and narrower than
-/// the palette's 560px, which is sized for prose-length command titles.
-const CARD_W: f32 = 460.0;
+/// Card width — the command palette's, to the pixel.
+///
+/// These are the app's two full-window overlays and they open on the same
+/// gesture-shaped question ("which one?"), so they are one card wearing two
+/// contents. 460 was chosen when this panel was the narrower of the two, and it
+/// showed: a row here carries four columns (name, path, state, age) where a
+/// palette row carries one, and cramming them into 100px less made the panel
+/// read as the smaller, lesser surface of the pair.
+const CARD_W: f32 = 560.0;
+
+/// How far down the window both overlays open. The palette's, for the same
+/// reason as [`CARD_W`].
+const CARD_TOP: f32 = 120.0;
 
 /// How tall the scrolling body may get before it scrolls. Sized so a typical
 /// two-machine setup never scrolls at all.
 const BODY_MAX_H: f32 = 420.0;
 
 /// Monogram diameter on a workspace row.
-const ROW_AVATAR: f32 = 19.0;
+const ROW_AVATAR: f32 = 20.0;
+
+/// Every row in the panel is exactly this tall, machines one step taller.
+///
+/// Fixed rather than padding-derived because the old layout set `py(6)` on some
+/// rows and `py(7)` on others, which is invisible in the source and reads as a
+/// stutter down the list.
+const ROW_H: f32 = 32.0;
+const HOST_H: f32 = 34.0;
+
+/// The one column every glyph in the panel lines up in.
+///
+/// A machine's icon, a workspace's monogram and a `+` all centre here, so the
+/// eye finds one vertical axis instead of re-finding the start of each row. The
+/// old layout had none: headers began at `px(10)`, rows at `ml(16) + px(10)`,
+/// and the glyphs inside them ranged 12–19px.
+const GUTTER: f32 = 26.0;
+
+/// Icon size everywhere in the panel. One value, deliberately — the old set ran
+/// 12, 13 and 19 px plus two `▸`/`▾` *text* glyphs, which follow the UI font's
+/// weight rather than the icon set's.
+const ICON: f32 = 16.0;
+
+/// How far a machine's workspaces sit in from its own row.
+const KID_INDENT: f32 = 16.0;
+
+/// Where the guide line down a remote machine's rows is drawn: the centre of
+/// that machine's own icon, which is what makes it read as descending *from*
+/// the machine.
+const RAIL_X: f32 = ROW_PAD + GUTTER / 2.;
+
+/// Horizontal padding inside a row.
+const ROW_PAD: f32 = 8.0;
+
+/// The age column. Fixed width and right-aligned so the ages read as a column
+/// instead of drifting with whatever path sits to their left.
+///
+/// Sized to `relative_time`'s **longest** string, "over a week ago", not to a
+/// typical one: the column is fixed, so anything that does not fit wraps to a
+/// second line and takes the row's height with it. ("1 min ago" over two lines
+/// is what 52px bought.)
+const WHEN_W: f32 = 96.0;
 
 /// What a machine's connection is doing, as far as this panel is concerned.
 ///
@@ -95,6 +145,13 @@ struct Group {
     /// the empty string, which no `RemoteTarget` can render as.
     key: String,
     label: String,
+    /// Where this machine actually is (`thomas@10.0.4.12:2222`), when that is
+    /// something other than the label already on the row.
+    ///
+    /// A `~/.ssh/config` alias says nothing about the box behind it, and two
+    /// aliases can point at one machine; the endpoint is what tells them apart.
+    /// Empty for the local group and for a target whose label *is* its endpoint.
+    endpoint: String,
     /// `None` for the local group.
     target: Option<RemoteTarget>,
     link: Link,
@@ -147,7 +204,9 @@ pub(crate) struct HostSnapshot {
     /// client yet has no other route back to a `RemoteTarget`, and without one
     /// it could never be given a group to appear in.
     pub target: RemoteTarget,
-    pub home: PathBuf,
+    /// What the remote said it had. The machine's `$HOME` is deliberately *not*
+    /// here — it lives in `RemoteConnections`, app-wide, because every window
+    /// needs it and only one of them ever did the connecting.
     pub rows: Vec<RemoteWorkspaceRow>,
 }
 
@@ -188,7 +247,11 @@ impl Tty7App {
         // connect. Idempotent and last-call-wins, exactly as `begin_connect`
         // registered it.
         remote_connect::register(cx);
-        let query = cx.new(|cx| InputState::new(window, cx));
+        // Named, because the field is the panel's only affordance that does not
+        // say what it does: a bare magnifier over a list of machines reads as
+        // "filter these rows", and it also finds machines that have no row yet.
+        let query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search workspaces and machines"));
         query.update(cx, |state, cx| state.focus(window, cx));
         let subs = vec![cx.subscribe_in(
             &query,
@@ -254,6 +317,7 @@ impl Tty7App {
                     groups.push(Group {
                         key,
                         label,
+                        endpoint: String::new(),
                         target,
                         link: Link::Offline,
                         home: None,
@@ -297,6 +361,7 @@ impl Tty7App {
             groups.push(Group {
                 label: key.clone(),
                 key,
+                endpoint: String::new(),
                 target: Some(target),
                 link: Link::Offline,
                 home: None,
@@ -315,6 +380,7 @@ impl Tty7App {
                 Group {
                     key: String::new(),
                     label: "This Computer".to_string(),
+                    endpoint: String::new(),
                     target: None,
                     link: Link::Offline,
                     home: None,
@@ -334,12 +400,24 @@ impl Tty7App {
         }
         groups.sort_by(|a, b| a.key.is_empty().cmp(&b.key.is_empty()).reverse());
 
-        // Link state and the remote's own view, per machine.
+        // Link state, the machine's own name, and the remote's own view.
+        //
+        // The name matters: a group's label starts life as `RemoteTarget`'s
+        // `Display`, which for a saved profile is its *uuid* — the type
+        // deliberately cannot reach into the profile store, so the panel has to
+        // do the lookup that turns that into the name the user typed.
+        let configured = remote_connect::available_hosts(cx);
         for group in &mut groups {
             let Some(target) = group.target.clone() else {
                 group.link = Link::Local;
                 continue;
             };
+            if let Some(known) = configured.iter().find(|h| h.target == target) {
+                group.label = known.label.clone();
+                if known.detail != known.label {
+                    group.endpoint = known.detail.clone();
+                }
+            }
             group.link = self.link_state(&target, cx);
             if let Some(ConnectFlow::Failed { choice, error }) = &self.connect
                 && choice.target == target
@@ -347,8 +425,12 @@ impl Tty7App {
                 group.error = Some(error.clone());
             }
             let id = target.host_id();
+            // Read app-wide, not from this window's snapshot: any window's
+            // connect, and every reconnect, records the machine's `$HOME` — and
+            // that row is the only way to make a workspace on a machine, so it
+            // has no business depending on which window did the connecting.
+            group.home = remote_connect::RemoteConnections::home(cx, id);
             if let Some(snapshot) = self.host_snapshots.get(&id) {
-                group.home = Some(snapshot.home.clone());
                 group.merge(&snapshot.rows, now);
             }
         }
@@ -523,9 +605,19 @@ impl Tty7App {
             .unwrap_or_default();
 
         let theme = cx.theme();
-        let (background, border, popover) = (theme.background, theme.border, theme.popover);
+        let (border, card_bg) = (theme.border, theme.popover);
+        // Card, radius, shadow and width are the command palette's, deliberately
+        // — these are the app's two full-window overlays and they should read as
+        // one thing wearing two contents, not two panels. The only colour that
+        // moved is the ground: the old dim was a wash of the window's *own*
+        // colour, so a dimmed window and a 5%-lifted card landed at the same
+        // value and the whole panel read as though something were lying over it.
+        // `scrim_fill` is the near-black that actually drops the window away.
+        let scrim = crate::ui::presets::scrim_fill(cx);
 
-        let mut body = v_flex().gap(px(1.));
+        // 6px between machines, 1px within one: a machine and its workspaces
+        // are a single block, and the gap is the only thing that says so.
+        let mut body = v_flex().gap(px(6.));
         let mut shown = 0usize;
         for group in &groups {
             let Some(rendered) = self.render_group(group, &query, cx) else {
@@ -541,7 +633,7 @@ impl Tty7App {
         if shown == 0 {
             body = body.child(
                 div()
-                    .px(px(12.))
+                    .px(px(ROW_PAD))
                     .py(px(14.))
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
@@ -551,7 +643,7 @@ impl Tty7App {
 
         let card = v_flex()
             .w(px(CARD_W))
-            .bg(popover)
+            .bg(card_bg)
             .border_1()
             .border_color(border)
             .rounded(px(10.))
@@ -575,8 +667,8 @@ impl Tty7App {
                 .flex()
                 .items_start()
                 .justify_center()
-                .pt(px(96.))
-                .bg(background.opacity(0.45))
+                .pt(px(CARD_TOP))
+                .bg(scrim)
                 .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
                     if ev.keystroke.key == "escape" {
                         cx.stop_propagation();
@@ -599,21 +691,31 @@ impl Tty7App {
         let (muted, border) = (theme.muted_foreground, theme.border);
         h_flex()
             .items_center()
-            .gap_2()
-            .px(px(12.))
-            .py(px(9.))
+            .gap(px(8.))
+            // `pl` matches the body's own padding so the magnifier lands on the
+            // same axis as every machine icon under it, rather than 7px inside
+            // it as it did when the two were padded independently.
+            .pl(px(6. + ROW_PAD))
+            .pr(px(12.))
+            .h(px(42.))
             .border_b_1()
             .border_color(border)
-            .child(Icon::new(IconName::Search).size(px(13.)).text_color(muted))
-            .children(
-                self.switcher
-                    .as_ref()
-                    .map(|sw| Input::new(&sw.query).appearance(false).small()),
-            )
+            .child(glyph_col(
+                GUTTER,
+                Icon::new(IconName::Search).size(px(ICON)).text_color(muted),
+            ))
+            .children(self.switcher.as_ref().map(|sw| {
+                // `pl_0`: a `small` input carries 8px of its own horizontal
+                // padding whether or not it draws a box, and stacked on this
+                // row's gap it set the query text 8px right of every label
+                // under it — the one thing in the panel that did not share the
+                // list's left edge.
+                Input::new(&sw.query).appearance(false).small().pl_0()
+            }))
     }
 
-    /// The one row the panel keeps below the fold: adding a machine it does not
-    /// know about yet.
+    /// The one row the panel keeps below the fold — adding a machine it does not
+    /// know about yet — and the one gesture nothing else advertises.
     ///
     /// Deliberately *not* an "add host" form. Design §2 is that a machine is
     /// configured once and remote workspaces reuse whatever is already set up,
@@ -627,29 +729,61 @@ impl Tty7App {
             theme.border,
         );
         let hover = hover_fill(cx);
-        div().border_t_1().border_color(border).p(px(6.)).child(
-            h_flex()
-                .id("switcher-add-host")
-                .items_center()
-                .gap_2()
-                .px(px(10.))
-                .py(px(7.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .hover(move |r| r.bg(hover))
-                .text_sm()
-                .text_color(muted)
-                .child(Icon::new(IconName::Plus).size(px(12.)).text_color(dim))
-                .child("Add SSH Host…")
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.close_switcher(window, cx);
-                    this.open_settings_section(
-                        crate::ui::settings::SettingsSection::Ssh,
-                        window,
-                        cx,
-                    );
-                })),
-        )
+        h_flex()
+            .items_center()
+            .justify_between()
+            .border_t_1()
+            .border_color(border)
+            .p(px(6.))
+            .child(
+                h_flex()
+                    .id("switcher-add-host")
+                    .items_center()
+                    .gap(px(8.))
+                    .h(px(ROW_H))
+                    .px(px(ROW_PAD))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .hover(move |r| r.bg(hover))
+                    .text_sm()
+                    .text_color(muted)
+                    .child(glyph_col(
+                        GUTTER,
+                        Icon::new(IconName::Plus).size(px(ICON)).text_color(dim),
+                    ))
+                    .child("Add SSH Host…")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_switcher(window, cx);
+                        this.open_settings_section(
+                            crate::ui::settings::SettingsSection::Ssh,
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+            // A plain click reuses this window, ⌘-click opens another. Every
+            // row's own label already says *where* the click lands (see the
+            // badges in `render_row`); this is the one part of the answer that
+            // has nowhere else to live, and it was previously discoverable only
+            // by accident.
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .pr(px(ROW_PAD))
+                    .text_xs()
+                    .text_color(dim)
+                    .child(
+                        div()
+                            .px(px(5.))
+                            .py(px(1.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(border)
+                            .child("⌘"),
+                    )
+                    .child("click for a new window"),
+            )
     }
 
     /// One machine: its header, and — when expanded — its workspaces.
@@ -694,7 +828,7 @@ impl Tty7App {
             block = block.child(
                 v_flex()
                     .gap(px(4.))
-                    .ml(px(16.))
+                    .ml(px(KID_INDENT))
                     .mr(px(4.))
                     .mb(px(2.))
                     .px(px(10.))
@@ -734,17 +868,50 @@ impl Tty7App {
             );
         }
         if expanded {
+            let mut kids = v_flex().gap(px(1.));
             for row in rows {
-                block = block.child(self.render_row(group, row, cx));
+                kids = kids.child(self.render_row(group, row, cx));
             }
             // "New Workspace" needs a directory it is not making up, and only a
             // handshake can supply the remote's. A connected machine always has
             // one; this computer needs none.
             if query.is_empty() && (group.target.is_none() || group.home.is_some()) {
-                block = block.child(self.render_new_row(group, cx));
+                kids = kids.child(self.render_new_row(group, cx));
             }
+            block = block.child(self.indent(group, kids, cx));
         }
         Some(block.into_any_element())
+    }
+
+    /// A machine's rows, set in from its own row — and, on a *remote* machine,
+    /// tied to it by a guide line descending from that machine's icon.
+    ///
+    /// The rail is the panel's one piece of pure structure, and it earns its
+    /// place by saying the thing the old layout made you scroll up to find out:
+    /// these rows are on another computer. The local group gets none, which is
+    /// the point — "here" needs no marking, and two rails in two greys would
+    /// only be one signal drawn twice.
+    fn indent(&self, group: &Group, kids: impl IntoElement, cx: &mut Context<Self>) -> AnyElement {
+        let rail = cx.theme().border;
+        div()
+            .relative()
+            .child(div().pl(px(KID_INDENT)).child(kids))
+            .when(group.target.is_some(), |wrap| {
+                wrap.child(
+                    div()
+                        .absolute()
+                        .left(px(RAIL_X))
+                        .top(px(0.))
+                        // Stops short of the last row's baseline rather than
+                        // running to the edge: a line that ends level with the
+                        // final "New Workspace" glyph reads as enclosing the
+                        // block, one that runs past it reads as unfinished.
+                        .bottom(px(ROW_H / 2.))
+                        .w(px(1.))
+                        .bg(rail),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_group_header(
@@ -761,21 +928,34 @@ impl Tty7App {
         );
         let hover = hover_fill(cx);
         let gref = GroupRef::of(group);
-        let menu_ref = gref.clone();
-        let app = cx.entity().downgrade();
 
-        let meta = match group.link {
-            Link::Local => match group.rows.len() {
-                1 => "1 workspace".to_string(),
-                n => format!("{n} workspaces"),
-            },
-            Link::Connected => format!("connected · {}", plural_ws(group.rows.len())),
-            Link::Connecting => "connecting…".to_string(),
-            Link::Failed => "couldn't connect".to_string(),
-            Link::Offline => match group.rows.len() {
-                0 => "not connected".to_string(),
-                n => format!("not connected · {}", plural_ws(n)),
-            },
+        // A machine wears the shape of what it is, which is the only thing on
+        // the row that says "somewhere else" before a word of it is read. Both
+        // glyphs are tty7's own: the stock set has no laptop and no server, and
+        // its nearest neighbours (`hard-drive`, `cpu`) draw a *component*
+        // rather than a computer. See `ui::assets`.
+        let glyph = match group.target {
+            None => "icons/machine-local.svg",
+            Some(_) => "icons/machine-remote.svg",
+        };
+
+        // Only the states that are *not* resting get words. A green dot beside
+        // the word "connected" says one thing twice; a grey dot alone says
+        // nothing at all to someone who has not learnt this panel yet.
+        let (dot, word): (Option<gpui::Hsla>, Option<&'static str>) = match group.link {
+            Link::Local => (None, None),
+            Link::Connected => (Some(gpui::rgb(crate::ui::tab_strip::LIVE_DOT).into()), None),
+            Link::Connecting => (Some(theme.warning), Some("connecting…")),
+            Link::Failed => (Some(theme.danger), Some("couldn't connect")),
+            Link::Offline => (
+                Some(gpui::rgb(crate::ui::tab_strip::UNKNOWN_DOT).into()),
+                Some("not connected"),
+            ),
+        };
+        let word_color = match group.link {
+            Link::Connecting => theme.warning,
+            Link::Failed => theme.danger,
+            _ => muted,
         };
 
         h_flex()
@@ -783,62 +963,74 @@ impl Tty7App {
                 "switcher-host:{}",
                 group.key
             )))
-            .group("switcher-host")
             .items_center()
-            .gap_2()
-            .px(px(10.))
-            .py(px(7.))
+            .gap(px(8.))
+            .h(px(HOST_H))
+            .px(px(ROW_PAD))
             .rounded(px(6.))
             .cursor_pointer()
             .hover(move |r| r.bg(hover))
+            .child(glyph_col(
+                GUTTER,
+                Icon::empty()
+                    .path(glyph)
+                    .size(px(ICON))
+                    .text_color(if group.link == Link::Local { muted } else { fg }),
+            ))
             .child(
                 div()
-                    .w(px(9.))
                     .flex_shrink_0()
-                    .text_xs()
-                    .text_color(dim)
-                    .child(if expanded { "▾" } else { "▸" }),
-            )
-            .child(
-                div()
+                    .truncate()
                     .text_sm()
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(fg)
                     .child(group.label.clone()),
             )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(match group.link {
-                        Link::Connecting => theme.warning,
-                        Link::Failed => theme.danger,
-                        _ => muted,
-                    })
-                    .child(meta),
-            )
-            .when(group.target.is_some(), |head| {
+            // An alias says nothing about the box behind it, so the endpoint
+            // rides alongside where there is one to show — and doubles as the
+            // row's spacer, so it gives way to the status on its right rather
+            // than pushing it off the row.
+            .when(group.endpoint.is_empty(), |head| head.child(div().flex_1()))
+            .when(!group.endpoint.is_empty(), |head| {
                 head.child(
                     div()
-                        .invisible()
-                        .flex_shrink_0()
-                        .group_hover("switcher-host", |x| x.visible())
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            Button::new(gpui::SharedString::from(format!(
-                                "switcher-host-more:{}",
-                                group.key
-                            )))
-                            .icon(IconName::Ellipsis)
-                            .ghost()
-                            .xsmall()
-                            .dropdown_menu(
-                                move |menu, _window, _cx| host_menu(menu, &menu_ref, app.clone()),
-                            ),
-                        ),
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(dim)
+                        .child(group.endpoint.clone()),
                 )
             })
+            .children(dot.map(|c| div().flex_shrink_0().size(px(6.)).rounded_full().bg(c)))
+            .children(word.map(|w| {
+                div()
+                    .flex_shrink_0()
+                    // Tighter than the row's gap: the dot and the word are one
+                    // reading, not two items.
+                    .ml(px(-2.))
+                    .text_xs()
+                    .text_color(word_color)
+                    .child(w)
+            }))
+            .when(!group.rows.is_empty(), |head| {
+                head.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(dim)
+                        .child(format!("{}", group.rows.len())),
+                )
+            })
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(px(ICON))
+                .text_color(dim),
+            )
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 this.switcher_toggle_host(&gref, cx)
             }))
@@ -854,10 +1046,8 @@ impl Tty7App {
             return h_flex()
                 .id(("switcher-rename", row.id.element_key() as usize))
                 .items_center()
-                .gap_2()
-                .px(px(10.))
-                .py(px(5.))
-                .ml(px(16.))
+                .h(px(ROW_H))
+                .px(px(ROW_PAD))
                 .rounded(px(6.))
                 .bg(hover_fill(cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -871,7 +1061,8 @@ impl Tty7App {
             theme.muted_foreground,
             theme.muted_foreground.opacity(0.7),
         );
-        let hover = hover_fill(cx);
+        let sf = rungs(cx);
+        let hover = gpui::rgb(sf.hover);
         let rref = RowRef::of(group, row);
         let click_ref = rref.clone();
         let menu_ref = rref.clone();
@@ -883,7 +1074,14 @@ impl Tty7App {
         // "Where will this click land?" written on the row rather than left to
         // be discovered: the same gesture focuses another window, swaps this
         // one over, or opens a new one, and only the row knows which.
-        let pill = if row.current {
+        //
+        // Still words rather than a coloured mark. The green pill this replaces
+        // was the loudest thing in the panel, but the fix is to quieten it, not
+        // to swap it for a bar or a ring — `workspace_avatar` already argues
+        // that the current row is marked by *subtraction* (every other badge
+        // fades, this one doesn't), and a second marker on the one row needing
+        // no introduction would undo that.
+        let badge = if row.current {
             Some(("this window", true))
         } else if row.open {
             Some(("open", false))
@@ -895,10 +1093,9 @@ impl Tty7App {
             .id(("switcher-row", key))
             .group("switcher-row")
             .items_center()
-            .gap_2()
-            .px(px(10.))
-            .py(px(6.))
-            .ml(px(16.))
+            .gap(px(8.))
+            .h(px(ROW_H))
+            .px(px(ROW_PAD))
             .rounded(px(6.))
             .cursor_pointer()
             .hover(move |r| r.bg(hover))
@@ -912,40 +1109,45 @@ impl Tty7App {
             .child(
                 div()
                     .flex_shrink_0()
+                    .truncate()
                     .text_sm()
+                    .when(row.current, |d| d.font_weight(gpui::FontWeight::MEDIUM))
                     .text_color(fg)
                     .child(row.name.clone()),
             )
             .child(
                 div()
                     .flex_1()
-                    .overflow_hidden()
+                    // `min_w_0` + `truncate`, not `overflow_hidden`: a flex
+                    // child will not shrink below its content without the
+                    // former, so a long path pushed the age column off the row
+                    // instead of ellipsing itself.
+                    .min_w_0()
+                    .truncate()
                     .text_xs()
                     .text_color(dim)
                     .child(row.path.clone()),
             )
-            .children(pill.map(|(label, here)| {
+            .children(badge.map(|(label, here)| {
                 div()
                     .flex_shrink_0()
                     .px(px(6.))
                     .py(px(1.))
                     .rounded(px(4.))
                     .text_xs()
-                    .bg(if here {
-                        gpui::rgba(0x22c55e18).into()
-                    } else {
-                        theme.secondary
-                    })
-                    .text_color(if here {
-                        gpui::rgb(0x8fdcaf).into()
-                    } else {
-                        muted
-                    })
+                    .bg(gpui::rgb(sf.selected))
+                    .text_color(if here { fg.opacity(0.85) } else { muted })
                     .child(label)
             }))
             .child(
                 div()
                     .flex_shrink_0()
+                    // Fixed and right-aligned: the ages are a column, and they
+                    // stopped being one the moment their left edge was allowed
+                    // to follow whatever path sat beside them.
+                    .w(px(WHEN_W))
+                    .truncate()
+                    .text_right()
                     .text_xs()
                     .text_color(dim)
                     .child(row.when.clone()),
@@ -984,37 +1186,45 @@ impl Tty7App {
         let (muted, dim) = (theme.muted_foreground, theme.muted_foreground.opacity(0.7));
         let hover = hover_fill(cx);
         let gref = GroupRef::of(group);
-        // Named rather than a bare "New Workspace": on a Mac connected to a
-        // Linux box, `~` is `/home/them`, and a row that did not say so would
-        // only reveal it at the first `pwd`.
-        let label = match &group.home {
-            Some(home) => format!("New Workspace in {}", crate::ui::home::display_path(home)),
-            None => "New Workspace".to_string(),
-        };
+        // The directory rides in the age column rather than inside the label.
+        // It still has to be *there* — on a Mac connected to a Linux box, `~` is
+        // `/home/them`, and a row that did not say so would only reveal it at
+        // the first `pwd` — but "New Workspace in /home/thomas" as one long
+        // sentence made the shortest row in the panel the widest.
+        let home = group
+            .home
+            .as_ref()
+            .map(|h| crate::ui::home::display_path(h));
         h_flex()
             .id(gpui::SharedString::from(format!(
                 "switcher-new:{}",
                 group.key
             )))
             .items_center()
-            .gap_2()
-            .px(px(10.))
-            .py(px(6.))
-            .ml(px(16.))
+            .gap(px(8.))
+            .h(px(ROW_H))
+            .px(px(ROW_PAD))
             .rounded(px(6.))
             .cursor_pointer()
             .hover(move |r| r.bg(hover))
             .text_sm()
             .text_color(muted)
-            .child(
+            // A narrower column than a machine's, so the `+` centres on the
+            // monograms above it rather than 3px to their right.
+            .child(glyph_col(
+                ROW_AVATAR,
+                Icon::new(IconName::Plus).size(px(ICON)).text_color(dim),
+            ))
+            .child(div().flex_shrink_0().child("New Workspace"))
+            .child(div().flex_1())
+            .children(home.map(|h| {
                 div()
-                    .w(px(ROW_AVATAR))
-                    .flex()
-                    .justify_center()
+                    .flex_shrink_0()
+                    .truncate()
+                    .text_xs()
                     .text_color(dim)
-                    .child(Icon::new(IconName::Plus).size(px(12.))),
-            )
-            .child(label)
+                    .child(h)
+            }))
             .on_click(cx.listener(move |this, _, window, cx| this.switcher_new(&gref, window, cx)))
     }
 
@@ -1053,20 +1263,16 @@ impl Tty7App {
             h_flex()
                 .id("switcher-others")
                 .items_center()
-                .gap_2()
-                .px(px(10.))
-                .py(px(7.))
+                .gap(px(8.))
+                .h(px(HOST_H))
+                .px(px(ROW_PAD))
                 .rounded(px(6.))
                 .cursor_pointer()
                 .hover(move |r| r.bg(hover))
-                .child(
-                    div()
-                        .w(px(9.))
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(dim)
-                        .child(if expanded { "▾" } else { "▸" }),
-                )
+                .child(glyph_col(
+                    GUTTER,
+                    Icon::new(IconName::Globe).size(px(ICON)).text_color(dim),
+                ))
                 .child(div().text_sm().text_color(muted).child("Other SSH Hosts"))
                 .child(div().flex_1())
                 .child(
@@ -1074,6 +1280,15 @@ impl Tty7App {
                         .text_xs()
                         .text_color(dim)
                         .child(format!("{}", others.len())),
+                )
+                .child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(ICON))
+                    .text_color(dim),
                 )
                 .on_click(cx.listener(|this, _, _window, cx| {
                     if let Some(sw) = this.switcher.as_mut() {
@@ -1084,32 +1299,40 @@ impl Tty7App {
         );
 
         if expanded {
+            // No rail here: these rows are machines, not a machine's
+            // workspaces, so there is no parent for a line to descend from.
+            let mut kids = v_flex().gap(px(1.));
             for (i, host) in hits.iter().enumerate() {
                 let choice = (*host).clone();
-                block = block.child(
+                kids = kids.child(
                     h_flex()
                         .id(("switcher-other", i))
                         .items_center()
-                        .gap_2()
-                        .px(px(10.))
-                        .py(px(6.))
-                        .ml(px(16.))
+                        .gap(px(8.))
+                        .h(px(ROW_H))
+                        .px(px(ROW_PAD))
                         .rounded(px(6.))
                         .cursor_pointer()
                         .hover(move |r| r.bg(hover))
+                        .child(glyph_col(
+                            ROW_AVATAR,
+                            Icon::empty()
+                                .path("icons/machine-remote.svg")
+                                .size(px(ICON))
+                                .text_color(dim),
+                        ))
                         .child(
                             div()
-                                .w(px(ROW_AVATAR))
-                                .flex()
-                                .justify_center()
-                                .text_color(dim)
-                                .child(Icon::new(IconName::Globe).size(px(12.))),
+                                .truncate()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(host.label.clone()),
                         )
-                        .child(div().text_sm().text_color(muted).child(host.label.clone()))
                         .child(div().flex_1())
                         .child(
                             div()
                                 .flex_shrink_0()
+                                .truncate()
                                 .text_xs()
                                 .text_color(dim)
                                 .child(host.detail.clone()),
@@ -1119,6 +1342,7 @@ impl Tty7App {
                         })),
                 );
             }
+            block = block.child(div().pl(px(KID_INDENT)).child(kids));
         }
         Some(block.into_any_element())
     }
@@ -1260,42 +1484,31 @@ fn row_menu(
     )
 }
 
-/// A machine's second-tier actions.
-fn host_menu(
-    menu: gpui_component::menu::PopupMenu,
-    group: &GroupRef,
-    app: gpui::WeakEntity<Tty7App>,
-) -> gpui_component::menu::PopupMenu {
-    let (a1, a2) = (app.clone(), app);
-    let g1 = group.clone();
-    let can_new = group.home.is_some();
-    menu.item(
-        PopupMenuItem::new("New Workspace Here")
-            .disabled(!can_new)
-            .on_click(move |_, window, cx| {
-                let _ = a1.update(cx, |this, cx| this.switcher_new(&g1, window, cx));
-            }),
-    )
-    .separator()
-    .item(
-        PopupMenuItem::new("SSH Settings…").on_click(move |_, window, cx| {
-            let _ = a2.update(cx, |this, cx| {
-                this.close_switcher(window, cx);
-                this.open_settings_section(crate::ui::settings::SettingsSection::Ssh, window, cx);
-            });
-        }),
-    )
+/// This card's interaction ladder — the popover one, the same rungs every menu
+/// and the command palette paint on.
+fn rungs(cx: &App) -> crate::ui::presets::Surface {
+    cx.global::<crate::ui::presets::Surfaces>().popover
 }
 
-fn plural_ws(n: usize) -> String {
-    match n {
-        1 => "1 workspace".to_string(),
-        n => format!("{n} workspaces"),
-    }
-}
-
-/// The popover ladder's hover rung, read from the shared surface presets rather
-/// than an alpha over whatever shows through.
+/// The hover rung, read from the shared surface presets rather than an alpha
+/// over whatever shows through.
 fn hover_fill(cx: &App) -> gpui::Rgba {
-    gpui::rgb(cx.global::<crate::ui::presets::Surfaces>().popover.hover)
+    gpui::rgb(rungs(cx).hover)
+}
+
+/// One glyph, centred in a column of `w`.
+///
+/// Every icon in the panel goes through this, which is the whole point: the old
+/// layout let each row start its own glyph wherever its padding happened to
+/// land, so nothing shared a vertical axis. A machine's column is [`GUTTER`];
+/// the rows underneath use [`ROW_AVATAR`], so a `+` lands on the monograms
+/// above it rather than beside them.
+fn glyph_col(w: f32, child: impl IntoElement) -> impl IntoElement {
+    div()
+        .w(px(w))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(child)
 }

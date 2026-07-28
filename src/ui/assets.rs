@@ -164,6 +164,21 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         // about *About*. No upstream `IconName` maps here, so it's referenced by
         // path (see `settings.rs`).
         "icons/circle-info.svg" => include_bytes!("../../assets/icons/circle-info.svg"),
+        // The switcher's two machine marks. gpui-component ships neither a
+        // laptop nor a server (its closest are `hard-drive` and `cpu`, both of
+        // which say "a component" rather than "a computer"), and these carry
+        // the whole local/remote distinction on a list where every other row is
+        // a monogram — so they are drawn to the spec above rather than
+        // approximated. Names upstream doesn't use, so no `IconName` resolves
+        // through them and nothing else in the tree is redrawn; both are
+        // referenced by path from `switcher.rs`.
+        //
+        // Deliberately the *conventional* pair (a clamshell, a rack) per rule 3
+        // of the shape notes above: this is the one place in the app where the
+        // glyph is the only thing saying "your work is on another machine", and
+        // a cleverer metaphor would spend recognition it cannot afford.
+        "icons/machine-local.svg" => include_bytes!("../../assets/icons/machine-local.svg"),
+        "icons/machine-remote.svg" => include_bytes!("../../assets/icons/machine-remote.svg"),
         // The Files tab's remote (SFTP) mode needs a refresh it doesn't need
         // locally: the local tree runs a recursive filesystem watcher and
         // invalidates itself, a remote listing has nothing watching it. Drawn to

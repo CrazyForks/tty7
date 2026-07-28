@@ -12,6 +12,7 @@ use gpui::{Axis, Entity, prelude::*, px};
 use gpui_component::ActiveTheme as _;
 
 use crate::terminal::view::TerminalView;
+use crate::ui::pending_pane::PendingPane;
 
 /// Legal band for a split's `a`-child ratio; keeps both panes usable.
 const MIN_RATIO: f32 = 0.1;
@@ -19,10 +20,81 @@ const MAX_RATIO: f32 = 0.9;
 /// Thickness (px) of the draggable divider between two split children.
 const DIVIDER_THICKNESS: f32 = 5.;
 
-/// The leaf payload is generic (defaulting to the real terminal view) so the
-/// pure tree logic can be exercised in tests with plain values; at runtime
-/// `Pane` is always `Pane<Entity<TerminalView>>`.
-pub enum Pane<L = Entity<TerminalView>> {
+/// What occupies one leaf of the tree.
+///
+/// A pane is a terminal in every state the user cares about — but a *remote*
+/// one is not a terminal for the first few hundred milliseconds of its life,
+/// because building it means waiting on another computer. Rather than block the
+/// window for that (which is what happened before; see
+/// [`ui::pending_pane`](crate::ui::pending_pane)), the slot goes into the tree
+/// straight away and holds the wait.
+///
+/// The tree itself is indifferent to which variant a leaf holds: splitting,
+/// closing, geometry and directional focus all work off identity and shape.
+/// Only [`render`](Pane::render) and the handful of places that genuinely need
+/// a *terminal* — writing input, saving the session, killing a pane — care, and
+/// those ask with [`terminal`](PaneSlot::terminal).
+#[derive(Clone)]
+pub enum PaneSlot {
+    Ready(Entity<TerminalView>),
+    /// Still connecting, or failed and offering a retry.
+    Connecting(Entity<PendingPane>),
+}
+
+impl PaneSlot {
+    /// Identity, for the by-identity tree operations. Both variants are gpui
+    /// entities, so one id space covers them and a slot keeps the same identity
+    /// across the swap only if the caller asks for it (it does not — the swap
+    /// is `replace_leaf`, matched on the *pending* id).
+    pub fn entity_id(&self) -> gpui::EntityId {
+        match self {
+            PaneSlot::Ready(v) => v.entity_id(),
+            PaneSlot::Connecting(v) => v.entity_id(),
+        }
+    }
+
+    /// The terminal, or `None` while this slot is still connecting.
+    ///
+    /// Deliberately an `Option` rather than something that waits: every caller
+    /// of this is answering a question about *now* (what is focused, what to
+    /// save, where to send this keystroke), and "there is no terminal here yet"
+    /// is a real answer to all of them.
+    pub fn terminal(&self) -> Option<&Entity<TerminalView>> {
+        match self {
+            PaneSlot::Ready(v) => Some(v),
+            PaneSlot::Connecting(_) => None,
+        }
+    }
+
+    /// Whether focus is inside this slot.
+    ///
+    /// `contains_focused`, not `is_focused`: a leaf is "active" when its
+    /// terminal surface *or any descendant* holds focus. The inline input
+    /// editor is a child with its own focus handle, so while the shell idles at
+    /// its prompt focus lives there, not on the terminal's own handle — an
+    /// exact `is_focused` check would miss the active pane.
+    pub fn contains_focused(&self, window: &Window, cx: &App) -> bool {
+        match self {
+            PaneSlot::Ready(v) => v.read(cx).focus_handle.contains_focused(window, cx),
+            PaneSlot::Connecting(v) => v.read(cx).focus_handle.contains_focused(window, cx),
+        }
+    }
+
+    /// This slot's focus handle, so a connecting pane can be focused like any
+    /// other — a tab whose only pane is still connecting must not be a tab with
+    /// nowhere for focus to go.
+    pub fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
+        match self {
+            PaneSlot::Ready(v) => v.read(cx).focus_handle.clone(),
+            PaneSlot::Connecting(v) => v.read(cx).focus_handle.clone(),
+        }
+    }
+}
+
+/// The leaf payload is generic (defaulting to the real pane slot) so the pure
+/// tree logic can be exercised in tests with plain values; at runtime `Pane` is
+/// always `Pane<PaneSlot>`.
+pub enum Pane<L = PaneSlot> {
     Leaf(L),
     Split {
         axis: Axis,
@@ -425,21 +497,12 @@ impl<L: Clone> Pane<L> {
     }
 }
 
-/// Focus- and render-aware operations on the concrete terminal-view tree.
-impl Pane<Entity<TerminalView>> {
+/// Focus- and render-aware operations on the concrete pane tree.
+impl Pane<PaneSlot> {
     /// The currently focused leaf, if any.
-    pub fn focused_leaf(&self, window: &Window, cx: &App) -> Option<Entity<TerminalView>> {
+    pub fn focused_leaf(&self, window: &Window, cx: &App) -> Option<PaneSlot> {
         match self {
-            // `contains_focused`, not `is_focused`: a leaf is "active" when its
-            // terminal surface *or any descendant* holds focus. The inline
-            // input editor is a child with its own focus handle, so while the
-            // shell idles at its prompt focus lives there, not on the terminal's
-            // own handle — an exact `is_focused` check would miss the active pane.
-            Pane::Leaf(v) => v
-                .read(cx)
-                .focus_handle
-                .contains_focused(window, cx)
-                .then(|| v.clone()),
+            Pane::Leaf(v) => v.contains_focused(window, cx).then(|| v.clone()),
             Pane::Split { a, b, .. } => a
                 .focused_leaf(window, cx)
                 .or_else(|| b.focused_leaf(window, cx)),
@@ -447,21 +510,37 @@ impl Pane<Entity<TerminalView>> {
         }
     }
 
-    /// The operation target: the focused leaf, or the first leaf if none is
-    /// focused. This is the standard "act on the current pane" selection rule.
-    pub fn focused_or_first(&self, window: &Window, cx: &App) -> Option<Entity<TerminalView>> {
+    /// The operation target as a *slot*: the focused leaf, or the first leaf if
+    /// none is focused. For the operations that work on a pane regardless of
+    /// whether its terminal has arrived — focusing it, closing it.
+    pub fn focused_or_first_slot(&self, window: &Window, cx: &App) -> Option<PaneSlot> {
         self.focused_leaf(window, cx).or_else(|| self.first_leaf())
+    }
+
+    /// The operation target's *terminal*: the standard "act on the current
+    /// pane" selection rule, skipping a slot that has not finished connecting.
+    ///
+    /// Still the name every caller had, because it is still what they meant.
+    /// A pane that is mid-connect has no terminal, and every one of these
+    /// operations — write input, resize, kill, read the cwd — is a no-op on it
+    /// rather than something to queue up and replay.
+    pub fn focused_or_first(&self, window: &Window, cx: &App) -> Option<Entity<TerminalView>> {
+        self.focused_or_first_slot(window, cx)
+            .and_then(|slot| slot.terminal().cloned())
+    }
+
+    /// Every leaf that is a live terminal, in `leaves()` order.
+    pub fn terminals(&self) -> Vec<Entity<TerminalView>> {
+        self.leaves()
+            .iter()
+            .filter_map(|slot| slot.terminal().cloned())
+            .collect()
     }
 
     /// The pane adjacent to the focused one in direction `dir`, matched by
     /// normalized geometry (tmux directional focus). `None` when nothing is
     /// focused or the focused pane is already at that edge.
-    pub fn neighbor_in_dir(
-        &self,
-        dir: Dir,
-        window: &Window,
-        cx: &App,
-    ) -> Option<Entity<TerminalView>> {
+    pub fn neighbor_in_dir(&self, dir: Dir, window: &Window, cx: &App) -> Option<PaneSlot> {
         let focused = self.focused_leaf(window, cx)?;
         let leaves = self.leaves();
         let from = leaves
@@ -492,36 +571,33 @@ impl Pane<Entity<TerminalView>> {
     /// Split a specific leaf (matched by entity identity) along `axis`, inserting
     /// `new` as the second child. The target must be captured *before* creating
     /// `new`, since constructing a terminal steals window focus.
-    pub fn split_leaf(
-        &mut self,
-        target: &Entity<TerminalView>,
-        axis: Axis,
-        new: Entity<TerminalView>,
-    ) -> bool {
-        self.split_leaf_where(&|v| v.entity_id() == target.entity_id(), axis, new)
+    pub fn split_leaf(&mut self, target: gpui::EntityId, axis: Axis, new: PaneSlot) -> bool {
+        self.split_leaf_where(&|v| v.entity_id() == target, axis, new)
     }
 
-    /// Replace `target` (matched by entity identity) with `new`, preserving the
-    /// tree shape. Used by the in-place SSH reconnect (PRD FR-E4).
-    pub fn replace_leaf(
-        &mut self,
-        target: &Entity<TerminalView>,
-        new: Entity<TerminalView>,
-    ) -> bool {
-        self.replace_leaf_where(&|v| v.entity_id() == target.entity_id(), new)
+    /// Replace the leaf with entity id `target` with `new`, preserving the tree
+    /// shape.
+    ///
+    /// Two callers, and the second is why this takes a bare id rather than a
+    /// slot: the in-place SSH reconnect (PRD FR-E4) has the dead pane in hand,
+    /// but a pane that finished connecting has only the id of the placeholder
+    /// it is replacing — the placeholder entity may already be dropped by the
+    /// time the terminal lands.
+    pub fn replace_leaf(&mut self, target: gpui::EntityId, new: PaneSlot) -> bool {
+        self.replace_leaf_where(&|v| v.entity_id() == target, new)
     }
 
     /// Remove the focused leaf, collapsing its parent split into the sibling.
     pub fn close_focused(&mut self, window: &Window, cx: &App) -> CloseOutcome {
-        self.close_leaf_where(&|v| v.read(cx).focus_handle.contains_focused(window, cx))
+        self.close_leaf_where(&|v| v.contains_focused(window, cx))
     }
 
     /// Remove a specific leaf (matched by entity identity), collapsing its
     /// parent split into the sibling. Used when a pane closes for a reason
     /// other than user focus — its child exited on its own — so the leaf to
     /// remove is the exited one, wherever focus happens to be.
-    pub fn close_leaf(&mut self, target: &Entity<TerminalView>) -> CloseOutcome {
-        self.close_leaf_where(&|v| v.entity_id() == target.entity_id())
+    pub fn close_leaf(&mut self, target: gpui::EntityId) -> CloseOutcome {
+        self.close_leaf_where(&|v| v.entity_id() == target)
     }
 
     /// Render the subtree. `show_focus` draws a focus ring on the active leaf
@@ -530,7 +606,7 @@ impl Pane<Entity<TerminalView>> {
         match self {
             Pane::Empty => div().into_any_element(),
             Pane::Leaf(v) => {
-                let focused = show_focus && v.read(cx).focus_handle.contains_focused(window, cx);
+                let focused = show_focus && v.contains_focused(window, cx);
                 // No full border (it reads as a hard rectangle).
                 div()
                     .size_full()
@@ -544,7 +620,10 @@ impl Pane<Entity<TerminalView>> {
                     // white). Applied to the container, so a click still lands on
                     // the terminal and focuses it.
                     .when(show_focus && !focused, |d| d.opacity(0.55))
-                    .child(v.clone())
+                    .map(|d| match v {
+                        PaneSlot::Ready(t) => d.child(t.clone()),
+                        PaneSlot::Connecting(p) => d.child(p.clone()),
+                    })
                     .into_any_element()
             }
             Pane::Split {

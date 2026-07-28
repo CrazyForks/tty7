@@ -409,16 +409,21 @@ fn main() {
                 .detach();
             keymap::init(cx);
 
-            // Reopen the workspaces that had a window at the last quit, each in
-            // its own window and at its own remembered geometry (`ui::windows`
-            // owns that logic now, since "New Workspace" and the workspace picker
-            // need the identical path). Quitting with every window closed — or a
-            // first run — opens a single window on a fresh workspace.
-            let (reopen, any_saved) = {
+            // Come up on the *one* workspace the user was last in, at its own
+            // remembered geometry (`ui::windows` owns that logic, since "New
+            // Workspace" and the workspace picker need the identical path).
+            //
+            // Deliberately one window, not one per workspace that was open at
+            // quit: see `Workspaces::workspace_to_restore` for why, and
+            // `WorkspaceStore::restore_one` for what happens to the others (they
+            // are detached, not forgotten — panes keep running and the switcher
+            // lists them). Quitting with every window closed — or a first run —
+            // opens a single window on a fresh workspace.
+            let any_saved = {
                 let store = crate::core::session::WorkspaceStore::all(cx);
-                let reopen: Vec<_> = store.open_workspaces().map(|w| w.id).collect();
-                (reopen, !store.workspaces.is_empty())
+                !store.workspaces.is_empty()
             };
+            let reopen = crate::core::session::WorkspaceStore::restore_one(cx);
             // With nothing to reopen, what that one window should hold depends on
             // whether there is anything to come back to: workspaces the user
             // detached are listed by the home page's picker, so leave it empty
@@ -430,12 +435,9 @@ fn main() {
             } else {
                 crate::ui::windows::FreshStart::Shell
             };
-            if reopen.is_empty() {
-                crate::ui::windows::open_with(cx, None, fresh);
-            } else {
-                for id in reopen {
-                    crate::ui::windows::open(cx, Some(id));
-                }
+            match reopen {
+                Some(id) => crate::ui::windows::open(cx, Some(id)),
+                None => crate::ui::windows::open_with(cx, None, fresh),
             }
         });
 }

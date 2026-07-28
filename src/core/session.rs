@@ -158,6 +158,36 @@ impl WorkspaceStore {
         store.workspaces.save();
     }
 
+    /// Pick the one workspace launch will show, and detach every other one that
+    /// was still open at the last quit.
+    ///
+    /// The detaching is the point: `open` means "a window is showing this", and
+    /// launch is about to make that false for all but one of them. Leaving the
+    /// rest marked open would have the switcher badge them "open" with no window
+    /// to switch to, and would have the *next* quit believe they were on screen.
+    /// Their panes are untouched — this is exactly the state
+    /// [`close_window`](Self::close_window) leaves behind, reached in bulk.
+    ///
+    /// Returns `None` when nothing was open, which launch reads as "come up on
+    /// the home page".
+    pub fn restore_one(cx: &mut gpui::App) -> Option<WorkspaceId> {
+        let store = Self::try_store(cx)?;
+        let keep = store.workspaces.workspace_to_restore()?;
+        let mut detached = 0usize;
+        for workspace in &mut store.workspaces.workspaces {
+            if workspace.open && workspace.id != keep {
+                workspace.open = false;
+                detached += 1;
+            }
+        }
+        store.workspaces.active = Some(keep);
+        store.workspaces.save();
+        if detached > 0 {
+            log::info!("launch: restoring 1 workspace, left {detached} detached");
+        }
+        Some(keep)
+    }
+
     /// Detach a workspace: its window is gone, but the panes keep running in
     /// the daemon and the entry stays for the picker to reopen.
     pub fn close_window(cx: &mut gpui::App, id: WorkspaceId) {

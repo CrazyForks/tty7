@@ -2106,6 +2106,19 @@ fn connect_routed(route: &PaneRoute) -> anyhow::Result<Stream> {
         return connect();
     };
 
+    // Past this point the call blocks on *another computer* — the daemon has to
+    // open an SSH channel (doing the whole handshake if nothing is pooled) and
+    // the remote `tty7-server` has to answer. The doc above says callers are on
+    // a background thread; this is what makes that a rule rather than a hope.
+    //
+    // The same guard the `Host` trait uses for its filesystem calls, for the
+    // same reason and with the same blast radius: `debug_assert!` compiles away
+    // in release, so a shipped build never trades a slow pane for a dead app.
+    // It fires in development the moment a routed connect is reintroduced on
+    // the UI thread — which is how spawning, restoring, listing and killing
+    // remote panes each froze the window in turn.
+    tty7_core::host::guard_off_ui();
+
     // WSL installs from the GUI process, never from the daemon: consent has to
     // be raised where it can be answered, and this machine *is* the machine
     // (see `install::wsl::ensure_wsl_server`'s own doc). The daemon's call a

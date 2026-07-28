@@ -451,11 +451,23 @@ pub fn stop_workspace(cx: &mut App, workspace: WorkspaceId) {
         .get(workspace)
         .map(|w| w.host_id())
         .unwrap_or(crate::ui::host_ops::HostId::LOCAL);
-    if let Some(ws) = WorkspaceStore::all(cx).get(workspace) {
-        let ids = ws.pane_ids();
-        for pane_id in ids {
-            crate::terminal::RemoteTerminal::kill_pane_on(&route, pane_id);
-        }
+    let ids = WorkspaceStore::all(cx)
+        .get(workspace)
+        .map(|ws| ws.pane_ids())
+        .unwrap_or_default();
+    if !ids.is_empty() {
+        // Off the UI thread: each of these dials `route`, and on a remote
+        // workspace that is an SSH channel per pane. Stopping a four-pane
+        // workspace used to freeze the window for as long as four round trips.
+        // Fire-and-forget — a missing daemon means there was nothing to kill.
+        let route = route.clone();
+        cx.background_executor()
+            .spawn(async move {
+                for pane_id in ids {
+                    crate::terminal::RemoteTerminal::kill_pane_on(&route, pane_id);
+                }
+            })
+            .detach();
     }
     // The panes this machine just reported as alive are the ones we killed, so
     // the cached answer is now wrong by our own hand. Waiting out its TTL would

@@ -468,6 +468,18 @@ pub fn rows_from_list(list: &[Value]) -> Vec<RemoteWorkspaceRow> {
 #[derive(Default)]
 pub struct RemoteConnections {
     hosts: HashMap<HostId, Arc<RemoteHost>>,
+    /// Each machine's `$HOME`, as its handshake reported it.
+    ///
+    /// Kept beside the connection because it is the same lifetime and the same
+    /// scope: it is a fact about the *machine*, true for every window, and it
+    /// arrives on the same handshake. It used to live only in the window-owned
+    /// `Tty7App::host_snapshots`, which meant "New Workspace" appeared on a
+    /// connected machine **only in the window that had personally connected to
+    /// it** — a machine brought up by the reconnect supervisor (app restart, a
+    /// dropped link, another window's connect) reached `Link::Connected` with no
+    /// home recorded anywhere this window could see, and the row silently
+    /// vanished.
+    homes: HashMap<HostId, PathBuf>,
 }
 
 impl Global for RemoteConnections {}
@@ -481,19 +493,34 @@ impl RemoteConnections {
             .cloned()
     }
 
+    /// Where a *new* workspace on `id` would start: that machine's own `$HOME`,
+    /// never this client's (design §10).
+    pub fn home(cx: &mut App, id: HostId) -> Option<PathBuf> {
+        cx.default_global::<RemoteConnections>()
+            .homes
+            .get(&id)
+            .cloned()
+    }
+
     /// Record a connection, and register the same object with the host registry
     /// so the file tree / git / editor reach it the way they reach any host.
-    pub fn insert(cx: &mut App, host: Arc<RemoteHost>) {
+    ///
+    /// `home` rides along rather than sitting behind its own setter so that no
+    /// connect path can register a machine and forget to say where its `$HOME`
+    /// is — which is exactly how the reconnect path lost it.
+    pub fn insert(cx: &mut App, host: Arc<RemoteHost>, home: PathBuf) {
         let id = host.id();
         crate::ui::host_registry::HostRegistry::insert(cx, Arc::clone(&host).into_shared());
-        cx.default_global::<RemoteConnections>()
-            .hosts
-            .insert(id, host);
+        let table = cx.default_global::<RemoteConnections>();
+        table.hosts.insert(id, host);
+        table.homes.insert(id, home);
     }
 
     /// Drop a machine's connection once nothing is using it.
     pub fn remove(cx: &mut App, id: HostId) {
-        cx.default_global::<RemoteConnections>().hosts.remove(&id);
+        let table = cx.default_global::<RemoteConnections>();
+        table.hosts.remove(&id);
+        table.homes.remove(&id);
         crate::ui::host_registry::HostRegistry::remove(cx, id);
     }
 

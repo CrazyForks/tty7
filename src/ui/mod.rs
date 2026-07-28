@@ -24,6 +24,7 @@ pub mod host_registry;
 pub mod keymap;
 pub mod palette;
 pub mod pane;
+pub mod pending_pane;
 pub mod perf;
 pub mod presets;
 pub mod remote_connect;

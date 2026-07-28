@@ -837,22 +837,40 @@ impl Tty7App {
         // leading magnifier + an appearance-less input, no box and no divider
         // under the bar, so the control row and list read as one continuous rail
         // rather than stacked panels.
+        // Laid out to land on the workspace chip directly above it rather than
+        // on the rail's own inset: the magnifier takes a column the width of the
+        // chip's monogram and the same 6px gap after it, so glyph sits over
+        // glyph and "Search tabs…" over the workspace name. Getting there needs
+        // three numbers that were all being left to their defaults — the chip is
+        // an `xsmall` Button, which adds 4px of padding of its own inside the
+        // rail's inset, and a default-size `Input` carries 12px more whether or
+        // not it draws a box.
+        let chip_inset = crate::ui::app::CONTENT_INSET - 7. + 4.;
         let top_bar = h_flex()
             .flex_shrink_0()
             .items_center()
-            .gap_1()
+            .gap(px(6.))
             .h(px(44.))
-            .px(px(crate::ui::app::CONTENT_INSET))
+            .pl(px(chip_inset))
+            .pr(px(crate::ui::app::CONTENT_INSET))
             .child(
-                Icon::new(IconName::Search)
-                    .small()
-                    .text_color(cx.theme().muted_foreground),
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(Self::AVATAR_PX))
+                    .child(
+                        Icon::new(IconName::Search)
+                            .size(px(14.))
+                            .text_color(cx.theme().muted_foreground),
+                    ),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(&self.sidebar_search).appearance(false)),
+                    .child(Input::new(&self.sidebar_search).appearance(false).pl_0()),
             );
 
         // ── Resize drag (mirrors the split divider in `pane.rs`) ──────────────
@@ -1020,7 +1038,7 @@ impl Tty7App {
                 // per tab, and two machines can't collide here without a
                 // window the model does not permit.
                 let cwd = tab.pane.first_leaf().and_then(|leaf| {
-                    let view = leaf.read(cx);
+                    let view = leaf.terminal()?.read(cx);
                     Some((view.host_id(), view.git_status_cwd()?.to_path_buf()))
                 });
                 if let Some(known) =
