@@ -1419,7 +1419,118 @@ pub use sock::{
     spawn_control_listener, spawn_control_listener_with,
 };
 
+/// The pool is plain threads and channels, so unlike the rest of this file's
+/// tests — which need a Unix socket pair — these hold on every platform.
 #[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    /// Workers are spawned only when nobody is free, so a serial stream of jobs
+    /// costs one thread rather than one thread per job.
+    #[test]
+    fn the_pool_reuses_a_warm_worker() {
+        let pool = Pool::new();
+
+        // A job signals from *inside* itself, so it has sent before its worker
+        // has parked again. Submitting in that window is a genuine "nobody is
+        // free" and legitimately spawns a second worker — so let the pool settle
+        // first, and the assertion is about reuse rather than about timing.
+        let settled = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let st = pool.inner.state.lock().unwrap();
+                if st.idle == st.workers {
+                    return;
+                }
+                drop(st);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("the pool never went idle");
+        };
+
+        for _ in 0..50 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            assert!(pool.submit(move || {
+                let _ = tx.send(());
+            }));
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            settled();
+        }
+        let st = pool.inner.state.lock().unwrap();
+        assert_eq!(
+            st.workers, 1,
+            "50 sequential jobs should not want 50 threads"
+        );
+    }
+
+    /// And it does grow when work genuinely overlaps.
+    #[test]
+    fn the_pool_grows_for_concurrent_work() {
+        let pool = Pool::new();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        for _ in 0..8 {
+            let gate = Arc::clone(&gate);
+            let done_tx = done_tx.clone();
+            assert!(pool.submit(move || {
+                let (lock, cv) = &*gate;
+                let mut open = lock.lock().unwrap();
+                let _ = done_tx.send(());
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            }));
+        }
+        for _ in 0..8 {
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(pool.inner.state.lock().unwrap().workers, 8);
+
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        pool.close();
+    }
+
+    /// Closing drops the backlog. That is what breaks the `Conn` → `Pool` → job
+    /// → `Arc<Conn>` cycle; leaving the jobs queued would keep every watch on a
+    /// dead connection alive for the life of the process.
+    #[test]
+    fn closing_the_pool_drops_queued_work() {
+        let pool = Pool::new();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let ran = Arc::new(AtomicBool::new(false));
+
+        // One job to occupy the single worker...
+        let blocker = Arc::clone(&gate);
+        assert!(pool.submit(move || {
+            let (lock, cv) = &*blocker;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+        }));
+        std::thread::sleep(Duration::from_millis(100));
+        // ...and one that must never run.
+        let ran2 = Arc::clone(&ran);
+        pool.submit(move || ran2.store(true, Ordering::SeqCst));
+
+        pool.close();
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a job queued at close still ran"
+        );
+        assert!(!pool.submit(|| {}), "a closed pool must refuse work");
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::daemon::control::{ControlHello, MTime, feature};
@@ -2189,112 +2300,6 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // The pool
-    // -----------------------------------------------------------------------
-
-    /// Workers are spawned only when nobody is free, so a serial stream of jobs
-    /// costs one thread rather than one thread per job.
-    #[test]
-    fn the_pool_reuses_a_warm_worker() {
-        let pool = Pool::new();
-
-        // A job signals from *inside* itself, so it has sent before its worker
-        // has parked again. Submitting in that window is a genuine "nobody is
-        // free" and legitimately spawns a second worker — so let the pool settle
-        // first, and the assertion is about reuse rather than about timing.
-        let settled = || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                let st = pool.inner.state.lock().unwrap();
-                if st.idle == st.workers {
-                    return;
-                }
-                drop(st);
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            panic!("the pool never went idle");
-        };
-
-        for _ in 0..50 {
-            let (tx, rx) = std::sync::mpsc::channel();
-            assert!(pool.submit(move || {
-                let _ = tx.send(());
-            }));
-            rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            settled();
-        }
-        let st = pool.inner.state.lock().unwrap();
-        assert_eq!(
-            st.workers, 1,
-            "50 sequential jobs should not want 50 threads"
-        );
-    }
-
-    /// And it does grow when work genuinely overlaps.
-    #[test]
-    fn the_pool_grows_for_concurrent_work() {
-        let pool = Pool::new();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        for _ in 0..8 {
-            let gate = Arc::clone(&gate);
-            let done_tx = done_tx.clone();
-            assert!(pool.submit(move || {
-                let (lock, cv) = &*gate;
-                let mut open = lock.lock().unwrap();
-                let _ = done_tx.send(());
-                while !*open {
-                    open = cv.wait(open).unwrap();
-                }
-            }));
-        }
-        for _ in 0..8 {
-            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        }
-        assert_eq!(pool.inner.state.lock().unwrap().workers, 8);
-
-        let (lock, cv) = &*gate;
-        *lock.lock().unwrap() = true;
-        cv.notify_all();
-        pool.close();
-    }
-
-    /// Closing drops the backlog. That is what breaks the `Conn` → `Pool` → job
-    /// → `Arc<Conn>` cycle; leaving the jobs queued would keep every watch on a
-    /// dead connection alive for the life of the process.
-    #[test]
-    fn closing_the_pool_drops_queued_work() {
-        let pool = Pool::new();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let ran = Arc::new(AtomicBool::new(false));
-
-        // One job to occupy the single worker...
-        let blocker = Arc::clone(&gate);
-        assert!(pool.submit(move || {
-            let (lock, cv) = &*blocker;
-            let mut open = lock.lock().unwrap();
-            while !*open {
-                open = cv.wait(open).unwrap();
-            }
-        }));
-        std::thread::sleep(Duration::from_millis(100));
-        // ...and one that must never run.
-        let ran2 = Arc::clone(&ran);
-        pool.submit(move || ran2.store(true, Ordering::SeqCst));
-
-        pool.close();
-        let (lock, cv) = &*gate;
-        *lock.lock().unwrap() = true;
-        cv.notify_all();
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(
-            !ran.load(Ordering::SeqCst),
-            "a job queued at close still ran"
-        );
-        assert!(!pool.submit(|| {}), "a closed pool must refuse work");
     }
 
     // -----------------------------------------------------------------------
