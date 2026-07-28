@@ -1573,29 +1573,47 @@ mod tests {
         })
     }
 
+    /// A path its own platform accepts but `str` cannot hold — Latin-1 bytes on
+    /// Unix, an unpaired surrogate on Windows. Both are real filenames, and
+    /// neither survives a JSON wire.
+    fn unrepresentable_path() -> PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9.rs"))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt as _;
+            // `C:\` then a lone high surrogate: legal in an NTFS name, not
+            // convertible to a `str`.
+            PathBuf::from(std::ffi::OsString::from_wide(&[
+                0x0043, 0x003a, 0x005c, 0xd800, 0x002e, 0x0072, 0x0073,
+            ]))
+        }
+    }
+
     /// `to_frame` reaches every "cannot be sent" verdict with the wire
     /// untouched. That is what lets the server answer such a reply with an
     /// error instead of dropping it, and the client keep its link on a local
     /// encode failure — both of which are silent hangs otherwise.
     #[test]
     fn to_frame_refuses_what_cannot_be_sent_without_writing_it() {
-        // A path that is not UTF-8: `serde` errors on `Path` rather than
-        // converting lossily, so this is the shape a `SearchHit` takes when the
-        // server has a Latin-1 filename under the search roots.
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt as _;
-        let latin1 = ControlServerMsg::Response {
+        // A path the platform accepts and `str` cannot hold. `serde` errors on
+        // such a `Path` rather than converting it lossily, which is the shape a
+        // `SearchHit` takes when the server has one under the search roots.
+        let unrepresentable = ControlServerMsg::Response {
             req_id: 1,
             reply: ControlReply::Ok(ReplyOk::Hits(vec![SearchHit {
-                name: "caf?.rs".into(),
-                path: PathBuf::from(OsStr::from_bytes(b"/tmp/caf\xe9.rs")),
+                name: "caf\u{fffd}.rs".into(),
+                path: unrepresentable_path(),
                 is_dir: false,
                 ignored: false,
             }])),
         };
         assert!(
-            latin1.to_frame().is_err(),
-            "a non-UTF-8 path must not encode"
+            unrepresentable.to_frame().is_err(),
+            "a path that is not valid Unicode must not encode"
         );
 
         // And the size verdict, which `write_frame` would otherwise reach only
