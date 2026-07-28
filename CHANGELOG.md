@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Dim inactive panes" switch. On by default, so nothing changes for anyone who
   was happy; off renders every pane at full opacity. (#214)
 
+### Changed
+
+- **One fewer duplicate SVG stack in the build** — the resvg 0.47 bump (#227)
+  left the gpui fork on 0.45, so the tree compiled two resvg/usvg/tiny-skia
+  stacks. The fork now pins 0.47 too, re-unifying its stack with the one tty7
+  uses for the tray icon. gpui-component still carries its own 0.45.1 until
+  that fork catches up. (#237)
+
 ### Fixed
 
 - **Italic CJK rendered as unrelated CJK on Windows** — every character came out
