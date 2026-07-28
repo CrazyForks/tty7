@@ -432,6 +432,22 @@ const TERM_PROGRAM_NAME: &str = "tty7";
 /// what the pane on the other end can decode.
 const CAPABILITY_ENV: [&str; 2] = ["TERM", "COLORTERM"];
 
+/// Whether a configured `env` key names one of [`CAPABILITY_ENV`]. Windows
+/// environment blocks are case-insensitive — `portable-pty` keeps one slot per
+/// lowercased key, so a configured `Term` there would replace `TERM` just as
+/// surely as the exact spelling — so the filter must use the platform's own
+/// notion of "the same variable". On Unix a differently-cased key is a genuinely
+/// distinct variable and stays the user's to set.
+fn names_capability_env(key: &str) -> bool {
+    CAPABILITY_ENV.iter().any(|cap| {
+        if cfg!(windows) {
+            key.eq_ignore_ascii_case(cap)
+        } else {
+            key == *cap
+        }
+    })
+}
+
 /// The environment every pane starts with, in application order — tty7's own
 /// advertisements first, then the user's `env` map, which overrides all but
 /// [`CAPABILITY_ENV`]. Returned as a list rather than applied in place so the
@@ -471,7 +487,7 @@ fn pane_environment(
     env.extend(
         extra_env
             .iter()
-            .filter(|(k, _)| !CAPABILITY_ENV.contains(&k.as_str()))
+            .filter(|(k, _)| !names_capability_env(k))
             .map(|(k, v)| (k.clone(), v.clone())),
     );
     env
@@ -4147,6 +4163,39 @@ mod tests {
             applied.get("COLORTERM").map(String::as_str),
             Some("truecolor")
         );
+    }
+
+    /// Windows environment blocks are case-insensitive — `portable-pty` keeps
+    /// one slot per lowercased key — so a configured `Term` would replace
+    /// `TERM` just as surely as the exact spelling. The capability filter must
+    /// therefore drop any casing of a capability key, not just the canonical
+    /// one. (On Unix a differently-cased key is a distinct variable and passes
+    /// through untouched.)
+    #[cfg(windows)]
+    #[test]
+    fn pane_environment_capability_keys_cannot_be_overridden_by_recasing() {
+        let configured = [("Term", "dumb"), ("ColorTerm", ""), ("term_program", "x")]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+
+        let applied = pane_environment(&configured);
+
+        assert!(
+            !applied.iter().any(|(k, _)| k == "Term" || k == "ColorTerm"),
+            "a recased capability key must be filtered out, or it would land \
+             in the same case-folded slot and win by coming later"
+        );
+        let get = |key: &str| {
+            applied
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("TERM"), Some("xterm-256color"));
+        assert_eq!(get("COLORTERM"), Some("truecolor"));
+        // Identity keys stay overridable in any casing the user spells.
+        assert_eq!(get("term_program"), Some("x"));
     }
 
     /// The macOS UTF-8 fallback applies only when the inherited environment has
