@@ -823,6 +823,16 @@ impl Tty7App {
                     .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
                 ),
             );
+        // The rail's head: which workspace this window is on. A row of its own,
+        // above the search box, because it names the thing the whole column
+        // enumerates. It is deliberately *not* folded into the repo group headers
+        // below — those are repositories, and one workspace holds several of them.
+        let workspace_head = h_flex()
+            .flex_shrink_0()
+            .px(px(crate::ui::app::CONTENT_INSET - 7.))
+            .pt(px(4.))
+            .child(self.workspace_head(cx));
+
         // Borderless "Search tabs…" that sits directly on the sunk surface: a
         // leading magnifier + an appearance-less input, no box and no divider
         // under the bar, so the control row and list read as one continuous rail
@@ -969,6 +979,7 @@ impl Tty7App {
                     .child(crate::ui::app::title_bar_drag(
                         controls.id("sidebar-titlebar-drag"),
                     ))
+                    .child(workspace_head)
                     .child(top_bar)
                     .child(crate::ui::scrollbar::with_vertical_scrollbar(
                         "tab-sidebar-scrollbar",

@@ -349,13 +349,14 @@ pub(crate) fn select_workspace_action(index: usize) -> Option<Box<dyn gpui::Acti
 }
 
 impl Tty7App {
-    /// Diameter of the workspace avatar, matching the 32px chrome tiles beside
-    /// it so the corner reads as one row of controls.
-    const AVATAR_PX: f32 = 26.0;
+    /// Diameter of the workspace avatar. Sized to the rail's row glyphs rather
+    /// than to a chrome tile: this control is the head of the tab list, so it
+    /// reads down the column instead of across a row of buttons.
+    const AVATAR_PX: f32 = 20.0;
 
-    /// The title-bar workspace control: a monogram of the current workspace
-    /// plus a chevron, opening the one menu that owns everything
-    /// workspace-scoped — and the app-level entries the "⋯" used to hold.
+    /// The rail's head: which workspace this window is on, plus the menu that
+    /// owns everything workspace-scoped — and the app-level entries the "⋯"
+    /// used to hold.
     ///
     /// This exists because the rest of it was too well hidden. Switching lived
     /// in the command palette, reopening lived on the home page, ending lived
@@ -363,14 +364,22 @@ impl Tty7App {
     /// defensible, together undiscoverable. Nothing in the window even *said*
     /// which workspace it was, which starts to matter the moment there are two.
     ///
-    /// A monogram rather than the full name: a fixed-width control can't be
-    /// pushed off the corner by a long repo name, and it sits level with the
-    /// icon tiles instead of introducing a third shape. The full name is in the
-    /// tooltip and checked in the menu.
+    /// It used to be a monogram in the window's top-right corner. Two things
+    /// were wrong with that. Physically: the corner it sat in is the *panel's*
+    /// top zone while the panel is open, so a control that has nothing to do
+    /// with the panel was eating width the panel's own tabs needed — at the
+    /// 200px minimum the row wanted 268px. Semantically: a window's workspace is
+    /// exactly what the rail below enumerates (this workspace's tabs), so the
+    /// name belonged at the head of that column, not across the window from it.
+    ///
+    /// Here it can afford the full name — the rail is a column with a width of
+    /// its own, and it truncates rather than pushing anything off an edge. The
+    /// monogram stays as a leading avatar because it is the mark that identifies
+    /// *this* workspace at a glance across windows.
     ///
     /// While a rename is in flight the control becomes the text field, so the
     /// name is edited where it is displayed.
-    pub(crate) fn workspace_chip(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    pub(crate) fn workspace_head(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         if let Some(rename) = self.workspace_rename.as_ref() {
             // The tile itself becomes the field — same height, same radius, and
             // the hover fill standing in for "this control is being edited".
@@ -382,10 +391,13 @@ impl Tty7App {
                 .id("workspace-rename")
                 .flex_shrink_0()
                 .items_center()
-                .h(px(32.))
-                .w(px(150.))
-                .px(px(8.))
-                .rounded_lg()
+                // Full rail width, not the old fixed 150px: this control is a row
+                // in a column now, so it takes the column's width like every other
+                // row does.
+                .h(px(30.))
+                .w_full()
+                .px(px(7.))
+                .rounded_md()
                 .bg(cx.theme().sidebar_accent)
                 // Swallow mouse-downs (including the double-click that selects a
                 // word) so they never reach the enclosing TitleBar and zoom the
@@ -418,34 +430,55 @@ impl Tty7App {
 
         div()
             .occlude()
-            .flex_shrink_0()
+            .w_full()
             .child(
-                Button::new("titlebar-workspace")
+                Button::new("rail-workspace-head")
                     .custom(chrome_tile_variant(cx))
                     .child(
                         h_flex()
+                            .w_full()
                             .items_center()
-                            .gap(px(3.))
+                            .gap(px(6.))
                             .child(
                                 div()
                                     .flex()
+                                    .flex_shrink_0()
                                     .items_center()
                                     .justify_center()
                                     .size(px(Self::AVATAR_PX))
                                     .rounded_full()
                                     .bg(cx.theme().secondary)
-                                    .text_size(px(11.))
+                                    .text_size(px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(monogram),
                             )
-                            // A chevron, unlike the toggles beside it: those do
-                            // one thing on click, this opens something, and the
+                            // The name shrinks and truncates rather than pushing
+                            // the chevron out — same rule the group headers below
+                            // it follow, so a long workspace name and a long repo
+                            // name behave identically.
+                            .child(
+                                div()
+                                    .flex_shrink(1.)
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(SharedString::from(current.clone())),
+                            )
+                            // A chevron, unlike the tiles in the row above: those
+                            // do one thing on click, this opens something, and the
                             // glyph is what says so.
-                            .child(Icon::new(IconName::ChevronDown).size(px(11.))),
+                            .child(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(px(11.))
+                                    .flex_shrink_0()
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
                     )
                     .xsmall()
-                    .h(px(32.))
-                    .rounded_lg()
+                    .w_full()
+                    .h(px(30.))
+                    .rounded_md()
                     .tooltip(SharedString::from(current))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_switcher(window, cx);
@@ -518,12 +551,15 @@ impl Tty7App {
             .flex_shrink_0()
             .items_center()
             .gap(px(2.))
-            // The workspace control leads the corner chrome: it is the only
-            // thing in the window that says *which* workspace this is, which
-            // starts to matter the moment there are two. It also absorbed the
-            // old "⋯" menu, so the corner has one menu instead of two adjacent
-            // ones, and nothing workspace-scoped is left behind a modifier
-            // gesture or a palette entry the user has to already know about.
+            // Two controls, both window-scoped, and that is the whole corner now.
+            // The workspace chip used to lead this group; it moved to the rail's
+            // head (`tab_sidebar`), where the list it names actually lives. What
+            // forced the move is that this group's other host is the *panel's* top
+            // zone, and a panel the user can drag down to 200px cannot seat the
+            // panel's four tabs plus three window controls — the row wanted 268px.
+            // Nothing that has no business being scoped to the panel gets to
+            // compete for that width.
+            //
             // The "⋯" glyph ends on the window's content inset like every other
             // right edge in the chrome — hence `inset - TILE_PAD`, which puts the
             // *glyph's ink* there instead of its hit box.
@@ -562,13 +598,37 @@ impl Tty7App {
                 ),
             )
             .child(self.app_menu_tile(window, cx))
-            .child(self.workspace_chip(cx))
     }
 
     /// The detail panel's tab tiles — icon-only, one per view. Lives here beside
     /// the rest of the chrome tiles so all of them share one styling helper.
+    ///
+    /// Body scale ([`TILE_SIZE_SM`]), not chrome scale. Two reasons, and the
+    /// second is why it changed: these tiles live *inside* a panel, which is what
+    /// that constant is for; and the row they sit in also carries the window's
+    /// own chrome at its trailing edge, so drawing both at 32px made seven
+    /// identical squares out of controls belonging to three different layers.
+    /// One size step is what separates "the panel's own tabs" from "the window's
+    /// buttons" without adding a rule or a divider. It also buys back the 32px
+    /// that made the row overflow a 200px-wide panel.
+    ///
+    /// [`TILE_SIZE_SM`]: crate::ui::app::TILE_SIZE_SM
     pub(crate) fn right_panel_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let active_tab = self.right_panel_tab;
+        // Changed-file count, carried in the Changes tooltip. It used to be a
+        // tally in that tab's header row, and that row is gone on macOS
+        // (`panel_title`) — but this is the one count worth keeping reachable
+        // *without* switching to the tab, since it answers "did I touch anything"
+        // from wherever you are. Outline's count didn't survive the move: it
+        // needs the active leaf, which needs a `&Window` this function doesn't
+        // take, and its list is right there the moment you switch.
+        let changed = match &self.right_panel.diff {
+            Some(Some(snap)) => {
+                let n = snap.files.len() + snap.untracked.len();
+                (n > 0).then_some(n)
+            }
+            _ => None,
+        };
         [
             (
                 RightPanelTab::Info,
@@ -600,13 +660,23 @@ impl Tty7App {
                 .occlude()
                 .flex_shrink_0()
                 .child(
-                    chrome_tile(
+                    chrome_tile_sized(
                         Button::new(("right-panel-tab", tab as usize)).icon(icon),
+                        crate::ui::app::TILE_SIZE_SM,
+                        crate::ui::app::TILE_GLYPH_SM,
                         active_tab == tab,
                         cx,
                     )
-                    .rounded_lg()
-                    .tooltip(label)
+                    // `rounded_md` against the chrome tiles' `rounded_lg`: the
+                    // corner radius tracks the box, or a 24px tile reads as a
+                    // 32px one with its sides shaved off.
+                    .rounded_md()
+                    .tooltip(match (tab, changed) {
+                        (RightPanelTab::Changes, Some(n)) => {
+                            SharedString::from(format!("{label} · {n}"))
+                        }
+                        _ => SharedString::from(label),
+                    })
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.set_right_panel_tab(tab, cx);
                     })),

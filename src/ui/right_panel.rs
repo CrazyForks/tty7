@@ -28,10 +28,7 @@ use std::rc::Rc;
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::PaneProcs;
 use crate::terminal::git_diff::{self, DiffSnapshot};
-use crate::ui::app::{
-    CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App, tile_trailing_inset,
-    tile_trailing_inset_sm,
-};
+use crate::ui::app::{CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App, tile_trailing_inset_sm};
 use crate::ui::scrollbar::with_vertical_scrollbar;
 
 /// Bounds for the panel's width, mirroring the rail's: a floor so the tree never
@@ -249,7 +246,11 @@ impl Tty7App {
                         .on_double_click(|_, window, _| window.titlebar_double_click())
                         .items_center()
                         .gap(px(2.))
-                        .pl(px(tile_trailing_inset()))
+                        // `_sm` because the tabs are body-scale tiles now
+                        // (`right_panel_tabs`): the leading inset has to line the
+                        // *glyph* up on `CONTENT_INSET`, and a 24px tile holds its
+                        // glyph a different distance inside the box than a 32px one.
+                        .pl(px(crate::ui::app::tile_trailing_inset_sm()))
                         .children(self.right_panel_tabs(cx))
                         .child(div().flex_1())
                         // The panel is what reaches the window's right edge while
@@ -375,6 +376,16 @@ impl Tty7App {
     /// of this one meant three stacked headers before a single line of content —
     /// so the two that were saying "this is a header" merge into one that also
     /// says which tab you are on.
+    ///
+    /// **On macOS it draws nothing unless a tab passes `trailing`.** The panel
+    /// there has its own tile row in its top zone, which already says which tab
+    /// you are on — restating it in words underneath was a whole row spent on
+    /// something the selected tile and the content below both already answer
+    /// (a file tree is Files, a diff is Changes). What it did cost was the row:
+    /// the panel opened with tiles, then a title, then a search box, before one
+    /// line of content. The counts it used to carry move into the tab tooltips.
+    /// A tab that has its own control still gets the row, because that control
+    /// has nowhere else to go.
     pub(crate) fn panel_title(
         &self,
         text: &str,
@@ -384,6 +395,9 @@ impl Tty7App {
     ) -> AnyElement {
         let tabs = (!cfg!(target_os = "macos")).then(|| self.right_panel_tabs(cx));
         let has_trailing = trailing.is_some();
+        if tabs.is_none() && !has_trailing {
+            return div().flex_none().into_any_element();
+        }
         h_flex()
             .flex_none()
             // Tall enough to seat the chrome-scale tiles when it carries them;
@@ -396,12 +410,10 @@ impl Tty7App {
             .items_center()
             .pl(px(CONTENT_INSET))
             // Trailing tiles align on the glyph like every other control in the
-            // window; a label-only header just takes the plain inset. `_SM` for a
-            // tab's own control, whose glyph sits a different distance inside its
-            // box than the chrome-scale tab tiles do.
+            // window; a label-only header just takes the plain inset. `_SM` covers
+            // both tile cases now — the tab tiles are body-scale too.
             .pr(px(match (&tabs, has_trailing) {
-                (Some(_), _) => tile_trailing_inset(),
-                (None, true) => tile_trailing_inset_sm(),
+                (Some(_), _) | (None, true) => tile_trailing_inset_sm(),
                 (None, false) => CONTENT_INSET,
             }))
             // The line that separates the header from the tab's content. Only
