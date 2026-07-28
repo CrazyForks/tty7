@@ -926,8 +926,12 @@ fn config_dir() -> Option<PathBuf> {
 
 /// Default config directory on Unix: `$HOME/.config/tty7` (the XDG-ish location
 /// tty7 has always used).
+///
+/// Public so a test guard can ask "is the dir we'd write to the *user's real
+/// one*?" without re-deriving the platform layout — see the `#[cfg(test)]`
+/// `Config::save` in the GUI crate's `core::config`.
 #[cfg(not(windows))]
-fn default_config_dir() -> Option<PathBuf> {
+pub fn default_config_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
     Some(PathBuf::from(home).join(".config/tty7"))
 }
@@ -935,8 +939,10 @@ fn default_config_dir() -> Option<PathBuf> {
 /// Default config directory on Windows: `%APPDATA%\tty7` (the conventional
 /// per-user roaming app-data location), falling back to
 /// `%USERPROFILE%\.config\tty7` to mirror the Unix layout if `APPDATA` is unset.
+///
+/// Public for the same reason as the Unix arm above.
 #[cfg(windows)]
-fn default_config_dir() -> Option<PathBuf> {
+pub fn default_config_dir() -> Option<PathBuf> {
     if let Some(appdata) = std::env::var_os("APPDATA").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(appdata).join("tty7"));
     }

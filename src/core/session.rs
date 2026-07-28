@@ -519,9 +519,7 @@ mod tests {
             // uses: `set_config_dir` is first-call-wins, so a test that pinned
             // a *different* scratch would silently redirect whichever tests
             // lost the race away from the directory they then read back.
-            let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).ok();
-            crate::core::config::set_config_dir(dir);
+            crate::core::config::pin_test_config_dir();
 
             let mut entry = Workspace::on_remote(remote_ref());
             entry.session = local_layout();

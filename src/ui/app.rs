@@ -4360,6 +4360,29 @@ impl Tty7App {
             }),
         );
 
+        // Live filter for the SSH section's host list; each keystroke re-renders
+        // the master column so the list narrows as you type.
+        let ssh_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter hosts…"));
+        subs.push(
+            cx.subscribe_in(&ssh_filter, window, |_this, _i, ev, _w, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        );
+
+        // The SSH empty state's quick-connect box. Its Connect button enables only
+        // on a parsable target, so each keystroke re-renders the pane.
+        let ssh_quick_connect =
+            cx.new(|cx| InputState::new(window, cx).placeholder("user@host  or  user@host:port"));
+        subs.push(
+            cx.subscribe_in(&ssh_quick_connect, window, |_this, _i, ev, _w, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        );
+
         self.settings = Some(SettingsState {
             focus_handle: focus_handle.clone(),
             section: SettingsSection::Appearance,
@@ -4381,6 +4404,9 @@ impl Tty7App {
             rebinding_note: None,
             ssh_form: None,
             ssh_detail: crate::ui::settings::SshDetail::None,
+            ssh_filter,
+            ssh_collapsed_groups: std::collections::HashSet::new(),
+            ssh_quick_connect,
             agent_hooks_host: crate::ui::host_ops::HostId::LOCAL,
             agent_hooks_states: crate::ui::settings::AgentHooksView::Loading,
             agent_hooks_seq: 0,
@@ -7312,6 +7338,15 @@ mod keybinding_gpui_tests {
     use gpui::{AppContext, Entity, TestAppContext, VisualTestContext};
 
     fn harness(cx: &mut TestAppContext) -> (Entity<Tty7App>, VisualTestContext) {
+        // Every keybinding edit below goes through `update_config`, which ends in
+        // `Config::save()` — a *full* overwrite of `config.json` at whatever path
+        // the config dir resolves to. Unpinned, that is the developer's real
+        // `~/.config/tty7/config.json`, so running these tests silently reset the
+        // user's entire config to `Config::default()` plus the shortcut recorded
+        // here. The test-only `Config::save` now panics rather than allow that;
+        // pin a scratch dir so it doesn't have to.
+        crate::core::config::pin_test_config_dir();
+
         // The pause-to-commit is a real `smol::Timer` (off the deterministic
         // executor), so waiting on it parks the test thread.
         cx.executor().allow_parking();

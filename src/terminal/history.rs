@@ -729,9 +729,7 @@ mod tests {
     #[test]
     fn append_then_load_recovers_the_command_and_metadata() {
         // Pin the config dir so history writes to a temp file, not the real one.
-        let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::core::config::set_config_dir(dir);
+        crate::core::config::pin_test_config_dir();
 
         // A command with an embedded newline is rejected (one-per-line format).
         append("bad\ncmd", None, 1_700_000_000, None);
@@ -767,9 +765,7 @@ mod tests {
         // into two write syscalls (text, then newline), so two panes appending
         // at once produced fused half-lines ("cmdAcmdB\n\n") that loaded back
         // as garbage commands. Each record must land as one atomic write.
-        let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::core::config::set_config_dir(dir);
+        crate::core::config::pin_test_config_dir();
 
         let tag = format!("tty7_race_{}", std::process::id());
         let handles: Vec<_> = (0..8)
@@ -809,9 +805,7 @@ mod tests {
         // the record, splitting it — the pre-newline half loaded back as a bogus
         // command and the real command gained a wrong cwd. Such a cwd is dropped
         // (empty field) so the record stays one line.
-        let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::core::config::set_config_dir(dir);
+        crate::core::config::pin_test_config_dir();
 
         let unique = format!("tty7_nlcwd_marker_{}", std::process::id());
         append(
