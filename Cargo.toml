@@ -320,12 +320,21 @@ lto = "thin"
 codegen-units = 1
 
 # ---- gpui fork ------------------------------------------------------------
-# Our `tty7` branch (cut from the pinned upstream rev, one commit on top) carries
-# a single patch: `prefers_ime_for_printable_keys` takes the keystroke, so an
-# input handler can answer per key instead of per view. tty7 needs it for
-# Option-as-Meta — macOS routes ⌥-chords to the IME whenever a CJK input source
-# is active, and without the keystroke there is no way to decline just those
-# chords (see `terminal::input::prefers_ime_for_printable_keys`, issue #177).
+# Our `tty7` branch (cut from the pinned upstream rev, two commits on top) carries:
+#
+# 1. `prefers_ime_for_printable_keys` takes the keystroke, so an input handler can
+#    answer per key instead of per view. tty7 needs it for Option-as-Meta — macOS
+#    routes ⌥-chords to the IME whenever a CJK input source is active, and without
+#    the keystroke there is no way to decline just those chords (see
+#    `terminal::input::prefers_ime_for_printable_keys`, issue #177).
+#
+# 2. gpui's Windows backend rasterizes a font-fallback run with the face
+#    DirectWrite actually shaped it with, instead of re-deriving one from the
+#    face's family/weight/style. The round trip mapped DirectWrite's italic to
+#    oblique, so italic CJK — which every pane reaches through the fallback chain,
+#    Hack having no CJK — drew a *different* face's outlines at the shaped glyph
+#    indices. Every character rendered as an unrelated character, one for one,
+#    which reads as mojibake rather than as a font bug.
 #
 # Patching by source rather than editing the `gpui`/`gpui_platform` pins above is
 # deliberate: `gpui-component` declares its own `gpui` from the upstream URL, and
