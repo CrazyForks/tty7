@@ -1109,7 +1109,7 @@ struct BuiltinSpec {
 }
 
 /// A hand-picked set of familiar terminal palettes.
-static BUILTINS: [BuiltinSpec; 8] = [
+static BUILTINS: [BuiltinSpec; 9] = [
     BuiltinSpec {
         id: "light",
         name: "Light",
@@ -1296,6 +1296,35 @@ static BUILTINS: [BuiltinSpec; 8] = [
         ],
     },
     BuiltinSpec {
+        id: "one_dark_pro",
+        name: "One Dark Pro",
+        background: 0x282c34,
+        foreground: 0xabb2bf,
+        // The editor cursor / focus blue, not the syntax blue `#61afef`: the
+        // accent doubles as the switch's checked track, and `#61afef` sits at
+        // the same luminance as the `#abb2bf` knob (1.11:1 — invisible).
+        accent: 0x528bff,
+        caret: None,
+        ansi16: [
+            (0x3f, 0x44, 0x51),
+            (0xe0, 0x6c, 0x75),
+            (0x98, 0xc3, 0x79),
+            (0xe5, 0xc0, 0x7b),
+            (0x61, 0xaf, 0xef),
+            (0xc6, 0x78, 0xdd),
+            (0x56, 0xb6, 0xc2),
+            (0xab, 0xb2, 0xbf),
+            (0x5c, 0x63, 0x70),
+            (0xff, 0x61, 0x6e),
+            (0xa5, 0xe0, 0x75),
+            (0xf0, 0xa4, 0x5d),
+            (0x4d, 0xc4, 0xff),
+            (0xde, 0x73, 0xff),
+            (0x4c, 0xd1, 0xe0),
+            (0xe6, 0xe6, 0xe6),
+        ],
+    },
+    BuiltinSpec {
         id: "rose_pine",
         name: "Rosé Pine",
         background: 0x191724,
@@ -1341,7 +1370,7 @@ mod tests {
     }
 
     /// Brightness is inferred correctly: the four light built-ins classify light,
-    /// the four dark ones dark.
+    /// the five dark ones dark.
     #[test]
     fn dark_is_inferred_from_background() {
         let dark: Vec<_> = builtins()
@@ -1349,7 +1378,10 @@ mod tests {
             .filter(|t| t.dark)
             .map(|t| t.id)
             .collect();
-        assert_eq!(dark, ["dark", "dracula", "harbor", "rose_pine"]);
+        assert_eq!(
+            dark,
+            ["dark", "dracula", "harbor", "one_dark_pro", "rose_pine"]
+        );
     }
 
     /// The selection surface must stay a *tint* — decisively on the background's
