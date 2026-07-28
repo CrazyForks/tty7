@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::{Host, MTime, SearchHit};
+use crate::daemon::control::WATCH_COALESCE_WINDOW;
 
 /// One conformance case.
 pub type Case = fn(h: &dyn Host, sandbox: &dyn Sandbox);
@@ -1129,18 +1130,20 @@ pub fn watch_set_dirs_adds_and_drops(h: &dyn Host, sb: &dyn Sandbox) {
     );
 }
 
-/// A burst becomes a batch. Fifty writes inside one window arrive as one or two
-/// deduplicated batches, not fifty repaints — and identically on every host, so
-/// where the files live cannot change how busy the UI looks.
+/// A burst becomes a batch. Fifty writes arrive as a handful of deduplicated
+/// batches, not fifty repaints — and identically on every host, so where the
+/// files live cannot change how busy the UI looks.
 pub fn watch_coalesces_within_window(h: &dyn Host, sb: &dyn Sandbox) {
     let sandbox = sb.path();
     let sub = h.watch(&[sandbox.to_path_buf()]).unwrap();
     drain(&sub);
 
     let f = h.join(sandbox, "busy.txt");
+    let started = Instant::now();
     for i in 0..50 {
         put(h, &f, format!("{i}").as_bytes());
     }
+    let burst = started.elapsed();
 
     // Give the window time to close, plus slack for a loaded machine.
     let batches = collect_batches(&sub, Duration::from_secs(2));
@@ -1152,9 +1155,20 @@ pub fn watch_coalesces_within_window(h: &dyn Host, sb: &dyn Sandbox) {
         })
         .collect();
     assert!(!with_file.is_empty(), "the burst produced no events at all");
+    // The guarantee is one batch per window, not a fixed batch count. A loaded
+    // runner can spend well over a window just issuing the writes, and a burst
+    // spread over N windows is *allowed* to arrive as N batches — bounding by a
+    // constant would be testing how fast the machine writes files, not whether
+    // the coalescer coalesces.
+    let windows = burst
+        .as_millis()
+        .div_ceil(WATCH_COALESCE_WINDOW.as_millis())
+        .max(1) as usize;
+    let allowed = windows + 2;
     assert!(
-        with_file.len() <= 4,
-        "50 writes coalesced into {} batches",
+        with_file.len() <= allowed,
+        "50 writes taking {burst:?} coalesced into {} batches, more than the \
+         {allowed} the elapsed windows allow",
         with_file.len()
     );
     for batch in &with_file {
