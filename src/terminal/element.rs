@@ -799,6 +799,27 @@ fn powerline_path(bounds: Bounds<Pixels>, shape: PowerlineShape) -> gpui::Path<P
     }
 }
 
+/// What a natively-drawn cell — a Powerline separator or a box-drawing/block
+/// character, both painted as geometry rather than as a font glyph — still has
+/// to send through the text pipeline after its ink is on screen.
+///
+/// `None` for the common case: the geometry *is* the whole cell, so the shaping
+/// and painting below can be skipped entirely.
+///
+/// `Some(' ')` when the style draws on blanks, i.e. it carries an underline (or
+/// is part of a hovered link). Underlines are not painted per-cell — they ride
+/// on the [`TextRun`] that `paint_glyphs` builds, so a cell that returns early
+/// silently loses its underline, leaving a one-column hole in an `ESC[4m` span
+/// or a hovered URL. Shaping a *space* in the cell's own style closes the hole:
+/// a space puts no glyph ink over the geometry already painted, and gpui draws
+/// the line from the same [`gpui::UnderlineStyle`] (curly and double included)
+/// it uses for every other cell, so weight, offset and colour match exactly.
+/// The space comes from the primary monospace face, whose advance *is* the cell
+/// width, so it needs no `force_width` to cover its column.
+fn native_cell_residue(style: &GlyphStyle) -> Option<char> {
+    style.draws_on_blanks().then_some(' ')
+}
+
 /// The width `paint_glyphs` clips a segment's paint to.
 ///
 /// A batched `Run`/`Wide` segment clips to its exact column span (`cells`
@@ -899,17 +920,19 @@ fn paint_glyphs(
                         point(geom.origin.x + geom.cell_width * (col as f32), y),
                         size(geom.cell_width, geom.line_height),
                     );
-                    if let Some(shape) = PowerlineShape::of(cell.c) {
+                    // Two families paint as native geometry rather than as a
+                    // font glyph: Powerline separators, and the box-drawing /
+                    // block characters (`boxdraw`) — a font glyph only covers
+                    // the font's own line height, which broke every vertical
+                    // run of `│`/`╭`/`╰` into dashes at line_height > 1.0.
+                    // Either way the cell may still owe an underline, so this
+                    // records whether the ink is already down rather than
+                    // returning outright.
+                    let native = if let Some(shape) = PowerlineShape::of(cell.c) {
                         let path = powerline_path(cell_bounds, shape);
                         window.paint_path(path, GlyphStyle::of(cell).fg);
-                        continue;
-                    }
-                    // Box-drawing / block characters paint as native geometry
-                    // sized to the actual (line-height-stretched) cell. A font
-                    // glyph only covers the font's own line height, which is
-                    // what broke every vertical run of `│`/`╭`/`╰` into dashes
-                    // at line_height > 1.0 — see `boxdraw`.
-                    if let Some(ink) =
+                        true
+                    } else if let Some(ink) =
                         super::boxdraw::glyph(cell.c, cell_bounds, window.scale_factor())
                     {
                         let fg = GlyphStyle::of(cell).fg;
@@ -924,9 +947,20 @@ fn paint_glyphs(
                                 super::boxdraw::Ink::Path(p) => window.paint_path(p, fg),
                             }
                         }
-                        continue;
+                        true
+                    } else {
+                        false
+                    };
+                    if !native {
+                        (col, 1, char_string(cell.c), None, true)
+                    } else {
+                        match native_cell_residue(&GlyphStyle::of(cell)) {
+                            None => continue,
+                            // `solo: false` clips the space to its own single
+                            // column so the underline can't spill sideways.
+                            Some(c) => (col, 1, char_string(c), None, false),
+                        }
                     }
-                    (col, 1, char_string(cell.c), None, true)
                 }
                 // Same pinning as the batched runs, just for one base: two
                 // columns get `force_width` so a fallback emoji face can't
@@ -2162,6 +2196,51 @@ mod tests {
                 .iter()
                 .any(|(tag, value)| tag == "liga" && *value == 1)
         );
+    }
+
+    /// A natively-drawn cell keeps its underline.
+    ///
+    /// Underlines ride on the `TextRun`, so the Solo arm's early return for
+    /// Powerline separators and box-drawing characters used to drop them: an
+    /// `ESC[4m` span or a hovered URL containing `─`, `│` or `` showed a
+    /// one-column hole where the line should have run through. The residue is
+    /// what closes it — a space shaped in the cell's own style, carrying the
+    /// underline and no glyph ink.
+    #[test]
+    fn natively_drawn_cells_still_carry_their_underline() {
+        let plain = GlyphStyle::of(&cell('│'));
+        assert_eq!(
+            native_cell_residue(&plain),
+            None,
+            "an unstyled box character has nothing left to shape"
+        );
+
+        for kind in [
+            UnderlineKind::Single,
+            UnderlineKind::Double,
+            UnderlineKind::Curly,
+        ] {
+            let mut c = cell('│');
+            c.underline = kind;
+            assert_eq!(
+                native_cell_residue(&GlyphStyle::of(&c)),
+                Some(' '),
+                "{kind:?} underline dropped on a box-drawing cell"
+            );
+        }
+
+        // A hovered link underlines even without an emulator underline, and
+        // the characters it spans may well be box drawing or a separator.
+        for ch in ['│', '─', '╭', '█', '\u{e0b0}'] {
+            let mut c = cell(ch);
+            c.link_hover = true;
+            assert_eq!(
+                native_cell_residue(&GlyphStyle::of(&c)),
+                Some(' '),
+                "hovered-link underline dropped on U+{:04X}",
+                ch as u32
+            );
+        }
     }
 
     #[test]

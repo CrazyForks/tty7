@@ -69,11 +69,8 @@ enum Arm {
     Heavy,
 }
 
-/// Cell geometry in f32, plus the light stroke thickness.
-///
-/// Thickness derives from the cell *width* — a pure font-size proxy — never the
-/// height: the height carries the line-height stretch, and a `─` that fattens
-/// when the user opens up their line spacing would look broken.
+/// Cell geometry in f32, plus the light stroke thickness `t` (see
+/// [`light_thickness`] for how that one is chosen).
 struct Cell {
     x0: f32,
     y0: f32,
@@ -85,12 +82,36 @@ struct Cell {
     scale: f32,
 }
 
+/// The light stroke thickness for a cell `cell_width` wide, in logical pixels.
+///
+/// Two rules, in order:
+///
+/// 1. Derive from the cell *width* — a pure font-size proxy — never the height:
+///    the height carries the line-height stretch, and a `─` that fattens when
+///    the user opens up their line spacing would look broken.
+/// 2. Then quantise so the result covers a whole number of device pixels.
+///
+/// Rule 2 keeps the nominal weight and the painted weight in agreement:
+/// [`Cell::vstroke`] lays a stroke off in whole device pixels, and everything
+/// positioned relative to `t` (the arm overshoot, the double-line separation,
+/// `heavy = 2 × light`) should be reasoning about the same value the rasteriser
+/// will actually produce.
+///
+/// Rounding the logical value *first* is what keeps 1x and 2x byte-identical to
+/// what this module shipped with — those are the scales it was tuned and
+/// visually verified at, so the fractional-scale fix must not disturb them.
+fn light_thickness(cell_width: f32, scale: f32) -> f32 {
+    let logical = (cell_width * 0.15).round().max(1.);
+    (logical * scale).round().max(1.) / scale
+}
+
 impl Cell {
     fn new(b: &Bounds<Pixels>, scale: f32) -> Self {
         let x0 = b.origin.x.as_f32();
         let y0 = b.origin.y.as_f32();
         let x1 = x0 + b.size.width.as_f32();
         let y1 = y0 + b.size.height.as_f32();
+        let scale = scale.max(0.1);
         Cell {
             x0,
             y0,
@@ -98,8 +119,8 @@ impl Cell {
             y1,
             cx: (x0 + x1) / 2.,
             cy: (y0 + y1) / 2.,
-            t: ((x1 - x0) * 0.15).round().max(1.),
-            scale: scale.max(0.1),
+            t: light_thickness(x1 - x0, scale),
+            scale,
         }
     }
 
@@ -123,6 +144,49 @@ impl Cell {
         Ink::Rect(self.rectb(x, y, w, h))
     }
 
+    /// A logical thickness as a whole number of device pixels, back in logical
+    /// units. Never zero: a stroke that rounds away is worse than one that is
+    /// a touch too thick.
+    fn stroke_px(&self, w: f32) -> f32 {
+        (w * self.scale).round().max(1.) / self.scale
+    }
+
+    /// A vertical stroke of logical width `w`, centred on `x`, spanning
+    /// `ya..yb`.
+    ///
+    /// The two *ends* snap like any other edge, so a stroke that runs to a cell
+    /// boundary still shares that boundary exactly with the cell beyond it —
+    /// the tiling property [`rectb`](Self::rectb) exists for.
+    ///
+    /// The *width* is deliberately not a second pair of independent snaps. Two
+    /// edges `w` apart land `w × scale` device pixels apart, and unless that is
+    /// exactly a whole number the two `round`s straddle it — rounding apart in
+    /// some cells and together in others, which made vertical rules alternate
+    /// thin/thick across the columns of a TUI table at Windows' default 125% /
+    /// 150% scaling. [`light_thickness`] picks `w` so the product is integral,
+    /// but `f32` cannot always represent it exactly (a `1.5×` scale gives
+    /// `2/1.5 × 1.5 = 2.0000001`), and a coordinate landing on a `.5` tie then
+    /// rounds whichever way the error points. Laying the width off from the
+    /// snapped near edge sidesteps the tie entirely: same weight everywhere,
+    /// by construction rather than by luck.
+    fn vstroke(&self, x: f32, w: f32, ya: f32, yb: f32) -> Ink {
+        let (x0, y0, y1) = (self.snap(x - w / 2.), self.snap(ya), self.snap(yb));
+        Ink::Rect(Bounds::new(
+            point(px(x0), px(y0)),
+            size(px(self.stroke_px(w)), px(y1 - y0)),
+        ))
+    }
+
+    /// A horizontal stroke of logical width `w`, centred on `y`, spanning
+    /// `xa..xb`. See [`vstroke`](Self::vstroke).
+    fn hstroke(&self, y: f32, w: f32, xa: f32, xb: f32) -> Ink {
+        let (y0, x0, x1) = (self.snap(y - w / 2.), self.snap(xa), self.snap(xb));
+        Ink::Rect(Bounds::new(
+            point(px(x0), px(y0)),
+            size(px(x1 - x0), px(self.stroke_px(w))),
+        ))
+    }
+
     /// The light/heavy arm combinations: one rectangle per arm, each running
     /// from its cell edge to just past the centre.
     ///
@@ -141,16 +205,16 @@ impl Cell {
         let m = wu.max(wd).max(wl).max(wr) / 2.;
         let mut ink = Vec::new();
         if wu > 0. {
-            ink.push(self.rect(self.cx - wu / 2., self.y0, wu, self.cy + m - self.y0));
+            ink.push(self.vstroke(self.cx, wu, self.y0, self.cy + m));
         }
         if wd > 0. {
-            ink.push(self.rect(self.cx - wd / 2., self.cy - m, wd, self.y1 - (self.cy - m)));
+            ink.push(self.vstroke(self.cx, wd, self.cy - m, self.y1));
         }
         if wl > 0. {
-            ink.push(self.rect(self.x0, self.cy - wl / 2., self.cx + m - self.x0, wl));
+            ink.push(self.hstroke(self.cy, wl, self.x0, self.cx + m));
         }
         if wr > 0. {
-            ink.push(self.rect(self.cx - m, self.cy - wr / 2., self.x1 - (self.cx - m), wr));
+            ink.push(self.hstroke(self.cy, wr, self.cx - m, self.x1));
         }
         ink
     }
@@ -173,8 +237,8 @@ impl Cell {
         let (x0, x1, y0, y1, cx, cy) = (self.x0, self.x1, self.y0, self.y1, self.cx, self.cy);
         let (va, vb) = (cx - d, cx + d);
         let (ha, hb) = (cy - d, cy + d);
-        let v = |x: f32, ya: f32, yb: f32| self.rect(x - h, ya, t, yb - ya);
-        let hz = |y: f32, xa: f32, xb: f32| self.rect(xa, y - h, xb - xa, t);
+        let v = |x: f32, ya: f32, yb: f32| self.vstroke(x, t, ya, yb);
+        let hz = |y: f32, xa: f32, xb: f32| self.hstroke(y, t, xa, xb);
         Some(match c {
             '═' => vec![hz(ha, x0, x1), hz(hb, x0, x1)],
             '║' => vec![v(va, y0, y1), v(vb, y0, y1)],
@@ -294,16 +358,14 @@ impl Cell {
         // seam exactly where they hand off.
         let lap = 1. / self.scale;
         if sy > 0. {
-            let top = cy + r - lap;
-            ink.push(self.rect(cx - h, top, self.t, self.y1 - top));
+            ink.push(self.vstroke(cx, self.t, cy + r - lap, self.y1));
         } else {
-            ink.push(self.rect(cx - h, self.y0, self.t, (cy - r + lap) - self.y0));
+            ink.push(self.vstroke(cx, self.t, self.y0, cy - r + lap));
         }
         if sx > 0. {
-            let left = cx + r - lap;
-            ink.push(self.rect(left, cy - h, self.x1 - left, self.t));
+            ink.push(self.hstroke(cy, self.t, cx + r - lap, self.x1));
         } else {
-            ink.push(self.rect(self.x0, cy - h, (cx - r + lap) - self.x0, self.t));
+            ink.push(self.hstroke(cy, self.t, self.x0, cx - r + lap));
         }
         // The arc band, from the vertical stub (θ=0) to the horizontal one
         // (θ=π/2) around the arc centre one radius into the quadrant.
@@ -399,9 +461,9 @@ impl Cell {
                 let s = a0 + seg * (i as f32 + 0.15);
                 let len = seg * 0.7;
                 if vertical {
-                    self.rect(self.cx - w / 2., s, w, len)
+                    self.vstroke(self.cx, w, s, s + len)
                 } else {
-                    self.rect(s, self.cy - w / 2., len, w)
+                    self.hstroke(self.cy, w, s, s + len)
                 }
             })
             .collect();
@@ -819,5 +881,89 @@ mod tests {
         let bottom = extents(&glyph('│', b, scale).unwrap()).3;
         let top = extents(&glyph('│', below, scale).unwrap()).2;
         assert_eq!(bottom, top, "adjacent │ cells no longer tile");
+    }
+
+    /// Every column must draw `│` at the *same* weight, and every row must draw
+    /// `─` at the same weight, at any scale factor — not just the integer ones.
+    ///
+    /// Note what the test above does *not* catch: it asserts each edge lands on
+    /// the device grid, which a 1-device-pixel stroke and a 2-device-pixel
+    /// stroke both satisfy. Windows' default 125%/150% display scaling put a
+    /// 1-logical-pixel stroke a non-integer number of device pixels wide, and
+    /// the two independent edge snaps then rounded apart in some columns and
+    /// together in others: vertical rules alternated thin/thick across a TUI
+    /// table, horizontal rules alternated down it. Both 1x and 2x are blind to
+    /// it by construction, so the earlier fixtures could never have failed.
+    #[test]
+    fn stroke_weight_is_uniform_across_cells_at_any_scale() {
+        // Realistic cell metrics: a 13/15/16px font's advance, line_height 1.4.
+        for (cw, lh) in [(7.8f32, 18.0f32), (9.03, 21.0), (9.6, 22.0), (10.8, 25.0)] {
+            for scale in [1.0f32, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0] {
+                let widths: Vec<f32> = (0..24)
+                    .map(|i| {
+                        let b = Bounds::new(point(px(cw * i as f32), px(0.)), size(px(cw), px(lh)));
+                        let Ink::Rect(r) = &glyph('│', b, scale).unwrap()[0] else {
+                            panic!("│ should be a rect")
+                        };
+                        (r.size.width.as_f32() * scale).round()
+                    })
+                    .collect();
+                let (lo, hi) = (
+                    widths.iter().cloned().fold(f32::MAX, f32::min),
+                    widths.iter().cloned().fold(f32::MIN, f32::max),
+                );
+                assert_eq!(
+                    lo, hi,
+                    "│ weight varies {lo}..{hi} device px across columns \
+                     (cell_width {cw}, scale {scale}): {widths:?}"
+                );
+                assert!(lo >= 1., "│ thinner than a device pixel at scale {scale}");
+
+                let heights: Vec<f32> = (0..24)
+                    .map(|r| {
+                        let b = Bounds::new(point(px(0.), px(lh * r as f32)), size(px(cw), px(lh)));
+                        let Ink::Rect(rect) = &glyph('─', b, scale).unwrap()[0] else {
+                            panic!("─ should be a rect")
+                        };
+                        (rect.size.height.as_f32() * scale).round()
+                    })
+                    .collect();
+                let (lo, hi) = (
+                    heights.iter().cloned().fold(f32::MAX, f32::min),
+                    heights.iter().cloned().fold(f32::MIN, f32::max),
+                );
+                assert_eq!(
+                    lo, hi,
+                    "─ weight varies {lo}..{hi} device px across rows \
+                     (cell_width {cw}, scale {scale}): {heights:?}"
+                );
+            }
+        }
+    }
+
+    /// Quantising the thickness in device space must not change what 1x and 2x
+    /// already rendered — those are the two scales the module was tuned and
+    /// visually verified at.
+    #[test]
+    fn integer_scales_keep_their_previous_thickness() {
+        for (cw, lh) in [(7.8f32, 18.0f32), (9.03, 21.0), (9.6, 22.0), (10.8, 25.0)] {
+            for scale in [1.0f32, 2.0, 3.0] {
+                let previous = (cw * 0.15).round().max(1.);
+                assert_eq!(
+                    light_thickness(cw, scale),
+                    previous,
+                    "cell_width {cw} at scale {scale} changed weight"
+                );
+                // And heavy stays exactly twice light, as `arms` assumes.
+                let b = Bounds::new(point(px(0.), px(0.)), size(px(cw), px(lh)));
+                let Ink::Rect(l) = &glyph('│', b, scale).unwrap()[0] else {
+                    panic!()
+                };
+                let Ink::Rect(h) = &glyph('┃', b, scale).unwrap()[0] else {
+                    panic!()
+                };
+                assert!(h.size.width.as_f32() > l.size.width.as_f32());
+            }
+        }
     }
 }
