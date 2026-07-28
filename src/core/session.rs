@@ -79,6 +79,11 @@ impl WorkspaceStore {
     /// when `id` is `None` / no longer on file (the "New Workspace" path). Marks it
     /// open and returns its id plus the tabs the window should rebuild.
     pub fn claim(cx: &mut gpui::App, id: Option<WorkspaceId>) -> (WorkspaceId, Session) {
+        // Read before the store is borrowed: whether the layout may be rebuilt
+        // depends on another global (the connection table), and a remote
+        // workspace whose machine is unreachable must open empty. See
+        // [`claimable_session`].
+        let reachable = id.is_none_or(|id| Self::machine_is_connected(cx, id));
         let Some(store) = Self::try_store(cx) else {
             // No store (tests): hand back a detached identity so the window
             // still builds, but nothing is persisted.
@@ -94,7 +99,7 @@ impl WorkspaceStore {
         };
         workspace.open = true;
         workspace.touch();
-        let claimed = (workspace.id, claimable_session(workspace));
+        let claimed = (workspace.id, claimable_session(workspace, reachable));
         store.workspaces.active = Some(claimed.0);
         store.workspaces.save();
         claimed
@@ -108,6 +113,11 @@ impl WorkspaceStore {
         session: Session,
         window: Option<crate::core::window_state::WindowState>,
     ) {
+        // Same reason as in [`claim`]: read the connection table before the
+        // store is borrowed. A window whose machine is unreachable is not
+        // describing that machine's layout, so it does not get to overwrite the
+        // copy we have of it — see [`record_session`].
+        let reachable = Self::machine_is_connected(cx, id);
         let Some(store) = Self::try_store(cx) else {
             return;
         };
@@ -116,7 +126,7 @@ impl WorkspaceStore {
             // tearing down); nothing to record.
             return;
         };
-        record_session(workspace, session);
+        record_session(workspace, session, reachable);
         if let Some(window) = window {
             workspace.window = Some(window);
         }
@@ -187,6 +197,20 @@ impl WorkspaceStore {
     /// The remote a workspace points at, or `None` when it is a local one.
     pub fn remote_ref(cx: &gpui::App, id: WorkspaceId) -> Option<RemoteRef> {
         Self::all(cx).get(id).and_then(|w| w.host.clone())
+    }
+
+    /// Whether this client can reach the machine `id`'s panes are on *right
+    /// now* — the predicate both halves of the layout cache turn on
+    /// ([`claimable_session`], [`record_session`]).
+    ///
+    /// A local workspace is always reachable: its daemon is this machine's, and
+    /// a gate that could answer otherwise for a local window would stop it
+    /// saving its own tabs.
+    pub fn machine_is_connected(cx: &mut gpui::App, id: WorkspaceId) -> bool {
+        let Some(host) = Self::remote_ref(cx, id) else {
+            return true;
+        };
+        crate::ui::remote_connect::RemoteConnections::get(cx, host.host_id()).is_some()
     }
 
     /// The client-side entry for `host` — the existing one if this machine has
@@ -268,15 +292,6 @@ impl WorkspaceStore {
     }
 }
 
-/// Write a window's layout onto its workspace entry, honouring design §10's
-/// storage split.
-///
-/// **A remote workspace's entry never holds a layout on this client.** The
-/// machine's own `workspaces.json` is the authority for it, and the client entry
-/// is a pointer plus this machine's view state. That is not just tidiness: a
-/// remote entry carrying local `SessionPane`s is exactly the shape "one window,
-/// two hosts" would take on disk, and clearing it here is what makes the
-/// invariant survive a restart rather than only holding while the app runs.
 /// The machine a window showing `id` is bound to.
 ///
 /// The whole of "one window, one machine" reduces to this being a *function*: a
@@ -305,30 +320,42 @@ pub(crate) fn crosses_machines(previous: HostId, current: HostId) -> bool {
 /// The layout a window opening on `workspace` may rebuild — the read-side twin
 /// of [`record_session`].
 ///
-/// Both halves are needed, and it took a real launch to notice: the write guard
-/// stops this client *creating* a remote entry with a local layout, but it says
-/// nothing about one that arrived some other way — a hand-edited `session.json`,
-/// a file written before the split existed, a sync tool. Restoring such an entry
-/// would rebuild local shells inside a window bound to another machine, which is
-/// design §3's "never do this" arriving through the back door.
+/// A remote entry's `session` is this client's copy of a record the machine
+/// owns: pulled on connect, refreshed on every `WorkspaceChanged`, pushed back
+/// on every structural change. Rebuilding from it is the whole of "reconnecting
+/// gets my tabs back", and it is safe to do because every pane it names is
+/// routed by [`crate::ui::remote_workspace::pane_workspace_for`] — a leaf in a
+/// remote workspace attaches or spawns *over there*, and a machine that cannot
+/// be reached fails the spawn rather than falling back to a local shell.
 ///
-/// So a remote workspace always opens empty here, and the entry is scrubbed on
-/// the way past so the bad layout does not survive to be tried again. The real
-/// layout is the remote's `workspaces.json`, pulled on connect.
-fn claimable_session(workspace: &mut Workspace) -> Session {
-    if workspace.is_remote() {
-        workspace.session = Session::default();
+/// `reachable` is what keeps that guarantee from being theoretical. With the
+/// link down, `List` answers nothing, so every leaf would miss its live pane and
+/// try to spawn a fresh one — either failing (an empty window, having thrown the
+/// layout away) or, worse, landing a second shell next to the one still running
+/// over there. So an unreachable remote workspace opens empty **without
+/// touching the cached layout**, and
+/// [`crate::ui::remote_workspace`]'s connect path rebuilds the window the moment
+/// the machine answers.
+fn claimable_session(workspace: &mut Workspace, reachable: bool) -> Session {
+    if workspace.is_remote() && !reachable {
         return Session::default();
     }
     workspace.session.clone()
 }
 
-fn record_session(workspace: &mut Workspace, session: Session) {
-    workspace.session = if workspace.is_remote() {
-        Session::default()
-    } else {
-        session
-    };
+/// Write a window's layout onto its entry — the write-side twin of
+/// [`claimable_session`].
+///
+/// A window that cannot reach its machine is not describing that machine's
+/// layout (its panes failed to restore, or are sitting there disconnected), so
+/// it records nothing rather than replacing the copy we have with the wreckage.
+/// The remote's own `workspaces.json` is still the authority; this entry is the
+/// cache the next launch opens from.
+fn record_session(workspace: &mut Workspace, session: Session, reachable: bool) {
+    if workspace.is_remote() && !reachable {
+        return;
+    }
+    workspace.session = session;
 }
 
 #[cfg(test)]
@@ -370,22 +397,25 @@ mod tests {
     #[test]
     fn a_local_workspace_stores_its_own_layout() {
         let mut workspace = Workspace::default();
-        record_session(&mut workspace, local_layout());
+        record_session(&mut workspace, local_layout(), true);
         assert_eq!(workspace.session.tabs.len(), 1);
         assert_eq!(workspace.pane_ids(), vec![7]);
     }
 
-    /// The one that matters: a remote entry must never end up holding panes
-    /// from this machine. This is the on-disk half of "a window is one machine"
-    /// — if a local layout could be written onto a remote entry, the next launch
-    /// would restore local shells into a window bound to a remote host, which is
-    /// design §3's "never do this".
+    /// The point of the whole cache: a connected remote window's layout is
+    /// kept, so the next launch has something to open from and
+    /// `remote_payload` has something to push. Without this, reconnecting to a
+    /// machine gives an empty window every time.
     #[test]
-    fn a_remote_workspace_never_stores_a_local_layout() {
+    fn a_connected_remote_workspace_stores_its_layout() {
         let mut workspace = Workspace::on_remote(remote_ref());
-        record_session(&mut workspace, local_layout());
-        assert!(workspace.session.tabs.is_empty());
-        assert!(workspace.pane_ids().is_empty());
+        record_session(&mut workspace, local_layout(), true);
+        assert_eq!(workspace.session.tabs.len(), 1);
+        assert_eq!(
+            workspace.pane_ids(),
+            vec![7],
+            "the pane ids are the remote daemon's, and are what a reconnect re-attaches"
+        );
     }
 
     /// A local workspace opens on the layout it saved.
@@ -395,42 +425,101 @@ mod tests {
             session: local_layout(),
             ..Workspace::default()
         };
-        let claimed = claimable_session(&mut workspace);
+        let claimed = claimable_session(&mut workspace, true);
         assert_eq!(claimed.tabs.len(), 1);
         // And the entry is left alone.
         assert_eq!(workspace.session.tabs.len(), 1);
     }
 
-    /// The regression a real launch caught: a remote entry that arrived holding
-    /// a local layout — a hand-edited `session.json`, or a file written before
-    /// the storage split — would otherwise rebuild local shells inside a window
-    /// bound to another machine on the next start.
-    ///
-    /// It must open empty *and* be scrubbed, so a layout that got in somehow
-    /// cannot sit there being retried on every launch.
+    /// A connected remote workspace reopens on the layout its machine last
+    /// reported — the read half of "reconnecting gets my tabs back".
     #[test]
-    fn a_remote_workspace_never_reopens_a_local_layout() {
+    fn a_connected_remote_workspace_reopens_its_layout() {
+        let mut workspace = Workspace::on_remote(remote_ref());
+        workspace.session = local_layout();
+        let claimed = claimable_session(&mut workspace, true);
+        assert_eq!(claimed.tabs.len(), 1);
+        assert_eq!(workspace.session.tabs.len(), 1);
+    }
+
+    /// With the machine unreachable, `List` answers nothing, so every leaf
+    /// would miss its live pane and try to spawn a fresh one beside it. The
+    /// window opens empty instead — and, the half that took a real launch to
+    /// get right, **the cached layout survives**: it is what the connect path
+    /// rebuilds the window from a moment later.
+    #[test]
+    fn an_unreachable_remote_workspace_opens_empty_but_keeps_its_layout() {
         let mut workspace = Workspace::on_remote(remote_ref());
         workspace.session = local_layout();
 
-        let claimed = claimable_session(&mut workspace);
+        let claimed = claimable_session(&mut workspace, false);
         assert!(claimed.tabs.is_empty(), "the window must open with no tabs");
-        assert!(
-            workspace.session.tabs.is_empty(),
-            "and the bad layout must not survive to be tried again"
+        assert_eq!(
+            workspace.session.tabs.len(),
+            1,
+            "and the layout must still be there for the connect to rebuild from"
         );
     }
 
-    /// And a remote entry that somehow *arrived* holding a layout (a
-    /// hand-edited `session.json`, a record from a build that predates the
-    /// split) is cleaned out the first time the window records itself, rather
-    /// than being left to restore later.
+    /// The write-side twin: a window that could not restore its panes is not
+    /// describing the machine's layout, so its empty tab list must not replace
+    /// the copy we have of it.
     #[test]
-    fn recording_clears_a_layout_a_remote_entry_should_never_have_had() {
+    fn an_unreachable_remote_window_does_not_overwrite_the_cached_layout() {
         let mut workspace = Workspace::on_remote(remote_ref());
         workspace.session = local_layout();
-        record_session(&mut workspace, Session::default());
-        assert!(workspace.session.tabs.is_empty());
+        record_session(&mut workspace, Session::default(), false);
+        assert_eq!(workspace.session.tabs.len(), 1);
+    }
+
+    /// The launch path end to end, with the store's own reachability lookup
+    /// rather than a hand-passed flag: nothing has ever connected to that
+    /// machine in this process, so the window opens empty and the layout it
+    /// will be rebuilt from is still on file afterwards.
+    ///
+    /// The config dir is pinned first because `claim` and `record` both persist
+    /// — without it this test would rewrite the developer's real
+    /// `session.json`.
+    #[gpui::test]
+    fn an_unconnected_machine_keeps_its_workspace_layout_across_a_claim(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            // The same path every other config-pinning test in this process
+            // uses: `set_config_dir` is first-call-wins, so a test that pinned
+            // a *different* scratch would silently redirect whichever tests
+            // lost the race away from the directory they then read back.
+            let dir = std::env::temp_dir().join(format!("tty7-covtest-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).ok();
+            crate::core::config::set_config_dir(dir);
+
+            let mut entry = Workspace::on_remote(remote_ref());
+            entry.session = local_layout();
+            let id = entry.id;
+            WorkspaceStore::install_for_test(
+                cx,
+                Workspaces {
+                    workspaces: vec![entry],
+                    active: None,
+                },
+            );
+
+            let (claimed, session) = WorkspaceStore::claim(cx, Some(id));
+            assert_eq!(claimed, id);
+            assert!(
+                session.tabs.is_empty(),
+                "an unreachable machine's window opens empty"
+            );
+
+            // …and the window recording that emptiness does not erase what the
+            // machine still has.
+            WorkspaceStore::record(cx, id, Session::default(), None);
+            assert_eq!(
+                WorkspaceStore::all(cx).get(id).unwrap().session.tabs.len(),
+                1,
+                "the cached layout must survive for the connect to rebuild from"
+            );
+        });
     }
 
     /// The remote-bound payload travels under the *remote's* id, so a record

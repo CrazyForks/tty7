@@ -1239,6 +1239,13 @@ impl Tty7App {
             session,
             Some(WindowState::from_bounds(self.window_bounds)),
         );
+        // …and for a remote workspace the machine that owns the layout has to
+        // hear about it, or `session.json` is the only place it exists and any
+        // other client (or a fresh install) opens the workspace empty. No-ops
+        // for a local workspace and for a machine we are not connected to —
+        // the latter is also what keeps a window that failed to restore from
+        // pushing its emptiness over a good record.
+        self.push_remote_layout(self.workspace, cx);
     }
 
     /// This window is going away: capture its final state (a plain `cd` may
@@ -6349,6 +6356,23 @@ fn tabs_from_session(
     (tabs, active)
 }
 
+/// Whether a restored leaf's saved `pane_id` names a pane in the same daemon
+/// the caller read its `alive` set from — the window's daemon.
+///
+/// Pane ids are unique only *within* a daemon, so the question is not academic:
+/// looking one up in the wrong set is how a saved id silently matches somebody
+/// else's live pane and the restore attaches to it.
+///
+/// A native-SSH leaf is the one case where a pane does not live in its window's
+/// daemon. Its russh session is spawned by **this client's** daemon however the
+/// window is bound, so in a remote workspace it belongs to a different machine
+/// than every other leaf around it — and its id must not be matched against the
+/// remote's pane list. It reconnects from its saved spec instead, which is what
+/// it does for any id that is no longer live.
+fn leaf_shares_the_window_daemon(window_is_remote: bool, leaf_is_native_ssh: bool) -> bool {
+    !(window_is_remote && leaf_is_native_ssh)
+}
+
 /// Rebuild a live `Pane` tree from a saved `SessionPane`. A leaf whose saved
 /// `pane_id` is still alive in the daemon re-`attach`es (process + scrollback
 /// intact); otherwise it spawns a fresh shell in the saved cwd. `alive` is the
@@ -6376,7 +6400,12 @@ fn session_to_pane(
         } => {
             // Only restore the pane id when the daemon confirms it's still live;
             // a stale id (daemon restarted, pane killed) falls back to a spawn.
-            let restore = (*pane_id).filter(|id| alive.contains(id));
+            //
+            // …and `alive` is *one* daemon's pane set, so a leaf whose pane
+            // lives in a different one must not be looked up in it.
+            let same_daemon =
+                leaf_shares_the_window_daemon(workspace.is_some(), ssh_spec.is_some());
+            let restore = (*pane_id).filter(|id| same_daemon && alive.contains(id));
             // A *dead* native-SSH leaf (spec persisted, pane no longer alive)
             // reconnects rather than dropping back to a local shell (FR-C2/E4):
             // re-resolve secrets from the profile when it names one, else reuse
@@ -6721,7 +6750,24 @@ fn apply_ssh_o_option(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ssh_connect_input, parse_ssh_option_words};
+    use super::{leaf_shares_the_window_daemon, parse_ssh_connect_input, parse_ssh_option_words};
+
+    /// A remote window's saved layout can hold a native-SSH pane, whose russh
+    /// session runs in *this* client's daemon rather than the machine's. Its
+    /// saved id must not be matched against the remote's pane list: the two
+    /// daemons number panes independently, so `1` over there is a different
+    /// pane, and restoring it would swap the user's SSH tab for whatever the
+    /// remote happens to be running.
+    #[test]
+    fn a_native_ssh_leaf_in_a_remote_window_is_not_looked_up_in_the_remote_daemon() {
+        assert!(!leaf_shares_the_window_daemon(true, true));
+        // Everything else is the window's own daemon: a shell in a remote
+        // window is a pane over there, and in a local window both kinds are
+        // panes here.
+        assert!(leaf_shares_the_window_daemon(true, false));
+        assert!(leaf_shares_the_window_daemon(false, true));
+        assert!(leaf_shares_the_window_daemon(false, false));
+    }
 
     #[test]
     fn parses_ssh_option_words_with_quotes() {

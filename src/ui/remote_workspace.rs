@@ -1513,6 +1513,10 @@ fn finish_attempt(
                 }
                 cx.default_global::<RemoteLinks>().preempted.remove(&id);
                 relink_panes(cx, id);
+                // A window that came up before its machine did has no panes to
+                // relink — it opened empty because there was nothing to route
+                // to. Now there is.
+                hydrate_window(cx, id);
             }
             RemoteLinks::mark(cx, host, |link| {
                 link.state = LinkState::Attached;
@@ -1601,6 +1605,55 @@ fn relink_panes(cx: &mut gpui::App, workspace: WorkspaceId) {
         })
         .detach();
     }
+}
+
+/// Build the tabs of a window that opened before its machine was reachable.
+///
+/// This is the other end of [`crate::core::session::WorkspaceStore::claim`]'s
+/// reachability rule. A remote workspace reopened at launch has nowhere to route
+/// to yet — the link is still being built — so it opens empty rather than
+/// spawning a second set of shells beside the ones still running over there.
+/// The layout it *would* have opened from is the entry's cached session, which
+/// [`finish_attempt`] has just refreshed from the machine itself, so by the time
+/// this runs the window is rebuilding from the authority.
+///
+/// # What it will not do
+///
+/// **Only an empty window is touched.** A window with tabs is one the user is
+/// working in; rearranging it because a link came back is the same fight
+/// [`refresh_remote_workspace`] refuses to pick. That also makes this safe to
+/// call on every reconnect — the second one through finds tabs and leaves.
+fn hydrate_window(cx: &mut gpui::App, workspace: WorkspaceId) {
+    let session = match WorkspaceStore::all(cx).get(workspace) {
+        Some(entry) if entry.is_remote() => entry.session.clone(),
+        // Local, or an entry that went away while the connect was in flight.
+        _ => return,
+    };
+    if session.tabs.is_empty() {
+        // Nothing to restore: a workspace that was quit from the home page, or
+        // a brand-new one. Its window is right as it is.
+        return;
+    }
+    let Some(handle) = crate::ui::windows::WindowRegistry::window_for(cx, workspace) else {
+        return;
+    };
+    let Some(app) =
+        crate::ui::windows::WindowRegistry::app_for(cx, workspace).and_then(|app| app.upgrade())
+    else {
+        return;
+    };
+    if !app.read(cx).tabs.is_empty() {
+        return;
+    }
+    log::info!(
+        "rebuilding {} tab(s) of workspace {workspace} now its machine is reachable",
+        session.tabs.len()
+    );
+    let _ = handle.update(cx, move |_, window, cx| {
+        app.update(cx, |app, cx| {
+            app.adopt_workspace(workspace, session, window, cx)
+        });
+    });
 }
 
 /// Design §10's takeover, on this client's side: stop holding a stream to a
