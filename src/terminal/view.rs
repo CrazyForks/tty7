@@ -459,10 +459,16 @@ struct PendingHistory {
 struct LastWordWalk {
     /// Index into `history` the last press took its word from.
     entry: usize,
-    /// Char offset of the word it inserted, and how many chars it spans — the
-    /// next press swaps that range for the word from an older entry.
+    /// Char offset of the word it inserted — the next press swaps that span
+    /// for the word from an older entry.
     at: usize,
-    len: usize,
+    /// The word itself: both the span's length and a fingerprint. Edits that
+    /// bypass `handle_editor_key` (IME-committed text, a paste, a completion
+    /// pick, ⌘Z) can't clear `last_word_nav`, so before resuming, the walk
+    /// checks the line still holds this word at `at` with the caret at its
+    /// end — anything else means an edit intervened and the walk starts over
+    /// rather than eating it.
+    word: String,
 }
 
 /// Seconds since the unix epoch — the timestamp history records carry.
@@ -2112,11 +2118,23 @@ impl TerminalView {
                 // A Meta chord with nothing local behind it (M-t transpose-word,
                 // M-u/M-l/M-c case widgets, whatever the user bound) goes to the
                 // shell rather than dying here — same reasoning as the Ctrl side
-                // above. Built from the key name, not `key_char`: the platforms
-                // that deliver Alt chords at all don't reliably carry one.
+                // above. The shared encoder goes first (it knows the shifted
+                // character and the Kitty form when `key_char` is there to
+                // consult), but the platforms that deliver Alt chords at all
+                // don't reliably carry one — then fall back to ESC + the key
+                // name, uppercased under Shift, as a raw terminal would send.
                 if m.alt && !m.control && !m.platform && key.chars().count() == 1 {
-                    let mut bytes = vec![0x1b];
-                    bytes.extend_from_slice(key.as_bytes());
+                    let bytes = super::input::keystroke_to_bytes(ks, self.kitty_flags())
+                        .unwrap_or_else(|| {
+                            let name = if m.shift {
+                                key.to_uppercase()
+                            } else {
+                                key.to_string()
+                            };
+                            let mut b = vec![0x1b];
+                            b.extend_from_slice(name.as_bytes());
+                            b
+                        });
                     self.handoff_line_to_shell(&bytes, cx);
                     return;
                 }
@@ -3600,15 +3618,33 @@ impl TerminalView {
     /// a run of presses leaves exactly one word behind. Entries with no words
     /// are stepped over rather than inserting nothing.
     fn insert_last_word(&mut self, cx: &mut Context<Self>) {
+        // Only trust the recorded walk while the line still shows it: its word
+        // sitting at `at`, caret at the word's end, nothing selected. The keys
+        // this dispatcher sees reset `last_word_nav` themselves, but edits that
+        // bypass it (IME-committed text, a paste, a completion pick, ⌘Z) don't
+        // — resuming over those would delete text the walk never inserted.
+        let resumed = self.last_word_nav.take().filter(|walk| {
+            let len = walk.word.chars().count();
+            self.cmd.cursor() == walk.at + len
+                && self.cmd.selection().is_none()
+                && self
+                    .cmd
+                    .text()
+                    .chars()
+                    .skip(walk.at)
+                    .take(len)
+                    .eq(walk.word.chars())
+        });
         // A repeat resumes one entry older than the last press; a fresh walk
         // starts at the newest entry.
-        let start = match &self.last_word_nav {
+        let start = match &resumed {
             Some(walk) => walk.entry.checked_sub(1),
             None => self.history.len().checked_sub(1),
         };
         let Some(mut entry) = start else {
             // Nothing older to reach (or no history at all) — leave the line as
             // it stands, the word the previous press inserted included.
+            self.last_word_nav = resumed;
             return;
         };
         let word = loop {
@@ -3616,6 +3652,7 @@ impl TerminalView {
                 break w.to_string();
             }
             let Some(older) = entry.checked_sub(1) else {
+                self.last_word_nav = resumed;
                 return;
             };
             entry = older;
@@ -3623,19 +3660,18 @@ impl TerminalView {
 
         // Take back what the previous press left, so the walk swaps words in
         // place rather than piling them up.
-        if let Some(walk) = self.last_word_nav.take() {
+        if let Some(walk) = resumed {
             self.cmd.clear_selection();
             self.cmd.set_cursor(walk.at);
-            self.cmd.extend_to(walk.at + walk.len);
+            self.cmd.extend_to(walk.at + walk.word.chars().count());
             self.cmd.delete_selection();
         }
-        let at = self.cmd.cursor();
         self.cmd.insert_str(&word);
-        self.last_word_nav = Some(LastWordWalk {
-            entry,
-            at,
-            len: word.chars().count(),
-        });
+        // `insert_str` replaces a live selection first, which moves the caret
+        // to the selection's start — so the word's position is wherever the
+        // caret landed minus the word, not the pre-insert cursor.
+        let at = self.cmd.cursor() - word.chars().count();
+        self.last_word_nav = Some(LastWordWalk { entry, at, word });
         // The line is now the user's own edit, not a recalled entry.
         self.history_nav = None;
         cx.notify();
@@ -4361,6 +4397,9 @@ impl TerminalView {
             self.cmd.insert_str(text);
             self.history_nav = None;
             self.editor_goal_col = None;
+            // Typed text ends an ⌥. run: IME-committed text bypasses
+            // `handle_editor_key`'s reset, so it has to happen here too.
+            self.last_word_nav = None;
             self.completion_refilter();
             self.cursor_visible = true;
             cx.notify();
@@ -8283,6 +8322,123 @@ mod gpui_tests {
                 );
             })
             .unwrap();
+    }
+
+    /// Edits that bypass `handle_editor_key` — IME-committed text is the
+    /// everyday one (it's how all typing arrives on macOS and Windows) — must
+    /// end the walk too. Without that, the next ⌥. deletes the span the walk
+    /// recorded even though the user's typing now sits inside it.
+    #[gpui::test]
+    fn an_intervening_ime_commit_restarts_the_last_word_walk(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        // `commit_text` edits the local line only while the editor is engaged
+        // at a shell prompt; anywhere else it writes gap text to the PTY.
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for_input_active(&window, cx);
+        window
+            .update(cx, |view, _, cx| {
+                let meta_dot = gpui::Keystroke {
+                    modifiers: gpui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    key: ".".to_string(),
+                    key_char: None,
+                };
+                view.history = ["cargo build --release", "echo hello world"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+
+                view.handle_editor_key(&meta_dot, cx);
+                assert_eq!(view.cmd.text(), "world");
+                view.commit_text("x", cx);
+                view.handle_editor_key(&meta_dot, cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "worldxworld",
+                    "the typed char survives; the walk starts over after it"
+                );
+            })
+            .unwrap();
+    }
+
+    /// ⌥. with a selection active: the word replaces the selection (insertion
+    /// replaces selections everywhere in this editor), and the walk records
+    /// where the word actually landed — the caret the selection collapsed to,
+    /// not where the caret stood before the insert — so a repeat swaps the
+    /// word cleanly.
+    #[gpui::test]
+    fn meta_dot_over_a_selection_records_where_the_word_landed(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                let meta_dot = gpui::Keystroke {
+                    modifiers: gpui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    key: ".".to_string(),
+                    key_char: None,
+                };
+                view.history = ["cargo build --release", "echo hello world"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                view.cmd.set("ls foo");
+                // Select "foo" with the caret at the selection's far end.
+                view.cmd.set_cursor(3);
+                view.cmd.extend_to(6);
+
+                view.handle_editor_key(&meta_dot, cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "ls world",
+                    "the word replaced the selection"
+                );
+                view.handle_editor_key(&meta_dot, cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "ls --release",
+                    "the repeat swapped the word, not some other span"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A shifted Meta chord must ship the shifted character: ⌥⇧U is `ESC U`
+    /// on the wire (upcase-region in zsh's keymap), not the `ESC u` of plain
+    /// ⌥U — gpui reports the key name unshifted, so the handoff has to apply
+    /// Shift itself when no `key_char` is there to consult.
+    #[gpui::test]
+    fn a_shifted_meta_chord_hands_off_the_shifted_character(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.cmd.set("echo hi");
+                view.handle_editor_key(
+                    &gpui::Keystroke {
+                        modifiers: gpui::Modifiers {
+                            alt: true,
+                            shift: true,
+                            ..Default::default()
+                        },
+                        key: "u".to_string(),
+                        key_char: None,
+                    },
+                    cx,
+                );
+                assert_eq!(view.cmd.text(), "");
+            })
+            .unwrap();
+        assert_eq!(next_input(&mut daemon), b"echo hi".to_vec());
+        assert_eq!(next_input(&mut daemon), b"\x1bU".to_vec());
     }
 
     /// Chords the editor *does* answer stay local — handing off would forfeit
