@@ -308,6 +308,17 @@ impl<K: Eq + Hash, V> ByHost<K, V> {
         self.map.get_mut(&host)?.remove(key)
     }
 
+    /// Every `(host, key)` currently cached.
+    ///
+    /// For the invalidations that reach the whole cache without emptying it:
+    /// marking each entry for a refresh needs the keys, and dropping them
+    /// instead is what makes a remote tree blink.
+    pub fn keys(&self) -> impl Iterator<Item = (HostId, &K)> {
+        self.map
+            .iter()
+            .flat_map(|(host, inner)| inner.keys().map(move |k| (*host, k)))
+    }
+
     /// Drop everything belonging to `host` — what a disconnect or a closed
     /// workspace does, without disturbing the other machines' entries.
     pub fn clear_host(&mut self, host: HostId) {

@@ -185,6 +185,15 @@ pub(crate) struct FileTreeState {
     /// only thing render reads — a miss is a queued load, never a host call.
     children: ByHost<PathBuf, Vec<TreeEntry>>,
     loads: InFlight<DirKey>,
+    /// Cached listings a watcher event has outdated: still on screen, queued to
+    /// be relisted, replaced only when the new listing lands.
+    ///
+    /// Dropping them at invalidation time instead is what a filesystem change
+    /// used to do, and it is invisible locally — the relist is microseconds. On
+    /// a remote host it is a round trip during which the directory has no
+    /// listing at all, so every row under it leaves the screen and comes back:
+    /// one file rewritten a few times a second makes the whole tree strobe.
+    stale: HashSet<DirKey>,
     /// Each pane cwd resolved to its repository root, so deriving the root set
     /// is a cache read rather than a walk up the tree per frame.
     repo_roots: ByHost<PathBuf, PathBuf>,
@@ -248,6 +257,7 @@ impl FileTreeState {
         Self {
             children: ByHost::default(),
             loads: InFlight::default(),
+            stale: HashSet::new(),
             repo_roots: ByHost::default(),
             repo_root_loads: InFlight::default(),
             search: SearchState::default(),
@@ -373,7 +383,12 @@ impl FileTreeState {
         }
     }
 
-    /// Spawn one directory listing, unless it's already cached or already out.
+    /// Spawn one directory listing, unless it's already cached (and current) or
+    /// already out.
+    ///
+    /// A cached-but-stale directory does re-ask: its rows stay on screen from
+    /// the old listing while the new one flies, which is the whole point of
+    /// keeping it.
     fn request_load(
         &mut self,
         host: &SharedHost,
@@ -383,7 +398,8 @@ impl FileTreeState {
     ) {
         let id = host.id();
         let key: DirKey = (id, dir.clone());
-        if self.children.get(id, &dir).is_some() || !self.loads.begin(key.clone()) {
+        let current = self.children.get(id, &dir).is_some() && !self.stale.contains(&key);
+        if current || !self.loads.begin(key.clone()) {
             return;
         }
         self.spawn_load(host, dir, root, cx);
@@ -468,7 +484,15 @@ impl FileTreeState {
         dir: PathBuf,
         entries: Vec<TreeEntry>,
     ) -> bool {
-        land_listing(&mut self.loads, &mut self.children, key, id, dir, entries)
+        land_listing(
+            &mut self.loads,
+            &mut self.children,
+            &mut self.stale,
+            key,
+            id,
+            dir,
+            entries,
+        )
     }
 
     /// Point the search at `query` (empty = not searching), starting a
@@ -596,14 +620,18 @@ impl FileTreeState {
         }
     }
 
-    /// Drop the cached listing for `dir` after a change under it.
+    /// Mark the cached listing for `dir` for a refresh after a change under it.
+    ///
+    /// The listing stays until its replacement lands — see [`FileTreeState::stale`].
     fn invalidate_dir(&mut self, host: HostId, dir: &Path) {
         let key: DirKey = (host, dir.to_path_buf());
-        self.children.remove(host, &key.1);
+        if self.children.get(host, dir).is_some() {
+            self.stale.insert(key.clone());
+        }
         self.loads.invalidate(&key);
     }
 
-    /// Drop every listing — for the changes no smaller invalidation covers: a
+    /// Mark every listing for a refresh — for the changes no smaller invalidation covers: a
     /// `.gitignore` edit (its patterns reach any depth below it) or a new root
     /// set.
     ///
@@ -616,7 +644,8 @@ impl FileTreeState {
     /// would have the root derivation re-resolve every cwd immediately after
     /// installing the roots that triggered it.
     fn invalidate_all(&mut self) {
-        self.children.clear();
+        self.stale
+            .extend(self.children.keys().map(|(host, dir)| (host, dir.clone())));
         self.loads.invalidate_all();
         self.search.restart();
     }
@@ -951,16 +980,8 @@ impl Tty7App {
             // the `ignored` flags those matchers produced.
             self.file_tree.invalidate_all();
         } else {
-            for p in paths {
-                if !event_can_change_a_row(p, self.file_tree.show_hidden) {
-                    continue;
-                }
-                if let Some(parent) = p.parent() {
-                    self.file_tree.invalidate_dir(host, parent);
-                }
-                // A changed dir itself (e.g. a mkdir) also invalidates its own
-                // listing if cached.
-                self.file_tree.invalidate_dir(host, p);
+            for dir in dirs_to_relist(paths, self.file_tree.show_hidden) {
+                self.file_tree.invalidate_dir(host, dir);
             }
             // Deliberately *not* restarting the search here. Its results are
             // their own walk rather than a view over the listings just dropped,
@@ -1824,6 +1845,7 @@ impl gpui::Render for DragGhost {
 fn land_listing(
     loads: &mut InFlight<DirKey>,
     children: &mut ByHost<PathBuf, Vec<TreeEntry>>,
+    stale: &mut HashSet<DirKey>,
     key: &DirKey,
     id: HostId,
     dir: PathBuf,
@@ -1831,7 +1853,32 @@ fn land_listing(
 ) -> bool {
     let superseded = !loads.finish(key);
     children.insert(id, dir, entries);
+    // What was on screen has just been replaced, so the mark goes. A listing
+    // superseded in flight is re-requested by the caller rather than by the
+    // mark, which is why clearing it here cannot lose the refresh.
+    stale.remove(key);
     superseded
+}
+
+/// The directories a batch of watcher events can have changed the listing of.
+///
+/// The parent of each event path, and **not the path itself**. A row is a child
+/// of the directory it appears under, so an event on `d` is news for `d`'s
+/// parent; `d`'s own listing changes only when something inside it does, and
+/// that arrives as an event on that child.
+///
+/// This is not just an economy. A watched directory gets an event of its own
+/// whenever anything inside it is touched — including the dot-files
+/// [`event_can_change_a_row`] deliberately skips — so relisting `d` for `d`'s
+/// event puts back exactly the round trip that filter exists to avoid. `$HOME`
+/// with a coding agent rewriting `~/.claude.json` was one relist of the home
+/// directory per write, forever.
+fn dirs_to_relist(paths: &HashSet<PathBuf>, show_hidden: bool) -> HashSet<&Path> {
+    paths
+        .iter()
+        .filter(|p| event_can_change_a_row(p, show_hidden))
+        .filter_map(|p| p.parent())
+        .collect()
 }
 
 /// Whether a watcher event for `path` can change a row the tree is showing.
@@ -1882,6 +1929,8 @@ mod tests {
         let dir = PathBuf::from("/home/me");
         let key: DirKey = (id, dir.clone());
 
+        let mut stale: HashSet<DirKey> = HashSet::new();
+
         assert!(loads.begin(key.clone()), "the listing goes out");
         // A watcher event lands mid-flight — the case that used to discard.
         loads.invalidate(&key);
@@ -1889,6 +1938,7 @@ mod tests {
         let again = land_listing(
             &mut loads,
             &mut children,
+            &mut stale,
             &key,
             id,
             dir.clone(),
@@ -1905,12 +1955,103 @@ mod tests {
         let again = land_listing(
             &mut loads,
             &mut children,
+            &mut stale,
             &key,
             id,
             dir.clone(),
             vec![entry("src", true)],
         );
         assert!(!again, "nothing superseded it, so one listing is enough");
+    }
+
+    /// An outdated listing keeps its rows on screen until the replacement
+    /// lands, and the replacement clears the mark.
+    ///
+    /// Dropping it at invalidation time is invisible locally and strobes over a
+    /// link: every watcher batch blanks the directory for a whole round trip.
+    #[test]
+    fn an_outdated_listing_stays_on_screen_until_its_replacement_lands() {
+        let mut loads: InFlight<DirKey> = InFlight::default();
+        let mut children: ByHost<PathBuf, Vec<TreeEntry>> = ByHost::default();
+        let mut stale: HashSet<DirKey> = HashSet::new();
+        let id = HostId::LOCAL;
+        let dir = PathBuf::from("/home/me");
+        let key: DirKey = (id, dir.clone());
+
+        loads.begin(key.clone());
+        land_listing(
+            &mut loads,
+            &mut children,
+            &mut stale,
+            &key,
+            id,
+            dir.clone(),
+            vec![entry("src", true)],
+        );
+
+        // What `invalidate_dir` does to a cached listing: mark, never remove.
+        stale.insert(key.clone());
+        assert_eq!(
+            children.get(id, &dir).map(Vec::len),
+            Some(1),
+            "the rows are still there to paint"
+        );
+
+        // …and the refresh does go out, which is what `request_load` asks.
+        let current = children.get(id, &dir).is_some() && !stale.contains(&key);
+        assert!(!current, "stale means re-ask");
+
+        loads.begin(key.clone());
+        land_listing(
+            &mut loads,
+            &mut children,
+            &mut stale,
+            &key,
+            id,
+            dir.clone(),
+            vec![entry("src", true), entry("README", false)],
+        );
+        assert!(!stale.contains(&key), "the replacement clears the mark");
+        assert_eq!(children.get(id, &dir).map(Vec::len), Some(2));
+    }
+
+    /// A directory's own watcher event relists its *parent*, not itself.
+    ///
+    /// Relisting itself hands back the round trip that skipping dot-files
+    /// saves: a watched directory gets an event of its own for every write
+    /// inside it, hidden or not.
+    #[test]
+    fn a_directorys_own_event_does_not_relist_it() {
+        // One `~/.claude.json` write, as the watcher reports it.
+        let batch: HashSet<PathBuf> = [
+            PathBuf::from("/home/me/.claude.json"),
+            PathBuf::from("/home/me"),
+        ]
+        .into_iter()
+        .collect();
+
+        let dirs = dirs_to_relist(&batch, false);
+        assert!(
+            !dirs.contains(Path::new("/home/me")),
+            "the home listing is not re-fetched for a dot-file write"
+        );
+        assert!(dirs.contains(Path::new("/home")), "its parent is");
+
+        // A visible file appearing under it does relist it — via its own path.
+        let batch: HashSet<PathBuf> = [
+            PathBuf::from("/home/me/notes.md"),
+            PathBuf::from("/home/me"),
+        ]
+        .into_iter()
+        .collect();
+        assert!(dirs_to_relist(&batch, false).contains(Path::new("/home/me")));
+
+        // And with hidden entries shown, the dot-file is a row again.
+        let batch: HashSet<PathBuf> = [PathBuf::from("/home/me/.claude.json")]
+            .into_iter()
+            .collect();
+        assert!(dirs_to_relist(&batch, true).contains(Path::new("/home/me")));
+        assert!(dirs_to_relist(&batch, false).is_empty());
     }
 
     /// The churn that made a remote tree flicker: a coding agent rewriting
