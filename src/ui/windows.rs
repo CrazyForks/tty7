@@ -280,20 +280,41 @@ pub fn menu_order(cx: &App) -> Vec<(WorkspaceId, bool)> {
 /// [`pane_liveness`](crate::terminal::pane_liveness): the prompt states an exact
 /// number about an irreversible action, so it wants a fresh count, not one that
 /// may be ten seconds old. This runs on a click, not on a frame.
-pub fn live_pane_count(cx: &App, workspace: WorkspaceId) -> Option<usize> {
+/// What [`live_pane_count`] needs from the app, gathered on the UI thread so the
+/// count itself does not have to run there.
+pub struct PaneCountQuery {
+    route: crate::terminal::PaneRoute,
+    claimed: Vec<u64>,
+}
+
+/// Read the inputs for [`live_pane_count`]. Cheap; UI thread only.
+pub fn pane_count_query(cx: &App, workspace: WorkspaceId) -> Option<PaneCountQuery> {
     let ws = WorkspaceStore::all(cx).get(workspace)?;
-    let claimed = ws.pane_ids();
+    Some(PaneCountQuery {
+        // Routed to the workspace's own machine: a remote workspace's pane ids
+        // mean nothing to this computer's daemon, so asking it would count
+        // whichever *local* panes happen to hold those numbers and put a "3
+        // running sessions will be ended" warning on a workspace that has none.
+        route: crate::ui::remote_workspace::pane_route_for(cx, workspace),
+        claimed: ws.pane_ids(),
+    })
+}
+
+/// **Blocking. Never call this on the UI thread.**
+///
+/// For a remote route this dials the workspace's machine — an SSH handshake if
+/// nothing is pooled — and a WSL one can go as far as installing the server
+/// binary. `guard_off_ui` makes a UI-thread call a debug-build abort rather
+/// than a dropped frame, which is what it did when this was reached straight
+/// from the Stop/Delete action handler.
+pub fn live_pane_count(q: &PaneCountQuery) -> Option<usize> {
+    let PaneCountQuery { route, claimed } = q;
     if claimed.is_empty() {
         return Some(0);
     }
     // One short-lived connection, only when there is something to ask about —
-    // the picker renders far more often than a workspace is closed. Routed to
-    // the workspace's own machine: a remote workspace's pane ids mean nothing
-    // to this computer's daemon, so asking it would count whichever *local*
-    // panes happen to hold those numbers and put a "3 running sessions will be
-    // ended" warning on a workspace that has none.
-    let route = crate::ui::remote_workspace::pane_route_for(cx, workspace);
-    match crate::terminal::RemoteTerminal::try_list_panes_on(&route) {
+    // the picker renders far more often than a workspace is closed.
+    match crate::terminal::RemoteTerminal::try_list_panes_on(route) {
         Ok(panes) => {
             let alive: std::collections::HashSet<u64> = panes
                 .into_iter()
@@ -369,33 +390,57 @@ fn confirm_destructive(
     verb: &'static str,
     act: fn(&mut App, WorkspaceId),
 ) {
-    let live = live_pane_count(cx, workspace);
     let name = WorkspaceStore::all(cx)
         .get(workspace)
         .map(|w| w.display_name())
         .unwrap_or_else(|| "this workspace".to_string());
-    // Only a machine that *answered* zero licenses skipping the prompt. An
-    // unreachable one is the case most likely to still have work in it.
-    if live == Some(0) && verb == "Stop" {
-        act(cx, workspace);
-        return;
-    }
-    let detail = destructive_detail(live, verb);
-    // Title Case, like every other prompt title in the app — this one used to
-    // lowercase "workspace" while its siblings read "Close Window?" /
-    // "Quit and Stop Daemon?".
-    let answer = window.prompt(
-        gpui::PromptLevel::Warning,
-        &format!("{verb} Workspace \u{201c}{name}\u{201d}?"),
-        Some(&detail),
-        &["Cancel", verb],
-        cx,
-    );
+    let query = pane_count_query(cx, workspace);
+    let handle = window.window_handle();
+
     cx.spawn(async move |cx| {
+        // The count dials the workspace's machine, so it does not belong on the
+        // UI thread — on a remote route that is an SSH handshake, and on a WSL
+        // one it can go as far as installing the server. Reached straight from
+        // the action handler, it was a `guard_off_ui` abort in a debug build
+        // and a window frozen for the length of a connect in a release one.
+        let live = match query {
+            Some(q) => {
+                cx.background_spawn(async move { live_pane_count(&q) })
+                    .await
+            }
+            None => None,
+        };
+
+        // Only a machine that *answered* zero licenses skipping the prompt. An
+        // unreachable one is the case most likely to still have work in it.
+        if live == Some(0) && verb == "Stop" {
+            let _ = cx.update(|cx| act(cx, workspace));
+            return;
+        }
+
+        let detail = destructive_detail(live, verb);
+        // Title Case, like every other prompt title in the app — this one used
+        // to lowercase "workspace" while its siblings read "Close Window?" /
+        // "Quit and Stop Daemon?".
+        let Ok(answer) = handle.update(cx, |_, window, cx| {
+            window.prompt(
+                gpui::PromptLevel::Warning,
+                &format!("{verb} Workspace \u{201c}{name}\u{201d}?"),
+                Some(&detail),
+                &["Cancel", verb],
+                cx,
+            )
+        }) else {
+            // The window went away while we were asking its machine. Nothing to
+            // confirm against, and acting unprompted is exactly what this path
+            // exists to prevent.
+            return;
+        };
+
         // Index 1 == the verb button; Cancel and a dismissed prompt both leave
         // the workspace alone.
         if let Ok(1) = answer.await {
-            cx.update(|cx| act(cx, workspace));
+            let _ = cx.update(|cx| act(cx, workspace));
         }
     })
     .detach();

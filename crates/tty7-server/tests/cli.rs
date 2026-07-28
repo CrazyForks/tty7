@@ -6,22 +6,40 @@
 //! a connection to a control server that is already running, which is the path
 //! an `ssh host tty7-server --stdio` takes on a machine with a live daemon and
 //! which no amount of `Host` conformance would exercise.
+//!
+//! Everything `--stdio` is Unix-only — the flag is refused on Windows, where a
+//! machine is reached over its own transport rather than by shipping a server
+//! onto it (contract §8). The plain argument handling below is not, and runs
+//! everywhere.
 
+use std::process::{Command, Stdio};
+
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::process::Child;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
 use tty7_core::daemon::control::{ControlHello, LinkShutdown};
+#[cfg(unix)]
 use tty7_core::host::Host;
+#[cfg(unix)]
 use tty7_core::host::local::LocalHost;
+#[cfg(unix)]
 use tty7_core::host::remote::RemoteHost;
+#[cfg(unix)]
 use tty7_core::host::server;
 
 const EXE: &str = env!("CARGO_BIN_EXE_tty7-server");
 
+#[cfg(unix)]
 struct ServerProcess(Mutex<Option<Child>>);
 
+#[cfg(unix)]
 impl LinkShutdown for ServerProcess {
     fn shutdown_link(&self) -> io::Result<()> {
         if let Some(mut c) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -33,6 +51,7 @@ impl LinkShutdown for ServerProcess {
 }
 
 /// Start `tty7-server --stdio <args>` and connect a `RemoteHost` to its pipes.
+#[cfg(unix)]
 fn stdio_child(args: &[&str]) -> io::Result<Arc<RemoteHost>> {
     let mut child = Command::new(EXE)
         .arg("--stdio")
@@ -49,6 +68,7 @@ fn stdio_child(args: &[&str]) -> io::Result<Arc<RemoteHost>> {
 }
 
 /// A control server on a temp socket, for the bridge to reach.
+#[cfg(unix)]
 fn listening_server(dir: &tempfile::TempDir) -> PathBuf {
     let sock = dir.path().join("control.sock");
     let listener = server::bind_control_socket(&sock).unwrap();
@@ -63,6 +83,7 @@ fn listening_server(dir: &tempfile::TempDir) -> PathBuf {
 /// stream carries belongs to the client and the server at the far end, and a
 /// bridge with an opinion about the protocol would become a third party to a
 /// negotiation it is not qualified to join.
+#[cfg(unix)]
 #[test]
 fn the_bridge_carries_a_whole_session() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -92,6 +113,7 @@ fn the_bridge_carries_a_whole_session() {
 /// `--bridge` with nowhere to bridge to fails rather than quietly serving
 /// itself. An operator who asked for the bridge is telling us a server exists;
 /// silently becoming that server would fork the machine's state in two.
+#[cfg(unix)]
 #[test]
 fn an_explicit_bridge_with_no_server_fails() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -105,6 +127,7 @@ fn an_explicit_bridge_with_no_server_fails() {
 
 /// With neither flag, `--stdio` probes: nothing listening means serve here, so a
 /// machine that has never run a daemon is still reachable over ssh.
+#[cfg(unix)]
 #[test]
 fn the_default_mode_serves_when_nothing_is_listening() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -117,6 +140,7 @@ fn the_default_mode_serves_when_nothing_is_listening() {
 
 /// ...and something listening means bridge to it, so a second `--stdio` session
 /// joins the machine's existing server instead of standing up a rival.
+#[cfg(unix)]
 #[test]
 fn the_default_mode_bridges_when_a_server_is_listening() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -130,6 +154,7 @@ fn the_default_mode_bridges_when_a_server_is_listening() {
 }
 
 /// Contradictory flags are refused rather than one silently winning.
+#[cfg(unix)]
 #[test]
 fn serve_and_bridge_together_are_refused() {
     let out = Command::new(EXE)

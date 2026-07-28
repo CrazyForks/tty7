@@ -45,7 +45,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use gpui::{App, AppContext as _, Context, Window};
+use gpui::{App, Context, Window};
 use gpui_component::WindowExt as _;
 
 // The host vocabulary, re-exported so a view imports everything it needs from
@@ -55,6 +55,156 @@ use gpui_component::WindowExt as _;
 pub use tty7_core::host::{
     Entry, Host, HostId, MTime, Meta, Output, SearchHit, SharedHost, WatchSub,
 };
+
+/// Where blocking [`Host`] calls actually run.
+///
+/// **Not gpui's background executor.** On Linux that is a fixed pool of
+/// `available_parallelism().max(2)` worker threads with no separate blocking
+/// tier, so N stalled host calls on an N-core client occupy every worker there
+/// is. Everything else that uses `background_executor` then queues behind them
+/// — including the reconnect in `remote_workspace::launch_attempt`, which is
+/// the one thing that would clear the stall. Expanding a subtree on a link that
+/// has gone silent is enough: one call per directory, each parked for its
+/// deadline (5s for a `ReadDir`, 30s for a `ReadFile`). macOS is far less
+/// exposed, since libdispatch grows its global queues when their threads block,
+/// which is why this does not show up in development.
+///
+/// Elastic and its own: a thread per concurrent call, reused while warm and
+/// retired after [`LINGER`], capped at [`MAX_THREADS`]. A `Host` call is
+/// user-driven — a directory expanded, a file opened — not per-frame, so the
+/// steady state is one or two threads.
+mod blocking {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::Duration;
+
+    type Job = Box<dyn FnOnce() + Send + 'static>;
+
+    /// Ceiling on threads. Deliberately well above any core count: these are
+    /// parked on a socket rather than competing for CPU, and what has to fit is
+    /// the number of host calls in flight — one per expanded directory in a
+    /// burst, plus whatever the editor and the git probes are doing.
+    const MAX_THREADS: usize = 64;
+
+    /// How long an idle worker waits for more work before retiring.
+    const LINGER: Duration = Duration::from_secs(30);
+
+    struct Inner {
+        state: Mutex<State>,
+        wake: Condvar,
+    }
+
+    struct State {
+        jobs: VecDeque<Job>,
+        threads: usize,
+        /// Workers parked in `wait_timeout`, counted from before they park
+        /// until after they have re-acquired the lock on the way out.
+        idle: usize,
+    }
+
+    impl State {
+        /// Whether a job just queued needs a thread spawned for it.
+        ///
+        /// Compares the backlog against the parked workers rather than asking
+        /// whether *any* worker is parked: `idle` still counts a worker that
+        /// has been handed a job but has not yet woken, and the job meant for
+        /// it is still in `jobs`, so counting both sides cancels the window out.
+        fn wants_another_thread(&self) -> bool {
+            self.jobs.len() > self.idle && self.threads < MAX_THREADS
+        }
+    }
+
+    fn pool() -> &'static Arc<Inner> {
+        static POOL: OnceLock<Arc<Inner>> = OnceLock::new();
+        POOL.get_or_init(|| {
+            Arc::new(Inner {
+                state: Mutex::new(State {
+                    jobs: VecDeque::new(),
+                    threads: 0,
+                    idle: 0,
+                }),
+                wake: Condvar::new(),
+            })
+        })
+    }
+
+    /// Queue `job`. Never refuses: a dropped job is a `Host` call whose caller
+    /// waits forever, and at this cap the backlog is a better failure than that.
+    pub(super) fn submit(job: impl FnOnce() + Send + 'static) {
+        let inner = pool();
+        let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.jobs.push_back(Box::new(job));
+        if st.wants_another_thread() {
+            st.threads += 1;
+            let spawned = Arc::clone(inner);
+            match std::thread::Builder::new()
+                .name("tty7-host-op".into())
+                .spawn(move || worker(spawned))
+            {
+                Ok(_) => return,
+                Err(e) => {
+                    // Out of threads: leave the job for whoever is already
+                    // running. With nobody at all there is no one to run it, so
+                    // run it here — blocking this caller, which is the lesser
+                    // harm against never answering.
+                    st.threads -= 1;
+                    log::warn!("could not start a host-op thread: {e}");
+                    if st.threads == 0
+                        && let Some(job) = st.jobs.pop_back()
+                    {
+                        drop(st);
+                        job();
+                        return;
+                    }
+                }
+            }
+        }
+        drop(st);
+        inner.wake.notify_one();
+    }
+
+    fn worker(inner: Arc<Inner>) {
+        loop {
+            let job = {
+                let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(job) = st.jobs.pop_front() {
+                        break job;
+                    }
+                    st.idle += 1;
+                    let (guard, timeout) = inner
+                        .wake
+                        .wait_timeout(st, LINGER)
+                        .unwrap_or_else(|e| e.into_inner());
+                    st = guard;
+                    st.idle -= 1;
+                    if timeout.timed_out() && st.jobs.is_empty() {
+                        st.threads -= 1;
+                        return;
+                    }
+                }
+            };
+            job();
+        }
+    }
+}
+
+/// Run `f` on the blocking pool and await its result.
+///
+/// `None` means the job was dropped without running, which happens only when
+/// the process is going down — the caller lands nothing rather than inventing
+/// an answer.
+async fn off_thread<T, F>(f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = smol::channel::bounded(1);
+    blocking::submit(move || {
+        let _ = tx.send_blocking(f());
+    });
+    rx.recv().await.ok()
+}
 
 /// The GPUI-facing facade over [`Host`].
 ///
@@ -84,7 +234,9 @@ impl HostOps {
         // optimizer sees through after the first.
         tty7_core::host::register_ui_thread();
         cx.spawn(async move |this, cx| {
-            let out = cx.background_spawn(async move { f(&*host) }).await;
+            let Some(out) = off_thread(move || f(&*host)).await else {
+                return;
+            };
             let _ = this.update(cx, |view, cx| land(view, out, cx));
         })
         .detach();
@@ -114,7 +266,9 @@ impl HostOps {
     {
         tty7_core::host::register_ui_thread();
         cx.spawn(async move |_this, cx| {
-            let out = cx.background_spawn(async move { f(&*host) }).await;
+            let Some(out) = off_thread(move || f(&*host)).await else {
+                return;
+            };
             cx.update(|cx| land(cx, out));
         })
         .detach();
@@ -131,7 +285,9 @@ impl HostOps {
     {
         tty7_core::host::register_ui_thread();
         cx.spawn_in(window, async move |this, cx| {
-            let out = cx.background_spawn(async move { f(&*host) }).await;
+            let Some(out) = off_thread(move || f(&*host)).await else {
+                return;
+            };
             let _ = this.update_in(cx, |view, window, cx| land(view, out, window, cx));
         })
         .detach();
@@ -492,7 +648,24 @@ mod gpui_tests {
         // The pane goes away before either answer can land — a tab closed
         // while its probe was in flight.
         drop(pane);
-        cx.background_executor.run_until_parked();
+
+        // Pumped rather than parked once: a `Host` call runs on `HostOps`' own
+        // thread pool, not on gpui's executor, so `run_until_parked` has
+        // nothing to wait for until the answer has already crossed back. The
+        // deadline is generous because what is being timed is a closure that
+        // returns a constant.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while detached.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Both were submitted together, so the detached one landing means the
+        // view-scoped one has had its chance too. A few more turns, in case it
+        // is merely slower.
+        for _ in 0..20 {
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
 
         assert_eq!(
             detached.load(Ordering::SeqCst),

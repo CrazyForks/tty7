@@ -600,15 +600,20 @@ mod tests {
 
     /// Pre-epoch times round-trip exactly rather than clamping to zero, because
     /// the editor compares mtimes for equality.
+    ///
+    /// Every nanosecond figure here is a multiple of 100: a Windows
+    /// `SystemTime` is a FILETIME, whose tick *is* 100ns, so a finer value
+    /// would be rounded on the way in and the assertion would be about
+    /// `SystemTime`'s resolution rather than about this conversion.
     #[test]
     fn mtime_handles_both_sides_of_the_epoch() {
         use std::time::{Duration, UNIX_EPOCH};
-        let t = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+        let t = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_700);
         assert_eq!(
             MTime::from_system_time(t),
             MTime {
                 secs: 1_700_000_000,
-                nanos: 123_456_789
+                nanos: 123_456_700
             }
         );
         assert_eq!(

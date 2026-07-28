@@ -19,6 +19,10 @@
 //! another's leftovers and nothing here can touch the developer's real
 //! `~/.local/share/tty7/workspaces.json`.
 
+// Unix-only, for the same reason as `stdio_conformance.rs`: the server under
+// test is a `--stdio` child, and two of the cases stand up a control socket.
+#![cfg(unix)]
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

@@ -1263,7 +1263,17 @@ impl Tty7App {
         // An empty workspace has nothing to come back to, so it is dropped
         // outright instead of accumulating as a blank row in the picker —
         // every `New Workspace` the user closes without using would leave one.
-        if self.tabs.is_empty() {
+        //
+        // Unless the emptiness is *this client's* ignorance rather than the
+        // machine's answer. `claimable_session` deliberately opens a remote
+        // workspace empty when its machine cannot be reached, so a window
+        // opened while the box was asleep and then closed — there was nothing
+        // in it to work on — would take the entry with it: its `RemoteRef`, its
+        // cached layout and its geometry, while its panes are still running
+        // over there. Nothing would reconnect it and nothing would offer it
+        // again; the only way back is re-adding the machine by hand.
+        let answered = WorkspaceStore::machine_is_connected(cx, self.workspace);
+        if self.tabs.is_empty() && answered {
             WorkspaceStore::remove(cx, self.workspace);
         } else {
             WorkspaceStore::close_window(cx, self.workspace);
@@ -1297,10 +1307,21 @@ impl Tty7App {
         else {
             return;
         };
-        let left = route.teardown();
-        if !left.is_empty() {
-            log::warn!("{} forwards survived a workspace teardown", left.len());
-        }
+        // Off the UI thread. `teardown` dials the daemon, which resolves the
+        // workspace's SSH connection and waits for the server to acknowledge a
+        // `cancel_tcpip_forward` — on a machine that has gone unreachable, which
+        // is exactly when someone reaches for Stop Workspace, that never comes
+        // back inside the request timeout. `ForwardRoute::list` is already
+        // backgrounded for the same reason; this was the one that was not, and
+        // it ran while the window was being torn down.
+        cx.background_executor()
+            .spawn(async move {
+                let left = route.teardown();
+                if !left.is_empty() {
+                    log::warn!("{} forwards survived a workspace teardown", left.len());
+                }
+            })
+            .detach();
     }
 
     /// Stop a workspace — kill its sessions and close its window — confirming

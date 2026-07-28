@@ -163,6 +163,7 @@ fn run_stdio(args: &[String]) -> io::Result<()> {
     {
         use std::os::unix::net::UnixStream;
         use tty7_core::daemon::duplex::StdioDuplex;
+        use tty7_core::daemon::spawn;
         use tty7_core::host::local::LocalHost;
         use tty7_core::host::server;
 
@@ -201,10 +202,43 @@ fn run_stdio(args: &[String]) -> io::Result<()> {
                 Err(e) if force_bridge => return Err(e),
                 Err(e) => {
                     log_stderr(format_args!(
-                        "no control server at {} ({e}); serving in this process",
+                        "no control server at {} ({e})",
                         sock.display()
                     ));
-                    None
+                    // One control server per machine, started if nobody has —
+                    // the same rule `bridge_panes` follows one dialect over,
+                    // and for the same reason. Two `--stdio` sessions both
+                    // falling through to serving in-process would each hold
+                    // their own `WorkspaceStore` over the one file, and
+                    // `persist` writes the whole document: the second to save
+                    // silently drops the first's changes. Their attachment
+                    // registries would be separate too, which makes design
+                    // §10's takeover a no-op between them — both clients would
+                    // hold the same workspace and neither would be told.
+                    //
+                    // Not attempted when the caller named a socket: starting a
+                    // daemon binds the machine's default endpoint, not theirs,
+                    // so it would be a daemon nobody asked for and nobody uses.
+                    if may_start_daemon(args) {
+                        match spawn::ensure_running()
+                            .map_err(io::Error::other)
+                            .and_then(|()| UnixStream::connect(&sock))
+                        {
+                            Ok(s) => {
+                                log_stderr(format_args!("started one; bridging to it"));
+                                Some(s)
+                            }
+                            Err(e) => {
+                                log_stderr(format_args!(
+                                    "could not start one ({e}); serving in this process"
+                                ));
+                                None
+                            }
+                        }
+                    } else {
+                        log_stderr(format_args!("serving in this process"));
+                        None
+                    }
                 }
             }
         };
@@ -358,6 +392,17 @@ fn control_services() -> tty7_core::host::server::Services {
 }
 
 /// `--flag <value>` or `--flag=<value>`, first occurrence wins.
+/// Whether a failed control probe may start the machine's daemon.
+///
+/// Only when the caller did not name a socket. `--control-sock` says "this
+/// endpoint", and `spawn::ensure_running` binds the machine's default one — so
+/// starting a daemon there would leave a process nobody asked for and nobody
+/// reaches. It is also what keeps the test suite, and any `--config-dir`
+/// isolation built on it, from spraying daemons across a developer's machine.
+fn may_start_daemon(args: &[String]) -> bool {
+    flag_value(args, "--control-sock").is_none()
+}
+
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     let with_eq = format!("{flag}=");
     let mut it = args.iter();
@@ -383,5 +428,25 @@ fn log_stderr(args: std::fmt::Arguments<'_>) {
 fn apply_config_dir_arg(args: &[String]) {
     if let Some(path) = flag_value(args, "--config-dir") {
         tty7_core::core::config::set_config_dir(path.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// A named socket suppresses the daemon start, in both spellings of the
+    /// flag. Without this guard every `--stdio` in the test suite that points
+    /// at a temp socket would start a real daemon on the developer's machine.
+    #[test]
+    fn a_named_control_socket_suppresses_starting_a_daemon() {
+        assert!(may_start_daemon(&argv(&[])));
+        assert!(may_start_daemon(&argv(&["--serve"])));
+        assert!(!may_start_daemon(&argv(&["--control-sock", "/tmp/x.sock"])));
+        assert!(!may_start_daemon(&argv(&["--control-sock=/tmp/x.sock"])));
     }
 }

@@ -41,7 +41,7 @@ use gpui_component::{
 };
 
 use crate::ui::app::Tty7App;
-use crate::ui::host_ops::{HostOps, MTime, WatchSub};
+use crate::ui::host_ops::{HostOps, MTime, SharedHost, WatchSub};
 
 /// Refuse to open files larger than this: the component's code editor is rated
 /// to ~50K lines, and a multi-megabyte blob is almost never what a terminal
@@ -165,6 +165,15 @@ pub(crate) struct EditorPanelState {
     /// and a server-side watcher recreated every time a file is opened or
     /// closed. `Arc` because `set_dirs` is itself a host call.
     watch: Option<Arc<WatchSub>>,
+    /// The host `watch` was opened against, kept so a subscription is never
+    /// reused across a different one.
+    ///
+    /// A `HostId` is not enough to tell them apart: reconnecting removes the
+    /// dead `RemoteHost` and inserts a fresh one under the *same* id, so the id
+    /// matches while the `ControlClient` behind the old subscription is gone.
+    /// Compared by pointer, which distinguishes both that and an outright
+    /// switch to another machine.
+    watch_host: Option<SharedHost>,
     /// A subscription is being opened; keeps a burst of opens from asking for
     /// one each.
     watch_opening: bool,
@@ -217,6 +226,7 @@ impl EditorPanelState {
         .detach();
         Self {
             watch: None,
+            watch_host: None,
             watch_opening: false,
             watch_busy: false,
             watch_dirty: false,
@@ -434,6 +444,25 @@ impl Tty7App {
             return;
         };
 
+        // Same rule as the file tree's: a subscription belongs to the host that
+        // opened it. A reconnect inserts a fresh `RemoteHost` under the same
+        // `HostId`, so the id matches while the `ControlClient` behind this
+        // subscription is gone — `set_dirs` then fails, is warned and dropped,
+        // and nothing opens a new one. The cost here is quieter and worse than
+        // a stale tree: external-change detection is what stops a save
+        // clobbering an edit made on the other side.
+        if !self
+            .editor
+            .watch_host
+            .as_ref()
+            .is_some_and(|opened_with| Arc::ptr_eq(opened_with, &host))
+        {
+            self.editor.watch = None;
+            self.editor.watch_host = None;
+            self.editor.watch_busy = false;
+            self.editor.watch_dirty = false;
+        }
+
         if let Some(sub) = self.editor.watch.clone() {
             if self.editor.watch_busy {
                 self.editor.watch_dirty = true;
@@ -462,6 +491,7 @@ impl Tty7App {
             return;
         }
         self.editor.watch_opening = true;
+        let opened_host = Arc::clone(&host);
         let opened_with = self.editor.watched_dirs.clone();
         HostOps::run(
             host,
@@ -481,6 +511,7 @@ impl Tty7App {
                 };
                 let events = sub.events().clone();
                 app.editor.watch = Some(sub);
+                app.editor.watch_host = Some(opened_host);
                 cx.spawn(async move |app, cx| {
                     while let Ok(batch) = events.recv().await {
                         let ok = app.update(cx, |app, _cx| {

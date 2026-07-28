@@ -53,7 +53,7 @@ use crate::daemon::control::{
     WireErrorKind, feature,
 };
 use crate::daemon::duplex::{Duplex, Halves};
-use crate::host::{Host, SharedHost, WatchSub};
+use crate::host::{Host, SearchHit, SharedHost, WatchSub};
 
 /// Ceiling on threads one connection's pool will grow to.
 ///
@@ -144,6 +144,21 @@ impl Services {
 #[derive(Default)]
 pub struct AttachRegistry {
     live: Mutex<Vec<Live>>,
+    /// Held across *both* tables for the length of one handover.
+    ///
+    /// A takeover moves two things that live in different places: this
+    /// registry's handles, and the `WorkspaceStore`'s record. Each is
+    /// internally locked, and that is not enough — two clients attaching to one
+    /// workspace at the same moment can each win a different table, after which
+    /// the store names a session the registry has already evicted and no
+    /// `detach` can ever clear it, because the token no longer matches. From
+    /// then on the workspace reports a takeover against a client that
+    /// disconnected hours ago.
+    ///
+    /// Coarse on purpose: attach and detach happen once per workspace opened or
+    /// closed, so serializing them costs nothing worth measuring. Always the
+    /// outermost lock of the two, and never held while writing to a peer.
+    handover: Mutex<()>,
 }
 
 struct Live {
@@ -182,6 +197,11 @@ struct Evicted {
 }
 
 impl AttachRegistry {
+    /// Take the handover lock. See [`AttachRegistry::handover`].
+    fn handover(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.handover.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Who holds `workspace` — `(token, hostname)`. Diagnostics and tests.
     pub fn holder(&self, workspace: &str) -> Option<(String, String)> {
         self.locked()
@@ -242,6 +262,14 @@ impl AttachRegistry {
             });
         }
         evicted
+    }
+
+    /// Forget `workspace` whoever holds it — the workspace itself is gone.
+    ///
+    /// Unconditional, unlike [`AttachRegistry::release`]: a delete is not one
+    /// session giving something up, it is the thing ceasing to exist.
+    fn forget_workspace(&self, workspace: &str) {
+        self.locked().retain(|l| l.workspace != workspace);
     }
 
     /// Release `workspace`, but only if `conn` still holds it. `false` means it
@@ -372,6 +400,7 @@ where
         sink: Arc::clone(&sink),
         inflight: Mutex::new(HashMap::new()),
         watches: Mutex::new(HashMap::new()),
+        deferred_watches: Mutex::new(HashMap::new()),
         next_watch: AtomicU64::new(1),
         pool: Pool::new(),
         workspaces: services.workspaces.clone(),
@@ -520,13 +549,21 @@ fn attach_workspace(
     dedicated: bool,
 ) -> io::Result<Option<String>> {
     let store = conn.workspaces()?;
-    let displaced = store.attach(
-        workspace,
-        Attachment::new(conn.holder.token.clone(), conn.holder.hostname.clone()),
-    );
-    let evicted = conn
-        .attachments
-        .claim(workspace, conn.id, &conn.holder, dedicated);
+    let (displaced, evicted) = {
+        // Both tables move under one lock. Held only across the two moves —
+        // the notice below goes out with nothing held, because writing to a
+        // peer that has stopped reading must not hold up the next client's
+        // attach.
+        let _handover = conn.attachments.handover();
+        let displaced = store.attach(
+            workspace,
+            Attachment::new(conn.holder.token.clone(), conn.holder.hostname.clone()),
+        );
+        let evicted = conn
+            .attachments
+            .claim(workspace, conn.id, &conn.holder, dedicated);
+        (displaced, evicted)
+    };
 
     if let Some(evicted) = evicted {
         log::info!(
@@ -562,6 +599,7 @@ fn attach_workspace(
 /// then tidied up must not evict the client that took over from it.
 fn detach_workspace(conn: &Arc<Conn>, workspace: &str) -> io::Result<bool> {
     let store = conn.workspaces()?;
+    let _handover = conn.attachments.handover();
     let released = conn.attachments.release(workspace, conn.id);
     let forgotten = store.detach(workspace, &conn.holder.token);
     Ok(released || forgotten)
@@ -637,7 +675,7 @@ fn run_job(conn: &Arc<Conn>, req_id: u64, req: ControlRequest, blob: Vec<u8>) {
     }
 
     let wants_blob = req.returns_blob();
-    let (reply, out_blob) = match run_request(conn, req, blob) {
+    let (reply, out_blob) = match run_request(conn, req_id, req, blob) {
         Ok((ok, bytes)) => (ControlReply::Ok(ok), bytes),
         Err(e) => (ControlReply::Err(WireError::from_io(&e)), Vec::new()),
     };
@@ -648,10 +686,36 @@ fn run_job(conn: &Arc<Conn>, req_id: u64, req: ControlRequest, blob: Vec<u8>) {
 // Dispatch
 // ---------------------------------------------------------------------------
 
+/// Drop the hits whose paths this wire cannot carry.
+///
+/// `SearchHit::path` is the one `PathBuf` that crosses the control dialect —
+/// every path in `ControlRequest` is a `String` for exactly this reason — and
+/// `serde` refuses to serialize a `Path` that is not UTF-8 rather than
+/// converting it lossily. So one Latin-1 filename under the search roots makes
+/// the *whole* reply unencodable: before this, the client saw no reply at all
+/// and waited out its 20-second search deadline, on that keystroke and on every
+/// one after it.
+///
+/// Dropped rather than converted lossily, because the lossy form is a path that
+/// does not open — the client would be offering the user a hit it cannot act
+/// on. `LocalHost` keeps full fidelity; this is the wire's limit, applied at the
+/// wire.
+fn drop_unsendable_hits(hits: &mut Vec<SearchHit>) {
+    let before = hits.len();
+    hits.retain(|hit| hit.path.to_str().is_some());
+    if hits.len() != before {
+        log::debug!(
+            "search dropped {} hit(s) whose paths are not UTF-8",
+            before - hits.len()
+        );
+    }
+}
+
 /// One request against the host. `Ok` carries the reply value and, for the
 /// methods that have one, the bulk bytes that ride the frame's blob.
 fn run_request(
     conn: &Arc<Conn>,
+    req_id: u64,
     req: ControlRequest,
     blob: Vec<u8>,
 ) -> io::Result<(ReplyOk, Vec<u8>)> {
@@ -693,13 +757,14 @@ fn run_request(
             show_hidden,
         } => {
             let roots: Vec<PathBuf> = roots.iter().map(|r| p(r)).collect();
-            let hits = h.search(
+            let mut hits = h.search(
                 &roots,
                 &query,
                 clamp_usize(limit),
                 clamp_usize(max_dirs),
                 show_hidden,
             )?;
+            drop_unsendable_hits(&mut hits);
             (ReplyOk::Hits(hits), Vec::new())
         }
 
@@ -748,7 +813,7 @@ fn run_request(
 
         // ----- watch ---------------------------------------------------------
         ControlRequest::WatchOpen { dirs } => {
-            let id = conn.open_watch(&paths(&dirs))?;
+            let id = conn.open_watch(req_id, &paths(&dirs))?;
             (ReplyOk::WatchId(id), Vec::new())
         }
         ControlRequest::WatchSet { id, dirs } => {
@@ -788,7 +853,19 @@ fn run_request(
         ControlRequest::WorkspaceDelete { id } => {
             // Deleting what is not there is success — a delete that raced
             // another client's delete has got what it asked for.
-            conn.workspaces()?.delete(&id, conn.workspace_origin)?;
+            let store = conn.workspaces()?;
+            {
+                // The store drops its own attachment on delete; the registry
+                // has to be told, and under the same lock, or the two disagree
+                // with no race needed at all. Left behind, the stale `Live`
+                // entry means the *next* client to attach a workspace with this
+                // id evicts a session nobody displaced — and, that entry being
+                // dedicated, closes its whole link, taking every other
+                // workspace on it down too.
+                let _handover = conn.attachments.handover();
+                store.delete(&id, conn.workspace_origin)?;
+                conn.attachments.forget_workspace(&id);
+            }
             (ReplyOk::Unit, Vec::new())
         }
 
@@ -833,6 +910,17 @@ struct Conn {
     /// leaks nothing.
     inflight: Mutex<HashMap<u64, bool>>,
     watches: Mutex<HashMap<u64, WatchSub>>,
+    /// Watch forwarders that have been set up but must not start until their
+    /// `WatchId` reply has gone out, keyed by the request that opened them.
+    ///
+    /// The forwarder writes to the same sink the reply does, and nothing
+    /// ordered the two: a directory that changed in the instant it was first
+    /// watched could push a batch that overtook the reply. The client files a
+    /// watch id only once `call` returns, so it has no entry for that id yet
+    /// and drops the batch under the unknown-id rule — and since the file tree
+    /// relists only on a watch event, the change stays invisible until
+    /// something else touches the directory.
+    deferred_watches: Mutex<HashMap<u64, (u64, smol::channel::Receiver<Vec<PathBuf>>)>>,
     next_watch: AtomicU64,
     pool: Pool,
     /// The machine's workspace records, when this server serves them.
@@ -868,6 +956,7 @@ impl Conn {
     /// earlier is already gone from the registry and is not touched — the exact
     /// case the store's token check exists for, seen from the other side.
     fn release_all_workspaces(&self) {
+        let _handover = self.attachments.handover();
         let released = self.attachments.release_conn(self.id);
         let Some(store) = self.workspaces.as_ref() else {
             return;
@@ -912,6 +1001,7 @@ impl Conn {
             .unwrap_or(false);
         if cancelled {
             log::trace!("control request {req_id} was cancelled; dropping its reply");
+            self.start_deferred_watch(req_id, false);
             return;
         }
 
@@ -927,13 +1017,41 @@ impl Conn {
         } else {
             ControlServerMsg::Response { req_id, reply }
         };
-        if let Err(e) = self.sink.send(&msg) {
-            log::debug!("control reply {req_id} could not be written: {e}");
-        }
+        // Encoded before anything is written, so a reply this server cannot put
+        // on the wire — a `SearchHit` whose path is not UTF-8, a `WorkspaceList`
+        // grown past `MAX_FRAME` — becomes an error the client *receives*.
+        // Dropping it instead leaves the client waiting out the request's whole
+        // deadline (20s for a search, and again on the next keystroke) for a
+        // reply that was never coming.
+        let delivered = match msg.to_frame() {
+            Ok((k, payload)) => match self.sink.send_frame(k, &payload) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::debug!("control reply {req_id} could not be written: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                log::warn!("control reply {req_id} could not be encoded: {e}");
+                let excuse = ControlServerMsg::Response {
+                    req_id,
+                    reply: ControlReply::Err(WireError::from_io(&e)),
+                };
+                if let Err(e) = self.sink.send(&excuse) {
+                    log::debug!("control error reply {req_id} could not be written: {e}");
+                }
+                false
+            }
+        };
+
+        // Only now, and only if the client actually learned the id: a batch
+        // that overtook this reply would be dropped by a client that has no
+        // entry for it yet. See `Conn::deferred_watches`.
+        self.start_deferred_watch(req_id, delivered);
     }
 
     /// Open a watch and start forwarding its batches as pushes.
-    fn open_watch(&self, dirs: &[PathBuf]) -> io::Result<u64> {
+    fn open_watch(&self, req_id: u64, dirs: &[PathBuf]) -> io::Result<u64> {
         let sub = self.host.watch(dirs)?;
         let id = self.next_watch.fetch_add(1, Ordering::Relaxed);
         // Clone the receiver before the subscription is filed away: the
@@ -944,8 +1062,40 @@ impl Conn {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, sub);
-        spawn_watch_forwarder(id, rx, Arc::clone(&self.sink));
+        // Parked rather than started — see `deferred_watches`. `finish` starts
+        // it once the reply carrying `id` is on the wire.
+        self.deferred_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(req_id, (id, rx));
         Ok(id)
+    }
+
+    /// Start the forwarder for a watch opened by `req_id`, if there was one.
+    ///
+    /// Called from [`Conn::finish`] after the reply has gone out, and on the
+    /// paths where no reply goes out at all — a cancelled request, or one whose
+    /// reply could not be written — so a parked forwarder is never left holding
+    /// a receiver nobody will read.
+    fn start_deferred_watch(&self, req_id: u64, deliver: bool) {
+        let parked = self
+            .deferred_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&req_id);
+        let Some((id, rx)) = parked else {
+            return;
+        };
+        if !deliver {
+            // The client never learned this id, so every batch would be
+            // dropped. Let the subscription go with the watch entry instead.
+            self.watches
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            return;
+        }
+        spawn_watch_forwarder(id, rx, Arc::clone(&self.sink));
     }
 
     fn set_watch_dirs(&self, id: u64, dirs: &[PathBuf]) -> io::Result<()> {
@@ -1065,11 +1215,21 @@ impl Sink {
     }
 
     fn send(&self, msg: &ControlServerMsg) -> io::Result<()> {
+        let (k, payload) = msg.to_frame()?;
+        self.send_frame(k, &payload)
+    }
+
+    /// The write half of [`Sink::send`], for callers that already encoded.
+    ///
+    /// Split so that "this reply cannot be encoded" and "this link is gone" are
+    /// distinguishable: only the second may have put bytes on the wire, and only
+    /// the first leaves the connection well enough to answer on.
+    fn send_frame(&self, k: u8, payload: &[u8]) -> io::Result<()> {
         let mut slot = self.out.lock().unwrap_or_else(|e| e.into_inner());
         let w = slot.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "control connection is closed")
         })?;
-        msg.encode(w).and_then(|()| w.flush())
+        crate::daemon::protocol::write_frame(&mut *w, k, payload).and_then(|()| w.flush())
     }
 
     /// Drop the write half at teardown, so a worker that finishes afterwards
@@ -1112,6 +1272,30 @@ struct PoolState {
     closed: bool,
 }
 
+impl PoolState {
+    /// Whether a job just queued needs a worker spawned for it.
+    ///
+    /// Compares the backlog against the parked workers rather than asking
+    /// whether *any* worker is parked. `idle` counts a worker from before it
+    /// parks until after it has re-acquired the lock on its way out, so for the
+    /// whole wake-up window a worker that has already been handed a job still
+    /// looks free — and the `notify_one` a second submit sends in that window
+    /// goes to a thread that has left the wait set, so it is lost.
+    ///
+    /// Concretely: with `k` workers parked, a client pipelining `k+1` frames in
+    /// one read — a `Git` plus `k` `ReadDir`s, which is what the file tree and
+    /// the branch line produce together — got `k` of them running and left the
+    /// last queued behind a `git status` that can take twenty seconds. That is
+    /// the head-of-line blocking this pool is elastic in order to avoid.
+    ///
+    /// Counting both sides makes the window harmless: the job destined for a
+    /// parked-but-notified worker is still in `jobs`, so it cancels that
+    /// worker out and the next job over sees no spare capacity.
+    fn wants_another_worker(&self) -> bool {
+        self.jobs.len() > self.idle && self.workers < MAX_WORKERS
+    }
+}
+
 impl Pool {
     fn new() -> Pool {
         Pool {
@@ -1136,9 +1320,10 @@ impl Pool {
         }
         st.jobs.push_back(Box::new(job));
 
-        // Spawn only when nobody is parked to take it, so a steady stream of
-        // requests is served by one warm worker rather than a thread per call.
-        if st.idle == 0 && st.workers < MAX_WORKERS {
+        // Spawn only when the backlog outruns the workers parked to take it, so
+        // a steady stream of requests is served by one warm worker rather than a
+        // thread per call.
+        if st.wants_another_worker() {
             st.workers += 1;
             let inner = Arc::clone(&self.inner);
             match std::thread::Builder::new()
@@ -1315,16 +1500,32 @@ mod sock {
 
     /// Bind the control socket, replacing a stale one.
     ///
-    /// Permissions are the access boundary — a Unix socket has no other. The
-    /// directory goes to 0700 and the socket to 0600 *before* anything can
-    /// connect, so there is no window in which another user on the box could
-    /// reach a server that answers `ReadFile` for arbitrary paths.
+    /// Permissions are the access boundary — a Unix socket has no other, and
+    /// what is behind it is `ReadFile`/`WriteFile`/`Git` on arbitrary paths as
+    /// this user. So the socket has to be 0600 from the first instant its final
+    /// name exists, which `bind` alone cannot give: `bind` creates the node at
+    /// `0777 & ~umask`, and a `chmod` on the next line is a window. Under a
+    /// `umask 002` — the default wherever user-private groups are configured —
+    /// that window is group-connectable.
+    ///
+    /// So the umask is tightened across the `bind` itself. Not a staging
+    /// directory and a rename, which would also close the window: the staging
+    /// path is longer than the final one, and `sun_path` is the one budget here
+    /// with no room to spend — [`socket_path_in`] already falls back to a hashed
+    /// name to stay under it.
     pub fn bind_control_socket(path: &Path) -> io::Result<UnixListener> {
-        if let Some(parent) = path.parent() {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        // `create_dir_all` and *only then* a chmod, on a directory that did not
+        // exist a moment ago: `path` can be `$TTY7_CONTROL_SOCK` or the hashed
+        // fallback, whose parent is `$XDG_RUNTIME_DIR` or `/tmp` — directories
+        // this process does not own and must not re-permission. Tightening
+        // `/tmp` to 0700 would lock every other user out of it, sticky bit and
+        // all, with nothing linking the breakage back to tty7.
+        if !parent.exists() {
             std::fs::create_dir_all(parent)?;
-            // Best effort: a pre-existing `$XDG_RUNTIME_DIR` we do not own is
-            // already 0700 by the platform's own rules, and failing here would
-            // refuse to start over a permission we did not need to change.
+            // Ours by construction, since it did not exist above. Best effort:
+            // losing the race to another tty7 starting at the same instant
+            // leaves the directory correct anyway.
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
 
@@ -1347,9 +1548,39 @@ mod sock {
             }
         }
 
-        let listener = UnixListener::bind(path)?;
+        let listener = bind_private(path)?;
+        // Belt and braces on two counts: it narrows the 0700 the umask below
+        // yields to the 0600 a socket actually needs, and it covers a
+        // filesystem that ignores the umask entirely (some FUSE mounts,
+        // anything with a default ACL) — which would otherwise leave the socket
+        // wide open with nothing to notice it.
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(listener)
+    }
+
+    /// `bind`, with the umask tightened so the node is created owner-only
+    /// rather than created at `0777 & ~umask` and fixed up afterwards.
+    ///
+    /// `0o077`, not `0o177`: the umask is process-global for the length of the
+    /// `bind`, and a *directory* another thread creates in that window would
+    /// come out without its owner-execute bit and be unusable — the test suite
+    /// found this the hard way. Masking only the group and other bits leaves
+    /// anything created alongside it working while still giving the socket no
+    /// group or world access, which is the whole property: connecting to a Unix
+    /// socket needs write permission on it.
+    pub(super) fn bind_private(path: &Path) -> io::Result<UnixListener> {
+        // Serializes tty7's own binds against each other, so two of them cannot
+        // interleave their save/restore and leave the umask tightened.
+        static UMASK: Mutex<()> = Mutex::new(());
+        let _held = UMASK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SAFETY: `umask` is always successful and has no preconditions; the
+        // only hazard is the process-global effect, which the lock and the
+        // immediate restore below bound.
+        let previous = unsafe { libc::umask(0o077) };
+        let bound = UnixListener::bind(path);
+        unsafe { libc::umask(previous) };
+        bound
     }
 
     /// Serve control connections on `listener` until it fails, one thread per
@@ -1419,13 +1650,158 @@ pub use sock::{
     spawn_control_listener, spawn_control_listener_with,
 };
 
+/// The pool is plain threads and channels, so unlike the rest of this file's
+/// tests — which need a Unix socket pair — these hold on every platform.
 #[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    /// Workers are spawned only when nobody is free, so a serial stream of jobs
+    /// costs one thread rather than one thread per job.
+    #[test]
+    fn the_pool_reuses_a_warm_worker() {
+        let pool = Pool::new();
+
+        // A job signals from *inside* itself, so it has sent before its worker
+        // has parked again. Submitting in that window is a genuine "nobody is
+        // free" and legitimately spawns a second worker — so let the pool settle
+        // first, and the assertion is about reuse rather than about timing.
+        let settled = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let st = pool.inner.state.lock().unwrap();
+                if st.idle == st.workers {
+                    return;
+                }
+                drop(st);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("the pool never went idle");
+        };
+
+        for _ in 0..50 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            assert!(pool.submit(move || {
+                let _ = tx.send(());
+            }));
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            settled();
+        }
+        let st = pool.inner.state.lock().unwrap();
+        assert_eq!(
+            st.workers, 1,
+            "50 sequential jobs should not want 50 threads"
+        );
+    }
+
+    /// The spawn decision, at the three states that distinguish it from
+    /// "is anybody parked?".
+    ///
+    /// Driven directly because the state it has to get right — a worker that
+    /// has been notified but has not yet re-acquired the lock, so it is counted
+    /// in `idle` while the job meant for it is still counted in `jobs` — is a
+    /// few instructions wide and a racing test passes against the broken rule
+    /// far more often than it fails.
+    #[test]
+    fn a_worker_is_spawned_when_the_backlog_outruns_the_parked_workers() {
+        let state = |jobs: usize, workers: usize, idle: usize| PoolState {
+            jobs: (0..jobs).map(|_| Box::new(|| ()) as Job).collect(),
+            workers,
+            idle,
+            closed: false,
+        };
+
+        // One parked worker, one job: it is exactly the warm-worker case, and
+        // spawning here is what would cost a thread per request.
+        assert!(!state(1, 1, 1).wants_another_worker());
+
+        // One parked worker, two jobs. The second job arrived inside the
+        // first's wake-up window, so `idle` still says 1 — and the old rule,
+        // which only asked whether `idle == 0`, left this job queued behind a
+        // request that can take twenty seconds.
+        assert!(state(2, 1, 1).wants_another_worker());
+
+        // Nobody parked at all.
+        assert!(state(1, 1, 0).wants_another_worker());
+
+        // And the ceiling still holds.
+        assert!(!state(64, MAX_WORKERS, 0).wants_another_worker());
+    }
+
+    /// And it does grow when work genuinely overlaps.
+    #[test]
+    fn the_pool_grows_for_concurrent_work() {
+        let pool = Pool::new();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        for _ in 0..8 {
+            let gate = Arc::clone(&gate);
+            let done_tx = done_tx.clone();
+            assert!(pool.submit(move || {
+                let (lock, cv) = &*gate;
+                let mut open = lock.lock().unwrap();
+                let _ = done_tx.send(());
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            }));
+        }
+        for _ in 0..8 {
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(pool.inner.state.lock().unwrap().workers, 8);
+
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        pool.close();
+    }
+
+    /// Closing drops the backlog. That is what breaks the `Conn` → `Pool` → job
+    /// → `Arc<Conn>` cycle; leaving the jobs queued would keep every watch on a
+    /// dead connection alive for the life of the process.
+    #[test]
+    fn closing_the_pool_drops_queued_work() {
+        let pool = Pool::new();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let ran = Arc::new(AtomicBool::new(false));
+
+        // One job to occupy the single worker...
+        let blocker = Arc::clone(&gate);
+        assert!(pool.submit(move || {
+            let (lock, cv) = &*blocker;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+        }));
+        std::thread::sleep(Duration::from_millis(100));
+        // ...and one that must never run.
+        let ran2 = Arc::clone(&ran);
+        pool.submit(move || ran2.store(true, Ordering::SeqCst));
+
+        pool.close();
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a job queued at close still ran"
+        );
+        assert!(!pool.submit(|| {}), "a closed pool must refuse work");
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::daemon::control::{ControlHello, MTime, feature};
     use crate::host::local::LocalHost;
     use crate::host::remote::RemoteHost;
-    use crate::host::{Entry, HostId, Meta, Output, SearchHit};
+    use crate::host::{Entry, HostId, Meta, Output};
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
@@ -2072,6 +2448,63 @@ mod tests {
         assert!(seen, "no watch event crossed the connection");
     }
 
+    /// The `WatchId` reply is on the wire before any batch for that id.
+    ///
+    /// The ordering is structural — the forwarder is parked in
+    /// `Conn::deferred_watches` and started by `finish`, so there is no
+    /// interleaving left to hit. This is the end-to-end statement of that, run
+    /// under churn; it does **not** reproduce the old race, whose window was a
+    /// few instructions between `open_watch` returning and `finish` writing on
+    /// the same thread.
+    ///
+    /// What the race cost, when it landed: the client files a watch id only
+    /// once its `call` returns, so a batch that overtook the reply hit a client
+    /// with no entry for that id and was dropped under the unknown-id rule. The
+    /// file tree relists only on a watch event, so that first change stayed
+    /// invisible until something else touched the directory.
+    #[test]
+    fn a_watch_id_reaches_the_client_before_any_batch_for_it() {
+        let (mut client, _ok) = raw();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        ControlClientMsg::Request {
+            req_id: 1,
+            req: ControlRequest::WatchOpen {
+                dirs: vec![tmp.path().to_string_lossy().into_owned()],
+            },
+        }
+        .encode(&mut client)
+        .unwrap();
+        client.flush().unwrap();
+
+        // Churn from the moment the request is sent, so the window between the
+        // watcher going live and the reply going out is a busy one.
+        let churn = tmp.path().to_path_buf();
+        let stop = Arc::new(AtomicBool::new(false));
+        let churning = Arc::clone(&stop);
+        let churner = std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !churning.load(Ordering::SeqCst) {
+                let _ = std::fs::write(churn.join(format!("f{n}")), b"x");
+                n = n.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        // The very first frame back has to be the reply, not an event.
+        let first = ControlServerMsg::read(&mut client).unwrap();
+        stop.store(true, Ordering::SeqCst);
+        churner.join().unwrap();
+
+        match first {
+            ControlServerMsg::Response {
+                req_id: 1,
+                reply: ControlReply::Ok(ReplyOk::WatchId(_)),
+            } => {}
+            other => panic!("a batch overtook the WatchId reply: {other:?}"),
+        }
+    }
+
     /// Dropping the subscription releases the *server's* watcher, not just the
     /// client's bookkeeping — otherwise every expanded directory in a long
     /// session leaks an OS watch on the remote machine.
@@ -2192,112 +2625,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The pool
-    // -----------------------------------------------------------------------
-
-    /// Workers are spawned only when nobody is free, so a serial stream of jobs
-    /// costs one thread rather than one thread per job.
-    #[test]
-    fn the_pool_reuses_a_warm_worker() {
-        let pool = Pool::new();
-
-        // A job signals from *inside* itself, so it has sent before its worker
-        // has parked again. Submitting in that window is a genuine "nobody is
-        // free" and legitimately spawns a second worker — so let the pool settle
-        // first, and the assertion is about reuse rather than about timing.
-        let settled = || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                let st = pool.inner.state.lock().unwrap();
-                if st.idle == st.workers {
-                    return;
-                }
-                drop(st);
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            panic!("the pool never went idle");
-        };
-
-        for _ in 0..50 {
-            let (tx, rx) = std::sync::mpsc::channel();
-            assert!(pool.submit(move || {
-                let _ = tx.send(());
-            }));
-            rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            settled();
-        }
-        let st = pool.inner.state.lock().unwrap();
-        assert_eq!(
-            st.workers, 1,
-            "50 sequential jobs should not want 50 threads"
-        );
-    }
-
-    /// And it does grow when work genuinely overlaps.
-    #[test]
-    fn the_pool_grows_for_concurrent_work() {
-        let pool = Pool::new();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        for _ in 0..8 {
-            let gate = Arc::clone(&gate);
-            let done_tx = done_tx.clone();
-            assert!(pool.submit(move || {
-                let (lock, cv) = &*gate;
-                let mut open = lock.lock().unwrap();
-                let _ = done_tx.send(());
-                while !*open {
-                    open = cv.wait(open).unwrap();
-                }
-            }));
-        }
-        for _ in 0..8 {
-            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        }
-        assert_eq!(pool.inner.state.lock().unwrap().workers, 8);
-
-        let (lock, cv) = &*gate;
-        *lock.lock().unwrap() = true;
-        cv.notify_all();
-        pool.close();
-    }
-
-    /// Closing drops the backlog. That is what breaks the `Conn` → `Pool` → job
-    /// → `Arc<Conn>` cycle; leaving the jobs queued would keep every watch on a
-    /// dead connection alive for the life of the process.
-    #[test]
-    fn closing_the_pool_drops_queued_work() {
-        let pool = Pool::new();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let ran = Arc::new(AtomicBool::new(false));
-
-        // One job to occupy the single worker...
-        let blocker = Arc::clone(&gate);
-        assert!(pool.submit(move || {
-            let (lock, cv) = &*blocker;
-            let mut open = lock.lock().unwrap();
-            while !*open {
-                open = cv.wait(open).unwrap();
-            }
-        }));
-        std::thread::sleep(Duration::from_millis(100));
-        // ...and one that must never run.
-        let ran2 = Arc::clone(&ran);
-        pool.submit(move || ran2.store(true, Ordering::SeqCst));
-
-        pool.close();
-        let (lock, cv) = &*gate;
-        *lock.lock().unwrap() = true;
-        cv.notify_all();
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(
-            !ran.load(Ordering::SeqCst),
-            "a job queued at close still ran"
-        );
-        assert!(!pool.submit(|| {}), "a closed pool must refuse work");
-    }
-
-    // -----------------------------------------------------------------------
     // The socket
     // -----------------------------------------------------------------------
 
@@ -2318,6 +2645,91 @@ mod tests {
             "a control socket is the access boundary; it must not be group- or world-reachable"
         );
         drop(listener);
+    }
+
+    /// A directory that was already there is left alone. `$TTY7_CONTROL_SOCK`
+    /// and the hashed fallback both put the socket straight into
+    /// `$XDG_RUNTIME_DIR` or `/tmp`; tightening one of those to 0700 would lock
+    /// every other user out of it — sticky bit and all, if this is running as
+    /// root — with nothing linking the breakage back to tty7.
+    #[test]
+    fn binding_does_not_re_permission_a_directory_it_did_not_create() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+        let listener = bind_control_socket(&shared.join("s.sock")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+            0o1777,
+            "a directory tty7 did not create must keep its own permissions"
+        );
+        drop(listener);
+    }
+
+    /// Owner-only comes from the umask the bind runs under, not from a `chmod`
+    /// after the fact. A socket that spends even one syscall at `0777 & ~umask`
+    /// is one another user on the box can connect to, and what is behind it is
+    /// `ReadFile` on arbitrary paths as this user.
+    #[test]
+    fn a_bind_is_owner_only_under_a_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("permissive.sock");
+
+        // SAFETY: `umask` has no preconditions. It is process-global, so an
+        // unrelated test creating a file in this window sees `0` rather than
+        // the developer's umask — more permissive, which nothing asserts on.
+        let previous = unsafe { libc::umask(0) };
+        let bound = sock::bind_private(&path);
+        unsafe { libc::umask(previous) };
+
+        let listener = bound.unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+            0,
+            "bind left a window in which another user could connect"
+        );
+        drop(listener);
+    }
+
+    /// One filename this wire cannot carry must not cost the whole search.
+    ///
+    /// Not driven through a real file: APFS rejects a non-UTF-8 name outright
+    /// (`EILSEQ`), so the case cannot be staged on the machine most of this is
+    /// developed on. The filter is the whole behaviour, so the filter is what
+    /// is pinned — `to_frame_refuses_what_cannot_be_sent_without_writing_it`
+    /// covers the other half, that such a hit really would fail to encode.
+    #[test]
+    fn a_filename_that_is_not_utf8_costs_only_its_own_hit() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let hit = |name: &str, path: &Path| SearchHit {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+            is_dir: false,
+            ignored: false,
+        };
+        let mut hits = vec![
+            hit("plain-needle.rs", Path::new("/home/me/plain-needle.rs")),
+            // `café-needle.rs` in Latin-1: a lone 0xe9 is not valid UTF-8.
+            hit(
+                "caf\u{fffd}-needle.rs",
+                Path::new(OsStr::from_bytes(b"/home/me/caf\xe9-needle.rs")),
+            ),
+            hit("other-needle.rs", Path::new("/home/me/other-needle.rs")),
+        ];
+
+        drop_unsendable_hits(&mut hits);
+        let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["plain-needle.rs", "other-needle.rs"],
+            "the representable hits must survive their neighbour"
+        );
     }
 
     /// A whole conformance-shaped exchange over a real listener, proving the
@@ -2820,6 +3232,98 @@ mod tests {
         assert!(
             ControlServerMsg::read(&mut laptop).is_err(),
             "a dedicated connection is closed once its workspace is gone"
+        );
+    }
+
+    /// Deleting a workspace clears it from *both* tables.
+    ///
+    /// The store drops its own attachment on delete. If the registry keeps its
+    /// handle, the two disagree with no race needed, and the next client to
+    /// attach that id evicts a session nobody displaced — closing its whole
+    /// link, since a dedicated entry takes every other workspace on that
+    /// connection down with it.
+    #[test]
+    fn deleting_a_workspace_clears_both_attachment_tables() {
+        let (services, _dir) = workspace_services();
+        let registry = Arc::clone(&services.attachments);
+        let store = services.workspaces.clone().unwrap();
+
+        let ((mut laptop, _), _l) =
+            raw_hello(services.clone(), hello_for("w", "tok-laptop", "laptop"));
+        await_holder(&registry, "w", "laptop");
+        assert!(store.attachment("w").is_some());
+
+        ask(
+            &mut laptop,
+            1,
+            ControlRequest::WorkspacePut {
+                id: "w".to_string(),
+                json: ws_record("w", "the workspace"),
+            },
+        );
+        let reply = ask(
+            &mut laptop,
+            2,
+            ControlRequest::WorkspaceDelete {
+                id: "w".to_string(),
+            },
+        );
+        assert!(
+            matches!(reply, ControlReply::Ok(ReplyOk::Unit)),
+            "{reply:?}"
+        );
+
+        assert!(
+            store.attachment("w").is_none(),
+            "the store still names a holder for a workspace that is gone"
+        );
+        assert!(
+            registry.holder("w").is_none(),
+            "the registry still holds a workspace that is gone"
+        );
+    }
+
+    /// The store's record and the registry's handle move under **one** lock.
+    ///
+    /// They are separate tables with separate locks, and taking them one after
+    /// the other is not enough: two clients attaching the same workspace at the
+    /// same instant can each win a different one, after which the store names a
+    /// session the registry has already evicted. No `detach` can clear it — its
+    /// token no longer matches — so from then on the workspace reports a
+    /// takeover against a client that disconnected hours ago.
+    ///
+    /// Held from the test rather than raced, because the window is a few
+    /// instructions wide and a racing test passes against the broken ordering
+    /// far more often than it fails. Holding the handover proves the stronger
+    /// thing anyway: with it held, an attach reaches *neither* table.
+    #[test]
+    fn an_attach_moves_both_tables_under_one_lock() {
+        let (services, _dir) = workspace_services();
+        let registry = Arc::clone(&services.attachments);
+        let store = services.workspaces.clone().unwrap();
+
+        let held = registry.handover();
+        // The handshake replies before the attach, so this returns rather than
+        // blocking on the lock we are holding.
+        let ((_laptop, _ok), _served) =
+            raw_hello(services.clone(), hello_for("w", "tok-laptop", "laptop"));
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            registry.holder("w").is_none(),
+            "the registry was moved while a handover was in flight"
+        );
+        assert!(
+            store.attachment("w").is_none(),
+            "the store was moved while a handover was in flight"
+        );
+
+        drop(held);
+        await_holder(&registry, "w", "laptop");
+        assert_eq!(
+            store.attachment("w").map(|a| a.token).as_deref(),
+            Some("tok-laptop"),
+            "both tables have to name the same session once the handover is done"
         );
     }
 
