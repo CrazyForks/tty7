@@ -1131,16 +1131,21 @@ fn a_bundle_that_lacks_the_asset_does_not_fall_back_to_the_network() {
 /// once, taking the pane with it.
 #[test]
 fn the_published_path_is_absolute_and_version_qualified() {
+    // Built from *this crate's* version rather than the fixture's `VERSION`:
+    // what the transport execs is whatever `client_version()` currently names,
+    // and pinning the shape to a literal would only re-assert the literal (and
+    // go red on every release bump, which is how it used to behave).
+    let published = asset::remote_paths(HOME, client_version()).binary;
     assert!(
-        BINARY.starts_with('/'),
+        published.starts_with('/'),
         "a relative path would resolve against whatever directory the exec landed in"
     );
     assert!(
-        BINARY.ends_with(&format!("tty7-server-{}", client_version())),
-        "the filename carries the version, so the bare name never names it: {BINARY}"
+        published.ends_with(&format!("tty7-server-{}", client_version())),
+        "the filename carries the version, so the bare name never names it: {published}"
     );
     assert_ne!(
-        BINARY.rsplit('/').next(),
+        published.rsplit('/').next(),
         Some("tty7-server"),
         "if this ever becomes the bare name, `PATH` lookup would start working by accident \
          and the reason for using the absolute path would be forgotten"

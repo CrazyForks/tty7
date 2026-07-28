@@ -1369,7 +1369,7 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "gpui_util",
  "indexmap",
@@ -1927,7 +1927,7 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2500,7 +2500,7 @@ version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbc773e24e02d4ddd8395fd30dc147524273a83e54e0f312d986ea30de5f5646"
 dependencies = [
- "roxmltree",
+ "roxmltree 0.20.0",
 ]
 
 [[package]]
@@ -2859,16 +2859,6 @@ dependencies = [
 
 [[package]]
 name = "gif"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ae047235e33e2829703574b54fdec96bfbad892062d97fed2f76022287de61b"
-dependencies = [
- "color_quant",
- "weezl",
-]
-
-[[package]]
-name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
@@ -3096,7 +3086,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -3180,7 +3170,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#469ab7a44f721723a4c404db984dc8223b55979e"
+source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#2264ff991da93bddfaa0780b5fc070d0ed0a36a5"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3263,7 +3253,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#469ab7a44f721723a4c404db984dc8223b55979e"
+source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#2264ff991da93bddfaa0780b5fc070d0ed0a36a5"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3277,7 +3267,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#469ab7a44f721723a4c404db984dc8223b55979e"
+source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#2264ff991da93bddfaa0780b5fc070d0ed0a36a5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3287,7 +3277,7 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -3338,7 +3328,7 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -3385,7 +3375,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -3396,7 +3386,7 @@ dependencies = [
 [[package]]
 name = "gpui_platform"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "console_error_panic_hook",
  "gpui",
@@ -3409,7 +3399,7 @@ dependencies = [
 [[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "schemars",
  "serde",
@@ -3419,7 +3409,7 @@ dependencies = [
 [[package]]
 name = "gpui_util"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "anyhow",
  "log",
@@ -3428,7 +3418,7 @@ dependencies = [
 [[package]]
 name = "gpui_web"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -3452,7 +3442,7 @@ dependencies = [
 [[package]]
 name = "gpui_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -3481,7 +3471,7 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -3800,7 +3790,7 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3825,7 +3815,7 @@ dependencies = [
 [[package]]
 name = "http_client_tls"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "rustls",
  "rustls-platform-verifier",
@@ -4035,9 +4025,9 @@ dependencies = [
 
 [[package]]
 name = "ignore"
-version = "0.4.26"
+version = "0.4.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b915661dd01db3f05050265b2477bcc6527b3792388e2749b41623cc592be67d"
+checksum = "7f8a7b8211e695a1d0cd91cace480d4d0bd57667ab10277cc412c5f7f4884f83"
 dependencies = [
  "crossbeam-deque",
  "globset",
@@ -4059,18 +4049,18 @@ dependencies = [
  "byteorder-lite",
  "color_quant",
  "exr",
- "gif 0.14.2",
+ "gif",
  "image-webp",
  "moxcms",
  "num-traits",
- "png 0.18.1",
+ "png",
  "qoi",
  "ravif",
  "rayon",
  "rgb",
  "tiff",
- "zune-core 0.5.1",
- "zune-jpeg 0.5.15",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4085,9 +4075,9 @@ dependencies = [
 
 [[package]]
 name = "imagesize"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edcd27d72f2f071c64249075f42e205ff93c9a4c5f6c6da53e79ed9f9832c285"
+checksum = "09e54e57b4c48b40f7aec75635392b12b3421fa26fe8b4332e63138ed278459c"
 
 [[package]]
 name = "imgref"
@@ -4512,12 +4502,13 @@ dependencies = [
 
 [[package]]
 name = "kurbo"
-version = "0.11.3"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c62026ae44756f8a599ba21140f350303d4f08dcdcc71b5ad9c9bb8128c13c62"
+checksum = "4b60dfc32f652b926df6192e55525b16d186c69d47876c3ead4da5cc9f8450e2"
 dependencies = [
  "arrayvec",
  "euclid",
+ "polycool",
  "smallvec",
 ]
 
@@ -4589,9 +4580,9 @@ checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libflate"
@@ -4946,7 +4937,7 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 [[package]]
 name = "media"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -5110,7 +5101,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "once_cell",
- "png 0.18.1",
+ "png",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
 ]
@@ -6044,7 +6035,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "perf"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "collections",
  "serde",
@@ -6261,19 +6252,6 @@ dependencies = [
 
 [[package]]
 name = "png"
-version = "0.17.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
-dependencies = [
- "bitflags 1.3.2",
- "crc32fast",
- "fdeflate",
- "flate2",
- "miniz_oxide",
-]
-
-[[package]]
-name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
@@ -6320,6 +6298,15 @@ dependencies = [
  "cpufeatures 0.3.0",
  "universal-hash",
  "zeroize",
+]
+
+[[package]]
+name = "polycool"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50596ddc09eb5ad5f75cacd40209568e66df71baf86e1499a0e99c4cff12a5a6"
+dependencies = [
+ "arrayvec",
 ]
 
 [[package]]
@@ -7021,7 +7008,7 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "derive_refineable",
 ]
@@ -7064,7 +7051,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "reqwest_client"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7081,11 +7068,11 @@ dependencies = [
 
 [[package]]
 name = "resvg"
-version = "0.45.1"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8928798c0a55e03c9ca6c4c6846f76377427d2c1e1f7e6de3c06ae57942df43"
+checksum = "9be183ad6a216aa96f33e4c8033b0988b8b3ea6fd2359d19af5bac4643fd8e81"
 dependencies = [
- "gif 0.13.3",
+ "gif",
  "image-webp",
  "log",
  "pico-args",
@@ -7093,7 +7080,7 @@ dependencies = [
  "svgtypes",
  "tiny-skia",
  "usvg",
- "zune-jpeg 0.4.21",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -7149,6 +7136,15 @@ name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "rsa"
@@ -7589,7 +7585,7 @@ dependencies = [
 [[package]]
 name = "scheduler"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "async-task",
  "backtrace",
@@ -8396,7 +8392,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "heapless",
  "log",
@@ -8491,9 +8487,9 @@ checksum = "0193cc4331cfd2f3d2011ef287590868599a2f33c3e69bc22c1a3d3acf9e02fb"
 
 [[package]]
 name = "svgtypes"
-version = "0.15.3"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68c7541fff44b35860c1a7a47a7cadf3e4a304c457b58f9870d9706ece028afc"
+checksum = "695b5790b3131dafa99b3bbfd25a216edb3d216dad9ca208d4657bfb8f2abc3d"
 dependencies = [
  "kurbo",
  "siphasher",
@@ -8778,7 +8774,7 @@ dependencies = [
  "half",
  "quick-error 2.0.1",
  "weezl",
- "zune-jpeg 0.5.15",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -8822,24 +8818,24 @@ dependencies = [
 
 [[package]]
 name = "tiny-skia"
-version = "0.11.4"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83d13394d44dae3207b52a326c0c85a8bf87f1541f23b0d143811088497b09ab"
+checksum = "47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea"
 dependencies = [
  "arrayref",
  "arrayvec",
  "bytemuck",
  "cfg-if",
  "log",
- "png 0.17.16",
+ "png",
  "tiny-skia-path",
 ]
 
 [[package]]
 name = "tiny-skia-path"
-version = "0.11.4"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
+checksum = "edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9"
 dependencies = [
  "arrayref",
  "bytemuck",
@@ -8873,9 +8869,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.0"
+version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d988bcd52dbe076d3d46903332f58c912b87a2c49b1428419a5845154762ffee"
+checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
  "bytes",
  "libc",
@@ -9135,9 +9131,9 @@ dependencies = [
 
 [[package]]
 name = "tray-icon"
-version = "0.24.1"
+version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65ba1e5f6b9ef9fd87e21b9c6f351554dbd717960089168fcfdef854686961dc"
+checksum = "045979e3f037cd18ad1cb2a419dfda133c5c29c9f3453370079f2255d46c257e"
 dependencies = [
  "crossbeam-channel",
  "dirs",
@@ -9149,7 +9145,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
  "once_cell",
- "png 0.18.1",
+ "png",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
 ]
@@ -9542,7 +9538,7 @@ dependencies = [
 
 [[package]]
 name = "tty7"
-version = "26.7.5"
+version = "26.7.6"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -9579,7 +9575,7 @@ dependencies = [
 
 [[package]]
 name = "tty7-core"
-version = "26.7.5"
+version = "26.7.6"
 dependencies = [
  "anyhow",
  "base64",
@@ -9596,7 +9592,7 @@ dependencies = [
  "russh-sftp",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "smol",
  "tempfile",
  "tokio",
@@ -9607,7 +9603,7 @@ dependencies = [
 
 [[package]]
 name = "tty7-server"
-version = "26.7.5"
+version = "26.7.6"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -9791,9 +9787,9 @@ dependencies = [
 
 [[package]]
 name = "usvg"
-version = "0.45.1"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80be9b06fbae3b8b303400ab20778c80bbaf338f563afe567cf3c9eea17b47ef"
+checksum = "d46cf96c5f498d36b7a9693bc6a7075c0bb9303189d61b2249b0dc3d309c07de"
 dependencies = [
  "base64",
  "data-url",
@@ -9803,13 +9799,14 @@ dependencies = [
  "kurbo",
  "log",
  "pico-args",
- "roxmltree",
+ "roxmltree 0.21.1",
  "rustybuzz",
  "simplecss",
  "siphasher",
  "strict-num",
  "svgtypes",
  "tiny-skia-path",
+ "ttf-parser",
  "unicode-bidi",
  "unicode-script",
  "unicode-vo",
@@ -9837,7 +9834,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "util"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "anyhow",
  "async-fs",
@@ -9876,7 +9873,7 @@ dependencies = [
 [[package]]
 name = "util_macros"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "perf",
  "quote",
@@ -11691,7 +11688,7 @@ dependencies = [
 [[package]]
 name = "zlog"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11736,7 +11733,7 @@ dependencies = [
 [[package]]
 name = "ztracing"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -11747,13 +11744,7 @@ dependencies = [
 [[package]]
 name = "ztracing_macro"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/zed?branch=tty7#24ed55f4cf1c6f90c2fb4a1db0f33aca949a7f02"
-
-[[package]]
-name = "zune-core"
-version = "0.4.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
+source = "git+https://github.com/l0ng-ai/zed?branch=tty7#3aac3ef3a1411d539c32610ed29e399ef1d3b0ae"
 
 [[package]]
 name = "zune-core"
@@ -11772,20 +11763,11 @@ dependencies = [
 
 [[package]]
 name = "zune-jpeg"
-version = "0.4.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
-dependencies = [
- "zune-core 0.4.12",
-]
-
-[[package]]
-name = "zune-jpeg"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core",
 ]
 
 [[package]]

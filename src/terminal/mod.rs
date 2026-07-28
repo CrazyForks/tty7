@@ -15,6 +15,7 @@
 //! `TermSize` / `RemoteTerminal` are re-exported here so the rest of the crate
 //! can refer to `terminal::RemoteTerminal` without reaching into submodules.
 
+mod boxdraw;
 mod cmd_editor;
 mod completion;
 pub mod element;

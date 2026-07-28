@@ -204,6 +204,18 @@ pub mod state {
     /// Resting label text. 4.6:1 keeps a de-emphasised label at WCAG AA on every
     /// theme; the fixed `mix(fg, bg, 0.42)` it replaces drifted with the seed.
     pub const TEXT_RESTING: f32 = 4.6;
+    /// The floor on how far the selected label sits from the resting one, so the
+    /// text channel keeps saying something when the fill beneath it is washed
+    /// out — a translucent window, a blurred background, an unvetted seed.
+    ///
+    /// A floor, not a target: most themes clear it by construction and are left
+    /// alone. It exists because the two label colors are derived from opposite
+    /// ends (`dim` walks the resting one *into* the surface, `ink_on` leaves the
+    /// selected one at the foreground whenever the fill allows), so a theme whose
+    /// foreground sits close to its background can collapse the gap without any
+    /// single derivation being wrong. One Dark Pro's `#abb2bf` on `#282c34` is
+    /// that theme: 1.32:1 on the popover surface before this floor existed.
+    pub const TEXT_STEP: f32 = 1.4;
 }
 
 /// The interaction-state ladder for one painting surface: the fills for each
@@ -348,19 +360,18 @@ impl Theme {
         let bg = self.background_color();
         let fg = legible_foreground(bg, self.foreground);
         let selected = raise(base, fg, state::SELECTED);
+        // Dimmed from the foreground until it is merely AA-readable on this
+        // surface, rather than a fixed blend — a resting label must stay
+        // legible on an imported theme nobody vetted, too.
+        let text_resting = dim(fg, base, state::TEXT_RESTING);
         Surface {
             base,
             hover: raise(base, fg, state::HOVER),
             selected,
             pressed: raise(base, fg, state::PRESSED),
             cursor: raise(base, fg, state::CURSOR),
-            // Dimmed from the foreground until it is merely AA-readable on this
-            // surface, rather than a fixed blend — a resting label must stay
-            // legible on an imported theme nobody vetted, too.
-            text_resting: dim(fg, base, state::TEXT_RESTING),
-            // Measured against the *selected fill*, not the surface: that fill is
-            // the ground this particular label actually sits on. See `ink_on`.
-            text_selected: ink_on(selected, fg, state::TEXT_RESTING),
+            text_resting,
+            text_selected: stepped_ink(selected, base, fg, text_resting),
         }
     }
 
@@ -401,7 +412,16 @@ impl Theme {
         let mut sidebar = self.surface(m.sidebar);
         // The rail's resting label is a tuned value (a lighter 0.28 dim, so rows
         // in a sunk column don't read as disabled), not the generic AA floor.
+        // Moving it moves the step the selected label is measured against, so
+        // that one is re-derived rather than left at what `surface` computed
+        // against the floor it no longer uses.
         sidebar.text_resting = m.sidebar_fg;
+        sidebar.text_selected = stepped_ink(
+            sidebar.selected,
+            sidebar.base,
+            legible_foreground(self.background_color(), self.foreground),
+            sidebar.text_resting,
+        );
         Surfaces {
             window: self.surface(m.background),
             sidebar,
@@ -537,6 +557,30 @@ fn dim(ink: u32, surface: u32, target: f32) -> u32 {
 /// against which even *pure black* tops out at 3.96:1. White text on a dark red
 /// button is the right answer there, and it is only reachable by looking the
 /// other way.
+/// The selected label on `fill`: [`ink_on`]'s answer, then pushed further from
+/// `resting` if the two would not read as a step ([`state::TEXT_STEP`]).
+///
+/// The push is the last resort it looks like — `ink_on` already guarantees the
+/// label is readable on its own fill, and this only widens a gap that is too
+/// narrow *between the two labels*. Most themes never reach it.
+///
+/// Direction is away from `base`, never toward it: `resting` is the foreground
+/// dimmed *into* the surface, so the far side of the surface is the only way to
+/// open the gap without walking the selected label back down onto its own
+/// ground. That also means the on-fill contrast `ink_on` established can only
+/// improve — `fill` sits between `base` and the foreground.
+fn stepped_ink(fill: u32, base: u32, fg: u32, resting: u32) -> u32 {
+    let ink = ink_on(fill, fg, state::TEXT_RESTING);
+    if contrast(ink, resting) >= state::TEXT_STEP {
+        return ink;
+    }
+    let away = match relative_luminance(base) < relative_luminance(resting) {
+        true => 0xffffff,
+        false => 0x000000,
+    };
+    bisect_contrast(ink, away, resting, state::TEXT_STEP)
+}
+
 fn ink_on(fill: u32, fg: u32, target: f32) -> u32 {
     if contrast(fg, fill) >= target {
         return fg;
@@ -1170,7 +1214,7 @@ struct BuiltinSpec {
 }
 
 /// A hand-picked set of familiar terminal palettes.
-static BUILTINS: [BuiltinSpec; 8] = [
+static BUILTINS: [BuiltinSpec; 9] = [
     BuiltinSpec {
         id: "light",
         name: "Light",
@@ -1357,6 +1401,35 @@ static BUILTINS: [BuiltinSpec; 8] = [
         ],
     },
     BuiltinSpec {
+        id: "one_dark_pro",
+        name: "One Dark Pro",
+        background: 0x282c34,
+        foreground: 0xabb2bf,
+        // The editor cursor / focus blue, not the syntax blue `#61afef`: the
+        // accent doubles as the switch's checked track, and `#61afef` sits at
+        // the same luminance as the `#abb2bf` knob (1.11:1 — invisible).
+        accent: 0x528bff,
+        caret: None,
+        ansi16: [
+            (0x3f, 0x44, 0x51),
+            (0xe0, 0x6c, 0x75),
+            (0x98, 0xc3, 0x79),
+            (0xe5, 0xc0, 0x7b),
+            (0x61, 0xaf, 0xef),
+            (0xc6, 0x78, 0xdd),
+            (0x56, 0xb6, 0xc2),
+            (0xab, 0xb2, 0xbf),
+            (0x5c, 0x63, 0x70),
+            (0xff, 0x61, 0x6e),
+            (0xa5, 0xe0, 0x75),
+            (0xf0, 0xa4, 0x5d),
+            (0x4d, 0xc4, 0xff),
+            (0xde, 0x73, 0xff),
+            (0x4c, 0xd1, 0xe0),
+            (0xe6, 0xe6, 0xe6),
+        ],
+    },
+    BuiltinSpec {
         id: "rose_pine",
         name: "Rosé Pine",
         background: 0x191724,
@@ -1402,7 +1475,7 @@ mod tests {
     }
 
     /// Brightness is inferred correctly: the four light built-ins classify light,
-    /// the four dark ones dark.
+    /// the five dark ones dark.
     #[test]
     fn dark_is_inferred_from_background() {
         let dark: Vec<_> = builtins()
@@ -1410,7 +1483,10 @@ mod tests {
             .filter(|t| t.dark)
             .map(|t| t.id)
             .collect();
-        assert_eq!(dark, ["dark", "dracula", "harbor", "rose_pine"]);
+        assert_eq!(
+            dark,
+            ["dark", "dracula", "harbor", "one_dark_pro", "rose_pine"]
+        );
     }
 
     /// The selection surface must stay a *tint* — decisively on the background's
@@ -1594,6 +1670,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ...and that step is guaranteed by construction, not by every built-in
+    /// happening to clear it.
+    ///
+    /// The two label colors are derived from opposite ends — `dim` walks the
+    /// resting one *into* the surface, while `ink_on` leaves the selected one
+    /// sitting at the foreground whenever the fill allows — so on a theme whose
+    /// foreground is close to its background they meet in the middle with
+    /// neither derivation being wrong. One Dark Pro's popover surface is exactly
+    /// that: 1.32:1 before [`stepped_ink`] existed. Widening the gap must not
+    /// hand back the on-fill readability `ink_on` was called for in the first
+    /// place.
+    #[test]
+    fn selected_label_is_stepped_off_the_resting_one() {
+        // One Dark Pro's popover ladder: `#abb2bf` foreground over `#282c34`.
+        let (base, fill, fg) = (0x2f333b, 0x40454d, 0xabb2bf);
+        let resting = dim(fg, base, state::TEXT_RESTING);
+
+        let plain = ink_on(fill, fg, state::TEXT_RESTING);
+        assert!(
+            contrast(plain, resting) < state::TEXT_STEP,
+            "the case this floor exists for no longer collapses — pick another"
+        );
+
+        let ink = stepped_ink(fill, base, fg, resting);
+        assert!(
+            contrast(ink, resting) >= state::TEXT_STEP - 0.01,
+            "stepped to {ink:#08x}, still only {:.2}:1 off the resting label",
+            contrast(ink, resting)
+        );
+        assert!(
+            contrast(ink, fill) >= state::TEXT_RESTING - 0.01,
+            "stepping cost the label its fill: {:.2}:1 on {fill:#08x}",
+            contrast(ink, fill)
+        );
     }
 
     /// A switch's two tracks must both be distinguishable *from each other* and

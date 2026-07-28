@@ -2611,6 +2611,12 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.check_for_updates = on);
     }
 
+    /// Toggle inactive-pane dimming. Applies on the next render — `update_config`
+    /// notifies, and this view's render is what hands the flag to the pane tree.
+    pub(crate) fn set_dim_inactive_panes(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.dim_inactive_panes = on);
+    }
+
     pub(crate) fn set_cursor_blink(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.cursor_blink = on);
         // Turning blink off mid-cycle could leave the cursor in its hidden phase;
@@ -5916,7 +5922,7 @@ impl Render for Tty7App {
             .get(self.active)
             .and_then(|t| t.pane.focused_or_first(window, cx))
             .and_then(|leaf| self.render_ssh_status_strip(&leaf, cx));
-        // Render the active tab's pane tree; show focus rings only when split.
+        // Render the active tab's pane tree.
         let body = match self.tabs.get(self.active) {
             // Zero tabs: the window's own face — the home page (see `ui::home`).
             None => self.render_home(cx).into_any_element(),
@@ -5937,8 +5943,11 @@ impl Render for Tty7App {
                         .child(leaf.clone())
                         .into_any_element(),
                     None => {
-                        let show_focus = active_tab.pane.leaves().len() > 1;
-                        active_tab.pane.render(show_focus, window, cx)
+                        // Fading the unfocused panes only says anything once the
+                        // tab is actually split, and the user can turn it off.
+                        let dim_inactive = active_tab.pane.leaves().len() > 1
+                            && cx.global::<Config>().dim_inactive_panes;
+                        active_tab.pane.render(dim_inactive, window, cx)
                     }
                 }
             }

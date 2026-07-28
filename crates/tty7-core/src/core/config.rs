@@ -190,6 +190,11 @@ pub struct Config {
     pub window_opacity: Option<f32>,
     /// Global window-blur override. `None` follows the active theme's `blur`.
     pub window_blur: Option<bool>,
+    /// Fade unfocused panes in a split tab so the focused terminal reads as
+    /// foreground. On by default; when off every pane renders at full opacity
+    /// and only focus (cursor, etc.) distinguishes the active one.
+    #[serde(default = "default_true")]
+    pub dim_inactive_panes: bool,
     /// Optional keybinding overrides: action name (e.g. "NewTab") → keystroke
     /// (e.g. "secondary-t", which is ⌘ on macOS and Ctrl elsewhere). Unknown
     /// actions and unparseable keystrokes are ignored (with a warning) so a bad
@@ -719,6 +724,7 @@ impl Default for Config {
             theme_preset_dark: "dark".to_string(),
             window_opacity: None,
             window_blur: None,
+            dim_inactive_panes: true,
             keybindings: HashMap::new(),
             keybinding_preset: default_preset(),
             prefix: default_prefix(),
@@ -1207,6 +1213,25 @@ mod tests {
         let newer: Config =
             serde_json::from_str(r#"{"confirm_window_close": false, "not_a_setting": 7}"#).unwrap();
         assert!(!newer.confirm_window_close);
+    }
+
+    /// Also opt-*out*: every config written before the switch existed predates
+    /// the choice, and those users have been looking at dimmed panes all along —
+    /// defaulting to `false` would silently change how every split tab looks on
+    /// upgrade. And once someone does turn it off, the `false` has to survive a
+    /// save/load cycle, or the effect they opted out of returns on next launch.
+    #[test]
+    fn dim_inactive_panes_defaults_on_and_round_trips() {
+        assert!(Config::default().dim_inactive_panes);
+
+        let old: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        assert!(old.dim_inactive_panes);
+
+        let off: Config = serde_json::from_str(r#"{"dim_inactive_panes": false}"#).unwrap();
+        assert!(!off.dim_inactive_panes);
+        let json = serde_json::to_string(&off).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(!back.dim_inactive_panes);
     }
 
     #[test]

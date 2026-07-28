@@ -40,7 +40,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # a private key's passphrase is stored under (PRD §7.2) — the account *name* is
 # part of the persisted config contract, so it belongs next to `CredentialRef`
 # even though only the GUI computes one today.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # The gitignore matcher chain (`core::gitignore`) the file tree dims entries
 # with — the same crate ripgrep uses. Lives here rather than in the GUI because

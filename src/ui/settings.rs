@@ -147,6 +147,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Appearance,
+            title: "Dim inactive panes",
+            keywords: "fade unfocused inactive split pane focus opacity highlight active dimming",
+        },
+        SearchEntry {
+            section: Appearance,
             title: "Font size",
             keywords: "typography text bigger smaller zoom",
         },
@@ -1570,10 +1575,12 @@ impl Tty7App {
             .into_any_element()
     }
 
-    /// Window section (Appearance): global opacity slider + blur switch that
-    /// apply to every theme. Both are config *overrides* — until touched they
-    /// follow the active theme's own `opacity`/`blur`, and "Follow theme"
-    /// clears them back to that state.
+    /// Window section (Appearance): the global opacity slider and blur switch
+    /// that apply to every theme, then the inactive-pane dimming switch. The
+    /// first two are config *overrides* — until touched they follow the active
+    /// theme's own `opacity`/`blur`, and "Follow theme" clears them back to that
+    /// state; the dimming switch is a plain flag no theme carries a value for,
+    /// so it sits below that button and "Follow theme" leaves it alone.
     fn render_window_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(slider) = self
             .active_settings()
@@ -1583,6 +1590,7 @@ impl Tty7App {
         };
         let config = cx.global::<Config>();
         let overridden = config.window_opacity.is_some() || config.window_blur.is_some();
+        let dim_inactive_panes = config.dim_inactive_panes;
         let theme = presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
         let opacity = Tty7App::effective_window_opacity(cx);
         let blur = cx.global::<Config>().window_blur.unwrap_or(theme.blur);
@@ -1605,6 +1613,10 @@ impl Tty7App {
             .on_click(
                 cx.listener(|this, on: &bool, window, cx| this.set_window_blur(*on, window, cx)),
             )
+            .into_any_element();
+        let dim_switch = crate::ui::theme::switch("dim-inactive-panes", cx)
+            .checked(dim_inactive_panes)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_dim_inactive_panes(*on, cx)))
             .into_any_element();
 
         v_flex()
@@ -1639,6 +1651,14 @@ impl Tty7App {
                     ),
                 )
             })
+            // Below "Follow theme", which resets the two rows above it and not
+            // this one — a plain setting with no theme value behind it.
+            .child(self.settings_row(
+                "Dim inactive panes",
+                "Fade unfocused panes in a split so the active one stands out.",
+                dim_switch,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -4781,6 +4801,7 @@ mod tests {
             "Sidebar grouping",
             "Tab completion",
             "History search",
+            "Dim inactive panes",
         ] {
             assert!(
                 settings_search_entries().iter().any(|e| e.title == title),

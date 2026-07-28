@@ -600,26 +600,33 @@ impl Pane<PaneSlot> {
         self.close_leaf_where(&|v| v.entity_id() == target)
     }
 
-    /// Render the subtree. `show_focus` draws a focus ring on the active leaf
-    /// (suppressed when the tab has a single pane).
-    pub fn render(&self, show_focus: bool, window: &mut Window, cx: &mut App) -> gpui::AnyElement {
+    /// Render the subtree. `dim_inactive` fades every leaf but the focused one;
+    /// the caller decides it — it is off for an unsplit tab (nothing to
+    /// distinguish) and off when the user turned `dim_inactive_panes` off. Kept
+    /// a parameter rather than a `Config` global read here so the tree stays
+    /// renderable without one, as the rest of this module is.
+    pub fn render(
+        &self,
+        dim_inactive: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
         match self {
             Pane::Empty => div().into_any_element(),
             Pane::Leaf(v) => {
-                let focused = show_focus && v.contains_focused(window, cx);
+                let focused = v.contains_focused(window, cx);
                 // No full border (it reads as a hard rectangle).
                 div()
                     .size_full()
                     .relative()
                     .overflow_hidden()
-                    // Inactive panes (only when the tab is actually split) fade back
-                    // so the focused terminal reads as foreground without a hard
-                    // border. Element opacity multiplies through the whole subtree
-                    // (terminal glyphs + cell fills), unlike a background-tinted
-                    // scrim which is near-invisible on a light theme (white on
-                    // white). Applied to the container, so a click still lands on
-                    // the terminal and focuses it.
-                    .when(show_focus && !focused, |d| d.opacity(0.55))
+                    // Inactive panes fade back so the focused terminal reads as
+                    // foreground without a hard border. Element opacity multiplies
+                    // through the whole subtree (terminal glyphs + cell fills),
+                    // unlike a background-tinted scrim which is near-invisible on a
+                    // light theme (white on white). Applied to the container, so a
+                    // click still lands on the terminal and focuses it.
+                    .when(dim_inactive && !focused, |d| d.opacity(0.55))
                     .map(|d| match v {
                         PaneSlot::Ready(t) => d.child(t.clone()),
                         PaneSlot::Connecting(p) => d.child(p.clone()),
@@ -753,7 +760,7 @@ impl Pane<PaneSlot> {
                             .flex_basis(px(0.))
                             .min_w_0()
                             .min_h_0()
-                            .child(a.render(show_focus, window, cx)),
+                            .child(a.render(dim_inactive, window, cx)),
                     )
                     .child(divider)
                     .child(
@@ -763,7 +770,7 @@ impl Pane<PaneSlot> {
                             .flex_basis(px(0.))
                             .min_w_0()
                             .min_h_0()
-                            .child(b.render(show_focus, window, cx)),
+                            .child(b.render(dim_inactive, window, cx)),
                     )
                     .into_any_element()
             }
