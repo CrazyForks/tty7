@@ -158,7 +158,7 @@ pub struct Semantics {
 
 /// The contrast targets that define how loud each interaction state reads.
 ///
-/// **These four numbers are the app's only knobs for state prominence.** They
+/// **These five numbers are the app's only knobs for state prominence.** They
 /// exist because the alternative — a fixed `mix(bg, fg, t)` per state, which is
 /// what this file used to do — makes the *perceived* step depend on the theme.
 /// The old ladder (`hover` 0.09, `sidebar_sel` 0.12, `list_active` 0.17) put
@@ -171,18 +171,36 @@ pub struct Semantics {
 /// same perceived step, so tuning taste here retunes the whole app at once and
 /// no theme can be an outlier.
 ///
-/// `SELECTED` is 1.70 because that is where the already-signed-off Dracula
-/// highlight sits (`mix(bg, fg, 0.17)` ≈ `#4b4d56`, 1.72:1) — the value the
-/// palette and menu look was tuned against. Anchoring *to* it keeps that look
-/// and pulls the light themes, which were as low as 1.20:1, up to match.
+/// # Two selections, not one
+///
+/// The old ladder had *three* signed-off values, not one, and folding them into
+/// a single `SELECTED` is what made light themes shout: the rail's selected row
+/// went from `#E2E2E2` to `#C0C0C0` on white — a silver slab twice the perceived
+/// step it had been — because it inherited the number the palette cursor was
+/// tuned to. The two are not the same job:
+///
+/// * [`SELECTED`] is a **resting state** — a rail row, a lit toggle, a switch
+///   track. It sits there for the whole session next to unselected siblings, so
+///   it stays quiet and leans on the text channel (see [`super::Surface`]).
+/// * [`CURSOR`] is the **one row under the pointer or keyboard** on a menu or
+///   the command palette: transient, alone on its surface, and the eye is
+///   already following it. It gets the loud rung.
+///
+/// Both are anchored to the Dracula values the look was signed off on —
+/// `mix(bg, fg, 0.12)` for the resting selection, `0.17` for the cursor — so the
+/// theme it was designed on is unmoved and every other theme is pulled onto the
+/// same two perceived steps.
 pub mod state {
     /// Pointer feedback. Deliberately a whisper: it answers the mouse without
     /// competing with the selection it may be sitting next to.
     pub const HOVER: f32 = 1.18;
     /// The resting selection. Never the *only* signal — see [`super::Surface`].
-    pub const SELECTED: f32 = 1.70;
+    pub const SELECTED: f32 = 1.30;
     /// Held down. One step past selected so pressing a selected item still reads.
-    pub const PRESSED: f32 = 2.10;
+    pub const PRESSED: f32 = 1.55;
+    /// The transient cursor row on a menu or overlay list. See the module docs
+    /// for why this is a separate knob from [`SELECTED`].
+    pub const CURSOR: f32 = 1.70;
     /// Resting label text. 4.6:1 keeps a de-emphasised label at WCAG AA on every
     /// theme; the fixed `mix(fg, bg, 0.42)` it replaces drifted with the seed.
     pub const TEXT_RESTING: f32 = 4.6;
@@ -216,6 +234,10 @@ pub struct Surface {
     pub hover: u32,
     pub selected: u32,
     pub pressed: u32,
+    /// The louder rung, for the single transient row a pointer or the keyboard
+    /// is *on* — a menu item, the palette's cursor. Not for a resting choice:
+    /// see [`state`] for why the two are separate knobs.
+    pub cursor: u32,
     /// Label color for a resting/unselected item on this surface.
     pub text_resting: u32,
     /// Label color for the selected item. Pair it with `FontWeight::MEDIUM`.
@@ -331,6 +353,7 @@ impl Theme {
             hover: raise(base, fg, state::HOVER),
             selected,
             pressed: raise(base, fg, state::PRESSED),
+            cursor: raise(base, fg, state::CURSOR),
             // Dimmed from the foreground until it is merely AA-readable on this
             // surface, rather than a fixed blend — a resting label must stay
             // legible on an imported theme nobody vetted, too.
@@ -499,7 +522,7 @@ fn dim(ink: u32, surface: u32, target: f32) -> u32 {
 /// other. Raising a fill toward the foreground necessarily moves the ground
 /// closer to the label it carries, and on a theme whose foreground isn't an
 /// extreme — Catppuccin Latte's `#4c4f69` is only 7.4:1 on its own background —
-/// a 1.70:1 selected fill drags the selected label down to 4.14:1, *below* the
+/// a 1.70:1 cursor fill drags the label on it down to 4.14:1, *below* the
 /// resting labels around it. A selection whose text is harder to read than its
 /// neighbours' is not a selection.
 ///
@@ -1429,14 +1452,23 @@ mod tests {
                 let sel_base = contrast(sf.selected, sf.base);
                 let sel_hover = contrast(sf.selected, sf.hover);
                 let hover_base = contrast(sf.hover, sf.base);
+                let cursor_sel = contrast(sf.cursor, sf.selected);
                 assert!(
-                    sel_base >= 1.6,
+                    sel_base >= 1.25,
                     "{}/{name}: selected is only {sel_base:.2}:1 from the surface",
                     t.id
                 );
                 assert!(
-                    sel_hover >= 1.3,
+                    sel_hover >= 1.08,
                     "{}/{name}: selected is only {sel_hover:.2}:1 from hover",
+                    t.id
+                );
+                // The two selection rungs have to stay apart, or splitting them
+                // bought nothing and a menu's cursor reads as a rail's resting
+                // selection again.
+                assert!(
+                    cursor_sel >= 1.2,
+                    "{}/{name}: cursor is only {cursor_sel:.2}:1 from the resting selection",
                     t.id
                 );
                 assert!(
@@ -1479,21 +1511,35 @@ mod tests {
         );
     }
 
-    /// Anchoring `SELECTED` to 1.70 must leave the signed-off Dracula highlight
-    /// where it was — the value the palette/menu look was tuned against. This is
-    /// what makes the fix a no-op on the theme it was designed on and a lift for
-    /// everything else; if a retune moves Dracula, that was a taste decision and
-    /// wants to be a deliberate one.
+    /// Both selection rungs must leave the signed-off Dracula greys where they
+    /// were — the values the look was tuned against, and two *different* values.
+    /// This is what makes the ratio ladder a no-op on the theme it was designed
+    /// on and a lift for everything else; if a retune moves Dracula, that was a
+    /// taste decision and wants to be a deliberate one.
+    ///
+    /// The resting rung is the half that regressed: folded into `CURSOR`'s
+    /// 1.70:1, the rail's selected row went to `#C0C0C0` on the Light theme —
+    /// twice the perceived step it had ever had.
     #[test]
-    fn dracula_selection_matches_the_signed_off_grey() {
+    fn dracula_selection_matches_the_signed_off_greys() {
         let dracula = builtins().into_iter().find(|t| t.id == "dracula").unwrap();
         let bg = dracula.background_color();
-        let legacy = mix(bg, dracula.foreground, 0.17); // the old `list_active`
-        let now = dracula.surfaces().window.selected;
-        assert!(
-            contrast(now, legacy) < 1.05,
-            "Dracula's selection moved: {now:#08x} vs the tuned {legacy:#08x}"
-        );
+        let s = dracula.surfaces();
+        for (what, now, legacy) in [
+            // The old `sidebar_sel`, against the rail it actually paints on.
+            (
+                "resting",
+                s.sidebar.selected,
+                mix(bg, dracula.foreground, 0.12),
+            ),
+            // The old `list_active`, which was mixed off the window background.
+            ("cursor", s.window.cursor, mix(bg, dracula.foreground, 0.17)),
+        ] {
+            assert!(
+                contrast(now, legacy) < 1.05,
+                "Dracula's {what} selection moved: {now:#08x} vs the tuned {legacy:#08x}"
+            );
+        }
     }
 
     /// A resting label must clear WCAG AA on the surface it sits on, for every

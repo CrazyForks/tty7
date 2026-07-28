@@ -183,11 +183,17 @@ pub(crate) fn chrome_tile_variant_for(selected: bool, cx: &gpui::App) -> ButtonC
         } else {
             cx.theme().sidebar_foreground
         })
-        // The sidebar's own selected-row fill (a 12% mix, ≈#E2E2E2 on white) at
-        // full strength: every icon tile in the chrome answers the pointer with
-        // the exact grey the rows do. It used to be that grey at 55% opacity,
-        // which on a light background is a ≈#EE tint nobody can see — and until
-        // the fork learned to read `hover` at all, nothing was painted anyway.
+        // The sidebar's own selected-row fill (`Surface::selected`, ≈#DBDBDB on
+        // white) at full strength: every icon tile in the chrome answers the
+        // pointer with the exact grey the rows do. It used to be that grey at
+        // 55% opacity, which on a light background is a ≈#EE tint nobody can
+        // see — and until the fork learned to read `hover` at all, nothing was
+        // painted anyway.
+        //
+        // Note this is a *hover* wearing the selected rung, which is only
+        // legible because that rung is the quiet one; when the ladder briefly
+        // folded resting selection into the palette cursor's 1.70:1, hovering a
+        // title-bar tile flashed a `#C0C0C0` slab.
         .hover(cx.theme().sidebar_accent)
         // Selected and pressed paint the *same* grey, not a darker step. The
         // chrome has one fill and one only: with two, a lit toggle and a hovered
