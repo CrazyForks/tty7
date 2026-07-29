@@ -16,7 +16,14 @@ set -euo pipefail
 
 TARGET="$1"
 ARCH="$2"
-VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+# Anchored on `= "` — see the note in bundle-macos.sh: the root manifest leads
+# with `version.workspace = true`, which a bare `^version` match would return
+# verbatim as the "version" and bake into every asset filename.
+VERSION="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+  echo "bundle-appimage: could not read a version from Cargo.toml (got '$VERSION')" >&2
+  exit 1
+fi
 NAME="tty7-${VERSION}-linux-${ARCH}"
 
 # AppImage tools need FUSE to self-mount; CI runners usually lack it, so extract
