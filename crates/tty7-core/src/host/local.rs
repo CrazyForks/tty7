@@ -329,6 +329,24 @@ impl Host for LocalHost {
         git::git_output(cwd, args)
     }
 
+    /// Straight off the pipe: this machine's git writes into a buffer we drain
+    /// as it fills, so a multi-megabyte diff never exists as one allocation.
+    fn git_lines(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        on_line: &mut dyn FnMut(&str),
+    ) -> io::Result<Option<i32>> {
+        guard_off_ui();
+        let mut split = git::LineSplitter::default();
+        let code = git::git_stream(cwd, args, |chunk| {
+            split.push(chunk, &mut *on_line);
+            true
+        })?;
+        split.finish(&mut *on_line);
+        Ok(code)
+    }
+
     fn shells(&self) -> io::Result<ShellInventory> {
         guard_off_ui();
         Ok(crate::core::shells::inventory())
@@ -385,6 +403,27 @@ impl WatchedDirs {
 /// A live local watch: the notify watcher plus the set it is following.
 struct LocalWatch {
     inner: Mutex<LocalWatchInner>,
+    /// The delivery end, kept solely so dropping this handle can close it.
+    ///
+    /// Tearing the watcher down is not instantaneous — the OS backend has its
+    /// own thread, and on Windows a `ReadDirectoryChangesW` completion can fire
+    /// *during* teardown, reach the event closure while `raw_tx` is still
+    /// alive, and be forwarded by a coalescer that has not noticed the
+    /// disconnect yet. A consumer holding a clone of the receiver would then
+    /// see an event for a change made after it unsubscribed.
+    ///
+    /// Closing the channel here makes "dropped" mean "no further batches" at
+    /// the instant of the drop, whatever the backend does afterwards. Batches
+    /// already queued stay readable — `close` stops sends, not receives — which
+    /// is the one thing a consumer racing its own drop may legitimately still
+    /// see.
+    batch_tx: smol::channel::Sender<Vec<PathBuf>>,
+}
+
+impl Drop for LocalWatch {
+    fn drop(&mut self) {
+        self.batch_tx.close();
+    }
 }
 
 struct LocalWatchInner {
@@ -450,6 +489,7 @@ fn local_watch(dirs: &[PathBuf], gitignore: Arc<Mutex<GitignoreChain>>) -> io::R
             watcher,
             dirs: Arc::clone(&watched),
         }),
+        batch_tx: batch_tx.clone(),
     };
     handle.set_dirs(dirs)?;
 

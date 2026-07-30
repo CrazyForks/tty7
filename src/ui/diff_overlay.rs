@@ -1,8 +1,13 @@
 //! The working-tree diff overlay: a read-only, GitHub-style side-by-side diff
 //! that covers the terminal area when the user clicks a sidebar row's git line
-//! (`⎇ branch +N −N`). A scrolling column of per-file cards with collapsible
-//! hunk bodies — old on the left, new on the right — plus an untracked-files
-//! section `git diff` itself can't show.
+//! (`⎇ branch +N −N`) or a Changes-panel row. A scrolling column of per-file
+//! cards with collapsible hunk bodies — old on the left, new on the right —
+//! plus an untracked-files section `git diff` itself can't show.
+//!
+//! The sidebar half of that is opt-out: everything below assumes the git line
+//! is a click target, which it is unless
+//! [`sidebar_diff_preview`](crate::core::config::Config::sidebar_diff_preview)
+//! is off. The panel row is not gated.
 //!
 //! Deliberately a *lens*, not a git client: no staging, no discard. The
 //! terminal keeps running underneath (the overlay covers
@@ -17,9 +22,20 @@
 //! snapshot whose branch or counts disagree with what's shown — so a finishing
 //! command or agent turn refreshes the overlay through the exact trigger
 //! machinery the sidebar numbers already use.
+//!
+//! One probe, one snapshot, however many watchers: every tab's overlay and the
+//! Changes panel go through
+//! [`spawn_shared_diff_probe`](Tty7App::spawn_shared_diff_probe) and hold the
+//! result behind an `Arc`. The element tree, meanwhile, is *not* virtualized —
+//! so what keeps a big working tree from stalling the window is refusing to
+//! build the rows in the first place: past
+//! [`AUTO_COLLAPSE_TOTAL_LINES`](git_diff::AUTO_COLLAPSE_TOTAL_LINES) every
+//! file opens collapsed under a summary, and at most
+//! [`MAX_RENDERED_FILES`] cards are built at all.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::{
     AnyElement, FocusHandle, FontWeight, KeyDownEvent, Pixels, Window, div, prelude::*, px,
@@ -28,7 +44,8 @@ use gpui_component::button::Button;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
 use crate::terminal::git_diff::{
-    self, AUTO_COLLAPSE_LINES, DiffSnapshot, FileDiff, FileStatus, LineKind,
+    self, AUTO_COLLAPSE_LINES, DiffSnapshot, DiffStats, FileDiff, FileStatus, LineKind,
+    MAX_RENDERED_FILES, Truncation,
 };
 use crate::ui::app::Tty7App;
 use crate::ui::rounding;
@@ -39,7 +56,11 @@ use crate::ui::rounding::RoundedCorners as _;
 pub(crate) enum DiffLoad {
     /// First probe still in flight.
     Loading,
-    Ready(DiffSnapshot),
+    /// A landed snapshot, shared rather than owned: one probe result reaches
+    /// every tab whose overlay watches this cwd *and* the Changes panel, and
+    /// the snapshot is a deep tree of owned strings — cloning it per holder on
+    /// the UI update path is exactly the cost issue #239 measured as a stall.
+    Ready(Arc<DiffSnapshot>),
     /// The probe came back "not a work tree" (repo deleted, dir gone).
     NotARepo,
 }
@@ -68,10 +89,19 @@ pub(crate) struct DiffOverlayState {
     pub(crate) load: DiffLoad,
     /// A probe is currently in flight (initial or refresh).
     pub(crate) loading: bool,
-    /// Files the user flipped away from their default collapse state (small
-    /// files default open, big/binary ones closed). Keyed by path so the set
-    /// survives a background refresh of the snapshot.
-    pub(crate) toggled: HashSet<String>,
+    /// Files the user has explicitly expanded (`true`) or collapsed (`false`),
+    /// keyed by path so the choice survives a background refresh of the
+    /// snapshot. Absent means "follow the default".
+    ///
+    /// Absolute state, deliberately not an inversion set. It used to be a
+    /// `HashSet` of "files flipped away from their default", which was fine
+    /// while the default was per-file and stable — but the repo-wide
+    /// `collapse_all` moves the default for *every* file at once, so a refresh
+    /// that crossed the oversized threshold inverted every explicit choice
+    /// simultaneously: the two files the user had opened snapped shut and the
+    /// rest sprang open. Storing what the user actually wanted makes a moving
+    /// default unable to touch it.
+    pub(crate) expanded: HashMap<String, bool>,
     /// When set, the overlay shows only this file (repo-relative path), always
     /// expanded — the "click a row in the Changes panel" entry point. `None` is
     /// the whole-tree view the git line opens. Kept as a path rather than an
@@ -147,6 +177,18 @@ impl Tty7App {
             }
             None => {}
         }
+        // The Changes panel may already hold this very repo's snapshot — it is
+        // the same `git diff HEAD`. Opening on it makes the overlay paint
+        // immediately instead of flashing "Reading diff…" for a probe whose
+        // answer is already in the process, and costs an `Arc` bump. A refresh
+        // probe still flies below, so the seeded view is never the last word.
+        // Read here, before the `&mut` borrow of the tab.
+        let seed = match (&self.right_panel.diff_cwd, &self.right_panel.diff) {
+            (Some(panel_key), Some(Some(snap))) if *panel_key == (host, cwd.clone()) => {
+                DiffLoad::Ready(Arc::clone(snap))
+            }
+            _ => DiffLoad::Loading,
+        };
         // The overlay steals focus (it needs Esc); snapshot the active pane so
         // closing lands back on the same terminal — same discipline as Settings.
         self.remember_active_pane(window, cx);
@@ -158,9 +200,9 @@ impl Tty7App {
             host_id: host,
             cwd,
             focus_handle: focus_handle.clone(),
-            load: DiffLoad::Loading,
+            load: seed,
             loading: false,
-            toggled: HashSet::new(),
+            expanded: HashMap::new(),
             focus,
         });
         window.focus(&focus_handle, cx);
@@ -219,37 +261,114 @@ impl Tty7App {
             return;
         };
         overlay.loading = true;
+        self.spawn_shared_diff_probe(host, cwd, cx);
+    }
+
+    /// One `git diff HEAD` per repository, however many things are waiting on
+    /// it — where "repository" is the machine *and* the path, since the same
+    /// path on two hosts is two different work trees.
+    ///
+    /// The overlay and the Changes panel used to probe the same repository
+    /// independently and each keep its own `DiffSnapshot` — issue #239's fifth
+    /// finding. Deduping here means opening both costs one invocation and one
+    /// parse, and [`install_diff_snapshot`](Self::install_diff_snapshot) hands
+    /// the *same* `Arc` to both rather than a second copy.
+    ///
+    /// Callers still mark themselves as waiting first (the overlay's `loading`
+    /// flag, the panel's `diff_pending`): that's the "refreshing…" hint, and it
+    /// is cleared by whichever probe lands for this repo, not necessarily the
+    /// one the caller thought it started.
+    pub(crate) fn spawn_shared_diff_probe(
+        &mut self,
+        host: crate::ui::host_ops::SharedHost,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (host.id(), cwd.clone());
+        if !self.diff_probes_inflight.insert(key.clone()) {
+            // Someone is already asking this exact question — but they asked it
+            // *earlier*, and the answer in flight describes the tree as it was
+            // then. This caller only got here because something changed since,
+            // so folding it into that request would hand it a snapshot already
+            // known to be stale and leave nothing to trigger another look: the
+            // overlay's own re-check is gated on `loading`, which the landing
+            // clears. Remember to ask again instead.
+            self.diff_probes_restale.insert(key);
+            return;
+        }
+        let host_for_retry = host.clone();
         let probe_cwd = cwd.clone();
         crate::ui::host_ops::HostOps::run(
             host,
             cx,
             move |h| git_diff::probe(h, &probe_cwd),
             move |app, result, cx| {
-                // Land on every tab whose overlay shows this repo on this
-                // machine — the spawning tab may no longer be active, and
-                // sibling tabs on the same repo are equally stale. A slot
-                // closed or swapped to another repo while we flew is skipped.
-                let mut landed = false;
-                for tab in app.tabs.iter_mut() {
-                    let Some(overlay) = tab
-                        .diff_overlay
-                        .as_mut()
-                        .filter(|o| o.cwd == cwd && o.host_id == id)
-                    else {
-                        continue;
-                    };
-                    overlay.loading = false;
-                    overlay.load = match &result {
-                        Some(snap) => DiffLoad::Ready(snap.clone()),
-                        None => DiffLoad::NotARepo,
-                    };
-                    landed = true;
-                }
-                if landed {
-                    cx.notify();
+                app.diff_probes_inflight.remove(&key);
+                app.install_diff_snapshot(key.0, &cwd, result.map(Arc::new), cx);
+                // Re-ask for whoever was folded in above. Cleared first, so the
+                // fresh probe starts with a clean slate and a request that
+                // arrives while *it* flies marks the flag again — this converges
+                // rather than looping, because a quiet tree never sets it.
+                if app.diff_probes_restale.remove(&(key.0, cwd.clone())) {
+                    app.spawn_shared_diff_probe(host_for_retry, cwd, cx);
                 }
             },
         );
+    }
+
+    /// Hand a landed probe to everything watching `cwd`: every tab whose
+    /// overlay shows it (the spawning tab may no longer be active, and sibling
+    /// tabs on the same repo are equally stale) and the Changes panel when it
+    /// is on the same cwd. Slots that closed or swapped repos while the probe
+    /// flew are skipped.
+    fn install_diff_snapshot(
+        &mut self,
+        host: crate::ui::host_ops::HostId,
+        cwd: &Path,
+        snap: Option<Arc<DiffSnapshot>>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut landed = false;
+        for tab in self.tabs.iter_mut() {
+            let Some(overlay) = tab
+                .diff_overlay
+                .as_mut()
+                .filter(|o| o.cwd == cwd && o.host_id == host)
+            else {
+                continue;
+            };
+            overlay.loading = false;
+            // `Arc::clone`, not a deep copy of the file/hunk/line tree.
+            overlay.load = match &snap {
+                Some(snap) => DiffLoad::Ready(Arc::clone(snap)),
+                None => DiffLoad::NotARepo,
+            };
+            landed = true;
+        }
+        // The panel's *wait* is cleared by the answer it asked for, whoever
+        // actually ran it — that's what `diff_pending` is for, and clearing it
+        // on a result for a repo the panel has since left is what lets the
+        // render path notice nothing is cached and re-probe.
+        let key = (host, cwd.to_path_buf());
+        if self.right_panel.diff_pending.as_ref() == Some(&key) {
+            self.right_panel.diff_pending = None;
+            landed = true;
+        }
+        // The panel's *data*, though, is claimed by the repo key alone.
+        // Requiring the panel to have been the one waiting meant a probe the
+        // overlay started was thrown away for the panel even when it was
+        // sitting on that exact repo — so clicking the sidebar counts left the
+        // overlay showing the new snapshot and the panel still rendering the
+        // old one, in the same window. With probes deduped per repo there is at
+        // most one in flight, so there is no out-of-order overwrite to guard
+        // against.
+        if self.right_panel.diff_cwd.as_ref() == Some(&key) {
+            self.right_panel.diff = Some(snap);
+            landed = true;
+        }
+        if landed {
+            cx.notify();
+        }
     }
 
     /// Re-probe the open overlay when the shared status cache learned
@@ -298,11 +417,19 @@ impl Tty7App {
         let content = match &overlay.load {
             DiffLoad::Loading => self.diff_message("Reading diff…", cx),
             DiffLoad::NotARepo => self.diff_message("Not a git repository", cx),
-            DiffLoad::Ready(snap) if snap.files.is_empty() && snap.untracked.is_empty() => {
+            // Empty because the read broke, not because the tree is clean. Both
+            // land here as a snapshot with no files — see
+            // `DiffSnapshot::read_failed` — and only one of them may be reported
+            // as a fact about the repository.
+            DiffLoad::Ready(snap) if empty_snapshot(snap) && snap.read_failed => self.diff_message(
+                "Couldn't read the working-tree diff — retrying on the next refresh.",
+                cx,
+            ),
+            DiffLoad::Ready(snap) if empty_snapshot(snap) => {
                 self.diff_message("Working tree clean", cx)
             }
             DiffLoad::Ready(snap) => {
-                self.diff_file_list(snap, &overlay.toggled, focused_file(snap, overlay), cx)
+                self.diff_file_list(snap, &overlay.expanded, focused_file(snap, overlay), cx)
             }
         };
 
@@ -345,10 +472,15 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        // Through `stats` like every other whole-snapshot question on the render
+        // path, rather than `totals` plus `untracked_count`: same single walk,
+        // and it keeps "ask the snapshot once" a rule with no exceptions to
+        // drift from.
         let (branch, files, untracked, added, removed) = match &overlay.load {
             DiffLoad::Ready(s) => {
-                let (a, r) = s.totals();
-                (s.branch.clone(), s.files.len(), s.untracked.len(), a, r)
+                let stats = s.stats();
+                let (a, r) = stats.totals;
+                (s.branch.clone(), s.files.len(), stats.untracked_count, a, r)
             }
             _ => (String::new(), 0, 0, 0, 0),
         };
@@ -521,28 +653,61 @@ impl Tty7App {
     fn diff_file_list(
         &self,
         snap: &DiffSnapshot,
-        toggled: &HashSet<String>,
+        expanded: &HashMap<String, bool>,
         focused: Option<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // One walk for every whole-snapshot number this render needs, rather
+        // than one walk per question over a file list whose length is the size
+        // of the working tree — see `DiffSnapshot::stats`.
+        let stats = snap.stats();
+        // An oversized tree opens fully collapsed: the file rows are still the
+        // useful part, and the bodies are what cost. A file the user opened by
+        // name is exempt — that's an explicit request for one body, not for the
+        // whole tree. See `DiffSnapshot::oversized`.
+        let oversized = focused.is_none() && stats.oversized;
         let mut list = v_flex().gap_3().p_4().w_full();
+        if oversized {
+            list = list.child(self.diff_oversized_notice(snap, &stats, cx));
+        }
+        // Hard ceiling on cards built at all: even collapsed, one card per file
+        // is one card per file, and the list is not virtualized.
+        let shown = snap.files.len().min(MAX_RENDERED_FILES);
         for (idx, file) in snap.files.iter().enumerate() {
             if focused.is_some_and(|f| f != idx) {
                 continue;
             }
+            if focused.is_none() && idx >= shown {
+                break;
+            }
             // A file opened by name was asked for explicitly — show its body
             // even when it's over the auto-collapse threshold. The header still
             // toggles, so a huge file can be folded back down.
-            let expanded = if focused == Some(idx) {
-                !toggled.contains(&file.path)
+            let is_expanded = if focused == Some(idx) {
+                expanded.get(&file.path).copied().unwrap_or(true)
             } else {
-                file_expanded(file, toggled)
+                file_expanded(file, expanded, oversized)
             };
-            list = list.child(self.diff_file_card(idx, file, expanded, cx));
+            list = list.child(self.diff_file_card(idx, file, is_expanded, cx));
+        }
+        if focused.is_none() && snap.files.len() > shown {
+            let rest = snap.files.len() - shown;
+            list = list.child(
+                div()
+                    .w_full()
+                    .px_2p5()
+                    .py_1p5()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "… and {rest} more changed file{} — run `git diff` in the terminal to see them.",
+                        if rest == 1 { "" } else { "s" }
+                    )),
+            );
         }
         // Untracked files are a property of the tree, not of the focused file.
         if focused.is_none() && !snap.untracked.is_empty() {
-            list = list.child(self.diff_untracked_section(&snap.untracked, cx));
+            list = list.child(self.diff_untracked_section(snap, cx));
         }
         div()
             .id("diff-overlay-scroll")
@@ -550,6 +715,36 @@ impl Tty7App {
             .min_h_0()
             .overflow_y_scroll()
             .child(list)
+            .into_any_element()
+    }
+
+    /// The banner an oversized diff leads with: says why every file is folded
+    /// shut and points at the two ways out (expand one file, or use the
+    /// terminal). Deliberately *above* the list rather than instead of it — the
+    /// file rows with their `+N −N` are the part that still reads fine at this
+    /// size.
+    fn diff_oversized_notice(
+        &self,
+        snap: &DiffSnapshot,
+        stats: &DiffStats,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let text = format!(
+            "This working tree is too large to render efficiently ({}). Every file is \
+             collapsed — expand individual files, or run `git diff` in the terminal.",
+            oversized_summary(snap, stats),
+        );
+        div()
+            .w_full()
+            .px_2p5()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(text)
             .into_any_element()
     }
 
@@ -562,8 +757,11 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // Binary files and pure renames have no hunk body to reveal; their
-        // header is inert (no chevron, no click).
-        let expandable = !file.binary && !file.hunks.is_empty();
+        // header is inert (no chevron, no click). A file the repo-wide budget
+        // emptied *is* expandable even with no hunks — what it reveals is the
+        // note explaining why, which is otherwise unreachable.
+        let expandable =
+            !file.binary && (!file.hunks.is_empty() || file.truncated == Some(Truncation::Budget));
         let (glyph, glyph_color) = match file.status {
             FileStatus::Added => ("A", cx.theme().success),
             FileStatus::Modified => ("M", cx.theme().warning),
@@ -580,7 +778,7 @@ impl Tty7App {
         // question: a binary file or a pure rename has no hunks and is not
         // truncated, so its body is empty and the header *is* the card. A
         // truncated file with no parsable hunks still renders the notice.
-        let has_body = expanded && (!file.hunks.is_empty() || file.truncated);
+        let has_body = expanded && (!file.hunks.is_empty() || file.truncated.is_some());
 
         // The header paints a solid band flush into the card's corners, and the
         // card's `overflow_hidden` cannot round it — that clip is a square,
@@ -613,11 +811,12 @@ impl Tty7App {
                             .get_mut(active)
                             .and_then(|t| t.diff_overlay.as_mut())
                         {
-                            // Flip this file's override; removing an existing
-                            // entry returns it to its default state.
-                            if !overlay.toggled.remove(&path) {
-                                overlay.toggled.insert(path.clone());
-                            }
+                            // Record what the user now wants, not "differs from
+                            // the default": `expanded` is the state this card is
+                            // currently drawn in, so the click means the
+                            // opposite of it, and that answer keeps holding even
+                            // if the default later moves under it.
+                            overlay.expanded.insert(path.clone(), !expanded);
                             cx.notify();
                         }
                     }))
@@ -697,7 +896,7 @@ impl Tty7App {
                 .iter()
                 .map(|hunk| (hunk, split_hunk(&hunk.lines)))
                 .collect();
-            let closing_row = if file.truncated {
+            let closing_row = if file.truncated.is_some() {
                 None
             } else {
                 hunks
@@ -722,7 +921,21 @@ impl Tty7App {
                     body = body.child(self.diff_split_row(row, closing_row == Some((h, r)), cx));
                 }
             }
-            if file.truncated {
+            if let Some(reason) = file.truncated {
+                let note = match reason {
+                    Truncation::PerFile => format!(
+                        "Diff truncated at {} lines — run `git diff` in the terminal for the rest.",
+                        git_diff::MAX_LINES_PER_FILE
+                    ),
+                    // Naming the repo-wide budget matters: this file may be
+                    // three lines long, and "truncated" without a why reads as
+                    // tty7 having lost the change.
+                    Truncation::Budget => {
+                        "Body not loaded — this working tree is past tty7's diff budget. \
+                         Run `git diff` in the terminal for this file."
+                            .to_string()
+                    }
+                };
                 body = body.child(
                     div()
                         .w_full()
@@ -730,10 +943,7 @@ impl Tty7App {
                         .py_1()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "Diff truncated at {} lines — run `git diff` in the terminal for the rest.",
-                            git_diff::MAX_LINES_PER_FILE
-                        )),
+                        .child(note),
                 );
             }
             card = card.child(body);
@@ -816,13 +1026,23 @@ impl Tty7App {
     /// The trailing "Untracked files" section: names only — `git diff HEAD`
     /// has no blob to diff a never-added file against, but hiding them would
     /// read as lost work (agents create files constantly).
-    fn diff_untracked_section(&self, untracked: &[String], cx: &Context<Self>) -> AnyElement {
+    ///
+    /// Bounded exactly like the file-card list above it, and for the same
+    /// reason: this is one non-virtualized row per path, and `ls-files
+    /// --others` on a tree whose dependency directory isn't ignored yet answers
+    /// with tens of thousands of them. The header count is the true total, so
+    /// capping the rows never makes files look gone.
+    fn diff_untracked_section(&self, snap: &DiffSnapshot, cx: &Context<Self>) -> AnyElement {
+        let total = snap.untracked_count();
+        let untracked = &snap.untracked[..snap.untracked.len().min(MAX_RENDERED_FILES)];
         // Same filled-band-in-a-rounded-card shape as `diff_file_card`, so the
         // header owns the corners it sits in. The rows below it paint no fill,
-        // which is why only the top pair is ever non-zero here.
+        // which is why only the top pair is ever non-zero here. Counted off the
+        // *total*, not the capped slice: a section with a "… and N more" tail
+        // still has rows under its header.
         let header_corners = rounding::stack_corners(
             0,
-            if untracked.is_empty() { 1 } else { 2 },
+            if total == 0 { 1 } else { 2 },
             rounding::CARD_RADIUS,
             rounding::HAIRLINE,
         );
@@ -841,7 +1061,7 @@ impl Tty7App {
                     .bg(cx.theme().secondary)
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!("Untracked files ({})", untracked.len())),
+                    .child(format!("Untracked files ({total})")),
             );
         for path in untracked {
             section = section.child(
@@ -861,6 +1081,20 @@ impl Tty7App {
                             .child("A"),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(path.clone())),
+            );
+        }
+        if total > untracked.len() {
+            let rest = total - untracked.len();
+            section = section.child(
+                div()
+                    .w_full()
+                    .px_2p5()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "… and {rest} more — run `git status` in the terminal to see them.",
+                    )),
             );
         }
         section.into_any_element()
@@ -886,11 +1120,83 @@ fn focused_name(overlay: &DiffOverlayState) -> Option<String> {
     Some(snap.files[idx].path.clone())
 }
 
-/// Whether a file's body shows: small text diffs default open, big ones (and
-/// anything the user explicitly flipped) invert via the `toggled` set.
-fn file_expanded(file: &FileDiff, toggled: &HashSet<String>) -> bool {
-    let default_open = file.added + file.removed <= AUTO_COLLAPSE_LINES;
-    default_open != toggled.contains(&file.path)
+/// Nothing to show: no changed file and no untracked path. Says nothing about
+/// *why* — [`DiffSnapshot::read_failed`] is what tells a clean tree apart from
+/// a read that never landed.
+fn empty_snapshot(snap: &DiffSnapshot) -> bool {
+    snap.files.is_empty() && snap.untracked.is_empty()
+}
+
+/// Whether a file's body shows.
+///
+/// An explicit choice in `expanded` is final: it is answered before the default
+/// is even computed, so nothing about the snapshot can change it. That ordering
+/// is the whole point — `collapse_all` is a repo-wide default that moves as the
+/// working tree grows and shrinks, and a user who opened one file inside an
+/// oversized diff must not have it snap shut the moment an agent reverts enough
+/// lines to drop the tree back under the threshold.
+///
+/// Files the user never touched follow the default: small text diffs open, big
+/// ones closed, and past
+/// [`AUTO_COLLAPSE_TOTAL_LINES`](git_diff::AUTO_COLLAPSE_TOTAL_LINES) nothing
+/// opens at all, because the per-file threshold can't see that forty innocent
+/// files are about to expand at once.
+fn file_expanded(file: &FileDiff, expanded: &HashMap<String, bool>, collapse_all: bool) -> bool {
+    if let Some(&want) = expanded.get(&file.path) {
+        return want;
+    }
+    !collapse_all && file.added + file.removed <= AUTO_COLLAPSE_LINES
+}
+
+/// The parenthetical inside the oversized banner: one clause per axis that
+/// contributes, so the banner never claims the *diff* is big when what is
+/// actually big is an un-ignored untracked tree.
+///
+/// Whether hunks were dropped is answered by the parser's own per-file
+/// [`Truncation`] flags, never by comparing the retained count against
+/// `added + removed`. Those two numbers are scoped differently — retained
+/// counts the context lines that get rendered too, `added + removed` doesn't —
+/// so on a diff of many small hunks the retained figure is the *larger* of the
+/// two and a `loaded < total` test reads a truncated tree as complete, while
+/// the file cards below it say "body not loaded". The comparison has produced a
+/// wrong answer on each axis it was ever asked about; it decides nothing here.
+///
+/// Both axes are named, and they compose: one file can hit the per-file cap in
+/// the same snapshot where the repo-wide budget emptied another, and the banner
+/// has to account for a body the reader can see is missing either way.
+///
+/// The changed-line figure stays [`totals`](DiffSnapshot::totals) exactly, so
+/// the banner agrees with the `+N −N` in the header directly above it; the
+/// retained figure is named as rendered rows rather than joined to it by "of",
+/// because it is not a fraction of it.
+fn oversized_summary(snap: &DiffSnapshot, stats: &DiffStats) -> String {
+    let mut parts = vec![format!(
+        "{} changed file{}",
+        snap.files.len(),
+        if snap.files.len() == 1 { "" } else { "s" }
+    )];
+    let (added, removed) = stats.totals;
+    let total_lines = (added + removed) as usize;
+    let loaded = stats.retained_lines;
+    let budget = stats.budget_exhausted;
+    let per_file = stats.per_file_truncated;
+    parts.push(match (budget, per_file) {
+        (false, false) => format!("{total_lines} diff lines"),
+        _ => {
+            let cap = match (budget, per_file) {
+                (true, true) => "tty7's budget and the per-file cap",
+                (true, false) => "tty7's budget",
+                _ => "the per-file cap",
+            };
+            format!(
+                "{total_lines} changed lines, {loaded} diff rows loaded before {cap} cut the rest"
+            )
+        }
+    });
+    if stats.untracked_count > 0 {
+        parts.push(format!("{} untracked", stats.untracked_count));
+    }
+    parts.join(", ")
 }
 
 /// Which column a split cell belongs to — picks the marker and tint.
@@ -1033,5 +1339,486 @@ mod tests {
         let rows = split_hunk(&lines);
         assert_eq!(rows[0].right.as_ref().unwrap().text, "    indented");
         assert!(rows[0].left.is_none());
+    }
+
+    /// A file of `added` changed lines, small enough to open by default on its
+    /// own.
+    fn small_file(path: &str, added: u32) -> FileDiff {
+        FileDiff {
+            path: path.to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            added,
+            removed: 0,
+            binary: false,
+            truncated: None,
+            hunks: vec![git_diff::Hunk {
+                header: "@@ -1,1 +1,1 @@".to_string(),
+                lines: (0..added)
+                    .map(|i| line(LineKind::Added, None, Some(i + 1), "x"))
+                    .collect(),
+            }],
+        }
+    }
+
+    /// A file whose body is mostly context: one changed line under six context
+    /// lines, so `retained_lines` counts seven where `+N −N` counts one. A tree
+    /// of these is the shape where the retained figure *exceeds* the changed
+    /// one, which is where a `loaded < total` comparison reads truncation
+    /// backwards.
+    fn context_heavy_file(path: &str) -> FileDiff {
+        FileDiff {
+            path: path.to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            added: 1,
+            removed: 0,
+            binary: false,
+            truncated: None,
+            hunks: vec![git_diff::Hunk {
+                header: "@@ -1,7 +1,7 @@".to_string(),
+                lines: (0..6)
+                    .map(|i| line(LineKind::Context, Some(i + 1), Some(i + 1), "ctx"))
+                    .chain(std::iter::once(line(LineKind::Added, None, Some(7), "x")))
+                    .collect(),
+            }],
+        }
+    }
+
+    /// An explicit choice map, for the tests below.
+    fn choices<const N: usize>(pairs: [(&str, bool); N]) -> HashMap<String, bool> {
+        pairs.into_iter().map(|(p, v)| (p.to_string(), v)).collect()
+    }
+
+    /// The banner text for a snapshot, deriving its stats the way the render
+    /// path does — so these tests exercise the same numbers the overlay shows
+    /// rather than a hand-assembled set.
+    fn banner(snap: &DiffSnapshot) -> String {
+        oversized_summary(snap, &snap.stats())
+    }
+
+    /// The per-file threshold on its own: a small file opens, a big one doesn't,
+    /// and an explicit choice overrides either. Unchanged behaviour — this is
+    /// the small-working-tree case that must feel identical.
+    #[test]
+    fn per_file_collapse_is_unchanged_below_the_repo_threshold() {
+        let small = small_file("small.rs", 10);
+        let big = small_file("big.rs", AUTO_COLLAPSE_LINES + 1);
+        let none = HashMap::new();
+        assert!(file_expanded(&small, &none, false));
+        assert!(!file_expanded(&big, &none, false));
+
+        let picked = choices([("small.rs", false), ("big.rs", true)]);
+        assert!(!file_expanded(&small, &picked, false));
+        assert!(file_expanded(&big, &picked, false));
+    }
+
+    /// The repo-wide override: past the total threshold nothing opens by
+    /// default, however small each file is — the case a per-file rule can't see
+    /// (issue #239, finding 4). An explicit choice still wins, which is what
+    /// "expand individual files" in the oversized notice means.
+    #[test]
+    fn repo_wide_collapse_overrides_the_per_file_default() {
+        let small = small_file("small.rs", 10);
+        let none = HashMap::new();
+        assert!(file_expanded(&small, &none, false));
+        assert!(!file_expanded(&small, &none, true), "collapsed en masse");
+
+        assert!(
+            file_expanded(&small, &choices([("small.rs", true)]), true),
+            "the user's own click still opens it"
+        );
+    }
+
+    /// An explicit choice must survive the default moving under it — the defect
+    /// the inversion-set representation had. A refresh that crosses the
+    /// oversized threshold in either direction leaves every file the user
+    /// touched exactly as they left it, and moves only the ones they didn't.
+    #[test]
+    fn explicit_choices_survive_an_oversized_transition() {
+        let opened = small_file("opened.rs", 10);
+        let closed = small_file("closed.rs", 10);
+        let untouched = small_file("untouched.rs", 10);
+        // The user opened one file and shut another while the tree was oversized.
+        let picked = choices([("opened.rs", true), ("closed.rs", false)]);
+
+        for collapse_all in [true, false] {
+            assert!(
+                file_expanded(&opened, &picked, collapse_all),
+                "an explicitly opened file stays open (collapse_all={collapse_all})"
+            );
+            assert!(
+                !file_expanded(&closed, &picked, collapse_all),
+                "an explicitly closed file stays closed (collapse_all={collapse_all})"
+            );
+        }
+        // Only the file the user never touched follows the default.
+        assert!(!file_expanded(&untouched, &picked, true));
+        assert!(file_expanded(&untouched, &picked, false));
+    }
+
+    /// Sixty files of a hundred and fifty lines each never trip the per-file
+    /// threshold (each is well under it), yet would open 9000 diff rows at once.
+    /// `oversized` catches it on the line axis, and with everything collapsed
+    /// the overlay builds zero rows.
+    #[test]
+    fn many_medium_files_are_oversized_and_build_no_rows() {
+        let snap = DiffSnapshot {
+            files: (0..60)
+                .map(|i| small_file(&format!("f{i}.rs"), 150))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(
+            snap.files.iter().all(|f| f.added <= AUTO_COLLAPSE_LINES),
+            "no single file is over the per-file threshold"
+        );
+        assert!(snap.stats().oversized);
+
+        let none = HashMap::new();
+        let rows_expanded: usize = snap
+            .files
+            .iter()
+            .filter(|f| file_expanded(f, &none, false))
+            .flat_map(|f| &f.hunks)
+            .map(|h| split_hunk(&h.lines).len())
+            .sum();
+        let rows_collapsed: usize = snap
+            .files
+            .iter()
+            .filter(|f| file_expanded(f, &none, true))
+            .flat_map(|f| &f.hunks)
+            .map(|h| split_hunk(&h.lines).len())
+            .sum();
+        assert_eq!(rows_expanded, 9000, "what the old rule would have built");
+        assert_eq!(rows_collapsed, 0);
+    }
+
+    /// The other side of the same coin: a busy-but-ordinary afternoon is *not*
+    /// oversized and opens expanded exactly as it does today. The thresholds
+    /// must not tax a normal working tree.
+    ///
+    /// Built out of context-heavy files rather than bare changed lines, because
+    /// that is what a real diff looks like and it is the difference the line
+    /// threshold is most easily mis-set against: git prints three lines of
+    /// context each side of every hunk, so `retained_lines` runs several times
+    /// the `+N −N` a person reads off the header. A tree of forty files with a
+    /// handful of small hunks each is an afternoon's work, and it must open.
+    #[test]
+    fn an_ordinary_busy_tree_is_not_oversized() {
+        // Forty files × ten hunks × (6 context + 1 changed) — 2800 retained
+        // lines behind a header reading `+400 −0`, which is a morning, not a
+        // refactor. Sized to sit above the threshold this used to carry and
+        // below the one it carries now: an assertion that passes either way
+        // would not be watching anything.
+        let snap = DiffSnapshot {
+            files: (0..40)
+                .map(|i| {
+                    let mut f = context_heavy_file(&format!("f{i}.rs"));
+                    f.hunks = std::iter::repeat_n(f.hunks[0].clone(), 10).collect();
+                    f.added = 10;
+                    f
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let (added, removed) = snap.totals();
+        assert!(
+            snap.stats().retained_lines > (added + removed) as usize * 4,
+            "the context lines dominate, as they do in a real diff"
+        );
+        assert!(
+            !snap.stats().oversized,
+            "an ordinary afternoon must not read as a tree too large to render \
+             ({} retained lines)",
+            snap.stats().retained_lines
+        );
+        let none = HashMap::new();
+        assert!(snap.files.iter().all(|f| file_expanded(f, &none, false)));
+    }
+
+    /// An empty snapshot means one of two opposite things, and the overlay has
+    /// to tell them apart before it says either out loud.
+    ///
+    /// "Working tree clean" is a claim about the repository. A probe that could
+    /// not run — a refused stream, a read that went silent, a git racing a
+    /// concurrent write — produces exactly the same empty file list, and saying
+    /// it there tells someone their changes are gone.
+    #[test]
+    fn an_empty_snapshot_reads_as_clean_only_when_the_probe_worked() {
+        let clean = DiffSnapshot {
+            branch: "main".into(),
+            ..Default::default()
+        };
+        assert!(empty_snapshot(&clean));
+        assert!(!clean.read_failed, "nothing went wrong: this tree is clean");
+
+        let broken = DiffSnapshot {
+            branch: "main".into(),
+            read_failed: true,
+            ..Default::default()
+        };
+        assert!(
+            empty_snapshot(&broken),
+            "indistinguishable by shape — which is the point"
+        );
+        assert!(broken.read_failed, "and distinguishable by this");
+
+        // A read that failed *after* producing something is not the empty case
+        // at all: the file list renders, and no claim about emptiness is made.
+        let partial = DiffSnapshot {
+            files: vec![small_file("one.rs", 3)],
+            read_failed: true,
+            ..Default::default()
+        };
+        assert!(!empty_snapshot(&partial));
+    }
+
+    /// A huge untracked list does *not* collapse the diff — and must not.
+    ///
+    /// It is the same one-row-per-entry cost, but `oversized` is not the lever
+    /// that answers it: folding every file body shut leaves the untracked
+    /// section rendering exactly as many rows as before, because that section
+    /// has no bodies to fold. Driving it from here meant a tree with an
+    /// un-ignored `node_modules` and three edited files hid the three cheap
+    /// things, kept the expensive one, and told the reader their working tree
+    /// was too large to render. What actually bounds it is the retention cap and
+    /// the row cap, asserted below.
+    #[test]
+    fn a_huge_untracked_list_does_not_collapse_the_diff() {
+        let snap = DiffSnapshot {
+            files: vec![small_file("one.rs", 3)],
+            untracked: (0..git_diff::MAX_UNTRACKED)
+                .map(|i| format!("node_modules/p{i}/index.js"))
+                .collect(),
+            untracked_total: 40_000,
+            ..Default::default()
+        };
+        assert!(snap.stats().retained_lines < git_diff::AUTO_COLLAPSE_TOTAL_LINES);
+        assert!(snap.files.len() < git_diff::AUTO_COLLAPSE_TOTAL_FILES);
+        assert!(
+            !snap.stats().oversized,
+            "collapsing the diff would not have removed a single untracked row"
+        );
+
+        // The bound that does apply, on the rows that are actually expensive.
+        assert_eq!(
+            snap.untracked.len(),
+            git_diff::MAX_UNTRACKED,
+            "retention is capped at the parser"
+        );
+        assert_eq!(
+            snap.untracked.len().min(MAX_RENDERED_FILES),
+            MAX_RENDERED_FILES,
+            "and rows at the renderer"
+        );
+        assert_eq!(
+            snap.untracked_count(),
+            40_000,
+            "while the reported count stays the true total"
+        );
+    }
+
+    /// The untracked section builds at most [`MAX_RENDERED_FILES`] rows while
+    /// still reporting the true total, so a capped list never reads as files
+    /// having vanished.
+    #[test]
+    fn untracked_rows_are_capped_but_the_count_stays_true() {
+        let snap = DiffSnapshot {
+            untracked: (0..git_diff::MAX_UNTRACKED)
+                .map(|i| format!("p{i}"))
+                .collect(),
+            untracked_total: 12_345,
+            ..Default::default()
+        };
+        let rendered = snap.untracked.len().min(MAX_RENDERED_FILES);
+        assert_eq!(rendered, MAX_RENDERED_FILES);
+        assert_eq!(snap.untracked_count(), 12_345, "header count is honest");
+        assert_eq!(snap.untracked_count() - rendered, 12_045);
+    }
+
+    /// A snapshot built without the streaming probe (tests, `..Default`) must
+    /// not under-report: the count falls back to the retained length.
+    #[test]
+    fn untracked_count_falls_back_to_the_retained_length() {
+        let snap = DiffSnapshot {
+            untracked: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
+        };
+        assert_eq!(snap.untracked_total, 0);
+        assert_eq!(snap.untracked_count(), 3);
+    }
+
+    /// However many files change, the overlay builds at most
+    /// [`MAX_RENDERED_FILES`] cards and says so.
+    #[test]
+    fn file_cards_are_capped() {
+        let snap = DiffSnapshot {
+            files: (0..MAX_RENDERED_FILES + 25)
+                .map(|i| small_file(&format!("f{i}.rs"), 1))
+                .collect(),
+            ..Default::default()
+        };
+        let shown = snap.files.len().min(MAX_RENDERED_FILES);
+        assert_eq!(shown, MAX_RENDERED_FILES);
+        assert_eq!(
+            snap.files.len() - shown,
+            25,
+            "the tail gets one summary line"
+        );
+    }
+
+    /// The shape the old `loaded < total_lines` test could not see: many
+    /// one-line hunks, each carrying its context. Retained lines count context
+    /// and `+N −N` does not, so here the retained figure is the *larger* of the
+    /// two — a budget-truncated tree that the comparison read as complete,
+    /// leaving the banner silent while the file cards below it said "body not
+    /// loaded". The banner must name the budget whenever any file carries
+    /// [`Truncation::Budget`], whatever the diff's shape.
+    #[test]
+    fn the_banner_names_the_budget_when_context_outweighs_the_changes() {
+        let files: Vec<FileDiff> = (0..200)
+            .map(|i| context_heavy_file(&format!("f{i}.rs")))
+            .collect();
+
+        // Same tree, one file whose body the repo-wide budget dropped.
+        let mut truncated = files.clone();
+        truncated.push(FileDiff {
+            hunks: vec![],
+            truncated: Some(Truncation::Budget),
+            ..context_heavy_file("dropped.rs")
+        });
+        let snap = DiffSnapshot {
+            files: truncated,
+            ..Default::default()
+        };
+        let (added, removed) = snap.totals();
+        let total = (added + removed) as usize;
+        assert!(
+            snap.stats().retained_lines > total,
+            "the context lines outweigh the changed ones — the shape that slipped through"
+        );
+        assert!(snap.stats().budget_exhausted);
+
+        let summary = banner(&snap);
+        assert!(summary.contains("budget"), "{summary}");
+        assert!(
+            summary.contains(&format!("{total} changed lines")),
+            "the exact `+N −N` from the header, not the retained count: {summary}"
+        );
+
+        // The same shape with nothing dropped must not claim a truncation.
+        let whole = DiffSnapshot {
+            files,
+            ..Default::default()
+        };
+        assert!(!whole.stats().budget_exhausted);
+        assert!(!banner(&whole).contains("budget"));
+    }
+
+    /// The sibling axis, blind in exactly the same place: one file cut at
+    /// [`MAX_LINES_PER_FILE`](git_diff::MAX_LINES_PER_FILE) inside a
+    /// context-heavy tree. `loaded < total_lines` is false here — the context
+    /// lines of every other file more than cover the cut one — so the branch
+    /// that used to carry this clause stayed silent while that file's own card
+    /// read "Diff truncated at 2000 lines". Both axes now come from the
+    /// parser's flags, and a snapshot carrying both must name both.
+    #[test]
+    fn the_banner_names_the_per_file_cap_when_context_outweighs_the_changes() {
+        let files: Vec<FileDiff> = (0..200)
+            .map(|i| context_heavy_file(&format!("f{i}.rs")))
+            .collect();
+
+        let mut cut = files.clone();
+        cut.push(FileDiff {
+            truncated: Some(Truncation::PerFile),
+            ..context_heavy_file("huge.rs")
+        });
+        let snap = DiffSnapshot {
+            files: cut,
+            ..Default::default()
+        };
+        let (added, removed) = snap.totals();
+        let total = (added + removed) as usize;
+        assert!(
+            snap.stats().retained_lines > total,
+            "the shape the comparison reads backwards"
+        );
+        assert!(
+            !snap.stats().budget_exhausted,
+            "the budget axis is not what fired"
+        );
+
+        let summary = banner(&snap);
+        assert!(summary.contains("per-file cap"), "{summary}");
+        assert!(
+            summary.contains(&format!("{total} changed lines")),
+            "the exact `+N −N` from the header, not the retained count: {summary}"
+        );
+
+        // Nothing cut, nothing claimed.
+        let whole = DiffSnapshot {
+            files: files.clone(),
+            ..Default::default()
+        };
+        assert!(!banner(&whole).contains("per-file"));
+
+        // Both kinds in one snapshot: neither clause may mask the other.
+        let mut both = files;
+        both.push(FileDiff {
+            truncated: Some(Truncation::PerFile),
+            ..context_heavy_file("huge.rs")
+        });
+        both.push(FileDiff {
+            hunks: vec![],
+            truncated: Some(Truncation::Budget),
+            ..context_heavy_file("dropped.rs")
+        });
+        let summary = banner(&DiffSnapshot {
+            files: both,
+            ..Default::default()
+        });
+        assert!(summary.contains("budget"), "{summary}");
+        assert!(summary.contains("per-file cap"), "{summary}");
+    }
+
+    /// Measurement harness for issue #239, finding 2 — run with
+    /// `cargo test -- --ignored --nocapture bench_snapshot_share`.
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn bench_snapshot_share() {
+        use std::time::Instant;
+
+        // Two sizes: what v26.7.5 would have held for a big agent session
+        // (300 files × 300 lines, no repo-wide budget), and what this build
+        // retains for the same tree once the budget applies.
+        for (label, files, per_file) in [
+            ("unbudgeted (v26.7.5 shape)", 300, 300),
+            ("budgeted (this build retains)", 300, 67),
+        ] {
+            let snap = Arc::new(DiffSnapshot {
+                files: (0..files)
+                    .map(|i| small_file(&format!("f{i}.rs"), per_file))
+                    .collect(),
+                ..Default::default()
+            });
+            let lines: usize = snap.stats().retained_lines;
+
+            let t = Instant::now();
+            for _ in 0..10 {
+                let _deep = (*snap).clone();
+            }
+            let deep = t.elapsed() / 10;
+
+            let t = Instant::now();
+            for _ in 0..100 {
+                let _shared = Arc::clone(&snap);
+            }
+            let shared = t.elapsed() / 100;
+            println!(
+                "{label}: {files} files / {lines} lines — deep clone {deep:?} vs \
+                 Arc::clone {shared:?}, per holder on the UI thread"
+            );
+        }
     }
 }

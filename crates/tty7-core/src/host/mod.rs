@@ -251,7 +251,11 @@ pub struct Output {
 }
 
 /// `Vec<u8>` ⇄ base64 string, for the byte fields that cross a JSON wire.
-mod b64 {
+///
+/// Shared with the control dialect ([`crate::daemon::control::ControlEvent::GitChunk`])
+/// rather than duplicated there: every byte field on that wire has the same
+/// hazard, and one encoding is one thing to get right.
+pub(crate) mod b64 {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize as _, Deserializer, Serializer};
@@ -504,6 +508,38 @@ pub trait Host: Send + Sync + 'static {
     /// a current directory, `GIT_OPTIONAL_LOCKS=0`, null stdin, `GIT_DIR` and
     /// `GIT_WORK_TREE` cleared, and both output streams captured.
     fn git(&self, cwd: &Path, args: &[&str]) -> io::Result<Output>;
+
+    /// [`git`](Self::git), delivered a line at a time.
+    ///
+    /// Same invocation, same invariants; the difference is that neither side
+    /// has to hold the whole output. `git diff HEAD` on a large work tree is
+    /// tens of megabytes and the caller keeps a small fraction of it, so
+    /// buffering it first is pure cost — see [`crate::core::git::git_stream`].
+    ///
+    /// Lines arrive with their trailing `\n`/`\r` stripped and invalid UTF-8
+    /// replaced. `Ok` means git ran, carrying its exit code (`None` when a
+    /// signal killed it); `Err` means it could not be run at all, exactly as
+    /// for [`git`](Self::git).
+    ///
+    /// **The default implementation buffers**, so this is never a second way to
+    /// reach git — every implementation still funnels through the same
+    /// invocation, and a host with no incremental transport simply pays the
+    /// memory it would have paid anyway. Both hosts that ship override it;
+    /// the default is what keeps a future one from having to. Overriding is an
+    /// optimisation, not a behaviour change: the lines a caller sees must be
+    /// identical either way.
+    fn git_lines(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        on_line: &mut dyn FnMut(&str),
+    ) -> io::Result<Option<i32>> {
+        let out = self.git(cwd, args)?;
+        let mut split = crate::core::git::LineSplitter::default();
+        split.push(&out.stdout, &mut *on_line);
+        split.finish(&mut *on_line);
+        Ok(out.status)
+    }
 
     // ----- machine inventory -----------------------------------------------
 

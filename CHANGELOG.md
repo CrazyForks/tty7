@@ -58,6 +58,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session" means: paste it into `codex resume`, a bug report, or another tool.
   (#211)
 
+- **Remote panes read big git output incrementally** — `Host` grew a streaming
+  companion to its buffered `git`, implemented on both the local host and the
+  remote wire protocol, so a read whose size scales with the work tree no
+  longer has to exist in memory all at once on either side. The buffered call
+  stays for the many reads that answer in bytes. A stream that goes silent for
+  two minutes while the link stays up ends with a timeout rather than parking
+  its reader forever — the wait is between chunks, not on the whole read, so a
+  slow-but-alive `git diff` still runs to completion. And the queue *between*
+  the two ends is bounded as well, not just the reads at either end: a peer that
+  pushes faster than this side can parse is cut off at 32 MiB of arrears with an
+  error, rather than quietly reassembling the whole diff in a channel. (#239)
+
+- **Sidebar diff preview is optional** — clicking a sidebar row's `+N −N`
+  working-tree counts opens the diff overlay, which is the point of them for
+  most people but not for everyone. Settings → Window & Tabs → *Open diff
+  preview from sidebar counts* turns the click off (`sidebar_diff_preview` in
+  `config.json`, on by default). Off, the branch and the counts stay exactly
+  where they are and read exactly the same; they simply stop being their own
+  click target, so the press falls through to ordinary tab activation like any
+  other part of the row. (#239)
+
 ### Changed
 
 - **The machine that runs your panes now owns their layout** — the workspace,
@@ -125,7 +146,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the 80px grab handle, so chips reach their minimum width and truncate a tab or
   two sooner. (#221)
 
+- **Large working-tree diffs no longer stall the window** — the diff overlay
+  had five costs that all scaled with the size of the tree rather than with
+  what it could show. Four were named by issue #239's source-level analysis;
+  the fifth, the untracked list, turned up while fixing those. Measured on a
+  300-file, 90 000-line, 4.5 MB working-tree diff:
+
+  - The full `git diff HEAD` was read into one `String` before parsing began.
+    It is now read incrementally through a new streaming call on `Host`, so
+    what is held at once is one 64 KiB read buffer plus the line being
+    reassembled rather than the whole diff — and that line is itself capped at
+    1 MiB, because a line is only complete at its newline and a minified bundle
+    is one line of many megabytes. Measured on this repository's own `git log -p
+    -n 400` (8 269 409 bytes of real git output, release build): 8.3 MB resident
+    → 64 KiB, and *faster* end to end — 829 ms buffered (817 ms read + 12 ms
+    parse) → 557 ms streamed, because parsing now overlaps with git producing
+    output instead of waiting for all of it.
+  - The parsed snapshot was deep-cloned onto every tab's overlay *on the UI
+    update path*. It is now shared behind an `Arc`: 1.99 ms of main-thread
+    copying per holder → 10 ns (426 µs → 10 ns even at the new retention
+    budget).
+  - The per-file 2000-line cap bounded one pathological file but not the sum,
+    so two hundred ordinary files could retain 90 000 `DiffLine`s. A repo-wide
+    budget now caps retained lines and files-with-hunks — 90 000 lines / 6.2 MiB
+    of line text → 20 000 lines / 1.2 MiB — while `+N −N` keeps counting the
+    whole diff, so the numbers stay exact and the overlay doesn't re-probe in a
+    loop chasing a total it can no longer reach.
+  - The untracked list escaped all of the above: `git ls-files --others` reports
+    every path not yet ignored, and one un-ignored `node_modules` reached the
+    overlay as tens of thousands of rows without touching the diff at all. It is
+    now streamed, capped where it is retained and again where it is rendered —
+    while the count shown stays the true total, so a capped list never reads as
+    files having vanished. It deliberately does *not* drive the collapse-
+    everything rule below: folding file bodies shut removes no untracked rows,
+    so a tree with an un-ignored dependency directory and three edited files
+    would have hidden the three cheap things and kept the expensive one.
+  - The 400-line auto-collapse rule was per-file, so sixty medium files all
+    opened at once (thousands of side-by-side rows, none of them individually
+    large). Past a repo-wide total the overlay now opens with every file
+    collapsed — zero rows built — leads with a summary saying the diff is too
+    large to render efficiently, and points at expanding individual files or
+    `git diff` in the terminal. That total counts the context lines git prints
+    around every hunk, which is what is actually rendered, so it sits several
+    times above the `+N −N` figure at which it would otherwise fire on an
+    ordinary afternoon's work.
+
+- **One `git diff` per repository, not two** — the Changes panel and the diff
+  overlay each ran their own full-diff probe and kept their own snapshot of the
+  same repository. They now share one probe and one snapshot, so opening both
+  costs one shell-out and one parse, and opening the overlay while the panel is
+  already showing that repo paints immediately instead of re-probing. (#239)
+
 ### Fixed
+
+- **An unsubscribed directory watch stops delivering immediately** — dropping a
+  local watch handle now closes its delivery channel rather than only asking the
+  OS backend to stand down. Tearing that backend down is not instantaneous, and
+  on Windows a `ReadDirectoryChangesW` completion can fire *during* teardown and
+  reach a consumer that has already unsubscribed. Batches already queued stay
+  readable, which is the one thing a consumer racing its own drop may
+  legitimately still see. (#239)
 
 - **Rounded UI controls no longer square off their corners**
   ([#236](https://github.com/l0ng-ai/tty7/issues/236)) — the cursor-shape

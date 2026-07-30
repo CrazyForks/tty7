@@ -22,10 +22,11 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, h_flex, v_flex,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::PaneProcs;
-use crate::terminal::git_diff::{self, DiffSnapshot};
+use crate::terminal::git_diff::{DiffSnapshot, MAX_RENDERED_FILES};
 use crate::ui::app::{
     CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App, tile_trailing_inset,
     tile_trailing_inset_sm,
@@ -61,10 +62,17 @@ pub(crate) struct RightPanelState {
     /// machines is two repositories.
     pub(crate) diff_cwd: Option<(crate::ui::host_ops::HostId, PathBuf)>,
     /// Last completed probe. `Some(None)` and `None` are different answers:
-    /// "probed, not a work tree" versus "never probed".
-    pub(crate) diff: Option<Option<DiffSnapshot>>,
-    /// A probe is in flight; keeps the render path from spawning a second one.
-    pub(crate) diff_loading: bool,
+    /// "probed, not a work tree" versus "never probed". Shared with the diff
+    /// overlay rather than a second copy of the same tree — see
+    /// [`Tty7App::spawn_shared_diff_probe`].
+    pub(crate) diff: Option<Option<Arc<DiffSnapshot>>>,
+    /// The machine-and-cwd this panel is waiting on a probe for; keeps the
+    /// render path from spawning a second one. A key rather than a flag because
+    /// the shared probe (see [`Tty7App::spawn_shared_diff_probe`]) lands per
+    /// repo: the panel has to know *which* answer clears its wait, or a probe
+    /// for the repo it just navigated away from would leave it stuck on
+    /// "Loading…".
+    pub(crate) diff_pending: Option<(crate::ui::host_ops::HostId, PathBuf)>,
     /// The pane `procs` describes, so a pane switch invalidates it rather than
     /// showing the previous pane's processes under the new pane's name.
     pub(crate) procs_pane: Option<u64>,
@@ -1133,6 +1141,13 @@ impl Tty7App {
     /// The working-tree diff as a compact file list — path plus `+N −M` — not the
     /// diff overlay's hunk cards, which need far more than 260px to be readable.
     /// Clicking a row opens the full overlay on that repo.
+    ///
+    /// Bounded the same way the overlay is
+    /// ([`MAX_RENDERED_FILES`](crate::terminal::git_diff::MAX_RENDERED_FILES),
+    /// one constant so the two views agree): the rows are not virtualized, so a
+    /// working tree with thousands of changed files is one row per file rebuilt
+    /// on the UI thread every frame — the stall issue #239 is about, reached
+    /// through this panel instead of the overlay.
     fn render_panel_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
         // The pane's own host, and the cwd it resolved its git line through —
@@ -1171,7 +1186,7 @@ impl Tty7App {
             self.right_panel.diff_cwd = Some(key);
             self.right_panel.diff = None;
             self.spawn_right_panel_diff(host.clone(), cwd.clone(), cx);
-        } else if self.right_panel.diff.is_none() && !self.right_panel.diff_loading {
+        } else if self.right_panel.diff.is_none() && self.right_panel.diff_pending.is_none() {
             // Nothing cached and nothing in flight: a probe for a previous cwd
             // landed after we had already moved on and dropped its result, so
             // no one is left to answer for this one. Without this the tab would
@@ -1183,7 +1198,7 @@ impl Tty7App {
         // so the diff borrow ends before `panel_title` takes `&mut cx`.
         let count = match &self.right_panel.diff {
             Some(Some(snap)) => {
-                let n = snap.files.len() + snap.untracked.len();
+                let n = snap.files.len() + snap.untracked_count();
                 (n > 0).then(|| n.to_string())
             }
             _ => None,
@@ -1205,18 +1220,35 @@ impl Tty7App {
                     cx,
                 ),
             Some(Some(snap)) => {
-                let files: Vec<(String, u32, u32)> = snap
-                    .files
-                    .iter()
-                    .map(|f| (f.path.clone(), f.added, f.removed))
-                    .collect();
-                let untracked = snap.untracked.clone();
+                // A refcount bump, not a copy of the file list: the loop below
+                // needs the borrow on `self.right_panel` to be over before
+                // `cx.listener` hands it back, which used to mean collecting
+                // every `(path, +N, −N)` into a Vec on every frame of this
+                // panel, on the UI thread. Sharing the snapshot made that a
+                // deep clone of the whole diff for nothing.
+                let snap = Arc::clone(snap);
+                // The count, not the paths: this used to clone every untracked
+                // path String on every frame of this panel, on the UI thread,
+                // for two `len()`/`is_empty()` reads — the same cost class the
+                // `Arc` switch removed from the probe path.
+                let untracked = snap.untracked_count();
                 let focused = self.diff_overlay_focus(host.id(), &cwd).map(str::to_string);
+                // The overlay's ceiling, deliberately the same number: this list
+                // is not virtualized either, so a whole-repo reformat means one
+                // row per changed file built from scratch every frame. The tally
+                // in the header above still counts every file — capping what is
+                // *rendered* must not change what is *reported*, the same rule
+                // `untracked_count` and `DiffSnapshot::totals` follow.
+                let shown = snap.files.len().min(MAX_RENDERED_FILES);
                 // Rows inset themselves rather than the list, so the hover and
                 // selected capsules bleed a little past the text into the same
                 // 12px gutter the tab rail's rows use.
                 let mut list = v_flex().px(px(CONTENT_INSET - 4.)).py(px(2.)).gap(px(1.));
-                for (path, added, removed) in files {
+                for file in snap.files.iter().take(shown) {
+                    // Owned per *rendered* row — bounded by `shown` — because the
+                    // element id and the click listener both outlive this frame.
+                    let path = file.path.clone();
+                    let (added, removed) = (file.added, file.removed);
                     let selected = focused.as_deref() == Some(path.as_str());
                     list = list.child(
                         h_flex()
@@ -1289,7 +1321,24 @@ impl Tty7App {
                             }),
                     );
                 }
-                if !untracked.is_empty() {
+                // The tail the cap cut, the way the overlay's file list and its
+                // untracked section already report theirs — a truncated list
+                // that says nothing reads as files having vanished.
+                if snap.files.len() > shown {
+                    let rest = snap.files.len() - shown;
+                    list = list.child(
+                        div()
+                            .px(px(4.))
+                            .py(px(3.))
+                            .text_size(px(11.5))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "… and {rest} more changed file{} — run `git diff` to see them.",
+                                if rest == 1 { "" } else { "s" }
+                            )),
+                    );
+                }
+                if untracked > 0 {
                     list = list.child(
                         h_flex()
                             .items_center()
@@ -1305,7 +1354,7 @@ impl Tty7App {
                                 div()
                                     .text_size(px(11.5))
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{} untracked", untracked.len())),
+                                    .child(format!("{untracked} untracked")),
                             ),
                     );
                 }
@@ -1315,33 +1364,24 @@ impl Tty7App {
         self.panel_scroll(inner, title)
     }
 
-    /// Off-thread `git diff` for the panel, mirroring the diff overlay's probe.
+    /// Off-thread `git diff` for the panel — the *same* probe the diff overlay
+    /// uses. This used to be its own `git_diff::probe` call keeping its own
+    /// `DiffSnapshot`, so a repo with both open generated, parsed and stored
+    /// its full diff twice (issue #239, finding 5). Now both go through
+    /// [`Tty7App::spawn_shared_diff_probe`], which dedupes by machine-and-cwd
+    /// and installs one `Arc` into whoever is watching — including this panel,
+    /// which is why there is no result handler left here.
     fn spawn_right_panel_diff(
         &mut self,
         host: crate::ui::host_ops::SharedHost,
         cwd: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        if self.right_panel.diff_loading {
+        if self.right_panel.diff_pending.is_some() {
             return;
         }
-        self.right_panel.diff_loading = true;
-        let key = (host.id(), cwd.clone());
-        crate::ui::host_ops::HostOps::run(
-            host,
-            cx,
-            move |h| git_diff::probe(h, &cwd),
-            move |app, result, cx| {
-                app.right_panel.diff_loading = false;
-                // Drop the result if the panel moved on to another repo — or
-                // another machine — while we flew; otherwise a slow probe would
-                // overwrite a newer one.
-                if app.right_panel.diff_cwd.as_ref() == Some(&key) {
-                    app.right_panel.diff = Some(result);
-                    cx.notify();
-                }
-            },
-        );
+        self.right_panel.diff_pending = Some((host.id(), cwd.clone()));
+        self.spawn_shared_diff_probe(host, cwd, cx);
     }
 
     /// Re-probe the Changes list when the shared status cache learned something
@@ -1356,7 +1396,7 @@ impl Tty7App {
     /// Comparing branch + totals first keeps the quiet case free, and re-probing
     /// in place leaves the rows on screen until the new snapshot lands.
     pub(crate) fn right_panel_refresh_changes(&mut self, cx: &mut Context<Self>) {
-        if self.right_panel.diff_loading {
+        if self.right_panel.diff_pending.is_some() {
             return;
         }
         let Some((id, cwd)) = self.right_panel.diff_cwd.clone() else {

@@ -42,15 +42,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::core::machine::{self, Attachment, MachineStore};
 use crate::daemon::control::{
     CONTROL_VERSION, ControlClientMsg, ControlEvent, ControlHello, ControlHelloOk, ControlReply,
-    ControlRequest, ControlServerMsg, LinkShutdown, ReplyOk, WATCH_BURST_CAP, WireError,
-    WireErrorKind, feature,
+    ControlRequest, ControlServerMsg, GIT_STREAM_CHUNK, GIT_STREAM_CHUNK_MAX, LinkShutdown,
+    MAX_CONCURRENT_GIT_STREAMS, ReplyOk, WATCH_BURST_CAP, WireError, WireErrorKind, feature,
 };
 use crate::daemon::duplex::{Duplex, Halves};
 use crate::host::{Host, SearchHit, SharedHost, WatchSub};
@@ -409,6 +409,7 @@ where
         watches: Mutex::new(HashMap::new()),
         deferred_watches: Mutex::new(HashMap::new()),
         next_watch: AtomicU64::new(1),
+        git_streams: Arc::new(AtomicUsize::new(0)),
         pool: Pool::new(),
         machine: services.machine.clone(),
         machine_origin: machine_sub.as_ref().map(machine::Subscription::id),
@@ -838,6 +839,13 @@ fn run_request(
             // semantics for every remote workspace at once.
             (ReplyOk::Output(h.git(&p(&cwd), &borrowed)?), Vec::new())
         }
+        ControlRequest::GitStream { id, cwd, args } => {
+            // Started straight away: the client chose `id` and registered its
+            // receiver before sending, so a chunk that overtakes this reply is
+            // delivered, not dropped. See `ControlRequest::GitStream`.
+            conn.start_git_stream(id, p(&cwd), args);
+            (ReplyOk::Unit, Vec::new())
+        }
 
         // ----- machine inventory ---------------------------------------------
         ControlRequest::Shells => (ReplyOk::Shells(h.shells()?), Vec::new()),
@@ -1060,6 +1068,10 @@ struct Conn {
     /// something else touches the directory.
     deferred_watches: Mutex<HashMap<u64, (u64, smol::channel::Receiver<Vec<PathBuf>>)>>,
     next_watch: AtomicU64,
+    /// Git streams running on this connection right now, against
+    /// [`MAX_CONCURRENT_GIT_STREAMS`]. Shared with each stream's own thread,
+    /// which gives its slot back on the way out — see [`StreamSlot`].
+    git_streams: Arc<AtomicUsize>,
     pool: Pool,
     /// The machine's workspace tree, when this server serves it.
     machine: Option<Arc<MachineStore>>,
@@ -1233,6 +1245,130 @@ impl Conn {
         spawn_watch_forwarder(id, rx, Arc::clone(&self.sink));
     }
 
+    /// Run a git stream, pushing its output under `id`.
+    ///
+    /// Whatever happens, the client hears the end of it: a stream that stops
+    /// sending without a [`ControlEvent::GitEnd`] leaves the reader waiting on
+    /// pushes that will never come, and only its idle timeout to fall out of.
+    /// The single exception is a link that is already gone, where there is
+    /// nobody left to tell.
+    ///
+    /// Capped at [`MAX_CONCURRENT_GIT_STREAMS`] per connection: this is the one
+    /// request that spawns a thread outside the bounded worker pool, so nothing
+    /// else counts them.
+    fn start_git_stream(&self, id: u64, cwd: PathBuf, args: Vec<String>) {
+        let host = Arc::clone(&self.host);
+        let sink = Arc::clone(&self.sink);
+        // The slot is claimed *before* the thread exists, so a burst of requests
+        // cannot all look at the counter and each see room. The guard gives it
+        // back however this leaves — refused here, failed to spawn below, or the
+        // thread running to its end.
+        let slot = StreamSlot(Arc::clone(&self.git_streams));
+        if slot.0.fetch_add(1, Ordering::AcqRel) >= MAX_CONCURRENT_GIT_STREAMS {
+            drop(slot);
+            let _ = self
+                .sink
+                .send(&ControlServerMsg::Event(ControlEvent::GitEnd {
+                    id,
+                    code: None,
+                    failed: true,
+                }));
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("tty7-control-git-stream".into())
+            .spawn(move || {
+                let _slot = slot;
+                let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+                let mut batch: Vec<u8> = Vec::with_capacity(GIT_STREAM_CHUNK);
+                let mut stopped: Option<StreamStop> = None;
+                let flush = |batch: &mut Vec<u8>, stopped: &mut Option<StreamStop>| {
+                    if stopped.is_some() {
+                        // Nothing will be sent again, so nothing is worth
+                        // holding: whatever accumulated goes now rather than
+                        // riding along to the end of the read.
+                        batch.clear();
+                        return;
+                    }
+                    if batch.is_empty() {
+                        return;
+                    }
+                    let bytes = std::mem::take(batch);
+                    // One flush is usually one frame; it is more only when a
+                    // single line pushed the batch past the frame ceiling.
+                    for piece in bytes.chunks(GIT_STREAM_CHUNK_MAX) {
+                        let event = ControlServerMsg::Event(ControlEvent::GitChunk {
+                            id,
+                            bytes: piece.to_vec(),
+                        });
+                        // Encoding and writing are asked separately because
+                        // their failures mean opposite things — see
+                        // `Sink::send_frame`. A payload that will not encode
+                        // leaves a connection this stream still owes an answer
+                        // to; a write that fails means there is nobody left to
+                        // answer.
+                        let Ok((kind, payload)) = event.to_frame() else {
+                            *stopped = Some(StreamStop::Unencodable);
+                            return;
+                        };
+                        if sink.send_frame(kind, &payload).is_err() {
+                            *stopped = Some(StreamStop::LinkGone);
+                            return;
+                        }
+                    }
+                };
+                let result = host.git_lines(&cwd, &borrowed, &mut |line| {
+                    // Once the stream has stopped speaking, keeping the rest of
+                    // the output would grow this batch to the size of the whole
+                    // diff for a client that will never see a byte of it — the
+                    // peak-memory cost streaming exists to remove. The residual
+                    // is deliberate and bounded: `git_lines` takes a callback
+                    // with no way to say "stop", so git still runs to
+                    // completion and spends its own CPU, but nothing here
+                    // accumulates.
+                    if stopped.is_some() {
+                        return;
+                    }
+                    batch.extend_from_slice(line.as_bytes());
+                    batch.push(b'\n');
+                    if batch.len() >= GIT_STREAM_CHUNK {
+                        flush(&mut batch, &mut stopped);
+                    }
+                });
+                flush(&mut batch, &mut stopped);
+                if matches!(stopped, Some(StreamStop::LinkGone)) {
+                    return;
+                }
+                let (code, failed) = match (stopped, result) {
+                    // The bytes exist but could not be put on the wire. The
+                    // client cannot be given them, and saying so is the only
+                    // honest end — silence would leave it parked on a stream
+                    // that will never speak again.
+                    (Some(StreamStop::Unencodable), _) => (None, true),
+                    (_, Ok(code)) => (code, false),
+                    // git could not be run at all — distinct from a non-zero exit,
+                    // and the client must be able to tell them apart.
+                    (_, Err(_)) => (None, true),
+                };
+                let _ = sink.send(&ControlServerMsg::Event(ControlEvent::GitEnd {
+                    id,
+                    code,
+                    failed,
+                }));
+            });
+        if spawned.is_err() {
+            // No thread to read git with: say so rather than leaving the client
+            // waiting out its deadline on a stream that will never speak.
+            let _ = self
+                .sink
+                .send(&ControlServerMsg::Event(ControlEvent::GitEnd {
+                    id,
+                    code: None,
+                    failed: true,
+                }));
+        }
+    }
+
     fn set_watch_dirs(&self, id: u64, dirs: &[PathBuf]) -> io::Result<()> {
         let watches = self.watches.lock().unwrap_or_else(|e| e.into_inner());
         let sub = watches.get(&id).ok_or_else(|| {
@@ -1380,6 +1516,34 @@ fn spawn_watch_forwarder(id: u64, rx: smol::channel::Receiver<Vec<PathBuf>>, sin
     if let Err(e) = spawned {
         log::warn!("could not start the watch forwarder for subscription {id}: {e}");
     }
+}
+
+/// One connection's claim on a concurrent git stream, given back on drop.
+///
+/// A guard rather than a bare `fetch_sub` at the end of the thread, so a slot is
+/// returned on every exit — including the thread that fails to spawn, and a
+/// panic unwinding out of the read.
+struct StreamSlot(Arc<AtomicUsize>);
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Why a git stream stopped pushing chunks early.
+///
+/// The two are not interchangeable, which is the whole reason the distinction
+/// is carried: only one of them means the peer is gone. See
+/// [`Conn::start_git_stream`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamStop {
+    /// The write failed: the link is retired or broken, and nothing more will
+    /// reach the client — including a `GitEnd`.
+    LinkGone,
+    /// The chunk would not encode. The connection is fine and still owes this
+    /// stream a terminating event.
+    Unencodable,
 }
 
 /// The connection's write half.
@@ -3189,6 +3353,124 @@ mod tests {
     // -----------------------------------------------------------------------
     // Raw-wire helpers
     // -----------------------------------------------------------------------
+
+    /// A stream slot is given back on every exit, so the per-connection ceiling
+    /// is a limit on *concurrency* and never drifts into a permanent refusal.
+    ///
+    /// The failure this guards is one-directional and unrecoverable: a slot that
+    /// leaks is never reclaimed, so after [`MAX_CONCURRENT_GIT_STREAMS`] leaks
+    /// that connection can no longer read a diff at all until it is rebuilt.
+    #[test]
+    fn a_stream_slot_comes_back_however_it_leaves() {
+        let count = Arc::new(AtomicUsize::new(0));
+
+        // The ordinary path: claimed, then released at the end of the read.
+        {
+            let slot = StreamSlot(Arc::clone(&count));
+            slot.0.fetch_add(1, Ordering::AcqRel);
+            assert_eq!(count.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(count.load(Ordering::Acquire), 0, "released on drop");
+
+        // The refusal path and the failed-to-spawn path are the same shape: the
+        // guard exists but the thread never runs.
+        let refused = StreamSlot(Arc::clone(&count));
+        refused.0.fetch_add(1, Ordering::AcqRel);
+        drop(refused);
+        assert_eq!(count.load(Ordering::Acquire), 0);
+
+        // A panic unwinding out of the read still returns the slot.
+        let panicking = Arc::clone(&count);
+        let _ = std::thread::spawn(move || {
+            let slot = StreamSlot(panicking);
+            slot.0.fetch_add(1, Ordering::AcqRel);
+            panic!("the read blew up");
+        })
+        .join();
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            0,
+            "a panicking stream must not take its slot with it"
+        );
+    }
+
+    /// A git stream end to end over the wire: the reply is accepted, chunks
+    /// arrive as events under the id the *client* chose, and the terminating
+    /// event carries git's exit code. Reassembled, the lines are exactly what
+    /// the buffered `Git` returns for the same invocation.
+    #[test]
+    fn git_stream_delivers_the_same_lines_as_the_buffered_read() {
+        let (mut client, _hello) = raw();
+        let here = env!("CARGO_MANIFEST_DIR");
+        let args: Vec<String> = ["log", "--oneline", "-n", "30"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // What the buffered path says, for comparison.
+        let buffered = match ask(
+            &mut client,
+            1,
+            ControlRequest::Git {
+                cwd: here.to_string(),
+                args: args.clone(),
+            },
+        ) {
+            ControlReply::Ok(ReplyOk::Output(o)) => o,
+            other => panic!("expected output, got {other:?}"),
+        };
+        if buffered.status != Some(0) {
+            return; // no git here; nothing to compare
+        }
+        let expected: Vec<String> = String::from_utf8_lossy(&buffered.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+
+        // The client picks the id, so it could have registered a receiver
+        // before sending — that is what makes an early chunk safe.
+        ControlClientMsg::Request {
+            req_id: 2,
+            req: ControlRequest::GitStream {
+                id: 77,
+                cwd: here.to_string(),
+                args,
+            },
+        }
+        .encode(&mut client)
+        .unwrap();
+        client.flush().unwrap();
+
+        let mut split = crate::core::git::LineSplitter::default();
+        let mut got: Vec<String> = Vec::new();
+        let mut accepted = false;
+        let code = loop {
+            match ControlServerMsg::read(&mut client).unwrap() {
+                ControlServerMsg::Response { req_id: 2, reply } => {
+                    assert!(
+                        matches!(reply, ControlReply::Ok(ReplyOk::Unit)),
+                        "{reply:?}"
+                    );
+                    accepted = true;
+                }
+                ControlServerMsg::Event(ControlEvent::GitChunk { id, bytes }) => {
+                    assert_eq!(id, 77, "chunks carry the id the client chose");
+                    split.push(&bytes, |l| got.push(l.to_string()));
+                }
+                ControlServerMsg::Event(ControlEvent::GitEnd { id, code, failed }) => {
+                    assert_eq!(id, 77);
+                    assert!(!failed, "git ran");
+                    break code;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        split.finish(|l| got.push(l.to_string()));
+        assert!(accepted, "the request was answered");
+        assert_eq!(code, Some(0));
+        assert_eq!(got, expected, "streamed lines match the buffered read");
+        assert!(!got.is_empty(), "this repo has commits");
+    }
 
     /// Issue one request and return its reply, ignoring any pushes that arrive
     /// first — a `Layout` delta from another connection can legitimately

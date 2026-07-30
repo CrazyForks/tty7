@@ -771,6 +771,27 @@ pub struct Tty7App {
     pub(crate) sftp_panel: crate::ui::sftp::SftpPanelState,
     /// Right detail panel (info / changes / files) docked beside the terminal.
     pub(crate) right_panel: crate::ui::right_panel::RightPanelState,
+    /// Repositories with a `git diff HEAD` probe in flight, keyed by machine
+    /// *and* working directory — the same path on two hosts is two different
+    /// work trees. One probe answers everyone: the diff overlay on any number of
+    /// tabs and the Changes panel all read the same result, instead of each
+    /// running its own copy of the same invocation and parse. See
+    /// [`Tty7App::spawn_shared_diff_probe`](crate::ui::app::Tty7App::spawn_shared_diff_probe).
+    pub(crate) diff_probes_inflight:
+        std::collections::HashSet<(crate::ui::host_ops::HostId, std::path::PathBuf)>,
+    /// Repositories whose in-flight probe was already stale when someone asked
+    /// again, so it has to be re-run the moment that one lands.
+    ///
+    /// Deduping by repo is what makes one `git diff` answer every watcher, but a
+    /// probe describes the tree at the moment it *started*. A refresh triggered
+    /// after that — a command finished, an agent turn ended — folds into the
+    /// running probe and would otherwise be answered with a snapshot already
+    /// known to be out of date, with nothing left to trigger another look: the
+    /// overlay re-checks only on a `GitStatusCache` change, and that one has
+    /// been spent. See
+    /// [`Tty7App::spawn_shared_diff_probe`](crate::ui::app::Tty7App::spawn_shared_diff_probe).
+    pub(crate) diff_probes_restale:
+        std::collections::HashSet<(crate::ui::host_ops::HostId, std::path::PathBuf)>,
     /// Local project file tree (left column of the body).
     pub(crate) file_tree: crate::ui::file_tree::FileTreeState,
     /// Code-editor panel (right column of the body).
@@ -1283,6 +1304,8 @@ impl Tty7App {
             },
             sftp_panel,
             right_panel: Default::default(),
+            diff_probes_inflight: Default::default(),
+            diff_probes_restale: Default::default(),
             file_tree,
             editor,
             sidebar_width: Rc::new(Cell::new(sidebar_width)),
@@ -2953,6 +2976,14 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         self.update_config(cx, |cfg| cfg.sidebar_grouping = grouping);
+    }
+
+    /// Set whether the sidebar's `+N −N` counts open the diff overlay
+    /// (Settings → Window & Tabs). The counts themselves are unaffected either
+    /// way — this only governs the click. Persists the choice; the sidebar
+    /// re-derives from the `Config` global on the next render.
+    pub(crate) fn set_sidebar_diff_preview(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.sidebar_diff_preview = on);
     }
 
     /// `ToggleTabSidebar`: flip the tab bar between the horizontal title-bar strip

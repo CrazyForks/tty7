@@ -188,6 +188,61 @@ pub mod kind {
     pub const EVENT: u8 = 63;
 }
 
+/// Target size of a [`ControlEvent::GitChunk`] batch. Big enough that a
+/// multi-megabyte diff is a few hundred frames rather than a frame per line,
+/// small enough that neither side ever holds much of it.
+pub const GIT_STREAM_CHUNK: usize = 64 * 1024;
+
+/// Hard ceiling on one [`ControlEvent::GitChunk`]'s payload, as opposed to
+/// [`GIT_STREAM_CHUNK`]'s target.
+///
+/// A batch is flushed once it *reaches* the target, so its size is the target
+/// plus whatever the line that crossed it was. Without a ceiling such a batch
+/// could encode to a frame larger than [`crate::daemon::protocol::MAX_FRAME`]
+/// and not be sendable at all. Half the frame limit leaves room for base64's
+/// four-thirds expansion and the JSON envelope around it. Splitting at this
+/// size can land mid-line; that is safe precisely because the receiver
+/// reassembles with [`crate::core::git::LineSplitter`], which spans chunk
+/// boundaries.
+///
+/// A backstop rather than a working limit: [`crate::core::git::MAX_LINE`] caps
+/// the line that crosses the target, so a real batch is a megabyte at worst and
+/// never reaches this. It stays because the two bounds answer to different
+/// things — one to what a diff viewer can show, this one to what a frame can
+/// hold — and a batch that cannot be sent is a stream that never ends.
+pub const GIT_STREAM_CHUNK_MAX: usize = crate::daemon::protocol::MAX_FRAME / 2;
+
+/// How long a [`ControlRequest::GitStream`] reader waits for the *next* chunk
+/// before giving up on the stream.
+///
+/// Idle time, deliberately, not elapsed time: a `git diff` over a big work tree
+/// on a slow link is allowed to take as long as it takes, and any cap on the
+/// total would eventually truncate a legitimate read. What it catches is the
+/// case nothing else can — a link that is *alive* while the server's git is
+/// wedged (a network filesystem that stops answering, a lock held by something
+/// that never exits). Keepalive cannot see that: the connection keeps answering
+/// pings, so it is never declared dead, and the stream is answered by pushes so
+/// the request deadline is long since satisfied. Without this the calling
+/// thread parks for the life of the process.
+///
+/// Set well past the slowest plausible gap between chunks — a cold-cache `git
+/// diff` on a huge tree can take a while to print its first byte, and that gap
+/// is the one being measured.
+pub const GIT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Ceiling on [`ControlRequest::GitStream`]s running at once on one connection.
+///
+/// Each is an OS thread of its own reading a `git` child, and unlike a request
+/// it is not answered from the bounded worker pool — nothing else counts them.
+/// One client asking honestly needs one or two (the diff overlay and the
+/// Changes panel share a probe); this is set well above that and is a backstop
+/// against a peer that asks faster than it drains, not a working limit.
+///
+/// A refused stream is answered with a failed [`ControlEvent::GitEnd`] rather
+/// than dropped, because a stream that never speaks is the one shape a client
+/// cannot recover from cheaply.
+pub const MAX_CONCURRENT_GIT_STREAMS: usize = 8;
+
 /// Capability strings advertised in [`crate::daemon::protocol::DaemonVersion::features`].
 ///
 /// These exist so a capability added after protocol v3 doesn't need another
@@ -336,6 +391,25 @@ pub enum ControlRequest {
     /// `git -C <cwd> <args>`. A non-zero exit is a successful reply carrying
     /// that status, **not** an error — see [`WireError`].
     Git {
+        cwd: String,
+        args: Vec<String>,
+    },
+    /// `git -C <cwd> <args>`, delivered incrementally: the server pushes
+    /// [`ControlEvent::GitChunk`]s under `id` until a [`ControlEvent::GitEnd`]
+    /// carrying the exit status.
+    ///
+    /// Same invariants as [`Git`](Self::Git) — it is the same invocation — but
+    /// neither side has to hold the whole output: `git diff HEAD` on a large
+    /// work tree is tens of megabytes, and the caller throws most of it away.
+    /// **The client picks `id`**, which is why there is no id in the reply.
+    /// Ids only have to be unique within a connection, and one connection has
+    /// one client — so choosing it here lets the client register its receiver
+    /// *before* the request goes out. A server-assigned id would arrive in the
+    /// reply, leaving a window in which a chunk that overtook it would reach a
+    /// client with no entry for that id and be dropped under the unknown-id
+    /// rule, silently losing the front of the diff.
+    GitStream {
+        id: u64,
         cwd: String,
         args: Vec<String>,
     },
@@ -537,7 +611,10 @@ impl ControlRequest {
             CreateFileNew { .. } | CreateDir { .. } | Rename { .. } | Remove { .. } => {
                 Duration::from_secs(10)
             }
-            Git { .. } | Search { .. } => Duration::from_secs(20),
+            // `GitStream`'s deadline covers only its *acceptance* — the reply is
+            // immediate and the data arrives as pushes, which have their own
+            // idle timeout (see `GIT_STREAM_IDLE_TIMEOUT`).
+            Git { .. } | GitStream { .. } | Search { .. } => Duration::from_secs(20),
             // Filesystem probes on Unix, but on Windows the WSL enumeration
             // spawns `wsl.exe -l -q`, which is slow enough to deserve the same
             // budget as git.
@@ -762,6 +839,38 @@ pub enum ControlEvent {
     /// the client invalidates the subtree instead of applying a list.
     WatchOverflow {
         id: u64,
+    },
+
+    /// A batch of a [`ControlRequest::GitStream`]'s stdout, in order.
+    ///
+    /// Line data, newline-terminated, batched into frames of roughly
+    /// [`GIT_STREAM_CHUNK`] bytes — not a verbatim slice of git's stdout. The
+    /// server reads through [`crate::host::Host::git_lines`], so what crosses
+    /// the wire is what that yields: line *content* is preserved exactly (bar
+    /// the lossy UTF-8 replacement it already applies), while `\r\n` endings
+    /// and whether the last line carried a terminator are normalised away. The
+    /// only consumer is line-oriented, so that is the contract rather than an
+    /// accident — and framing per batch instead of per line is what keeps a
+    /// 90 000-line diff from becoming 90 000 frames.
+    ///
+    /// Base64 for the same reason [`crate::host::Output::stdout`] is: events
+    /// are encoded with `serde_json`, which has no byte type and renders one as
+    /// an array of decimal numbers, so a plain `Vec<u8>` would put roughly four
+    /// bytes on the wire per byte of diff — making the streaming path *more*
+    /// expensive than the buffered read it exists to replace, on exactly the
+    /// multi-megabyte diff it was added for.
+    GitChunk {
+        id: u64,
+        #[serde(with = "crate::host::b64")]
+        bytes: Vec<u8>,
+    },
+    /// The stream is over. `code` is git's exit status, `None` when it was
+    /// killed by a signal; `failed` reports a read error on the server side,
+    /// which is distinct from git exiting non-zero.
+    GitEnd {
+        id: u64,
+        code: Option<i32>,
+        failed: bool,
     },
 
     // ----- reserved for M5/M6; defined so the dialect doesn't need a bump ---
@@ -1344,6 +1453,8 @@ struct ClientInner {
     /// rather than joining a thread that may never return.
     reader_done: Mutex<bool>,
     reader_exit: Condvar,
+    /// Run when the link is declared dead — see [`ControlClient::on_link_down`].
+    link_down: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl ControlClient {
@@ -1445,6 +1556,7 @@ impl ControlClient {
             shutdown,
             reader_done: Mutex::new(false),
             reader_exit: Condvar::new(),
+            link_down: Mutex::new(Vec::new()),
         });
 
         let reader_inner = Arc::clone(&inner);
@@ -1467,6 +1579,38 @@ impl ControlClient {
     /// reconnect builds a new `ControlClient`.
     pub fn is_connected(&self) -> bool {
         self.inner.connected.load(Ordering::Acquire)
+    }
+
+    /// Register work to run when the link is declared dead.
+    ///
+    /// `call` needs nothing of the sort — it waits on a slot in `pending`, and
+    /// `fail_all` empties that. But a caller parked on a *push* is invisible
+    /// there: [`ControlRequest::GitStream`]'s reply arrives long before its
+    /// data does, so the thread draining the chunks is waiting on a channel
+    /// this module has never heard of. Without a hook that channel is never
+    /// closed and the thread parks until its idle timeout expires, holding
+    /// whatever the caller believed was merely in flight.
+    ///
+    /// [`GIT_STREAM_IDLE_TIMEOUT`] does not make this redundant, and neither
+    /// makes the other so: this fires the instant the link is known to be gone,
+    /// where the timeout would sit out its full wait for an answer that is
+    /// already impossible. The timeout covers the case a hook cannot see at all
+    /// — a link that stays up while the far side stops producing.
+    ///
+    /// A hook may run more than once (`close` and the reader's own teardown
+    /// both declare the link dead) and must therefore be idempotent, and it
+    /// must not call back into this client — it runs while the hook table is
+    /// held, on whichever thread noticed the link go.
+    pub fn on_link_down<F: Fn() + Send + Sync + 'static>(&self, hook: F) {
+        if let Ok(mut hooks) = self.inner.link_down.lock() {
+            hooks.push(Box::new(hook));
+        }
+        // The link can die between the handshake and this call — a connection
+        // refused mid-registration would otherwise leave the hook armed for an
+        // event that has already passed.
+        if !self.is_connected() {
+            self.inner.run_link_down();
+        }
     }
 
     /// How long the link has been silent. The caller's keepalive policy reads
@@ -1728,17 +1872,32 @@ impl ClientInner {
     /// Fail every outstanding request. Called when the link dies, so callers
     /// get `ConnectionReset` immediately instead of each waiting out its own
     /// deadline.
+    ///
+    /// Waiters on a *push* rather than a reply are not in `pending` and cannot
+    /// be woken from here, so the hooks run too — see
+    /// [`ControlClient::on_link_down`].
     fn fail_all(&self, why: &str) {
         self.connected.store(false, Ordering::Release);
         let drained: Vec<_> = match self.pending.lock() {
             Ok(mut p) => p.drain().collect(),
-            Err(_) => return,
+            Err(_) => Vec::new(),
         };
         for (req_id, tx) in drained {
             let _ = tx.try_send(ControlReply::Err(WireError::new(
                 WireErrorKind::ConnectionReset,
                 format!("{why} (request {req_id})"),
             )));
+        }
+        self.run_link_down();
+    }
+
+    /// Run every registered link-down hook. Idempotent by contract, since both
+    /// `close` and the reader's own teardown reach `fail_all`.
+    fn run_link_down(&self) {
+        if let Ok(hooks) = self.link_down.lock() {
+            for hook in hooks.iter() {
+                hook();
+            }
         }
     }
 }
@@ -1836,6 +1995,7 @@ mod tests {
             shutdown: None,
             reader_done: Mutex::new(false),
             reader_exit: Condvar::new(),
+            link_down: Mutex::new(Vec::new()),
         })
     }
 
@@ -2303,6 +2463,61 @@ mod tests {
         assert_eq!(&buf[5..13], &77u64.to_le_bytes());
         assert_eq!(&buf[13..17], &0u32.to_le_bytes());
         assert_eq!(buf.len(), 17);
+    }
+
+    /// A git chunk's bytes cross the wire as base64, not as a JSON array of
+    /// decimal numbers.
+    ///
+    /// The difference is roughly four wire bytes per byte of diff, on the one
+    /// path whose entire reason for existing is a multi-megabyte read — and it
+    /// is invisible in a plain round-trip assertion, because the array form
+    /// decodes back perfectly well. So the size is asserted too: 8 KiB of
+    /// printable text cannot fit in under twice its length as decimals and
+    /// commas, and does fit comfortably as base64.
+    #[test]
+    fn a_git_chunk_crosses_the_wire_as_base64() {
+        let bytes: Vec<u8> = (0..8192u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let event = ControlEvent::GitChunk {
+            id: 7,
+            bytes: bytes.clone(),
+        };
+        let json = to_json(&event).unwrap();
+        assert!(
+            json.len() < bytes.len() * 2,
+            "a {}-byte chunk encoded to {} bytes of JSON — the array-of-numbers \
+             encoding is back",
+            bytes.len(),
+            json.len()
+        );
+
+        let (k, payload) = ControlServerMsg::Event(event).to_frame().unwrap();
+        match ControlServerMsg::from_frame(k, payload).unwrap() {
+            ControlServerMsg::Event(ControlEvent::GitChunk { id, bytes: got }) => {
+                assert_eq!(id, 7);
+                assert_eq!(got, bytes, "the bytes survive the encoding exactly");
+            }
+            other => panic!("expected a GitChunk, got {other:?}"),
+        }
+    }
+
+    /// The chunk ceiling leaves room for what encoding costs. A chunk capped at
+    /// [`GIT_STREAM_CHUNK_MAX`] grows by base64's four-thirds before the JSON
+    /// envelope goes round it, so a ceiling set anywhere near [`MAX_FRAME`]
+    /// would produce chunks that cannot be sent at all — the failure this cap
+    /// exists to make impossible.
+    #[test]
+    fn the_git_chunk_ceiling_leaves_room_for_base64_and_the_envelope() {
+        let encoded = GIT_STREAM_CHUNK_MAX / 3 * 4 + 4;
+        assert!(
+            encoded + 4096 < MAX_FRAME,
+            "a full chunk encodes to {encoded} bytes against a {MAX_FRAME}-byte frame limit"
+        );
+        const {
+            assert!(
+                GIT_STREAM_CHUNK_MAX > GIT_STREAM_CHUNK,
+                "the ceiling is a backstop for an oversized line, not the batch target"
+            )
+        };
     }
 
     /// An event's `req_id` is on the wire and is zero — the eight redundant

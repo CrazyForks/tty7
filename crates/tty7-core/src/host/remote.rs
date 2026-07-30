@@ -35,13 +35,14 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::daemon::control::{
     ControlClient, ControlEvent, ControlHello, ControlHelloOk, ControlRequest, EventSink,
-    KEEPALIVE_DEAD_AFTER, KEEPALIVE_IDLE_BEFORE_PING, KEEPALIVE_PING_INTERVAL, LinkShutdown,
-    ReplyOk,
+    GIT_STREAM_IDLE_TIMEOUT, KEEPALIVE_DEAD_AFTER, KEEPALIVE_IDLE_BEFORE_PING,
+    KEEPALIVE_PING_INTERVAL, LinkShutdown, ReplyOk,
 };
 use crate::host::{
     Entry, Host, HostId, Meta, Output, SearchHit, SharedHost, ShellInventory, WatchHandle, WatchSub,
@@ -53,6 +54,11 @@ pub struct RemoteHost {
     client: Arc<ControlClient>,
     separator: char,
     watches: Arc<WatchRegistry>,
+    streams: Arc<GitStreamRegistry>,
+    /// Ids for [`ControlRequest::GitStream`]. Client-assigned so the receiver
+    /// can be registered before the request is sent; unique per connection is
+    /// all they need to be.
+    next_stream: AtomicU64,
 }
 
 impl RemoteHost {
@@ -123,6 +129,8 @@ impl RemoteHost {
         // rather than reached back into.
         let watches = Arc::new(WatchRegistry::default());
         let sink_watches = Arc::clone(&watches);
+        let streams: Arc<GitStreamRegistry> = Arc::new(GitStreamRegistry::default());
+        let sink_streams = Arc::clone(&streams);
         // The id is derived here rather than read back off the host because the
         // sink has to exist before the host does — and because an event that
         // could not say *which machine* it came from would be useless to the
@@ -133,15 +141,25 @@ impl RemoteHost {
             ControlEvent::Watch { .. } | ControlEvent::WatchOverflow { .. } => {
                 sink_watches.dispatch(event);
             }
+            // Git chunks belong to whichever thread is draining that stream.
+            ControlEvent::GitChunk { .. } | ControlEvent::GitEnd { .. } => {
+                sink_streams.dispatch(event);
+            }
             // Everything else is about a *window*, and this layer has none.
             other => crate::daemon::control::observe_event(id, other),
         });
 
         let client = Arc::new(ControlClient::connect_with(r, w, shutdown, hello, sink)?);
         let separator = client.hello().separator;
+        // A stream is answered by pushes, not by a reply, so `fail_all` cannot
+        // see anyone waiting on one — see [`GitStreamRegistry::close_all`].
+        let down_streams = Arc::clone(&streams);
+        client.on_link_down(move || down_streams.close_all());
 
         let host = Arc::new(RemoteHost {
             id,
+            streams,
+            next_stream: AtomicU64::new(1),
             client: Arc::clone(&client),
             separator,
             watches,
@@ -357,6 +375,49 @@ impl Host for RemoteHost {
         }
     }
 
+    /// Incremental, always: [`ControlRequest::GitStream`] is part of the
+    /// protocol, not an extension a peer may lack. Remote workspaces have never
+    /// shipped a release, so there is no older server to negotiate with — and a
+    /// capability check with a buffered fallback would be dead code pretending
+    /// otherwise.
+    fn git_lines(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        on_line: &mut dyn FnMut(&str),
+    ) -> io::Result<Option<i32>> {
+        // Registered *before* the request goes out, so a chunk cannot arrive
+        // with nowhere to go — see `ControlRequest::GitStream`.
+        let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        self.streams.insert(
+            id,
+            StreamSink {
+                tx,
+                queued: Arc::clone(&queued),
+            },
+        );
+        // The receiver comes off the registry however this returns: an early
+        // `?` below would otherwise leak the entry for the life of the
+        // connection.
+        let _guard = StreamGuard {
+            streams: &self.streams,
+            id,
+        };
+
+        match self.call(ControlRequest::GitStream {
+            id,
+            cwd: wire_path(cwd),
+            args: args.iter().map(|a| a.to_string()).collect(),
+        })? {
+            ReplyOk::Unit => {}
+            other => return Err(wrong_shape("an accepted git stream", &other)),
+        }
+
+        drain_git_stream(&rx, &queued, GIT_STREAM_IDLE_TIMEOUT, on_line)
+    }
+
     /// Safe to send unguarded: the request landed in control v2, and the
     /// handshake already refused any peer on another dialect. A server too old
     /// to know the variant is never on the other end of a live connection — it
@@ -419,6 +480,253 @@ impl std::fmt::Debug for RemoteHost {
 // ---------------------------------------------------------------------------
 // Watches
 // ---------------------------------------------------------------------------
+
+/// Bytes one stream may have sitting between the reader thread and the thread
+/// draining it.
+///
+/// The queue below is unbounded and its `send` never waits, deliberately: the
+/// reader thread serves the *whole* connection, so parking it there would stall
+/// every other reply, every watch event and the keepalive pongs — a peer that
+/// out-runs one diff reader would take the link down with it. The cost of not
+/// waiting is that nothing throttles the sender, and "streaming" would bound
+/// what each end reads at once while letting the queue between them grow to the
+/// size of the whole diff — the exact peak this path exists to remove, one
+/// container further along.
+///
+/// So the queue is *bounded* instead of back-pressured: past this the stream is
+/// failed with [`GitStreamMsg::Overrun`] rather than served, which turns an
+/// unbounded allocation into a read that says what happened. Real back-pressure
+/// would need credit-based flow control in the dialect — the client telling the
+/// server how much more it may push — which is a protocol change, not a
+/// buffering policy, and is not what this is.
+///
+/// Set far above any healthy gap. The drainer only splits lines and parses, at
+/// roughly 8 MB per 12 ms, so it stays within a chunk or two of a link that is
+/// merely fast; reaching 32 MiB of arrears means the consumer is wedged, not
+/// busy.
+const GIT_STREAM_QUEUE_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Reassemble one git stream's pushes into lines, ending on `GitEnd`, on a link
+/// that died, on the queue budget blowing, or on `idle` elapsing between chunks.
+///
+/// Split out from [`RemoteHost::git_lines`] so the ways a stream ends are
+/// reachable from a test without a socket — the timeout in particular, which
+/// otherwise could only be exercised by waiting out
+/// [`GIT_STREAM_IDLE_TIMEOUT`].
+///
+/// `queued` is the arrears this stream has accrued, in bytes; every chunk taken
+/// off the channel is subtracted from it, which is what lets the reader thread
+/// see a consumer falling behind. See [`GIT_STREAM_QUEUE_BUDGET`].
+fn drain_git_stream(
+    rx: &mpsc::Receiver<GitStreamMsg>,
+    queued: &AtomicUsize,
+    idle: Duration,
+    on_line: &mut dyn FnMut(&str),
+) -> io::Result<Option<i32>> {
+    let mut split = crate::core::git::LineSplitter::default();
+    loop {
+        // The wait is per *chunk*, not for the stream as a whole — a slow link
+        // is allowed to take as long as it takes, a silent one is not. See
+        // `GIT_STREAM_IDLE_TIMEOUT` for what this catches that neither the
+        // request deadline nor keepalive can.
+        match rx.recv_timeout(idle) {
+            Ok(GitStreamMsg::Chunk(bytes)) => {
+                // Before parsing, not after: the arrears the reader thread reads
+                // must fall as soon as the bytes are ours, or a slow parse of one
+                // chunk would count against the budget twice.
+                //
+                // Saturating, because the two sides of this counter are updated
+                // by different threads and only the *sum* is ever meaningful: a
+                // chunk that reached the channel before its charge landed would
+                // otherwise wrap the counter to `usize::MAX` and kill the next
+                // healthy stream for being over budget.
+                let _ = queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+                    Some(q.saturating_sub(bytes.len()))
+                });
+                split.push(&bytes, &mut *on_line);
+            }
+            // The queue outgrew its budget, so the reader thread stopped filling
+            // it. Everything after the last delivered chunk is missing, which
+            // makes this a failed read rather than a short one — the same rule
+            // the timeout arm follows.
+            Ok(GitStreamMsg::Overrun) => {
+                return Err(io::Error::other(format!(
+                    "the git stream outran this client by more than \
+                     {GIT_STREAM_QUEUE_BUDGET} queued bytes"
+                )));
+            }
+            Ok(GitStreamMsg::End { code, failed }) => {
+                split.finish(&mut *on_line);
+                return if failed {
+                    Err(io::Error::other("the server could not run git"))
+                } else {
+                    Ok(code)
+                };
+            }
+            // Nothing is coming and nothing said so. The lines already handed
+            // out are *not* retracted, but the result is an error: half a diff
+            // reported as a successful read is how a stale overlay becomes a
+            // wrong one.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("the git stream went silent for {idle:?} while the link stayed up"),
+                ));
+            }
+            // The connection died mid-stream. Distinguishable from a non-zero
+            // exit, same as everywhere else in this file.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("the control connection closed mid-stream"));
+            }
+        }
+    }
+}
+
+/// Removes a stream's registry entry however its reader leaves — an early
+/// return on a wire error would otherwise leave the sender in the map for the
+/// life of the connection.
+struct StreamGuard<'a> {
+    streams: &'a GitStreamRegistry,
+    id: u64,
+}
+
+impl Drop for StreamGuard<'_> {
+    fn drop(&mut self) {
+        self.streams.remove(self.id);
+    }
+}
+
+/// One chunk of a running [`ControlRequest::GitStream`], as the reader thread
+/// hands it to the thread that asked for the stream.
+enum GitStreamMsg {
+    Chunk(Vec<u8>),
+    /// The stream is over: git's exit code, and whether the server failed to
+    /// run it at all.
+    End {
+        code: Option<i32>,
+        failed: bool,
+    },
+    /// This stream fell far enough behind to hit [`GIT_STREAM_QUEUE_BUDGET`],
+    /// so the reader thread cut it loose. Always the last message: its sender
+    /// is off the table by the time it is sent.
+    Overrun,
+}
+
+/// Where one running stream's pushes go, plus what it owes.
+struct StreamSink {
+    tx: mpsc::Sender<GitStreamMsg>,
+    /// Bytes handed to `tx` and not yet taken off it. Written by the reader
+    /// thread, subtracted by the drainer — the one number both sides of the
+    /// queue can see, and the only thing standing between an unbounded queue
+    /// and the whole diff. See [`GIT_STREAM_QUEUE_BUDGET`].
+    queued: Arc<AtomicUsize>,
+}
+
+/// Receivers for git streams currently running on this connection, keyed by the
+/// id the client chose for each. Entries are inserted *before* the request goes
+/// out and removed when the stream ends, so no chunk can arrive with nowhere to
+/// go — see [`ControlRequest::GitStream`].
+#[derive(Default)]
+struct GitStreamRegistry {
+    streams: Mutex<StreamTable>,
+}
+
+#[derive(Default)]
+struct StreamTable {
+    senders: HashMap<u64, StreamSink>,
+    /// Set by [`GitStreamRegistry::close_all`] and never cleared: a
+    /// `ControlClient` never comes back up, so once the link is gone no stream
+    /// registered afterwards could ever be answered. Without it a `git_lines`
+    /// that registered just after the teardown swept the table would park on a
+    /// sender nothing will ever close.
+    closed: bool,
+}
+
+impl GitStreamRegistry {
+    fn insert(&self, id: u64, sink: StreamSink) {
+        if let Ok(mut m) = self.streams.lock()
+            && !m.closed
+        {
+            m.senders.insert(id, sink);
+        }
+        // Dropped rather than filed when the link is already down, which closes
+        // the channel and sends the caller straight down the mid-stream arm.
+    }
+
+    fn remove(&self, id: u64) {
+        if let Ok(mut m) = self.streams.lock() {
+            m.senders.remove(&id);
+        }
+    }
+
+    /// Wake every reader still draining a stream, because the link they were
+    /// being fed by is gone.
+    ///
+    /// The counterpart to `ClientInner::fail_all`, and the reason this is
+    /// needed at all: a `GitStream` reply arrives long before its data, so from
+    /// `fail_all`'s point of view the request is finished and there is nobody
+    /// to fail. The thread is really parked on the channel below, which lives
+    /// here and outlives the reader thread — so unless the senders are closed
+    /// deliberately, a dropped connection parks that thread forever and the
+    /// caller's in-flight bookkeeping is never unwound.
+    fn close_all(&self) {
+        let Ok(mut m) = self.streams.lock() else {
+            return;
+        };
+        m.closed = true;
+        // Dropping every sender is the signal: chunks already queued stay
+        // readable and the receiver then sees `Disconnected` rather than
+        // waiting out its idle timeout for a link that is already gone.
+        m.senders.clear();
+    }
+
+    /// Route one push. Runs on the reader thread, so it must not block — the
+    /// channel is unbounded and `send` never waits. A chunk for an id that has
+    /// already finished (a cancelled read the server had not noticed yet) is
+    /// dropped, which is the same unknown-id rule watches follow.
+    ///
+    /// Not blocking is what makes the queue everyone's problem, so this is also
+    /// where it is bounded: each chunk is charged to the stream's arrears, and a
+    /// stream whose drainer has fallen [`GIT_STREAM_QUEUE_BUDGET`] behind is cut
+    /// loose with an [`Overrun`](GitStreamMsg::Overrun) instead of being fed
+    /// further. Cutting it loose — rather than dropping the chunk — is the only
+    /// honest option: the queue is a byte stream being reassembled into lines, so
+    /// a hole in the middle of it is not a shorter diff, it is a wrong one.
+    fn dispatch(&self, event: ControlEvent) {
+        let (id, msg) = match event {
+            ControlEvent::GitChunk { id, bytes } => (id, GitStreamMsg::Chunk(bytes)),
+            ControlEvent::GitEnd { id, code, failed } => (id, GitStreamMsg::End { code, failed }),
+            _ => return,
+        };
+        let Ok(mut m) = self.streams.lock() else {
+            return;
+        };
+        let over = match (m.senders.get(&id), &msg) {
+            (None, _) => return,
+            (Some(sink), GitStreamMsg::Chunk(bytes)) => {
+                sink.queued.fetch_add(bytes.len(), Ordering::AcqRel) + bytes.len()
+                    > GIT_STREAM_QUEUE_BUDGET
+            }
+            // `End` and `Overrun` carry no payload to charge for, and an end must
+            // always get through — a stream that stops speaking without one is
+            // the shape the idle timeout exists to catch, at a cost of two
+            // minutes.
+            (Some(_), _) => false,
+        };
+        if over {
+            // Taken off the table first, so the chunks still arriving for this id
+            // meet the unknown-id rule above instead of queueing behind a message
+            // that says the queue is full.
+            if let Some(sink) = m.senders.remove(&id) {
+                let _ = sink.tx.send(GitStreamMsg::Overrun);
+            }
+            return;
+        }
+        if let Some(sink) = m.senders.get(&id) {
+            let _ = sink.tx.send(msg);
+        }
+    }
+}
 
 /// Live subscriptions, keyed by the id the server assigned.
 ///
@@ -686,6 +994,353 @@ mod tests {
         )
         .unwrap();
         (host, seen_rx)
+    }
+
+    /// `git_lines` asks the peer to stream, and reassembles the chunks it pushes
+    /// into lines. The id in the request is the one the client chose, which is
+    /// what let it register the receiver before sending.
+    #[test]
+    fn git_lines_streams_over_the_wire() {
+        let (host, seen) = host_with_peer_streaming();
+
+        let mut lines = Vec::new();
+        let code = host
+            .git_lines(Path::new("/repo"), &["diff"], &mut |l| {
+                lines.push(l.to_string())
+            })
+            .unwrap();
+
+        assert_eq!(code, Some(0));
+        assert_eq!(lines, ["alpha", "beta", "gamma"]);
+        match seen.recv().unwrap() {
+            ControlRequest::GitStream { id, cwd, args } => {
+                assert_eq!(id, 1, "the client picks the id, starting at 1");
+                assert_eq!(cwd, "/repo");
+                assert_eq!(args, ["diff"]);
+            }
+            other => panic!("expected a GitStream request, got {other:?}"),
+        }
+    }
+
+    /// A peer that serves `GitStream`: it answers the request, then pushes the
+    /// output as chunks and a terminating `GitEnd`. Deliberately splits a line
+    /// across two chunks, since that is the case the client's reassembly exists
+    /// for.
+    fn host_with_peer_streaming() -> (Arc<RemoteHost>, mpsc::Receiver<ControlRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            match ControlClientMsg::read(&mut sock).unwrap() {
+                ControlClientMsg::Hello(_) => {}
+                other => panic!("expected Hello, got {other:?}"),
+            }
+            ControlServerMsg::HelloOk(hello_ok('/'))
+                .encode(&mut sock)
+                .unwrap();
+            sock.flush().unwrap();
+            loop {
+                let (req_id, req) = match ControlClientMsg::read(&mut sock) {
+                    Ok(ControlClientMsg::Request { req_id, req }) => (req_id, req),
+                    _ => return,
+                };
+                let id = match &req {
+                    ControlRequest::GitStream { id, .. } => *id,
+                    other => panic!("expected GitStream, got {other:?}"),
+                };
+                seen_tx.send(req).unwrap();
+                ControlServerMsg::Response {
+                    req_id,
+                    reply: ControlReply::Ok(ReplyOk::Unit),
+                }
+                .encode(&mut sock)
+                .unwrap();
+                for bytes in [b"alpha\nbe".to_vec(), b"ta\ngamma\n".to_vec()] {
+                    ControlServerMsg::Event(ControlEvent::GitChunk { id, bytes })
+                        .encode(&mut sock)
+                        .unwrap();
+                }
+                ControlServerMsg::Event(ControlEvent::GitEnd {
+                    id,
+                    code: Some(0),
+                    failed: false,
+                })
+                .encode(&mut sock)
+                .unwrap();
+                sock.flush().unwrap();
+            }
+        });
+
+        let sock = TcpStream::connect(addr).unwrap();
+        let host = RemoteHost::over_tcp(
+            sock,
+            "ssh-alias:testbox",
+            &ControlHello::host_rpc("tok", "laptop"),
+        )
+        .unwrap();
+        (host, seen_rx)
+    }
+
+    /// A stream that goes quiet without ending gives up rather than parking
+    /// forever.
+    ///
+    /// This is the case nothing else on the client can see. Keepalive watches
+    /// the *link*, and the link is fine — a server whose `git` is wedged on a
+    /// network filesystem keeps answering pings. The request deadline was
+    /// satisfied by the immediate `Unit` reply, long before any data. So without
+    /// this the calling thread — one of a small pool — is parked for the life of
+    /// the process, and the repo it was probing never gets another answer.
+    ///
+    /// Driven through the extracted drain loop with a short idle so the test
+    /// costs milliseconds instead of `GIT_STREAM_IDLE_TIMEOUT`.
+    #[test]
+    fn a_stream_that_goes_silent_times_out() {
+        let (tx, rx) = mpsc::channel();
+        // A live sender that simply never speaks again — the wedged-server
+        // shape. Dropping it would exercise `Disconnected` instead, which is a
+        // different arm.
+        tx.send(GitStreamMsg::Chunk(b"alpha\n".to_vec())).unwrap();
+
+        let mut lines = Vec::new();
+        let started = Instant::now();
+        let queued = AtomicUsize::new(b"alpha\n".len());
+        let got = drain_git_stream(&rx, &queued, Duration::from_millis(120), &mut |l| {
+            lines.push(l.to_string())
+        });
+
+        let err = got.expect_err("a stream that never ends must not read as success");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(lines, ["alpha"], "what did arrive was still delivered");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait is the idle gap, not the whole stream"
+        );
+        drop(tx);
+    }
+
+    /// The idle timer measures the gap *between* chunks, not the stream's total
+    /// length: a slow-but-alive read must be allowed to take as long as it
+    /// takes, which is why a total deadline would be the wrong instrument.
+    #[test]
+    fn a_slow_stream_outlives_its_idle_timeout() {
+        let (tx, rx) = mpsc::channel();
+        let idle = Duration::from_millis(150);
+        thread::spawn(move || {
+            // Five gaps, each under the idle limit; together well past it.
+            for i in 0..5 {
+                thread::sleep(Duration::from_millis(60));
+                let _ = tx.send(GitStreamMsg::Chunk(format!("line {i}\n").into_bytes()));
+            }
+            let _ = tx.send(GitStreamMsg::End {
+                code: Some(0),
+                failed: false,
+            });
+        });
+
+        let mut lines = Vec::new();
+        let started = Instant::now();
+        let queued = AtomicUsize::new(0);
+        let code =
+            drain_git_stream(&rx, &queued, idle, &mut |l| lines.push(l.to_string())).unwrap();
+
+        assert_eq!(code, Some(0));
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert!(
+            started.elapsed() > idle,
+            "the read outlived a single idle window without being cut"
+        );
+    }
+
+    /// A stream whose drainer falls far enough behind is cut loose instead of
+    /// being queued without limit.
+    ///
+    /// This is the bound that makes the streaming path's memory claim true on a
+    /// *remote* host. The read is incremental on both ends — 64 KiB at the
+    /// server, one line at the client — but between them sits a queue the reader
+    /// thread never waits on, and it cannot wait on it: that thread serves the
+    /// whole connection, so parking it there would stall every other reply and
+    /// the keepalive with it. Unbounded, a peer pushing faster than this client
+    /// parses rebuilds the whole-diff peak in the channel, which is the one thing
+    /// the buffered read was replaced to avoid.
+    ///
+    /// Driven through `dispatch`, not by hand, because the accounting is split
+    /// across the two threads and only their pairing is worth asserting.
+    #[test]
+    fn a_stream_that_outruns_its_queue_budget_is_cut_loose() {
+        let registry = GitStreamRegistry::default();
+        let (tx, rx) = mpsc::channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        registry.insert(
+            1,
+            StreamSink {
+                tx,
+                queued: Arc::clone(&queued),
+            },
+        );
+
+        // Nobody is draining, so every chunk is arrears. One megabyte at a time
+        // to keep the test's own allocation modest.
+        let chunk = vec![b'x'; 1024 * 1024];
+        let pushes = GIT_STREAM_QUEUE_BUDGET / chunk.len() + 2;
+        for _ in 0..pushes {
+            registry.dispatch(ControlEvent::GitChunk {
+                id: 1,
+                bytes: chunk.clone(),
+            });
+        }
+        assert!(
+            queued.load(Ordering::Acquire) <= GIT_STREAM_QUEUE_BUDGET + chunk.len(),
+            "the arrears stopped growing at the budget, not at the diff's size"
+        );
+
+        // The reader thread also stops routing to it, so a stream that keeps
+        // arriving cannot queue behind the notice.
+        registry.dispatch(ControlEvent::GitChunk {
+            id: 1,
+            bytes: chunk.clone(),
+        });
+
+        // What the drainer sees: the chunks that fit, then the overrun, and an
+        // error rather than a short read reported as a success.
+        let mut lines = Vec::new();
+        let err = drain_git_stream(&rx, &queued, Duration::from_secs(5), &mut |l| {
+            lines.push(l.to_string())
+        })
+        .expect_err("a cut-off stream must not read as a complete diff");
+        assert!(err.to_string().contains("outran"), "{err}");
+    }
+
+    /// The budget must not fire on a stream that is merely *large*. It bounds
+    /// how far the consumer may fall behind, not how much may cross — a drainer
+    /// keeping up returns the arrears as fast as they are charged, so a diff of
+    /// any size passes through a queue that never grows.
+    ///
+    /// The feeder throttles itself on the same counter the reader thread charges,
+    /// which is what "a consumer keeping up" means here and is what keeps this
+    /// test a statement about the accounting rather than a race between two
+    /// threads' speeds.
+    #[test]
+    fn a_large_but_drained_stream_never_trips_the_budget() {
+        let registry = Arc::new(GitStreamRegistry::default());
+        let (tx, rx) = mpsc::channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        registry.insert(
+            1,
+            StreamSink {
+                tx,
+                queued: Arc::clone(&queued),
+            },
+        );
+
+        // Twice the budget in total, in 1 MiB chunks, never more than 4 MiB of it
+        // outstanding at once.
+        let feeder = Arc::clone(&registry);
+        let feeder_queued = Arc::clone(&queued);
+        let chunks = GIT_STREAM_QUEUE_BUDGET / (1024 * 1024) * 2;
+        thread::spawn(move || {
+            for _ in 0..chunks {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while feeder_queued.load(Ordering::Acquire) > 4 * 1024 * 1024 {
+                    if Instant::now() > deadline {
+                        break; // the drainer is wedged; let the assertions say so
+                    }
+                    thread::yield_now();
+                }
+                let mut bytes = vec![b'x'; 1024 * 1024 - 1];
+                bytes.push(b'\n');
+                feeder.dispatch(ControlEvent::GitChunk { id: 1, bytes });
+            }
+            feeder.dispatch(ControlEvent::GitEnd {
+                id: 1,
+                code: Some(0),
+                failed: false,
+            });
+        });
+
+        let mut lines = 0usize;
+        let code = drain_git_stream(&rx, &queued, Duration::from_secs(10), &mut |_| lines += 1)
+            .expect("a drained stream is not an overrun, however much crosses it");
+        assert_eq!(code, Some(0));
+        assert_eq!(lines, chunks, "every line arrived");
+        assert_eq!(queued.load(Ordering::Acquire), 0, "the arrears settled");
+    }
+
+    /// A link that dies mid-stream ends the read with an error rather than
+    /// parking the thread that was draining it.
+    ///
+    /// The regression this guards is a *hang*, not a wrong answer, so the call
+    /// is made on its own thread and the assertion is on it having returned at
+    /// all. A stream is answered by pushes, so the failure path every other
+    /// method relies on — a deadline, or `fail_all` emptying `pending` — has
+    /// nothing to fail here; only closing the stream's own channel wakes it.
+    #[test]
+    fn a_link_that_dies_mid_stream_ends_the_read() {
+        let host = host_with_peer_dying_mid_stream();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let got = host.git_lines(Path::new("/repo"), &["diff"], &mut |_| {});
+            let _ = done_tx.send(got.is_err());
+        });
+
+        match done_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(errored) => assert!(
+                errored,
+                "a stream cut short must report an error, not a successful read of half a diff"
+            ),
+            Err(_) => panic!(
+                "git_lines never returned: the reader is parked on a stream nothing will close"
+            ),
+        }
+    }
+
+    /// A peer that accepts a `GitStream`, pushes part of it, and then hangs up
+    /// without a `GitEnd` — an SSH link dropping mid-diff.
+    fn host_with_peer_dying_mid_stream() -> Arc<RemoteHost> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            match ControlClientMsg::read(&mut sock).unwrap() {
+                ControlClientMsg::Hello(_) => {}
+                other => panic!("expected Hello, got {other:?}"),
+            }
+            ControlServerMsg::HelloOk(hello_ok('/'))
+                .encode(&mut sock)
+                .unwrap();
+            sock.flush().unwrap();
+            let (req_id, id) = match ControlClientMsg::read(&mut sock) {
+                Ok(ControlClientMsg::Request {
+                    req_id,
+                    req: ControlRequest::GitStream { id, .. },
+                }) => (req_id, id),
+                other => panic!("expected a GitStream request, got {other:?}"),
+            };
+            ControlServerMsg::Response {
+                req_id,
+                reply: ControlReply::Ok(ReplyOk::Unit),
+            }
+            .encode(&mut sock)
+            .unwrap();
+            ControlServerMsg::Event(ControlEvent::GitChunk {
+                id,
+                bytes: b"alpha\n".to_vec(),
+            })
+            .encode(&mut sock)
+            .unwrap();
+            sock.flush().unwrap();
+            // Dropping the socket here is the whole point: the client is now
+            // waiting on chunks that will never come, with the reply it was
+            // told to wait for already delivered.
+        });
+
+        let sock = TcpStream::connect(addr).unwrap();
+        RemoteHost::over_tcp(
+            sock,
+            "ssh-alias:testbox",
+            &ControlHello::host_rpc("tok", "laptop"),
+        )
+        .unwrap()
     }
 
     /// The dropdown of a remote window is built from the *server's* shells.
