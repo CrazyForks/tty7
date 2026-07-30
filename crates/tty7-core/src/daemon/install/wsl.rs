@@ -891,7 +891,8 @@ impl ServerBinarySource for BundledServerBinary {
 /// opens one routed connection per pane, all at once, on separate daemon
 /// threads. Without this they run the installer concurrently against the same
 /// distribution, and the interleaving is destructive rather than merely wasteful:
-/// two runs both write `.tty7-server-<ver>.tmp`, the first renames it into place
+/// two runs in *this* process share a pid and so share
+/// `.tty7-server-c<c>p<p>.<pid>.tmp`, the first renames it into place
 /// and reports success, and the second's rename then fails — which sends it down
 /// [`Installer::install`]'s recovery branch, whose `remove_file(&paths.binary)`
 /// **deletes the binary the first run just published**. Every later pane then
@@ -1754,6 +1755,24 @@ mod tests {
                     })
                 };
             }
+            if let Some(exe) = cmd
+                .trim()
+                .strip_suffix(crate::daemon::install::PROTOCOL_FLAG)
+            {
+                // Every binary this fake holds is one the installer just put
+                // there, so it speaks what this build speaks. Anything else
+                // cannot answer, exactly like a server older than the flag.
+                let exe = exe.trim().trim_matches('\'');
+                return if self.files.lock().unwrap().contains_key(exe) {
+                    ok(&crate::daemon::install::RemoteProtocol::of_this_build().to_line())
+                } else {
+                    Ok(ExecOutput {
+                        status: Some(1),
+                        stdout: String::new(),
+                        stderr: "unknown flag".into(),
+                    })
+                };
+            }
             // The `/proc` sweep: no other build is running.
             ok("")
         }
@@ -1882,9 +1901,14 @@ mod tests {
         assert!(report.installed);
         assert!(report.launched);
         assert!(report.confirmed, "a first install asks");
+        let dialect = crate::daemon::install::RemoteProtocol::of_this_build();
         assert_eq!(
             report.paths.binary,
-            "/home/me/.local/share/tty7/bin/tty7-server-26.7.5"
+            format!(
+                "/home/me/.local/share/tty7/bin/tty7-server-c{}p{}",
+                dialect.control, dialect.protocol
+            ),
+            "the name follows the dialect, not the `--with_version` release"
         );
         assert_eq!(
             ops.files.lock().unwrap()[&report.paths.binary].0,
