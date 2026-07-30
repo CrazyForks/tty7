@@ -98,8 +98,8 @@ impl gpui::EventEmitter<AuthPromptReady> for TerminalView {}
 ///
 /// The id arrives asynchronously, on the agent's own hooks, long after
 /// everything that *structurally* changes a window. Nothing else was making the
-/// window save in between, so whether the id reached `session.json` came down
-/// to whether the user happened to open a tab, split a pane or move focus
+/// window save in between, so whether the id reached the persisted layout came
+/// down to whether the user happened to open a tab, split a pane or move focus
 /// afterwards. That is what made resume-after-End-Sessions work sometimes and
 /// not others: the layout on file simply had no agent in it.
 pub struct AgentSessionChanged;
@@ -1599,7 +1599,7 @@ impl TerminalView {
     /// machine.** The host id comes off the workspace's own `RemoteTarget`,
     /// through the same `connection_key` the connection was opened under — so
     /// the id resolves to the very host object
-    /// [`RemoteConnections::insert`](crate::ui::remote_connect::RemoteConnections::insert)
+    /// [`HostLinks::insert`](crate::ui::remote_connect::HostLinks::insert)
     /// registered, with no second source of truth to drift from it. Setting the
     /// route and setting the host is one operation because a pane that ran its
     /// shell on one machine and its `git` on another would be worse than
@@ -8017,7 +8017,7 @@ mod tests {
     /// (which needs a window, a daemon and a pane): the derivation under test is
     /// the target → `HostId` one, and pinning it here is what catches a future
     /// `set_workspace` that forgets the host half. The ids must agree with what
-    /// `RemoteConnections::insert` registered — same `connection_key`, checked
+    /// `HostLinks::insert` registered — same `connection_key`, checked
     /// by `connection_keys_match_the_contract_table` in `tty7-core`.
     #[test]
     fn a_panes_host_is_its_workspaces_machine() {
@@ -8073,6 +8073,27 @@ pub(crate) fn quiet_test_pane(
         .expect("socketpair-backed terminal");
     let view = cx.new(|cx| TerminalView::with_terminal(terminal, pane_id, window, cx));
     (view, daemon_side)
+}
+
+/// [`quiet_test_pane`], marked as a native-SSH pane — the shape a remote
+/// window's local SSH split has. `ssh_spec` is otherwise set only by the real
+/// spawn path, which needs an actual SSH handshake.
+#[cfg(all(test, unix))]
+pub(crate) fn quiet_test_ssh_pane(
+    pane_id: u64,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> (gpui::Entity<TerminalView>, std::os::unix::net::UnixStream) {
+    let (view, stream) = quiet_test_pane(pane_id, window, cx);
+    view.update(cx, |view, _| {
+        view.ssh_spec = Some(Box::new(
+            serde_json::from_str(
+                r#"{"host":"build-box","port":22,"user":"me","auth_mode":"auto"}"#,
+            )
+            .expect("a minimal NativeSshSpec decodes"),
+        ));
+    });
+    (view, stream)
 }
 
 /// gpui-harness tests: a real (headless) App + Window around a `TerminalView`
@@ -9658,19 +9679,19 @@ mod gpui_tests {
         cx: &mut Context<TerminalView>,
     ) -> crate::core::session::WorkspaceId {
         use crate::core::session::{
-            RemoteRef, RemoteTarget, WorkspaceId, WorkspaceStore, Workspaces,
+            RemoteRef, RemoteTarget, WindowViews, WorkspaceId, WorkspaceStore,
         };
         use crate::terminal::PaneWorkspace;
         let host = RemoteRef::new(
             RemoteTarget::direct("me", "build-box", 22),
             WorkspaceId::new(),
         );
-        let entry = crate::core::session::Workspace::on_remote(host.clone());
+        let entry = crate::core::session::WindowView::on_remote(host.clone());
         let id = entry.id;
         WorkspaceStore::install_for_test(
             cx,
-            Workspaces {
-                workspaces: vec![entry],
+            WindowViews {
+                views: vec![entry],
                 active: None,
             },
         );
