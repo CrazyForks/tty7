@@ -937,7 +937,6 @@ impl Tty7App {
     /// that is no longer on file.
     pub fn for_workspace(
         id: Option<WorkspaceId>,
-        fresh: crate::ui::windows::FreshStart,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -960,19 +959,12 @@ impl Tty7App {
         // A remote workspace hydrates even with restore off: its panes are
         // running sessions on another machine, not a saved layout.
         let hydrate = known && (restore || is_remote);
-        // What the window opens holding is the caller's call for a *brand-new*
-        // workspace: `None` takes the first-run path in `with_session`,
-        // spawning a single default terminal — what `New Workspace` and a
-        // first run both want — while an empty session lands on the home page,
-        // for the launch that exists to show the workspace picker. A known
-        // workspace opens empty (the hydration fills it), or on a fresh shell
-        // when the user turned restore off.
-        let session = match (known, fresh) {
-            (true, _) if hydrate => Some(Session::default()),
-            (true, _) => None,
-            (false, crate::ui::windows::FreshStart::Shell) => None,
-            (false, crate::ui::windows::FreshStart::HomePage) => Some(Session::default()),
-        };
+        // A brand-new workspace takes the first-run path in `with_session`
+        // (`None`), spawning a single default terminal — what `New Workspace`
+        // and a first run both want. A known workspace opens on an empty
+        // session that the hydration fills, or on a fresh shell when the user
+        // turned restore off.
+        let session = hydrate.then(Session::default);
         let app = Self::with_session(Some(workspace), session, window, cx);
         if hydrate {
             // No immediate save: the window is deliberately empty, and racing
@@ -1701,6 +1693,12 @@ impl Tty7App {
 
         let claimed = WorkspaceStore::claim(cx, Some(id));
         crate::ui::windows::WindowRegistry::rebind(cx, previous, claimed);
+        // A pick from the switcher is one of the ways a remote workspace comes
+        // back, so it owes the supervisor the same call the launch path makes —
+        // see `RemoteLinks::supervise` for what skipping it leaves on screen.
+        // The outgoing workspace needs no counterpart: `pump_tick` drops a
+        // machine the moment its last open workspace goes.
+        crate::ui::remote_workspace::RemoteLinks::supervise(cx, claimed);
         // The machine's tree is the layout's only home now, so an explicit
         // pick from the switcher always hydrates — restore-off governs what
         // *launch* comes back to, not what a deliberate open shows. The window
