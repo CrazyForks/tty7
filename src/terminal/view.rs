@@ -149,6 +149,7 @@ pub struct TerminalView {
     history_meta: std::collections::HashMap<String, super::history::EntryMeta>,
     history_ranked: Vec<String>,
     history_frecency: Vec<f64>,
+    history_scope: super::history::Scope,
     ranked_cwd: Option<std::path::PathBuf>,
     history_nav: Option<usize>,
     history_stash: String,
@@ -251,6 +252,8 @@ const INTEGRATION_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 const OPPORTUNISTIC_GIT_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
 
+const MAX_HISTORY_BYTES: u64 = 4 << 20;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GitRefresh {
     Edge,
@@ -308,6 +311,7 @@ fn ring_system_bell() -> bool {
 
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
+        let text = text.replace("\r\n", "\n");
         let mut bytes = b"\x1b[200~".to_vec();
         bytes.extend(text.bytes().filter(|&b| b != 0x1b));
         bytes.extend_from_slice(b"\x1b[201~");
@@ -670,7 +674,7 @@ impl TerminalView {
 
         window.focus(&focus_handle, cx);
 
-        let history = super::history::load();
+        let history = super::history::load(&super::history::Scope::Local);
         let history_ranked = super::history::rank_by_frecency(
             &history.entries,
             &history.counts,
@@ -739,6 +743,7 @@ impl TerminalView {
             history_meta: history.meta,
             history_ranked,
             history_frecency,
+            history_scope: super::history::Scope::Local,
             ranked_cwd: None,
             history_nav: None,
             history_stash: String::new(),
@@ -2097,6 +2102,95 @@ impl TerminalView {
         } else if tool_activity {
             self.refresh_git_status(cwd_now, GitRefresh::Opportunistic, cx);
         }
+
+        self.follow_history_scope(cx);
+    }
+
+    fn desired_history_scope(&self) -> super::history::Scope {
+        if let Some(ctx) = self.remote_context() {
+            return super::history::Scope::remote(&ctx.target);
+        }
+        if !self.host_id.is_local() {
+            return super::history::Scope::remote(&format!("host-{:016x}", self.host_id.0));
+        }
+        super::history::Scope::Local
+    }
+
+    fn follow_history_scope(&mut self, cx: &mut Context<Self>) {
+        let scope = self.desired_history_scope();
+        if scope == self.history_scope {
+            return;
+        }
+        self.flush_pending_history();
+        self.history_scope = scope.clone();
+        self.history.clear();
+        self.history_counts.clear();
+        self.history_cwds.clear();
+        self.history_meta.clear();
+        self.history_ranked.clear();
+        self.history_frecency.clear();
+        self.history_nav = None;
+        self.reverse_search = None;
+        cx.notify();
+
+        let shell_files = self.remote_shell_history_sources(cx);
+        let loading = scope.clone();
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    let files = shell_files
+                        .into_iter()
+                        .filter_map(|(host, path)| host.read_file(&path, MAX_HISTORY_BYTES).ok())
+                        .collect();
+                    super::history::load_with_shell_files(&loading, files)
+                })
+                .await;
+            this.update(cx, |view, cx| {
+                if view.history_scope != scope {
+                    return;
+                }
+                view.history = loaded.entries;
+                view.history_counts = loaded.counts;
+                view.history_cwds = loaded.cwds;
+                view.history_meta = loaded.meta;
+                let cwd = view.ranked_cwd.clone();
+                view.rerank_history(cwd.as_deref());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn remote_shell_history_sources(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Vec<(crate::ui::host_ops::SharedHost, std::path::PathBuf)> {
+        if self.history_scope.is_local() || self.host_id.is_local() {
+            return Vec::new();
+        }
+        // The Host reaches the workspace machine's home directory and nothing
+        // beyond it. A pane that has ssh'ed onward from there (remote_context)
+        // is scoped to the *inner* target, and seeding that scope from the
+        // workspace host's ~/.zsh_history would offer commands from the wrong
+        // box — the exact confusion scoping exists to prevent. Those panes
+        // start from what tty7 recorded for the inner target, like bare ssh.
+        if self.remote_context().is_some() {
+            return Vec::new();
+        }
+        let Some(host) = self.host(cx) else {
+            return Vec::new();
+        };
+        if !host.is_connected() {
+            return Vec::new();
+        }
+        let Some(home) = crate::ui::remote_connect::HostLinks::home(cx, self.host_id) else {
+            return Vec::new();
+        };
+        super::history::shell_history_names()
+            .into_iter()
+            .map(|name| (std::sync::Arc::clone(&host), host.join(&home, name)))
+            .collect()
     }
 
     fn refresh_git_status(
@@ -2662,7 +2756,7 @@ impl TerminalView {
         {
             m.exit = exit;
         }
-        super::history::append(&p.line, p.cwd.as_deref(), p.ts, exit);
+        super::history::append(&self.history_scope, &p.line, p.cwd.as_deref(), p.ts, exit);
     }
 
     fn ghost_suggestion(&self) -> Option<String> {
@@ -5146,6 +5240,20 @@ mod tests {
         assert_eq!(
             paste_bytes("a\nb", true),
             b"\x1b[200~a\nb\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn paste_bytes_folds_crlf_so_a_windows_clipboard_pastes_like_any_other() {
+        assert_eq!(
+            paste_bytes("a\r\nb\r\n", true),
+            b"\x1b[200~a\nb\n\x1b[201~".to_vec(),
+            "CRLF must reach the app as one line break, not two"
+        );
+        assert_eq!(
+            paste_bytes("a\r\nb", true),
+            paste_bytes("a\nb", true),
+            "a Windows clipboard must paste exactly like a Unix one"
         );
     }
 
