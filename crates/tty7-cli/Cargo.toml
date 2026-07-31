@@ -29,5 +29,17 @@ serde_json.workspace = true
 # user, same as the GUI package's own single-user pins (regex, memchr, …).
 clap = { version = "4", features = ["derive"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+# The end-to-end suite drives the compiled tty7.exe against a real isolated
+# server; its own main doubles as that server process, so no libtest harness.
+[[test]]
+name = "cli_e2e"
+harness = false
+
 [lints]
 workspace = true

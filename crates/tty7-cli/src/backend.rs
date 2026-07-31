@@ -1,7 +1,11 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use tty7_core::core::session::WorkspaceId;
-use tty7_core::daemon::control::{ControlEvent, ControlRequest, ReplyOk};
+use tty7_core::daemon::control::{ControlEvent, ControlHelloOk, ControlRequest, ReplyOk};
 use tty7_core::daemon::protocol::PaneProcs;
+
+mod real;
+
+pub use real::RealBackend;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunSpec {
@@ -14,8 +18,9 @@ pub struct RunSpec {
 pub trait Backend {
     fn control(&mut self, req: ControlRequest) -> Result<ReplyOk>;
 
-    fn spawn_shell(&mut self, pane: u64, workspace: WorkspaceId, cwd: Option<String>)
-    -> Result<()>;
+    fn hello(&mut self) -> Result<ControlHelloOk>;
+
+    fn spawn_shell(&mut self, workspace: WorkspaceId, cwd: Option<String>) -> Result<u64>;
 
     fn send_input(&mut self, pane: u64, bytes: Vec<u8>) -> Result<()>;
 
@@ -30,50 +35,6 @@ pub trait Backend {
     fn events(&mut self, on_event: &mut dyn FnMut(ControlEvent) -> Result<()>) -> Result<()>;
 }
 
-pub struct StubBackend;
-
-const NOT_WIRED: &str =
-    "the tty7 CLI is not wired to a server yet — the transport client lands in the next slice";
-
-impl Backend for StubBackend {
-    fn control(&mut self, _req: ControlRequest) -> Result<ReplyOk> {
-        bail!(NOT_WIRED)
-    }
-
-    fn spawn_shell(
-        &mut self,
-        _pane: u64,
-        _workspace: WorkspaceId,
-        _cwd: Option<String>,
-    ) -> Result<()> {
-        bail!(NOT_WIRED)
-    }
-
-    fn send_input(&mut self, _pane: u64, _bytes: Vec<u8>) -> Result<()> {
-        bail!(NOT_WIRED)
-    }
-
-    fn capture(&mut self, _pane: u64, _scrollback: bool) -> Result<String> {
-        bail!(NOT_WIRED)
-    }
-
-    fn procs(&mut self, _pane: u64) -> Result<PaneProcs> {
-        bail!(NOT_WIRED)
-    }
-
-    fn attach_pane(&mut self, _pane: u64) -> Result<()> {
-        bail!(NOT_WIRED)
-    }
-
-    fn run(&mut self, _spec: RunSpec) -> Result<i32> {
-        bail!(NOT_WIRED)
-    }
-
-    fn events(&mut self, _on_event: &mut dyn FnMut(ControlEvent) -> Result<()>) -> Result<()> {
-        bail!(NOT_WIRED)
-    }
-}
-
 #[cfg(test)]
 pub mod mock {
     use std::collections::VecDeque;
@@ -81,23 +42,45 @@ pub mod mock {
     use anyhow::{Result, anyhow};
     use tty7_core::core::machine::Machine;
     use tty7_core::core::session::WorkspaceId;
-    use tty7_core::daemon::control::{ControlEvent, ControlRequest, ReplyOk};
-    use tty7_core::daemon::protocol::PaneProcs;
+    use tty7_core::daemon::control::{
+        CONTROL_VERSION, ControlEvent, ControlHelloOk, ControlRequest, ReplyOk, feature,
+    };
+    use tty7_core::daemon::protocol::{PROTOCOL_VERSION, PaneProcs};
 
     use super::{Backend, RunSpec};
 
-    #[derive(Default)]
     pub struct MockBackend {
         pub machine: Machine,
         pub replies: VecDeque<ReplyOk>,
         pub control_calls: Vec<ControlRequest>,
-        pub spawned: Vec<(u64, WorkspaceId, Option<String>)>,
+        pub spawned: Vec<(WorkspaceId, Option<String>)>,
+        pub next_spawn_id: u64,
         pub sent: Vec<(u64, Vec<u8>)>,
         pub captured: Vec<(u64, bool)>,
         pub capture_text: String,
         pub procs_calls: Vec<u64>,
         pub procs_reply: PaneProcs,
         pub runs: Vec<RunSpec>,
+        pub events: Vec<ControlEvent>,
+    }
+
+    impl Default for MockBackend {
+        fn default() -> MockBackend {
+            MockBackend {
+                machine: Machine::default(),
+                replies: VecDeque::new(),
+                control_calls: Vec::new(),
+                spawned: Vec::new(),
+                next_spawn_id: 6,
+                sent: Vec::new(),
+                captured: Vec::new(),
+                capture_text: String::new(),
+                procs_calls: Vec::new(),
+                procs_reply: PaneProcs::default(),
+                runs: Vec::new(),
+                events: Vec::new(),
+            }
+        }
     }
 
     impl MockBackend {
@@ -119,14 +102,23 @@ pub mod mock {
             Ok(self.replies.pop_front().unwrap_or(ReplyOk::Unit))
         }
 
-        fn spawn_shell(
-            &mut self,
-            pane: u64,
-            workspace: WorkspaceId,
-            cwd: Option<String>,
-        ) -> Result<()> {
-            self.spawned.push((pane, workspace, cwd));
-            Ok(())
+        fn hello(&mut self) -> Result<ControlHelloOk> {
+            Ok(ControlHelloOk {
+                control_version: CONTROL_VERSION,
+                protocol_version: PROTOCOL_VERSION,
+                build: "mock".into(),
+                separator: '\\',
+                home: "C:\\Users\\mock".into(),
+                features: vec![feature::CONTROL.into(), feature::MACHINE_TREE.into()],
+                instance: "mock-instance".into(),
+            })
+        }
+
+        fn spawn_shell(&mut self, workspace: WorkspaceId, cwd: Option<String>) -> Result<u64> {
+            self.spawned.push((workspace, cwd));
+            let id = self.next_spawn_id;
+            self.next_spawn_id += 1;
+            Ok(id)
         }
 
         fn send_input(&mut self, pane: u64, bytes: Vec<u8>) -> Result<()> {
@@ -153,7 +145,10 @@ pub mod mock {
             Ok(0)
         }
 
-        fn events(&mut self, _on_event: &mut dyn FnMut(ControlEvent) -> Result<()>) -> Result<()> {
+        fn events(&mut self, on_event: &mut dyn FnMut(ControlEvent) -> Result<()>) -> Result<()> {
+            for event in self.events.drain(..) {
+                on_event(event)?;
+            }
             Ok(())
         }
     }

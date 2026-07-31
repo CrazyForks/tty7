@@ -103,18 +103,6 @@ pub fn workspace_of_pane(machine: &Machine, pane: u64) -> Result<&Workspace> {
         .ok_or_else(|| anyhow::anyhow!("no pane %{pane} on this machine — `tty7 pane ls` lists them"))
 }
 
-pub fn next_pane_id(machine: &Machine) -> u64 {
-    let recorded = machine.panes.iter().map(|p| p.id).max().unwrap_or(0);
-    let in_trees = machine
-        .workspaces
-        .iter()
-        .flat_map(|ws| ws.tabs.iter())
-        .flat_map(|tab| tab.root.pane_ids())
-        .max()
-        .unwrap_or(0);
-    recorded.max(in_trees) + 1
-}
-
 pub fn short_id(id: &WorkspaceId) -> String {
     id.to_string().chars().take(8).collect()
 }
@@ -184,10 +172,4 @@ mod tests {
         assert!(err.contains("%99"), "{err}");
     }
 
-    #[test]
-    fn new_pane_ids_never_collide_with_records_or_trees() {
-        let m = two_workspace_machine();
-        assert_eq!(next_pane_id(&m), 6, "highest existing pane is %5");
-        assert_eq!(next_pane_id(&Machine::default()), 1, "a fresh machine starts at %1");
-    }
 }

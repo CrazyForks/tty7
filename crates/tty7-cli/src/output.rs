@@ -1,5 +1,6 @@
 use tty7_core::core::machine::{Machine, PaneNode, Workspace};
 use tty7_core::core::session::WorkspaceId;
+use tty7_core::daemon::control::{PaneAgentState, RouteInfo, ServerStatus};
 use tty7_core::daemon::protocol::PaneProcs;
 
 use crate::resolve;
@@ -161,6 +162,60 @@ pub fn procs_tables(procs: &PaneProcs) -> String {
         out.push_str(&table(&["PORT", "PID", "NAME"], &rows));
     }
     out
+}
+
+pub fn agents_table(states: &[PaneAgentState]) -> String {
+    if states.is_empty() {
+        return "no agents running\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = states
+        .iter()
+        .map(|s| {
+            vec![
+                format!("%{}", s.pane_id),
+                s.agent
+                    .map(|a| format!("{a:?}").to_lowercase())
+                    .unwrap_or_else(|| "-".to_string()),
+                format!("{:?}", s.state.status).to_lowercase(),
+                s.state.message.clone().unwrap_or_else(|| "-".to_string()),
+            ]
+        })
+        .collect();
+    table(&["PANE", "AGENT", "STATUS", "MESSAGE"], &rows)
+}
+
+pub fn status_lines(status: &ServerStatus) -> String {
+    let rows = vec![
+        vec!["pid".to_string(), status.pid.to_string()],
+        vec!["uptime".to_string(), format!("{}s", status.uptime_secs)],
+        vec!["panes".to_string(), status.panes.to_string()],
+        vec![
+            "dialect".to_string(),
+            format!(
+                "control v{}, protocol v{}",
+                status.control_version, status.protocol_version
+            ),
+        ],
+        vec!["build".to_string(), status.build.clone()],
+        vec!["socket".to_string(), status.socket.clone()],
+    ];
+    table(&["SERVER", ""], &rows)
+}
+
+pub fn routes_table(routes: &[RouteInfo]) -> String {
+    let mut rows = vec![vec![
+        "local".to_string(),
+        "local".to_string(),
+        "yes".to_string(),
+    ]];
+    rows.extend(routes.iter().map(|r| {
+        vec![
+            r.key.clone(),
+            r.kind.clone(),
+            if r.connected { "yes" } else { "no" }.to_string(),
+        ]
+    }));
+    table(&["MACHINE", "KIND", "CONNECTED"], &rows)
 }
 
 #[cfg(test)]

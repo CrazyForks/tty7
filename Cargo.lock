@@ -9694,7 +9694,9 @@ version = "26.7.6"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "serde_json",
+ "tempfile",
  "tty7-core",
 ]
 
