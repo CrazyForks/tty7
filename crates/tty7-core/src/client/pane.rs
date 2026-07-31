@@ -73,8 +73,9 @@ impl PaneClient {
         size: WinSize,
         shell: Option<ShellSpec>,
         owner: Option<String>,
+        workspace: Option<String>,
     ) -> io::Result<PaneSession> {
-        PaneSession::spawn_over(self.open()?, cwd, size, shell, owner, OPEN_REPLY_WAIT)
+        PaneSession::spawn_over(self.open()?, cwd, size, shell, owner, workspace, OPEN_REPLY_WAIT)
     }
 
     pub fn attach(&self, pane_id: u64, size: WinSize) -> io::Result<PaneSession> {
@@ -95,6 +96,7 @@ impl PaneSession {
         size: WinSize,
         shell: Option<ShellSpec>,
         owner: Option<String>,
+        workspace: Option<String>,
         reply_wait: Duration,
     ) -> io::Result<PaneSession> {
         ClientMsg::Spawn {
@@ -102,6 +104,7 @@ impl PaneSession {
             size,
             shell,
             owner,
+            workspace,
         }
         .encode(&mut stream)?;
         let mut session = PaneSession::over(stream, 0)?;
@@ -354,9 +357,16 @@ mod tests {
             }
         });
 
-        let mut session =
-            PaneSession::spawn_over(client_end, None, size(), None, Some("unit".into()), REPLY_WAIT)
-                .expect("spawn");
+        let mut session = PaneSession::spawn_over(
+            client_end,
+            None,
+            size(),
+            None,
+            Some("unit".into()),
+            None,
+            REPLY_WAIT,
+        )
+        .expect("spawn");
         assert_eq!(session.pane_id(), 7);
 
         match session.recv().expect("first stream message") {

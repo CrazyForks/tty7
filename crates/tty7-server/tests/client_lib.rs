@@ -270,6 +270,7 @@ fn a_spawned_pane_streams_its_output_and_its_exit() {
             size(),
             Some(one_shot_shell("echo tty7_pane_roundtrip")),
             Some("client-lib-test".into()),
+            None,
         )
         .expect("spawn a one-shot pane");
     assert_ne!(session.pane_id(), 0, "the daemon must name the pane");
@@ -290,7 +291,7 @@ fn input_reaches_the_shell_and_a_reattach_replays_it() {
     let daemon = Daemon::start();
     let panes = daemon.panes();
     let mut session = panes
-        .spawn(None, size(), Some(interactive_shell()), None)
+        .spawn(None, size(), Some(interactive_shell()), None, None)
         .expect("spawn an interactive pane");
     let pane_id = session.pane_id();
     session
