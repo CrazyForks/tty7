@@ -63,6 +63,10 @@ mod imp_unix {
         let path = socket_path().ok_or_else(|| {
             io::Error::other("could not resolve daemon socket path (no config dir)")
         })?;
+        connect_endpoint_at(&path)
+    }
+
+    pub fn connect_endpoint_at(path: &Path) -> io::Result<Stream> {
         let stream = UnixStream::connect(path)?;
         tune(&stream);
         Ok(stream)
@@ -336,10 +340,7 @@ mod imp_windows {
         let (port, token) = read_port_file()
             .filter(|(p, _)| *p != 0)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no daemon port file"))?;
-        let mut stream = TcpStream::connect(loopback(port))?;
-        tune(&stream);
-        stream.write_all(&token)?;
-        Ok(stream)
+        connect_with_token(port, &token)
     }
 
     pub fn authenticate(stream: &mut Stream) -> io::Result<()> {
@@ -412,9 +413,26 @@ mod imp_windows {
         let (port, token) = read_port_file_named(file)
             .filter(|(p, _)| *p != 0)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no {file} file")))?;
+        connect_with_token(port, &token)
+    }
+
+    pub fn connect_endpoint_at(path: &std::path::Path) -> io::Result<Stream> {
+        let contents = std::fs::read_to_string(path)?;
+        let (port, token) = parse_port_file(&contents)
+            .filter(|(p, _)| *p != 0)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no listener recorded at {}", path.display()),
+                )
+            })?;
+        connect_with_token(port, &token)
+    }
+
+    fn connect_with_token(port: u16, token: &Token) -> io::Result<Stream> {
         let mut stream = TcpStream::connect(loopback(port))?;
         tune(&stream);
-        stream.write_all(&token)?;
+        stream.write_all(token)?;
         Ok(stream)
     }
 
