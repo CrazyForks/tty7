@@ -1,0 +1,33 @@
+# The thin console CLI from docs/cli-design.md: the `tty7` on the user's PATH.
+# A control/pane-protocol client of tty7-server — the GUI is never required.
+# Kept apart from the GUI binary on purpose (subsystem, upgrade file locks,
+# millisecond cold start); until the GUI bin is renamed, build this package
+# alone (`cargo build -p tty7-cli`) so the two `tty7` bins never collide.
+[package]
+name = "tty7-cli"
+version.workspace = true
+edition.workspace = true
+description = "tty7's command line: a thin client for the tty7 server — workspaces, tabs, panes, agents, no GUI required"
+repository = "https://github.com/l0ng-ai/tty7"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "tty7"
+path = "src/main.rs"
+
+[dependencies]
+# Protocol types only (ControlRequest/ReplyOk, the machine tree, PaneProcs).
+# Default features: no gssapi, no remote-install — the CLI is a client of a
+# server that already exists, it never links krb5 or an HTTP fetcher.
+tty7-core = { path = "../tty7-core" }
+
+anyhow.workspace = true
+serde_json.workspace = true
+
+# The command grammar. Not in [workspace.dependencies] because this is its only
+# user, same as the GUI package's own single-user pins (regex, memchr, …).
+clap = { version = "4", features = ["derive"] }
+
+[lints]
+workspace = true
