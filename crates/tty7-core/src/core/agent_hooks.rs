@@ -136,7 +136,7 @@ fn write_to_controlling_tty(bytes: &[u8]) -> bool {
             .iter()
             .find(|p| p.pid == pid)
             .and_then(|p| name_of(p.parent))
-            .is_some_and(|n| n == "tty7.exe")
+            .is_some_and(|n| n == "tty7-app.exe")
     });
 
     if let Some(pid) = shell {

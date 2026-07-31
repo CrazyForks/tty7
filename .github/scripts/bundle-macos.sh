@@ -25,8 +25,8 @@ APP="dist/tty7.app"
 
 rm -rf dist
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "target/${TARGET}/release/tty7" "$APP/Contents/MacOS/tty7"
-chmod +x "$APP/Contents/MacOS/tty7"
+cp "target/${TARGET}/release/tty7-app" "$APP/Contents/MacOS/tty7-app"
+chmod +x "$APP/Contents/MacOS/tty7-app"
 cp assets/tty7.icns "$APP/Contents/Resources/tty7.icns"
 # Completion signatures are loaded at runtime (not embedded), resolved relative
 # to the executable as ../Resources/completions — see terminal::signature.
@@ -44,7 +44,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>com.github.tty7</string>
     <key>CFBundleVersion</key><string>${VERSION}</string>
     <key>CFBundleShortVersionString</key><string>${VERSION}</string>
-    <key>CFBundleExecutable</key><string>tty7</string>
+    <key>CFBundleExecutable</key><string>tty7-app</string>
     <key>CFBundleIconFile</key><string>tty7</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>NSHighResolutionCapable</key><true/>
@@ -96,7 +96,7 @@ ENT
 
     # Sign inner-out: the executable first, then the bundle.
     codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" \
-        --sign "$SIGN_ID" "$APP/Contents/MacOS/tty7"
+        --sign "$SIGN_ID" "$APP/Contents/MacOS/tty7-app"
     codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" \
         --sign "$SIGN_ID" "$APP"
     codesign --verify --strict --verbose=2 "$APP"
