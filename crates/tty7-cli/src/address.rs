@@ -1,0 +1,218 @@
+use anyhow::{Result, anyhow, bail};
+use tty7_core::core::session::WorkspaceId;
+
+pub const ENV_PANE: &str = "TTY7_PANE";
+pub const ENV_WS: &str = "TTY7_WS";
+pub const ENV_SOCKET: &str = "TTY7_SOCKET";
+
+pub const OUTSIDE_SHELL: &str =
+    "not inside a tty7 shell — pass an explicit %pane/@tab/workspace";
+
+#[derive(Debug, Clone, Default)]
+pub struct Context {
+    pub pane: Option<String>,
+    pub ws: Option<String>,
+    pub socket: Option<String>,
+}
+
+impl Context {
+    pub fn from_env() -> Context {
+        Context {
+            pane: std::env::var(ENV_PANE).ok().filter(|v| !v.is_empty()),
+            ws: std::env::var(ENV_WS).ok().filter(|v| !v.is_empty()),
+            socket: std::env::var(ENV_SOCKET).ok().filter(|v| !v.is_empty()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Address {
+    Pane(u64),
+    Tab(TabAddress),
+    Workspace(WorkspaceAddress),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TabAddress {
+    Ordinal(u64),
+    Id(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceAddress {
+    Id(WorkspaceId),
+    Named(String),
+}
+
+pub fn parse(s: &str) -> Result<Address> {
+    if s.starts_with('%') {
+        return parse_pane(s).map(Address::Pane);
+    }
+    if s.starts_with('@') {
+        return parse_tab(s).map(Address::Tab);
+    }
+    Ok(Address::Workspace(parse_workspace(s)))
+}
+
+pub fn parse_pane(s: &str) -> Result<u64> {
+    let digits = s
+        .strip_prefix('%')
+        .ok_or_else(|| anyhow!("'{s}' is not a pane address — panes look like %42"))?;
+    digits
+        .parse()
+        .map_err(|_| anyhow!("'%{digits}' is not a pane address — panes look like %42"))
+}
+
+pub fn parse_tab(s: &str) -> Result<TabAddress> {
+    let body = s
+        .strip_prefix('@')
+        .ok_or_else(|| anyhow!("'{s}' is not a tab address — tabs look like @7"))?;
+    if body.is_empty() {
+        bail!("'{s}' is not a tab address — tabs look like @7");
+    }
+    if let Ok(n) = body.parse::<u64>() {
+        return Ok(TabAddress::Ordinal(n));
+    }
+    if looks_like_uuid(body) {
+        return Ok(TabAddress::Id(body.to_string()));
+    }
+    bail!("'{s}' is not a tab address — @7 as numbered by `tty7 ls`, or @<full tab id>");
+}
+
+fn looks_like_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+pub fn parse_workspace(s: &str) -> WorkspaceAddress {
+    match s.parse::<WorkspaceId>() {
+        Ok(id) => WorkspaceAddress::Id(id),
+        Err(_) => WorkspaceAddress::Named(s.to_string()),
+    }
+}
+
+pub fn pane_or_context(explicit: Option<&str>, ctx: &Context) -> Result<u64> {
+    if let Some(s) = explicit {
+        return parse_pane(s);
+    }
+    match &ctx.pane {
+        Some(v) => pane_from_env(v),
+        None => bail!(OUTSIDE_SHELL),
+    }
+}
+
+fn pane_from_env(v: &str) -> Result<u64> {
+    let digits = v.strip_prefix('%').unwrap_or(v);
+    digits
+        .parse()
+        .map_err(|_| anyhow!("{ENV_PANE}='{v}' is not a pane id; unset it or pass %pane explicitly"))
+}
+
+pub fn workspace_or_context(explicit: Option<&str>, ctx: &Context) -> Result<WorkspaceAddress> {
+    if let Some(s) = explicit {
+        return Ok(parse_workspace(s));
+    }
+    match &ctx.ws {
+        Some(v) => Ok(parse_workspace(v)),
+        None => bail!(OUTSIDE_SHELL),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shell_context() -> Context {
+        Context {
+            pane: Some("42".into()),
+            ws: Some("0d4e1a54-0000-4000-8000-000000000001".into()),
+            socket: Some("\\\\.\\pipe\\tty7".into()),
+        }
+    }
+
+    #[test]
+    fn the_three_address_shapes_parse_apart() {
+        assert_eq!(parse("%42").unwrap(), Address::Pane(42));
+        assert_eq!(parse("@7").unwrap(), Address::Tab(TabAddress::Ordinal(7)));
+        assert_eq!(
+            parse("api").unwrap(),
+            Address::Workspace(WorkspaceAddress::Named("api".into()))
+        );
+        let id = "0d4e1a54-0000-4000-8000-000000000001";
+        assert_eq!(
+            parse(id).unwrap(),
+            Address::Workspace(WorkspaceAddress::Id(id.parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn a_full_tab_id_is_also_an_address() {
+        let id = "0d4e1a54-0000-4000-8000-000000000002";
+        assert_eq!(
+            parse_tab(&format!("@{id}")).unwrap(),
+            TabAddress::Id(id.into())
+        );
+    }
+
+    #[test]
+    fn malformed_addresses_say_what_they_should_look_like() {
+        let err = parse_pane("42").unwrap_err().to_string();
+        assert!(err.contains("%42"), "the fix is shown: {err}");
+        let err = parse_pane("%abc").unwrap_err().to_string();
+        assert!(err.contains("%42"), "{err}");
+        let err = parse_tab("@build").unwrap_err().to_string();
+        assert!(err.contains("@7"), "{err}");
+    }
+
+    #[test]
+    fn omitted_addresses_fall_back_to_the_injected_context() {
+        let ctx = shell_context();
+        assert_eq!(pane_or_context(None, &ctx).unwrap(), 42);
+        assert_eq!(
+            workspace_or_context(None, &ctx).unwrap(),
+            WorkspaceAddress::Id("0d4e1a54-0000-4000-8000-000000000001".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn an_explicit_address_beats_the_context() {
+        let ctx = shell_context();
+        assert_eq!(pane_or_context(Some("%7"), &ctx).unwrap(), 7);
+    }
+
+    #[test]
+    fn env_pane_values_may_carry_the_percent_or_not() {
+        let bare = Context {
+            pane: Some("42".into()),
+            ..Context::default()
+        };
+        let marked = Context {
+            pane: Some("%42".into()),
+            ..Context::default()
+        };
+        assert_eq!(pane_or_context(None, &bare).unwrap(), 42);
+        assert_eq!(pane_or_context(None, &marked).unwrap(), 42);
+    }
+
+    #[test]
+    fn outside_a_tty7_shell_the_error_names_the_fix() {
+        let ctx = Context::default();
+        let err = pane_or_context(None, &ctx).unwrap_err().to_string();
+        assert_eq!(err, OUTSIDE_SHELL);
+        let err = workspace_or_context(None, &ctx).unwrap_err().to_string();
+        assert_eq!(err, OUTSIDE_SHELL);
+    }
+
+    #[test]
+    fn a_broken_env_pane_is_reported_not_silently_ignored() {
+        let ctx = Context {
+            pane: Some("not-a-pane".into()),
+            ..Context::default()
+        };
+        let err = pane_or_context(None, &ctx).unwrap_err().to_string();
+        assert!(err.contains("TTY7_PANE"), "{err}");
+    }
+}
