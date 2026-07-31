@@ -3,7 +3,7 @@
 ; payload and passes every path in via /D defines:
 ;
 ;   /DAppVersion=<semver>   version parsed from Cargo.toml
-;   /DStageDir=<abs path>   staged payload (tty7.exe, completions\, LICENSE.txt, README.md)
+;   /DStageDir=<abs path>   staged payload (tty7-app.exe, completions\, LICENSE.txt, README.md)
 ;   /DOutputDir=<abs path>  where the setup exe is written
 ;   /DOutputName=<basename> setup exe filename, without ".exe"
 ;
@@ -35,14 +35,14 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 LicenseFile={#StageDir}\LICENSE.txt
 SetupIconFile=..\..\assets\favicon.ico
-UninstallDisplayIcon={app}\tty7.exe
+UninstallDisplayIcon={app}\tty7-app.exe
 OutputDir={#OutputDir}
 OutputBaseFilename={#OutputName}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-; The persistent daemon (tty7.exe --daemon) is a detached background process
-; that outlives the GUI and holds the running image of tty7.exe, so Windows
+; The persistent daemon (tty7-app.exe --daemon) is a detached background process
+; that outlives the GUI and holds the running image of tty7-app.exe, so Windows
 ; locks the file and an upgrade can't replace it. We stop it explicitly in
 ; PrepareToInstall below; keep the Restart Manager as a backstop but don't let
 ; it relaunch anything (the GUI respawns the daemon itself on next start).
@@ -53,7 +53,7 @@ RestartApplications=no
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "{#StageDir}\tty7.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\tty7-app.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\completions\*"; DestDir: "{app}\completions"; Flags: ignoreversion recursesubdirs
 Source: "{#StageDir}\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -63,26 +63,26 @@ Source: "{#StageDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\server\*"; DestDir: "{app}\server"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 
 [Icons]
-Name: "{autoprograms}\tty7"; Filename: "{app}\tty7.exe"
-Name: "{autodesktop}\tty7"; Filename: "{app}\tty7.exe"; Tasks: desktopicon
+Name: "{autoprograms}\tty7"; Filename: "{app}\tty7-app.exe"
+Name: "{autodesktop}\tty7"; Filename: "{app}\tty7-app.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\tty7.exe"; Description: "{cm:LaunchProgram,tty7}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\tty7-app.exe"; Description: "{cm:LaunchProgram,tty7}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Stop the daemon before the uninstaller deletes tty7.exe — the running daemon
+; Stop the daemon before the uninstaller deletes tty7-app.exe — the running daemon
 ; is the locked image of that file, so removing it fails otherwise. This runs at
 ; the start of uninstallation, before any files are removed. The installed binary
 ; is this version, which understands the flag; runhidden suppresses any flash and
 ; the call returns without opening a window. RunOnceId keys the entry so a repeated
 ; uninstall doesn't run it twice.
-Filename: "{app}\tty7.exe"; Parameters: "--stop-daemon"; Flags: runhidden waituntilterminated; RunOnceId: "StopDaemon"
+Filename: "{app}\tty7-app.exe"; Parameters: "--stop-daemon"; Flags: runhidden waituntilterminated; RunOnceId: "StopDaemon"
 
 [Code]
-(* Gracefully stop the persistent daemon before we overwrite tty7.exe. We can't
+(* Gracefully stop the persistent daemon before we overwrite tty7-app.exe. We can't
   run the *installed* binary here — on an upgrade from an older build it may not
   understand --stop-daemon and would launch the GUI instead — so we extract the
-  *new* tty7.exe to {tmp} and run that. It connects to the running daemon, hangs
+  *new* tty7-app.exe to {tmp} and run that. It connects to the running daemon, hangs
   up every shell, waits for it to exit (releasing the file lock), then returns
   without opening a window. Best effort: any failure falls through to the Restart
   Manager backstop, and a fresh install simply has no daemon to stop. *)
@@ -90,8 +90,8 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
-  ExtractTemporaryFile('tty7.exe');
-  Exec(ExpandConstant('{tmp}\tty7.exe'), '--stop-daemon', '',
+  ExtractTemporaryFile('tty7-app.exe');
+  Exec(ExpandConstant('{tmp}\tty7-app.exe'), '--stop-daemon', '',
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
 end;

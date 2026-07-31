@@ -7,10 +7,10 @@ repository = "https://github.com/l0ng-ai/tty7"
 license = "Apache-2.0"
 readme = "README.md"
 publish = false
-default-run = "tty7"
+default-run = "tty7-app"
 
 [[bin]]
-name = "tty7"
+name = "tty7-app"
 path = "src/main.rs"
 
 [dependencies]

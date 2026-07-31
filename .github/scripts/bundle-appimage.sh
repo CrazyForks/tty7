@@ -52,8 +52,8 @@ APPDIR="dist/AppDir"
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin"
 
-cp "target/${TARGET}/release/tty7" "$APPDIR/usr/bin/tty7"
-chmod +x "$APPDIR/usr/bin/tty7"
+cp "target/${TARGET}/release/tty7-app" "$APPDIR/usr/bin/tty7-app"
+chmod +x "$APPDIR/usr/bin/tty7-app"
 
 # A desktop entry + icon are mandatory AppImage metadata; linuxdeploy places
 # them and generates AppRun. Icon basename must match the desktop's Icon= key.
@@ -62,7 +62,7 @@ cat > "$TOOLS/tty7.desktop" <<'DESKTOP'
 Type=Application
 Name=tty7
 Comment=A fast, native terminal
-Exec=tty7
+Exec=tty7-app
 Icon=tty7
 Categories=System;TerminalEmulator;
 Terminal=false
@@ -76,7 +76,7 @@ convert assets/app-icon.png -resize 256x256 "$TOOLS/tty7.png"
 # install the desktop/icon into their standard locations.
 "$LINUXDEPLOY" \
   --appdir "$APPDIR" \
-  --executable "$APPDIR/usr/bin/tty7" \
+  --executable "$APPDIR/usr/bin/tty7-app" \
   --desktop-file "$TOOLS/tty7.desktop" \
   --icon-file "$TOOLS/tty7.png"
 

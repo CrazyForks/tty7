@@ -8,7 +8,7 @@ SELF=${0:A}
 HERE=${SELF:h}
 REPO=${HERE:h:h}
 WORK=${TTY7_BENCH_DIR:-$REPO/.bench}
-TTY7_BIN=${TTY7_BIN:-$REPO/target/release/tty7}
+TTY7_BIN=${TTY7_BIN:-$REPO/target/release/tty7-app}
 RUNS=${1:-3}
 R=$WORK/results
 mkdir -p $R

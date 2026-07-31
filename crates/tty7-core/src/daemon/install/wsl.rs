@@ -1103,7 +1103,7 @@ mod tests {
 
     #[test]
     fn the_search_order_is_specific_first_and_deduplicated() {
-        let exe = PathBuf::from("/opt/tty7/bin/tty7.exe");
+        let exe = PathBuf::from("/opt/tty7/bin/tty7-app.exe");
         let dirs = bundled_search_dirs(Some(&exe), None);
         assert_eq!(dirs[0], PathBuf::from("/opt/tty7/bin/server"));
         assert_eq!(dirs[1], PathBuf::from("/opt/tty7/bin"));

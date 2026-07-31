@@ -5,7 +5,7 @@
 #     (Program Files or per-user, Start Menu shortcut, "Apps" uninstall entry)
 #
 # Fonts are embedded via include_bytes! and the app icon is compiled into the
-# executable as a resource (see build.rs). So the payload is tty7.exe plus a
+# executable as a resource (see build.rs). So the payload is tty7-app.exe plus a
 # sibling completions\ dir (loaded at runtime — see terminal::signature) and the
 # license/readme. Both artifacts are unsigned builds — SmartScreen will
 # warn on first launch.
@@ -20,7 +20,7 @@ $Stage = "dist/$Name"
 Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 
-Copy-Item "target/$Target/release/tty7.exe" "$Stage/tty7.exe"
+Copy-Item "target/$Target/release/tty7-app.exe" "$Stage/tty7-app.exe"
 New-Item -ItemType Directory -Force -Path "$Stage/completions" | Out-Null
 Copy-Item "assets/completions/*.json" "$Stage/completions/"
 Copy-Item LICENSE "$Stage/LICENSE.txt"
@@ -29,7 +29,7 @@ Copy-Item README.md "$Stage/README.md"
 # The Linux musl `tty7-server`, staged at server/ so a WSL distro can be handed
 # the binary this client shipped with (WSL downloads nothing). The
 # lookup path is a contract with `daemon::install::wsl` — it searches
-# <dir of tty7.exe>/server/<asset> first — so this directory name is not free to
+# <dir of tty7-app.exe>/server/<asset> first — so this directory name is not free to
 # change on its own. Missing is a warning, not an error, matching `server-musl`'s
 # own skip-don't-fail probe; WSL then fails at connect time with a message
 # naming the directories it searched.
