@@ -28,6 +28,10 @@ pub enum Outcome {
     Exit(i32),
 }
 
+pub const EXIT_CODE_UNKNOWN: &str =
+    "the command exited but its real exit code could not be determined — exiting 1 as a \
+     stand-in, not as the command's own code";
+
 fn report(human: impl Into<String>, json: Value) -> Result<Outcome> {
     Ok(Outcome::Report(Report {
         human: human.into(),
@@ -37,6 +41,7 @@ fn report(human: impl Into<String>, json: Value) -> Result<Outcome> {
 
 pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
     let json_mode = cli.json;
+    let machine = cli.machine.clone();
     match cli.command {
         None => launch_gui(cli.path),
         Some(Command::Ls) | Some(Command::Ws(WsCmd::Ls)) => ws_ls(backend),
@@ -77,12 +82,35 @@ pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Out
             "managing machine links from the CLI is not implemented yet — \
              use the GUI's connection manager for now"
         ),
-        Some(Command::Server(ServerCmd::Start)) => crate::server::start(),
-        Some(Command::Server(ServerCmd::Stop)) => crate::server::stop(),
-        Some(Command::Server(ServerCmd::Restart)) => crate::server::restart(),
-        Some(Command::Server(ServerCmd::Logs)) => crate::server::logs(),
+        Some(Command::Server(ServerCmd::Start)) => {
+            local_server(machine.as_deref(), "start", crate::server::start)
+        }
+        Some(Command::Server(ServerCmd::Stop)) => {
+            local_server(machine.as_deref(), "stop", crate::server::stop)
+        }
+        Some(Command::Server(ServerCmd::Restart)) => {
+            local_server(machine.as_deref(), "restart", crate::server::restart)
+        }
+        Some(Command::Server(ServerCmd::Logs)) => {
+            local_server(machine.as_deref(), "logs", crate::server::logs)
+        }
         Some(Command::Doctor) => doctor(ctx, backend),
     }
+}
+
+fn local_server(
+    machine: Option<&str>,
+    verb: &str,
+    act: fn() -> Result<Outcome>,
+) -> Result<Outcome> {
+    if let Some(machine) = machine {
+        bail!(
+            "`tty7 server {verb}` manages only the server on THIS machine — with -m {machine} \
+             it would still have acted on the LOCAL server, so it was refused; a remote \
+             machine's server lifecycle is handled by the install/reconnect flows, not the CLI"
+        );
+    }
+    act()
 }
 
 fn launch_gui(path: Option<String>) -> Result<Outcome> {
@@ -224,7 +252,7 @@ fn attach(target: &str, backend: &mut dyn Backend) -> Result<Outcome> {
     match address::parse(target)? {
         Address::Pane(pane) => {
             backend.attach_pane(pane)?;
-            report("", json!({ "detached_from": pane }))
+            report("", json!({ "attached": pane }))
         }
         Address::Workspace(addr) => ws_attach(addr, backend),
         Address::Tab(_) => bail!("attach takes a %pane or a workspace, not a tab"),
@@ -239,13 +267,39 @@ fn run(args: RunArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcom
         }
         None => ctx.ws.as_deref().and_then(|v| v.parse::<WorkspaceId>().ok()),
     };
-    let code = backend.run(RunSpec {
+    if args.keep && workspace.is_none() {
+        bail!(
+            "`run --keep` keeps the pane alive, so it must be filed into a workspace — \
+             pass --ws, or run inside a tty7 shell where $TTY7_WS names one"
+        );
+    }
+    let pane = backend.run_spawn(RunSpec {
         workspace,
-        cwd: args.cwd,
+        cwd: args.cwd.clone(),
         command: args.cmd,
         keep: args.keep,
     })?;
-    Ok(Outcome::Exit(code))
+    if args.keep {
+        let workspace = workspace.expect("checked above: --keep requires a workspace");
+        backend.control(ControlRequest::TabCreate {
+            workspace,
+            at: None,
+            pane: PaneSeed {
+                pane,
+                cwd: args.cwd,
+                ssh_spec: None,
+                agent: None,
+            },
+            tab: None,
+        })?;
+    }
+    match backend.run_wait()? {
+        Some(code) => Ok(Outcome::Exit(code)),
+        None => {
+            eprintln!("tty7: {EXIT_CODE_UNKNOWN}");
+            Ok(Outcome::Exit(1))
+        }
+    }
 }
 
 fn pane_split(args: SplitArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
@@ -991,6 +1045,116 @@ mod tests {
             }]
         );
         assert!(matches!(out, Outcome::Exit(0)), "run's outcome is the child's exit code");
+    }
+
+    #[test]
+    fn run_keep_spawns_first_then_files_the_pane_into_the_workspace() {
+        let mut backend = mock();
+        let api = backend.machine.workspaces[0].id;
+        let out = execute(
+            cli(&[
+                "tty7", "run", "--keep", "--ws", "api", "--cwd", "C:\\proj", "--", "cargo",
+                "watch",
+            ]),
+            &Context::default(),
+            &mut backend,
+        )
+        .unwrap();
+        assert_eq!(
+            backend.control_calls,
+            vec![
+                ControlRequest::MachineGet,
+                ControlRequest::TabCreate {
+                    workspace: api,
+                    at: None,
+                    pane: PaneSeed {
+                        pane: 6,
+                        cwd: Some("C:\\proj".into()),
+                        ssh_spec: None,
+                        agent: None,
+                    },
+                    tab: None,
+                },
+            ],
+            "the daemon-assigned pane id (6) lands in the tree op, so the spawn came first"
+        );
+        assert_eq!(
+            backend.runs,
+            vec![RunSpec {
+                workspace: Some(api),
+                cwd: Some("C:\\proj".into()),
+                command: vec!["cargo".into(), "watch".into()],
+                keep: true,
+            }]
+        );
+        assert!(matches!(out, Outcome::Exit(0)));
+    }
+
+    #[test]
+    fn run_without_keep_files_nothing() {
+        let mut backend = mock();
+        let out = execute(
+            cli(&["tty7", "run", "--", "cargo", "test"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .unwrap();
+        assert!(
+            backend.control_calls.is_empty(),
+            "a reaped pane must not be filed into the tree"
+        );
+        assert_eq!(backend.runs.len(), 1);
+        assert!(matches!(out, Outcome::Exit(0)));
+    }
+
+    #[test]
+    fn run_keep_without_a_workspace_names_the_fix() {
+        let mut backend = mock();
+        let err = execute(
+            cli(&["tty7", "run", "--keep", "--", "make"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .expect_err("a kept pane with no workspace would be an unlisted orphan");
+        assert!(err.to_string().contains("--ws"), "{err}");
+        assert!(backend.runs.is_empty(), "nothing must be spawned");
+    }
+
+    #[test]
+    fn a_missing_exit_code_still_exits_nonzero_via_the_note_path() {
+        let mut backend = mock();
+        backend.run_exit = None;
+        let out = execute(
+            cli(&["tty7", "run", "--", "make"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .unwrap();
+        assert!(
+            matches!(out, Outcome::Exit(1)),
+            "an unknown exit code is still a failure"
+        );
+        assert!(EXIT_CODE_UNKNOWN.contains("could not be determined"));
+    }
+
+    #[test]
+    fn a_machine_flag_refuses_the_local_server_verbs() {
+        for verb in ["start", "stop", "restart", "logs"] {
+            let mut backend = mock();
+            let err = execute(
+                cli(&["tty7", "-m", "devbox", "server", verb]),
+                &Context::default(),
+                &mut backend,
+            )
+            .expect_err("server lifecycle verbs are local-only");
+            let msg = err.to_string();
+            assert!(msg.contains("LOCAL"), "{msg}");
+            assert!(msg.contains(verb), "{msg}");
+            assert!(
+                backend.control_calls.is_empty(),
+                "the refusal must come before any dial"
+            );
+        }
     }
 
     #[test]

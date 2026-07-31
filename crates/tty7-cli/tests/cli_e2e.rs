@@ -24,8 +24,10 @@ fn main() {
         ("ls_on_an_empty_server", ls_on_an_empty_server),
         ("new_builds_a_workspace_with_a_live_pane", new_builds_a_workspace_with_a_live_pane),
         ("run_streams_output_and_passes_the_exit_code", run_streams_output_and_passes_the_exit_code),
+        ("run_keep_files_the_pane_so_ls_shows_it", run_keep_files_the_pane_so_ls_shows_it),
         ("send_then_capture_round_trip", send_then_capture_round_trip),
         ("status_reports_the_live_server", status_reports_the_live_server),
+        ("status_answers_over_tty7_socket_alone", status_answers_over_tty7_socket_alone),
         ("events_stream_reports_a_workspace_creation", events_stream_reports_a_workspace_creation),
     ];
 
@@ -51,6 +53,8 @@ fn main() {
 struct Daemon {
     child: Child,
     dir: tempfile::TempDir,
+    #[cfg(windows)]
+    _job: job::Job,
 }
 
 impl Daemon {
@@ -67,7 +71,14 @@ impl Daemon {
             .stderr(Stdio::null())
             .spawn()
             .expect("start the in-test tty7 server");
-        let daemon = Daemon { child, dir };
+        #[cfg(windows)]
+        let _job = job::Job::kill_on_close(&child);
+        let daemon = Daemon {
+            child,
+            dir,
+            #[cfg(windows)]
+            _job,
+        };
         daemon.await_ready();
         daemon
     }
@@ -153,6 +164,56 @@ impl Drop for Daemon {
     }
 }
 
+#[cfg(windows)]
+mod job {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::process::Child;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    pub struct Job(HANDLE);
+
+    impl Job {
+        pub fn kill_on_close(child: &Child) -> Job {
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                assert!(!handle.is_null(), "CreateJobObjectW failed");
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                assert_ne!(
+                    SetInformationJobObject(
+                        handle,
+                        JobObjectExtendedLimitInformation,
+                        (&raw const info).cast(),
+                        size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    ),
+                    0,
+                    "SetInformationJobObject failed"
+                );
+                assert_ne!(
+                    AssignProcessToJobObject(handle, child.as_raw_handle()),
+                    0,
+                    "AssignProcessToJobObject failed"
+                );
+                Job(handle)
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 fn workdir() -> String {
     std::env::temp_dir().display().to_string()
 }
@@ -208,6 +269,74 @@ fn run_streams_output_and_passes_the_exit_code(daemon: &Daemon) {
         Some(7),
         "the child's exit code must pass through: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn run_keep_files_the_pane_so_ls_shows_it(daemon: &Daemon) {
+    let ws = daemon.run_json(&["ws", "new", "runws"]);
+    let ws_id = ws["id"].as_str().expect("ws new prints the id").to_string();
+
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--keep".into(),
+        "--ws".into(),
+        ws_id.clone(),
+        "--".into(),
+    ];
+    args.extend(one_shot("echo tty7_e2e_keep_marker"));
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = daemon.run(&arg_refs);
+    assert!(
+        out.status.success(),
+        "run --keep failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let listed = daemon.run_json(&["ls"]);
+    let workspaces = listed["workspaces"].as_array().expect("ls --json lists workspaces");
+    let ours = workspaces
+        .iter()
+        .find(|w| w["id"].as_str() == Some(ws_id.as_str()))
+        .unwrap_or_else(|| panic!("the target workspace is missing from ls: {listed}"));
+    assert_eq!(
+        ours["panes"].as_u64(),
+        Some(1),
+        "the kept pane must be filed where every listing sees it: {listed}"
+    );
+
+    let panes = daemon.run_json(&["pane", "ls", &ws_id]);
+    let filed = panes["panes"].as_array().expect("pane ls --json lists panes");
+    assert_eq!(filed.len(), 1, "{panes}");
+    assert!(
+        filed[0]["pane"].as_u64().is_some_and(|p| p >= 1),
+        "{panes}"
+    );
+}
+
+fn status_answers_over_tty7_socket_alone(daemon: &Daemon) {
+    let out = Command::new(env!("CARGO_BIN_EXE_tty7"))
+        .args(["status", "--json"])
+        .env_remove("TTY7_CONFIG_DIR")
+        .env_remove("TTY7_DATA_DIR")
+        .env_remove("TTY7_CONTROL_SOCK")
+        .env_remove("TTY7_PANE")
+        .env_remove("TTY7_WS")
+        .env("TTY7_SOCKET", daemon.control_endpoint())
+        .output()
+        .expect("run tty7 status with only TTY7_SOCKET");
+    assert!(
+        out.status.success(),
+        "status over TTY7_SOCKET failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("status --json prints one JSON object");
+    assert_eq!(
+        status["pid"].as_u64(),
+        Some(u64::from(daemon.child.id())),
+        "the answer must come from the isolated daemon TTY7_SOCKET points at: {status}"
     );
 }
 
