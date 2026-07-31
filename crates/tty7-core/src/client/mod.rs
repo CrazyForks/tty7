@@ -7,7 +7,9 @@ pub use pane::{PaneClient, PaneInput, PaneOutput, PaneSession};
 pub use crate::daemon::control::{
     ControlEvent, ControlHello, ControlHelloOk, ControlRequest, ControlResponse, ReplyOk,
 };
-pub use crate::daemon::protocol::{DaemonMsg, DaemonVersion, PaneInfo, ShellSpec, WinSize};
+pub use crate::daemon::protocol::{
+    DaemonMsg, DaemonVersion, PaneInfo, PaneProcs, ShellSpec, WinSize,
+};
 pub use crate::daemon::router::RouteTarget;
 
 #[cfg(test)]
