@@ -158,12 +158,9 @@ impl Backend for RealBackend {
     }
 
     fn send_input(&mut self, pane: u64, bytes: Vec<u8>) -> Result<()> {
-        let mut session = self
-            .pane_client()?
-            .attach(pane, SESSION_SIZE)
-            .with_context(|| format!("attaching to pane %{pane}"))?;
-        session.input(&bytes)?;
-        session.detach()?;
+        self.pane_client()?
+            .send_input(pane, &bytes)
+            .with_context(|| format!("sending input to pane %{pane}"))?;
         Ok(())
     }
 
