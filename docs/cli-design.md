@@ -93,6 +93,9 @@ PATH 上的 CLI 与 GUI 版本一致性;agent hooks 安装状态;每条 remote l
 
 - `run` = Spawn(带 cwd/ws)→ 订阅 Output 流 → Exited{code} 透传;`--keep` 保留 pane,默认退出即收。
 - `attach` = pane socket Attach + Snapshot 回放 + 双向 raw mode(termios/ConPTY),detach 键约定 `C-\ C-\`。
+  **决定:暂不实现。** CLI 的主用户是 coding agent(run/send/capture/events 已覆盖);attach 只服务
+  "无 GUI 的机器上人要接管 shell"这一个场景,底层(PaneSession 双半泵、Observe、Snapshot 回放)已就绪,
+  要用时补一个 raw-mode 控制台模块即可。现状:`tty7 attach` 明确报未实现。
 - CLI 的 control/pane 客户端代码在 tty7-core 里已有(验收测试的 control-client 即此),抽成 `tty7_core::client` 共享。
 
 ### 新增 —— 真缺口,都是小改
