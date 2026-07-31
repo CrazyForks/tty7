@@ -249,8 +249,7 @@ fn control_requests_build_the_tree_and_events_reach_the_other_client() {
         );
         match watcher.next_event(remaining) {
             Some(ControlEvent::Layout { workspace, delta })
-                if workspace == key
-                    && matches!(delta, LayoutDelta::WorkspaceCreated { .. }) =>
+                if workspace == key && matches!(delta, LayoutDelta::WorkspaceCreated { .. }) =>
             {
                 break;
             }

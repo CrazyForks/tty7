@@ -118,7 +118,15 @@ impl PaneClient {
         owner: Option<String>,
         workspace: Option<String>,
     ) -> io::Result<PaneSession> {
-        PaneSession::spawn_over(self.open()?, cwd, size, shell, owner, workspace, OPEN_REPLY_WAIT)
+        PaneSession::spawn_over(
+            self.open()?,
+            cwd,
+            size,
+            shell,
+            owner,
+            workspace,
+            OPEN_REPLY_WAIT,
+        )
     }
 
     pub fn attach(&self, pane_id: u64, size: WinSize) -> io::Result<PaneSession> {
@@ -155,9 +163,12 @@ impl PaneSession {
         }
         .encode(&mut stream)?;
         let mut session = PaneSession::over(stream, 0)?;
-        session.set_recv_timeout(Some(reply_wait))?;
+        // Best effort, deliberately not `?`: see `checked` — a daemon that has
+        // already refused and hung up makes setsockopt fail, and that must not
+        // become the error the caller sees instead of the refusal itself.
+        let _ = session.set_recv_timeout(Some(reply_wait));
         let first = session.recv();
-        session.set_recv_timeout(None)?;
+        let _ = session.set_recv_timeout(None);
         match first {
             Ok(DaemonMsg::Spawned { pane_id }) => {
                 session.input.pane_id = pane_id;
@@ -202,9 +213,17 @@ impl PaneSession {
         reply_wait: Duration,
     ) -> io::Result<PaneSession> {
         let mut session = PaneSession::over(stream, pane_id)?;
-        session.set_recv_timeout(Some(reply_wait))?;
+        // Best effort, deliberately not `?`. The daemon answers a bad request by
+        // writing one Error frame and closing immediately; on macOS setsockopt
+        // against a socket whose peer is already gone fails with EINVAL. Letting
+        // that propagate replaces "no such pane 42" — which is sitting in our
+        // buffer right now — with "Invalid argument", the least useful thing we
+        // could tell the caller. If the timeout does not take, the read below
+        // still cannot hang: a closed peer returns EOF at once, and a peer
+        // that is alive is exactly the case where setsockopt succeeds.
+        let _ = session.set_recv_timeout(Some(reply_wait));
         let verdict = session.output.refusal_check(request, pane_id);
-        session.set_recv_timeout(None)?;
+        let _ = session.set_recv_timeout(None);
         verdict?;
         Ok(session)
     }
