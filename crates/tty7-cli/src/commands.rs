@@ -2,9 +2,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use tty7_core::core::machine::{Axis, Machine, PaneSeed, Workspace};
 use tty7_core::core::session::WorkspaceId;
-use tty7_core::daemon::control::{
-    CONTROL_VERSION, ControlEvent, ControlRequest, ReplyOk,
-};
+use tty7_core::daemon::control::{CONTROL_VERSION, ControlEvent, ControlRequest, ReplyOk};
 use tty7_core::daemon::protocol::PROTOCOL_VERSION;
 
 use crate::address::{self, Context, WorkspaceAddress};
@@ -25,11 +23,12 @@ pub struct Report {
 #[derive(Debug)]
 pub enum Outcome {
     Report(Report),
-    Exit(i32),
+    /// A verb that stands in for a child process: the code is the CLI's own
+    /// exit status. The report comes too, so `--json` still answers here.
+    Exit(i32, Report),
 }
 
-pub const EXIT_CODE_UNKNOWN: &str =
-    "the command exited but its real exit code could not be determined — exiting 1 as a \
+pub const EXIT_CODE_UNKNOWN: &str = "the command exited but its real exit code could not be determined — exiting 1 as a \
      stand-in, not as the command's own code";
 
 fn report(human: impl Into<String>, json: Value) -> Result<Outcome> {
@@ -70,8 +69,10 @@ pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Out
         Some(Command::Tab(TabCmd::Close { tab })) => tab_close(&tab, backend),
         Some(Command::Tab(TabCmd::Rename { tab, name })) => tab_rename(&tab, name, backend),
         Some(Command::Tab(TabCmd::Move { tab, index })) => tab_move(&tab, index, backend),
-        Some(Command::Pane(PaneCmd::Ls { ws })) => pane_ls(ws.as_deref(), backend),
-        Some(Command::Pane(PaneCmd::Close { target })) => pane_close(target.as_deref(), ctx, backend),
+        Some(Command::Pane(PaneCmd::Ls { ws, all })) => pane_ls(ws.as_deref(), all, backend),
+        Some(Command::Pane(PaneCmd::Close { target })) => {
+            pane_close(target.as_deref(), ctx, backend)
+        }
         Some(Command::Events) => events(json_mode, backend),
         Some(Command::Agents) => agents(backend),
         Some(Command::Status) | Some(Command::Server(ServerCmd::Status)) => status(backend),
@@ -81,24 +82,37 @@ pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Out
             "managing machine links from the CLI is not implemented yet — \
              use the GUI's connection manager for now"
         ),
-        Some(Command::Server(ServerCmd::Start)) => {
-            local_server(machine.as_deref(), "start", crate::server::start)
-        }
-        Some(Command::Server(ServerCmd::Stop)) => {
-            local_server(machine.as_deref(), "stop", crate::server::stop)
-        }
-        Some(Command::Server(ServerCmd::Restart)) => {
-            local_server(machine.as_deref(), "restart", crate::server::restart)
-        }
-        Some(Command::Server(ServerCmd::Logs)) => {
-            local_server(machine.as_deref(), "logs", crate::server::logs)
-        }
+        Some(Command::Server(ServerCmd::Start)) => local_server(
+            machine.as_deref(),
+            ctx.socket.as_deref(),
+            "start",
+            crate::server::start,
+        ),
+        Some(Command::Server(ServerCmd::Stop)) => local_server(
+            machine.as_deref(),
+            ctx.socket.as_deref(),
+            "stop",
+            crate::server::stop,
+        ),
+        Some(Command::Server(ServerCmd::Restart)) => local_server(
+            machine.as_deref(),
+            ctx.socket.as_deref(),
+            "restart",
+            crate::server::restart,
+        ),
+        Some(Command::Server(ServerCmd::Logs)) => local_server(
+            machine.as_deref(),
+            ctx.socket.as_deref(),
+            "logs",
+            crate::server::logs,
+        ),
         Some(Command::Doctor) => doctor(ctx, backend),
     }
 }
 
 fn local_server(
     machine: Option<&str>,
+    socket: Option<&str>,
     verb: &str,
     act: fn() -> Result<Outcome>,
 ) -> Result<Outcome> {
@@ -109,6 +123,7 @@ fn local_server(
              machine's server lifecycle is handled by the install/reconnect flows, not the CLI"
         );
     }
+    crate::server::only_the_default_endpoint(socket, verb)?;
     act()
 }
 
@@ -145,11 +160,7 @@ fn ws_ls(backend: &mut dyn Backend) -> Result<Outcome> {
     )
 }
 
-fn resolve_ws(
-    explicit: Option<&str>,
-    ctx: &Context,
-    machine: &Machine,
-) -> Result<WorkspaceId> {
+fn resolve_ws(explicit: Option<&str>, ctx: &Context, machine: &Machine) -> Result<WorkspaceId> {
     let addr = address::workspace_or_context(explicit, ctx)?;
     Ok(resolve::workspace(machine, &addr)?.id)
 }
@@ -253,7 +264,10 @@ fn run(args: RunArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcom
             let machine = fetch_machine(backend)?;
             Some(resolve::workspace(&machine, &address::parse_workspace(explicit))?.id)
         }
-        None => ctx.ws.as_deref().and_then(|v| v.parse::<WorkspaceId>().ok()),
+        None => ctx
+            .ws
+            .as_deref()
+            .and_then(|v| v.parse::<WorkspaceId>().ok()),
     };
     if args.keep && workspace.is_none() {
         bail!(
@@ -281,13 +295,29 @@ fn run(args: RunArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcom
             tab: None,
         })?;
     }
-    match backend.run_wait()? {
-        Some(code) => Ok(Outcome::Exit(code)),
+    let (code, exact) = match backend.run_wait()? {
+        Some(code) => (code, true),
         None => {
             eprintln!("tty7: {EXIT_CODE_UNKNOWN}");
-            Ok(Outcome::Exit(1))
+            (1, false)
         }
-    }
+    };
+    // The command's own output already went to stdout as it streamed, so the
+    // human report is empty — but --json still owes the caller a machine
+    // readable answer, and `exit_code_known` is how it tells a real 1 from the
+    // stand-in above.
+    Ok(Outcome::Exit(
+        code,
+        Report {
+            human: String::new(),
+            json: json!({
+                "pane": pane,
+                "exit": code,
+                "exit_code_known": exact,
+                "kept": args.keep,
+            }),
+        },
+    ))
 }
 
 fn pane_split(args: SplitArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
@@ -337,7 +367,10 @@ fn send(args: SendArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
         bytes.push(b'\r');
     }
     backend.send_input(pane, bytes)?;
-    report("", json!({ "pane": pane, "sent": text, "enter": args.enter }))
+    report(
+        "",
+        json!({ "pane": pane, "sent": text, "enter": args.enter }),
+    )
 }
 
 fn capture(args: CaptureArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
@@ -450,7 +483,10 @@ fn tab_move(tab: &str, index: u64, backend: &mut dyn Backend) -> Result<Outcome>
     report("", json!({ "tab": tab.to_string(), "to": index }))
 }
 
-fn pane_ls(explicit: Option<&str>, backend: &mut dyn Backend) -> Result<Outcome> {
+fn pane_ls(explicit: Option<&str>, all: bool, backend: &mut dyn Backend) -> Result<Outcome> {
+    if all {
+        return pane_ls_all(backend);
+    }
     let machine = fetch_machine(backend)?;
     let only = match explicit {
         Some(s) => Some(resolve::workspace(&machine, &address::parse_workspace(s))?.id),
@@ -474,14 +510,67 @@ fn pane_ls(explicit: Option<&str>, backend: &mut dyn Backend) -> Result<Outcome>
             }
         }
     }
-    report(output::pane_table(&machine, only), json!({ "panes": panes }))
+    report(
+        output::pane_table(&machine, only),
+        json!({ "panes": panes }),
+    )
+}
+
+/// The registry's own list, annotated with the workspace holding each pane.
+/// Panes with no holder are the ones every tree-walking listing misses: an
+/// interrupted `tty7 run` leaves its pane running with nothing referencing it,
+/// and until it shows up here there is no way to find or stop it.
+fn pane_ls_all(backend: &mut dyn Backend) -> Result<Outcome> {
+    let machine = fetch_machine(backend)?;
+    let running = backend.list_panes()?;
+    let held: Vec<(u64, WorkspaceId)> = machine
+        .workspaces
+        .iter()
+        .flat_map(|ws| ws.tabs.iter().map(move |tab| (ws.id, tab)))
+        .flat_map(|(id, tab)| tab.root.pane_ids().into_iter().map(move |pane| (pane, id)))
+        .collect();
+    let holder = |pane: u64| held.iter().find(|(p, _)| *p == pane).map(|(_, ws)| *ws);
+
+    let panes: Vec<Value> = running
+        .iter()
+        .map(|info| {
+            json!({
+                "pane": info.pane_id,
+                "workspace": holder(info.pane_id).map(|ws| ws.to_string()),
+                "orphan": holder(info.pane_id).is_none(),
+                "owner": info.owner,
+                "title": info.title,
+                "cwd": info.cwd,
+                "live": info.alive,
+            })
+        })
+        .collect();
+    let orphans = running
+        .iter()
+        .filter(|info| holder(info.pane_id).is_none())
+        .count();
+    let mut human = output::registry_table(&running, &|pane| holder(pane).map(|ws| ws.to_string()));
+    if orphans > 0 {
+        human.push_str(&format!(
+            "\n{orphans} pane(s) held by no workspace — `tty7 pane close %<id>` stops one\n"
+        ));
+    }
+    report(human, json!({ "panes": panes, "orphans": orphans }))
 }
 
 fn pane_close(target: Option<&str>, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
     let pane = address::pane_or_context(target, ctx)?;
     let machine = fetch_machine(backend)?;
-    let workspace = resolve::workspace_of_pane(&machine, pane)?.id;
-    backend.control(ControlRequest::PaneClose { workspace, pane })?;
+    match resolve::workspace_of_pane(&machine, pane) {
+        Ok(ws) => {
+            let workspace = ws.id;
+            backend.control(ControlRequest::PaneClose { workspace, pane })?;
+        }
+        // No workspace holds it, so PaneClose has nothing to route through.
+        // Hang it up directly instead of refusing — this is exactly the orphan
+        // `pane ls --all` just pointed the user at.
+        Err(_) => backend.kill_pane(pane)?,
+    }
     report("", json!({ "closed": pane }))
 }
 
@@ -529,9 +618,10 @@ fn agents(backend: &mut dyn Backend) -> Result<Outcome> {
 
 fn status(backend: &mut dyn Backend) -> Result<Outcome> {
     match backend.control(ControlRequest::Status)? {
-        ReplyOk::Status(status) => {
-            report(output::status_lines(&status), serde_json::to_value(&status)?)
-        }
+        ReplyOk::Status(status) => report(
+            output::status_lines(&status),
+            serde_json::to_value(&status)?,
+        ),
         other => bail!("the server answered Status with {other:?}"),
     }
 }
@@ -570,7 +660,10 @@ fn doctor(ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
                     hello.control_version, hello.protocol_version
                 )
             };
-            rows.push(vec!["server".to_string(), format!("ok (build {})", hello.build)]);
+            rows.push(vec![
+                "server".to_string(),
+                format!("ok (build {})", hello.build),
+            ]);
             rows.push(vec!["dialect".to_string(), dialect]);
             let status = match backend.control(ControlRequest::Status)? {
                 ReplyOk::Status(status) => status,
@@ -646,8 +739,123 @@ mod tests {
     fn human(outcome: Outcome) -> String {
         match outcome {
             Outcome::Report(r) => r.human,
-            Outcome::Exit(code) => panic!("expected a report, got exit {code}"),
+            Outcome::Exit(code, _) => panic!("expected a report, got exit {code}"),
         }
+    }
+
+    fn json_of(outcome: Outcome) -> Value {
+        match outcome {
+            Outcome::Report(r) => r.json,
+            Outcome::Exit(code, _) => panic!("expected a report, got exit {code}"),
+        }
+    }
+
+    fn pane_info(pane_id: u64, owner: Option<&str>) -> tty7_core::daemon::protocol::PaneInfo {
+        tty7_core::daemon::protocol::PaneInfo {
+            pane_id,
+            cwd: None,
+            title: "sh".into(),
+            alive: true,
+            owner: owner.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn pane_ls_all_surfaces_the_panes_no_workspace_holds() {
+        let mut backend = mock();
+        // %1 and %3 are in the tree (see two_workspace_machine); %77 is what an
+        // interrupted `tty7 run` leaves behind.
+        backend.registry = vec![
+            pane_info(1, None),
+            pane_info(3, None),
+            pane_info(77, Some("tty7-cli")),
+        ];
+
+        let out = run_cli(
+            &["tty7", "pane", "ls", "--all"],
+            &Context::default(),
+            &mut backend,
+        );
+        let json = json_of(out);
+        assert_eq!(json["orphans"], serde_json::json!(1), "{json}");
+
+        let orphan = json["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["pane"] == serde_json::json!(77))
+            .expect("the orphan is listed");
+        assert_eq!(orphan["orphan"], serde_json::json!(true));
+        assert!(
+            orphan["workspace"].is_null(),
+            "no workspace holds it: {orphan}"
+        );
+        assert_eq!(orphan["owner"], serde_json::json!("tty7-cli"), "{orphan}");
+
+        let filed = json["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["pane"] == serde_json::json!(1))
+            .expect("the filed pane is listed too");
+        assert_eq!(filed["orphan"], serde_json::json!(false));
+        assert!(!filed["workspace"].is_null(), "{filed}");
+    }
+
+    #[test]
+    fn pane_ls_without_all_cannot_see_an_orphan() {
+        let mut backend = mock();
+        backend.registry = vec![pane_info(77, Some("tty7-cli"))];
+        let json = json_of(run_cli(
+            &["tty7", "pane", "ls"],
+            &Context::default(),
+            &mut backend,
+        ));
+        let listed: Vec<&Value> = json["panes"].as_array().unwrap().iter().collect();
+        assert!(
+            listed.iter().all(|p| p["pane"] != serde_json::json!(77)),
+            "the tree-walking listing cannot reach the registry — that is why --all exists"
+        );
+    }
+
+    #[test]
+    fn closing_an_orphan_falls_back_to_hanging_the_pane_up() {
+        let mut backend = mock();
+        run_cli(
+            &["tty7", "pane", "close", "%77"],
+            &Context::default(),
+            &mut backend,
+        );
+        assert_eq!(
+            backend.killed,
+            vec![77],
+            "a pane no workspace holds must still be stoppable"
+        );
+        assert_eq!(
+            backend.control_calls,
+            vec![ControlRequest::MachineGet],
+            "PaneClose needs a workspace, so it must not be attempted for an orphan"
+        );
+
+        // A pane the tree does hold still goes through PaneClose.
+        let mut backend = mock();
+        run_cli(
+            &["tty7", "pane", "close", "%1"],
+            &Context::default(),
+            &mut backend,
+        );
+        assert!(
+            backend.killed.is_empty(),
+            "a filed pane is closed, not killed"
+        );
+        assert!(
+            backend
+                .control_calls
+                .iter()
+                .any(|c| matches!(c, ControlRequest::PaneClose { pane: 1, .. })),
+            "{:?}",
+            backend.control_calls
+        );
     }
 
     #[test]
@@ -668,7 +876,11 @@ mod tests {
         backend
             .replies
             .push_back(ReplyOk::WorkspaceTree(Box::new(api.clone())));
-        run_cli(&["tty7", "ws", "tree", "api"], &Context::default(), &mut backend);
+        run_cli(
+            &["tty7", "ws", "tree", "api"],
+            &Context::default(),
+            &mut backend,
+        );
         assert_eq!(
             backend.control_calls,
             vec![
@@ -685,7 +897,11 @@ mod tests {
         backend
             .replies
             .push_back(ReplyOk::WorkspaceTree(Box::new(created.clone())));
-        let out = run_cli(&["tty7", "ws", "new", "dev"], &Context::default(), &mut backend);
+        let out = run_cli(
+            &["tty7", "ws", "new", "dev"],
+            &Context::default(),
+            &mut backend,
+        );
         assert_eq!(
             backend.control_calls,
             vec![ControlRequest::WorkspaceCreate {
@@ -693,7 +909,11 @@ mod tests {
                 workspace: None,
             }]
         );
-        assert_eq!(human(out), created.id.to_string(), "the id is the printed result");
+        assert_eq!(
+            human(out),
+            created.id.to_string(),
+            "the id is the printed result"
+        );
     }
 
     #[test]
@@ -706,7 +926,11 @@ mod tests {
         backend
             .replies
             .push_back(ReplyOk::TabTree(Box::new(Tab::leaf(6))));
-        let out = run_cli(&["tty7", "new", "C:\\newproj"], &Context::default(), &mut backend);
+        let out = run_cli(
+            &["tty7", "new", "C:\\newproj"],
+            &Context::default(),
+            &mut backend,
+        );
         assert_eq!(
             backend.control_calls,
             vec![
@@ -802,7 +1026,11 @@ mod tests {
 
         backend.control_calls.clear();
         let api = backend.machine.workspaces[0].clone();
-        run_cli(&["tty7", "tab", "rename", "@1", "build2"], &ctx, &mut backend);
+        run_cli(
+            &["tty7", "tab", "rename", "@1", "build2"],
+            &ctx,
+            &mut backend,
+        );
         assert_eq!(
             backend.control_calls[1],
             ControlRequest::TabRename {
@@ -835,7 +1063,11 @@ mod tests {
             ws: Some(api.id.to_string()),
             ..Context::default()
         };
-        run_cli(&["tty7", "tab", "new", "--cwd", "C:\\elsewhere"], &ctx, &mut backend);
+        run_cli(
+            &["tty7", "tab", "new", "--cwd", "C:\\elsewhere"],
+            &ctx,
+            &mut backend,
+        );
         assert_eq!(
             backend.control_calls[1],
             ControlRequest::TabCreate {
@@ -850,7 +1082,10 @@ mod tests {
                 tab: None,
             }
         );
-        assert_eq!(backend.spawned, vec![(api.id, Some("C:\\elsewhere".to_string()))]);
+        assert_eq!(
+            backend.spawned,
+            vec![(api.id, Some("C:\\elsewhere".to_string()))]
+        );
     }
 
     #[test]
@@ -883,7 +1118,11 @@ mod tests {
             "the new pane inherits the split pane's cwd"
         );
         assert_eq!(backend.spawned, vec![(api, Some("C:\\proj".to_string()))]);
-        assert_eq!(human(out), "%6", "the new pane address is the printed result");
+        assert_eq!(
+            human(out),
+            "%6",
+            "the new pane address is the printed result"
+        );
     }
 
     #[test]
@@ -913,7 +1152,11 @@ mod tests {
     #[test]
     fn pane_close_traces_the_pane_to_its_workspace() {
         let mut backend = mock();
-        run_cli(&["tty7", "pane", "close", "%5"], &Context::default(), &mut backend);
+        run_cli(
+            &["tty7", "pane", "close", "%5"],
+            &Context::default(),
+            &mut backend,
+        );
         let web = backend.machine.workspaces[1].id;
         assert_eq!(
             backend.control_calls,
@@ -980,7 +1223,11 @@ mod tests {
             &mut backend,
         );
         assert_eq!(backend.captured, vec![(2, true)]);
-        assert_eq!(human(out), "$ make\nok\n", "capture prints the pane verbatim");
+        assert_eq!(
+            human(out),
+            "$ make\nok\n",
+            "capture prints the pane verbatim"
+        );
 
         run_cli(&["tty7", "procs", "%1"], &Context::default(), &mut backend);
         assert_eq!(backend.procs_calls, vec![1]);
@@ -1009,7 +1256,10 @@ mod tests {
                 keep: true,
             }]
         );
-        assert!(matches!(out, Outcome::Exit(0)), "run's outcome is the child's exit code");
+        assert!(
+            matches!(out, Outcome::Exit(0, _)),
+            "run's outcome is the child's exit code"
+        );
     }
 
     #[test]
@@ -1018,8 +1268,7 @@ mod tests {
         let api = backend.machine.workspaces[0].id;
         let out = execute(
             cli(&[
-                "tty7", "run", "--keep", "--ws", "api", "--cwd", "C:\\proj", "--", "cargo",
-                "watch",
+                "tty7", "run", "--keep", "--ws", "api", "--cwd", "C:\\proj", "--", "cargo", "watch",
             ]),
             &Context::default(),
             &mut backend,
@@ -1052,7 +1301,7 @@ mod tests {
                 keep: true,
             }]
         );
-        assert!(matches!(out, Outcome::Exit(0)));
+        assert!(matches!(out, Outcome::Exit(0, _)));
     }
 
     #[test]
@@ -1069,7 +1318,7 @@ mod tests {
             "a reaped pane must not be filed into the tree"
         );
         assert_eq!(backend.runs.len(), 1);
-        assert!(matches!(out, Outcome::Exit(0)));
+        assert!(matches!(out, Outcome::Exit(0, _)));
     }
 
     #[test]
@@ -1096,10 +1345,56 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(out, Outcome::Exit(1)),
+            matches!(out, Outcome::Exit(1, _)),
             "an unknown exit code is still a failure"
         );
         assert!(EXIT_CODE_UNKNOWN.contains("could not be determined"));
+
+        let Outcome::Exit(_, report) = out else {
+            unreachable!("just matched")
+        };
+        assert_eq!(
+            report.json["exit_code_known"],
+            serde_json::json!(false),
+            "--json has to distinguish a stand-in 1 from the command's own 1: {}",
+            report.json
+        );
+    }
+
+    #[test]
+    fn run_answers_json_even_though_it_carries_an_exit_code() {
+        let mut backend = mock();
+        let api = backend.machine.workspaces[0].id;
+        let ctx = Context {
+            ws: Some(api.to_string()),
+            ..Context::default()
+        };
+        let out = execute(
+            cli(&["tty7", "run", "--json", "--", "cargo", "test"]),
+            &ctx,
+            &mut backend,
+        )
+        .unwrap();
+        let Outcome::Exit(code, report) = out else {
+            panic!("run stands in for its child, so it exits with the child's code");
+        };
+        assert_eq!(code, 0);
+        assert_eq!(report.json["exit"], serde_json::json!(0), "{}", report.json);
+        assert_eq!(
+            report.json["exit_code_known"],
+            serde_json::json!(true),
+            "{}",
+            report.json
+        );
+        assert!(
+            report.json["pane"].as_u64().is_some(),
+            "the pane that ran it is part of the answer: {}",
+            report.json
+        );
+        assert!(
+            report.human.is_empty(),
+            "the command's own output already streamed; the report must not repeat it"
+        );
     }
 
     #[test]
@@ -1123,11 +1418,57 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_tty7_socket_refuses_the_server_lifecycle_verbs() {
+        // Inside a shell of an isolated instance every other verb follows
+        // $TTY7_SOCKET, but stop/start can only drive the default endpoint —
+        // so they must refuse rather than act on a different server.
+        let ctx = Context {
+            socket: Some("/tmp/some-other-instance/control.sock".into()),
+            ..Context::default()
+        };
+        for verb in ["start", "stop", "restart", "logs"] {
+            let mut backend = mock();
+            let err = execute(cli(&["tty7", "server", verb]), &ctx, &mut backend)
+                .expect_err("a foreign endpoint must not be managed by accident");
+            let msg = err.to_string();
+            assert!(msg.contains("TTY7_SOCKET"), "{msg}");
+            assert!(msg.contains(verb), "{msg}");
+            assert!(
+                backend.control_calls.is_empty(),
+                "the refusal must come before any dial"
+            );
+        }
+
+        // Read-only status still follows the variable, as every other verb does.
+        let mut backend = mock();
+        backend
+            .replies
+            .push_back(ReplyOk::Status(tty7_core::daemon::control::ServerStatus {
+                pid: 1,
+                uptime_secs: 0,
+                panes: 0,
+                control_version: CONTROL_VERSION,
+                protocol_version: PROTOCOL_VERSION,
+                build: "test".into(),
+                socket: String::new(),
+            }));
+        execute(cli(&["tty7", "server", "status"]), &ctx, &mut backend)
+            .expect("status is a query, not a lifecycle verb");
+        assert_eq!(backend.control_calls, vec![ControlRequest::Status]);
+    }
+
+    #[test]
     fn the_still_missing_verbs_say_so_without_touching_the_wire() {
         for (args, needle) in [
             (vec!["tty7", "ws", "stop", "api"], "not implemented"),
-            (vec!["tty7", "machine", "connect", "devbox"], "not implemented"),
-            (vec!["tty7", "machine", "disconnect", "devbox"], "not implemented"),
+            (
+                vec!["tty7", "machine", "connect", "devbox"],
+                "not implemented",
+            ),
+            (
+                vec!["tty7", "machine", "disconnect", "devbox"],
+                "not implemented",
+            ),
         ] {
             let mut backend = mock();
             let err = execute(cli(&args), &Context::default(), &mut backend)
@@ -1175,10 +1516,17 @@ mod tests {
             kind: "ssh".into(),
             connected: true,
         }]));
-        let out = run_cli(&["tty7", "machine", "ls"], &Context::default(), &mut backend);
+        let out = run_cli(
+            &["tty7", "machine", "ls"],
+            &Context::default(),
+            &mut backend,
+        );
         assert_eq!(backend.control_calls, vec![ControlRequest::Routes]);
         let rendered = human(out);
-        assert!(rendered.contains("local"), "machine 0 is always listed: {rendered}");
+        assert!(
+            rendered.contains("local"),
+            "machine 0 is always listed: {rendered}"
+        );
         assert!(rendered.contains("me@build-box:22"), "{rendered}");
     }
 
@@ -1201,11 +1549,18 @@ mod tests {
 
     #[test]
     fn doctor_reports_the_injected_context_and_the_server_half() {
-        let out = human(run_cli(&["tty7", "doctor"], &Context::default(), &mut doctor_backend()));
+        let out = human(run_cli(
+            &["tty7", "doctor"],
+            &Context::default(),
+            &mut doctor_backend(),
+        ));
         assert!(out.contains("TTY7_SOCKET"), "{out}");
         assert!(out.contains("missing"), "{out}");
         assert!(out.contains("dialect"), "{out}");
-        assert!(out.contains(&format!("control v{CONTROL_VERSION}")), "{out}");
+        assert!(
+            out.contains(&format!("control v{CONTROL_VERSION}")),
+            "{out}"
+        );
         assert!(out.contains("pid 4242"), "{out}");
         assert!(out.contains("0 known"), "{out}");
 

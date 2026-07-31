@@ -9698,6 +9698,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tty7-core",
+ "unicode-width",
  "windows-sys 0.59.0",
 ]
 

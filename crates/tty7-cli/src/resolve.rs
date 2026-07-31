@@ -100,7 +100,9 @@ pub fn workspace_of_pane(machine: &Machine, pane: u64) -> Result<&Workspace> {
         .workspaces
         .iter()
         .find(|ws| ws.tabs.iter().any(|tab| tab.root.contains(pane)))
-        .ok_or_else(|| anyhow::anyhow!("no pane %{pane} on this machine — `tty7 pane ls` lists them"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no pane %{pane} on this machine — `tty7 pane ls` lists them")
+        })
 }
 
 pub fn short_id(id: &WorkspaceId) -> String {
@@ -110,8 +112,8 @@ pub fn short_id(id: &WorkspaceId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testbed::two_workspace_machine;
     use crate::address::parse_workspace;
+    use crate::testbed::two_workspace_machine;
 
     #[test]
     fn tab_ordinals_number_the_machine_in_tree_order() {
@@ -143,8 +145,13 @@ mod tests {
         let by_prefix = workspace(&m, &parse_workspace(&prefix)).unwrap();
         assert_eq!(by_prefix.id, api.id);
 
-        let err = workspace(&m, &parse_workspace("nope")).unwrap_err().to_string();
-        assert!(err.contains("tty7 ls"), "the error points at the listing: {err}");
+        let err = workspace(&m, &parse_workspace("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("tty7 ls"),
+            "the error points at the listing: {err}"
+        );
     }
 
     #[test]
@@ -159,7 +166,9 @@ mod tests {
         assert_eq!(ws, m.workspaces[0].id);
         assert_eq!(tab, wanted);
 
-        let err = super::tab(&m, &TabAddress::Ordinal(9)).unwrap_err().to_string();
+        let err = super::tab(&m, &TabAddress::Ordinal(9))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("@9"), "{err}");
     }
 
@@ -171,5 +180,4 @@ mod tests {
         let err = workspace_of_pane(&m, 99).unwrap_err().to_string();
         assert!(err.contains("%99"), "{err}");
     }
-
 }

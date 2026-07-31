@@ -5,11 +5,15 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
     name = "tty7",
     version,
     about = "A terminal workbench, from the command line",
-    long_about = "One name, three artifacts: this CLI, the tty7 GUI, and tty7-server.\n\
-                  GUI, CLI, and coding agents are equal clients of the server on each\n\
-                  machine — none of them needs the others to be present.\n\n\
-                  Bare `tty7` (or `tty7 <path>`) launches or activates the GUI.\n\
-                  Everything else talks straight to the server."
+    long_about = "One name, three artifacts: this CLI, the tty7 GUI (tty7-app), and\n\
+                  tty7-server.\n\n\
+                  The GUI and this CLI are both clients of the server on each machine —\n\
+                  neither needs the other to be running. This CLI is built for coding\n\
+                  agents: every verb is non-interactive, and --json makes the output\n\
+                  machine-readable.\n\n\
+                  An agent reaches the server through this binary, not through a wire\n\
+                  protocol of its own. Inside a tty7 shell, $TTY7_PANE / $TTY7_WS /\n\
+                  $TTY7_SOCKET let the address-taking verbs run with no address given."
 )]
 pub struct Cli {
     #[arg(
@@ -21,13 +25,20 @@ pub struct Cli {
     )]
     pub machine: Option<String>,
 
-    #[arg(long, global = true, help = "Machine-readable output, one JSON object per command")]
+    #[arg(
+        long,
+        global = true,
+        help = "Machine-readable output, one JSON object per command"
+    )]
     pub json: bool,
 
     #[arg(short, long, global = true, help = "Quiet mode: no output on success")]
     pub quiet: bool,
 
-    #[arg(value_name = "PATH", help = "Launch or activate the GUI, at PATH if given")]
+    #[arg(
+        value_name = "PATH",
+        help = "Launch or activate the GUI, at PATH if given (not wired up yet)"
+    )]
     pub path: Option<String>,
 
     #[command(subcommand)]
@@ -54,7 +65,10 @@ pub enum Command {
     #[command(about = "Type text into a pane")]
     Send(SendArgs),
 
-    #[command(about = "Print a pane's raw output (ANSI bytes): the newest scrollback segment by default")]
+    #[command(
+        about = "Print a pane's output with its ANSI escapes intact, decoded as UTF-8 \
+                 (invalid bytes become U+FFFD): the newest scrollback segment by default"
+    )]
     Capture(CaptureArgs),
 
     #[command(about = "Processes and listening ports inside a pane")]
@@ -72,10 +86,15 @@ pub enum Command {
     #[command(about = "Server health at a glance (= tty7 server status)")]
     Status,
 
-    #[command(about = "Check this install: socket, dialect, config, versions, hooks, links, context")]
+    #[command(
+        about = "Check this install: socket, dialect, config, versions, hooks, links, context"
+    )]
     Doctor,
 
-    #[command(subcommand, about = "Workspaces: the named session trees the server keeps alive")]
+    #[command(
+        subcommand,
+        about = "Workspaces: the named session trees the server keeps alive"
+    )]
     Ws(WsCmd),
 
     #[command(subcommand, about = "Tabs within a workspace (@N addresses)")]
@@ -84,7 +103,10 @@ pub enum Command {
     #[command(subcommand, about = "Panes: the terminals themselves (%N addresses)")]
     Pane(PaneCmd),
 
-    #[command(subcommand, about = "Machines: this one plus every remote the server has a link to")]
+    #[command(
+        subcommand,
+        about = "Machines: this one plus every remote the server has a link to"
+    )]
     Machine(MachineCmd),
 
     #[command(subcommand, about = "The tty7-server process on this machine")]
@@ -119,16 +141,36 @@ pub struct RunArgs {
 #[derive(Debug, Args)]
 #[command(group = ArgGroup::new("axis").required(true))]
 pub struct SplitArgs {
-    #[arg(value_name = "%PANE", help = "Pane to split; defaults to $TTY7_PANE inside a tty7 shell")]
+    #[arg(
+        value_name = "%PANE",
+        help = "Pane to split; defaults to $TTY7_PANE inside a tty7 shell"
+    )]
     pub target: Option<String>,
 
-    #[arg(long = "h", group = "axis", help = "Side by side: the new pane goes to the right")]
+    // Spelled out, with the one-letter forms kept as aliases: `--h` alone reads
+    // like a typo for `-h`, and scripts written against it keep working.
+    #[arg(
+        long = "horizontal",
+        visible_alias = "h",
+        group = "axis",
+        help = "Side by side: the new pane goes to the right"
+    )]
     pub horizontal: bool,
 
-    #[arg(long = "v", group = "axis", help = "Stacked: the new pane goes below")]
+    #[arg(
+        long = "vertical",
+        visible_alias = "v",
+        group = "axis",
+        help = "Stacked: the new pane goes below"
+    )]
     pub vertical: bool,
 
-    #[arg(long, default_value_t = 0.5, value_name = "RATIO", help = "Share kept by the existing pane")]
+    #[arg(
+        long,
+        default_value_t = 0.5,
+        value_name = "RATIO",
+        help = "Share kept by the existing pane"
+    )]
     pub ratio: f32,
 }
 
@@ -146,7 +188,10 @@ pub struct SendArgs {
 
 #[derive(Debug, Args)]
 pub struct CaptureArgs {
-    #[arg(value_name = "%PANE", help = "Pane to read; defaults to $TTY7_PANE inside a tty7 shell")]
+    #[arg(
+        value_name = "%PANE",
+        help = "Pane to read; defaults to $TTY7_PANE inside a tty7 shell"
+    )]
     pub target: Option<String>,
 
     #[arg(
@@ -183,7 +228,7 @@ pub enum WsCmd {
         name: String,
     },
 
-    #[command(about = "End the shells, keep the layout")]
+    #[command(about = "End the shells, keep the layout (not implemented yet)")]
     Stop {
         #[arg(value_name = "WORKSPACE")]
         ws: String,
@@ -220,7 +265,11 @@ pub enum TabCmd {
     New {
         #[arg(value_name = "WORKSPACE")]
         ws: Option<String>,
-        #[arg(long, value_name = "DIR", help = "Working directory for the tab's shell")]
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "Working directory for the tab's shell"
+        )]
         cwd: Option<String>,
     },
 
@@ -253,6 +302,14 @@ pub enum PaneCmd {
     Ls {
         #[arg(value_name = "WORKSPACE")]
         ws: Option<String>,
+
+        #[arg(
+            long,
+            conflicts_with = "ws",
+            help = "Every pane the server runs, including ones no workspace holds \
+                    (an interrupted `run` leaves those behind)"
+        )]
+        all: bool,
     },
 
     #[command(about = "Split a pane in two")]
@@ -270,13 +327,13 @@ pub enum MachineCmd {
     #[command(about = "This machine and every linked remote")]
     Ls,
 
-    #[command(about = "Open a link to a machine from an SSH profile")]
+    #[command(about = "Open a link to a machine from an SSH profile (not implemented yet)")]
     Connect {
         #[arg(value_name = "PROFILE")]
         profile: String,
     },
 
-    #[command(about = "Drop the link; the remote server keeps running")]
+    #[command(about = "Drop the link; the remote server keeps running (not implemented yet)")]
     Disconnect {
         #[arg(value_name = "MACHINE")]
         machine: String,
@@ -327,15 +384,30 @@ mod tests {
     #[test]
     fn every_top_level_verb_parses() {
         assert!(matches!(parse(&["tty7", "ls"]).command, Some(Command::Ls)));
-        assert!(matches!(parse(&["tty7", "new"]).command, Some(Command::New { path: None })));
+        assert!(matches!(
+            parse(&["tty7", "new"]).command,
+            Some(Command::New { path: None })
+        ));
         assert!(matches!(
             parse(&["tty7", "new", "C:\\proj"]).command,
             Some(Command::New { path: Some(p) }) if p == "C:\\proj"
         ));
-        assert!(matches!(parse(&["tty7", "agents"]).command, Some(Command::Agents)));
-        assert!(matches!(parse(&["tty7", "events"]).command, Some(Command::Events)));
-        assert!(matches!(parse(&["tty7", "status"]).command, Some(Command::Status)));
-        assert!(matches!(parse(&["tty7", "doctor"]).command, Some(Command::Doctor)));
+        assert!(matches!(
+            parse(&["tty7", "agents"]).command,
+            Some(Command::Agents)
+        ));
+        assert!(matches!(
+            parse(&["tty7", "events"]).command,
+            Some(Command::Events)
+        ));
+        assert!(matches!(
+            parse(&["tty7", "status"]).command,
+            Some(Command::Status)
+        ));
+        assert!(matches!(
+            parse(&["tty7", "doctor"]).command,
+            Some(Command::Doctor)
+        ));
         assert!(matches!(
             parse(&["tty7", "procs", "%3"]).command,
             Some(Command::Procs { target: Some(t) }) if t == "%3"
@@ -349,7 +421,10 @@ mod tests {
             panic!("run did not parse");
         };
         assert_eq!(args.cmd, vec!["cargo", "test", "--keep"]);
-        assert!(!args.keep, "--keep after -- belongs to the child, not to tty7");
+        assert!(
+            !args.keep,
+            "--keep after -- belongs to the child, not to tty7"
+        );
 
         let cli = parse(&["tty7", "run", "--keep", "--cwd", "C:\\proj", "--", "make"]);
         let Some(Command::Run(args)) = cli.command else {
@@ -385,9 +460,17 @@ mod tests {
         assert_eq!(args.ratio, 0.3);
 
         let err = Cli::try_parse_from(["tty7", "split", "%1"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "an axis must be chosen");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::MissingRequiredArgument,
+            "an axis must be chosen"
+        );
         let err = Cli::try_parse_from(["tty7", "split", "--h", "--v"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "the two axes exclude each other");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::ArgumentConflict,
+            "the two axes exclude each other"
+        );
     }
 
     #[test]
@@ -410,7 +493,10 @@ mod tests {
 
     #[test]
     fn every_ws_verb_parses() {
-        assert!(matches!(parse(&["tty7", "ws", "ls"]).command, Some(Command::Ws(WsCmd::Ls))));
+        assert!(matches!(
+            parse(&["tty7", "ws", "ls"]).command,
+            Some(Command::Ws(WsCmd::Ls))
+        ));
         assert!(matches!(
             parse(&["tty7", "ws", "tree", "api"]).command,
             Some(Command::Ws(WsCmd::Tree { ws: Some(w) })) if w == "api"
@@ -469,7 +555,10 @@ mod tests {
     fn every_pane_verb_parses() {
         assert!(matches!(
             parse(&["tty7", "pane", "ls"]).command,
-            Some(Command::Pane(PaneCmd::Ls { ws: None }))
+            Some(Command::Pane(PaneCmd::Ls {
+                ws: None,
+                all: false
+            }))
         ));
         assert!(matches!(
             parse(&["tty7", "pane", "close", "%9"]).command,
@@ -533,7 +622,11 @@ mod tests {
     #[test]
     fn usage_errors_exit_with_code_2() {
         let err = Cli::try_parse_from(["tty7", "ws", "frobnicate"]).unwrap_err();
-        assert_eq!(err.exit_code(), 2, "clap's usage-error exit code is the CLI contract");
+        assert_eq!(
+            err.exit_code(),
+            2,
+            "clap's usage-error exit code is the CLI contract"
+        );
         let err = Cli::try_parse_from(["tty7", "tab", "move", "@7", "not-a-number"]).unwrap_err();
         assert_eq!(err.exit_code(), 2);
     }

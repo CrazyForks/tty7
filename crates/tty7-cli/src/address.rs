@@ -5,8 +5,7 @@ pub const ENV_PANE: &str = "TTY7_PANE";
 pub const ENV_WS: &str = "TTY7_WS";
 pub const ENV_SOCKET: &str = "TTY7_SOCKET";
 
-pub const OUTSIDE_SHELL: &str =
-    "not inside a tty7 shell — pass an explicit %pane/@tab/workspace";
+pub const OUTSIDE_SHELL: &str = "not inside a tty7 shell — pass an explicit %pane/@tab/workspace";
 
 #[derive(Debug, Clone, Default)]
 pub struct Context {
@@ -89,9 +88,9 @@ pub fn pane_or_context(explicit: Option<&str>, ctx: &Context) -> Result<u64> {
 
 fn pane_from_env(v: &str) -> Result<u64> {
     let digits = v.strip_prefix('%').unwrap_or(v);
-    digits
-        .parse()
-        .map_err(|_| anyhow!("{ENV_PANE}='{v}' is not a pane id; unset it or pass %pane explicitly"))
+    digits.parse().map_err(|_| {
+        anyhow!("{ENV_PANE}='{v}' is not a pane id; unset it or pass %pane explicitly")
+    })
 }
 
 pub fn workspace_or_context(explicit: Option<&str>, ctx: &Context) -> Result<WorkspaceAddress> {

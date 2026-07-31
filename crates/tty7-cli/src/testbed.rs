@@ -1,6 +1,4 @@
-use tty7_core::core::machine::{
-    Axis, Machine, PaneNode, PaneRecord, Tab, TabId, Workspace,
-};
+use tty7_core::core::machine::{Axis, Machine, PaneNode, PaneRecord, Tab, TabId, Workspace};
 use tty7_core::core::session::WorkspaceId;
 
 pub fn two_workspace_machine() -> Machine {

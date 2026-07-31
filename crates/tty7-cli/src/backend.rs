@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tty7_core::core::session::WorkspaceId;
 use tty7_core::daemon::control::{ControlEvent, ControlHelloOk, ControlRequest, ReplyOk};
-use tty7_core::daemon::protocol::PaneProcs;
+use tty7_core::daemon::protocol::{PaneInfo, PaneProcs};
 
 mod real;
 
@@ -28,6 +28,14 @@ pub trait Backend {
 
     fn procs(&mut self, pane: u64) -> Result<PaneProcs>;
 
+    /// Every pane the server is actually running, straight from its registry —
+    /// including ones no workspace tree references. The machine tree cannot see
+    /// those, so this is the only way an orphan becomes visible.
+    fn list_panes(&mut self) -> Result<Vec<PaneInfo>>;
+
+    /// Hang up a pane by id alone, with no workspace to route the request
+    /// through. Orphans have no workspace, so `PaneClose` cannot reach them.
+    fn kill_pane(&mut self, pane: u64) -> Result<()>;
 
     fn run_spawn(&mut self, spec: RunSpec) -> Result<u64>;
 
@@ -46,7 +54,7 @@ pub mod mock {
     use tty7_core::daemon::control::{
         CONTROL_VERSION, ControlEvent, ControlHelloOk, ControlRequest, ReplyOk, feature,
     };
-    use tty7_core::daemon::protocol::{PROTOCOL_VERSION, PaneProcs};
+    use tty7_core::daemon::protocol::{PROTOCOL_VERSION, PaneInfo, PaneProcs};
 
     use super::{Backend, RunSpec};
 
@@ -61,6 +69,8 @@ pub mod mock {
         pub capture_text: String,
         pub procs_calls: Vec<u64>,
         pub procs_reply: PaneProcs,
+        pub registry: Vec<PaneInfo>,
+        pub killed: Vec<u64>,
         pub runs: Vec<RunSpec>,
         pub run_exit: Option<i32>,
         pub events: Vec<ControlEvent>,
@@ -79,6 +89,8 @@ pub mod mock {
                 capture_text: String::new(),
                 procs_calls: Vec::new(),
                 procs_reply: PaneProcs::default(),
+                registry: Vec::new(),
+                killed: Vec::new(),
                 runs: Vec::new(),
                 run_exit: Some(0),
                 events: Vec::new(),
@@ -139,6 +151,14 @@ pub mod mock {
             Ok(self.procs_reply.clone())
         }
 
+        fn list_panes(&mut self) -> Result<Vec<PaneInfo>> {
+            Ok(self.registry.clone())
+        }
+
+        fn kill_pane(&mut self, pane: u64) -> Result<()> {
+            self.killed.push(pane);
+            Ok(())
+        }
 
         fn run_spawn(&mut self, spec: RunSpec) -> Result<u64> {
             self.runs.push(spec);

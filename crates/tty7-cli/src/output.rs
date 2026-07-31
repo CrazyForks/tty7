@@ -1,16 +1,24 @@
+use unicode_width::UnicodeWidthStr;
+
 use tty7_core::core::machine::{Machine, PaneNode, Workspace};
 use tty7_core::core::session::WorkspaceId;
 use tty7_core::daemon::control::{PaneAgentState, RouteInfo, ServerStatus};
-use tty7_core::daemon::protocol::PaneProcs;
+use tty7_core::daemon::protocol::{PaneInfo, PaneProcs};
 
 use crate::resolve;
 
+/// Display columns, not bytes: a CJK path is two columns per char and three
+/// bytes, so padding by `len()` would push every later column out of line.
+fn width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
 pub fn table(header: &[&str], rows: &[Vec<String>]) -> String {
-    let mut widths: Vec<usize> = header.iter().map(|h| h.len()).collect();
+    let mut widths: Vec<usize> = header.iter().map(|h| width(h)).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() {
-                widths[i] = widths[i].max(cell.len());
+                widths[i] = widths[i].max(width(cell));
             }
         }
     }
@@ -29,7 +37,11 @@ fn render_row(out: &mut String, cells: &mut dyn Iterator<Item = String>, widths:
             line.push_str("  ");
         }
         line.push_str(&cell);
-        let pad = widths.get(i).copied().unwrap_or(0).saturating_sub(cell.len());
+        let pad = widths
+            .get(i)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(width(&cell));
         line.push_str(&" ".repeat(pad));
     }
     out.push_str(line.trim_end());
@@ -91,6 +103,33 @@ pub fn pane_table(machine: &Machine, only: Option<WorkspaceId>) -> String {
         return "no panes\n".to_string();
     }
     table(&["PANE", "WS", "TAB", "CWD", "LIVE"], &rows)
+}
+
+/// The server's registry rather than the machine tree, so orphans appear. `held`
+/// answers which workspace holds a pane, if any; a pane with no holder is shown
+/// as `-` under WS, which is the whole point of the listing.
+pub fn registry_table(panes: &[PaneInfo], held: &dyn Fn(u64) -> Option<String>) -> String {
+    if panes.is_empty() {
+        return "no panes\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = panes
+        .iter()
+        .map(|info| {
+            vec![
+                format!("%{}", info.pane_id),
+                held(info.pane_id)
+                    .map(|ws| ws.chars().take(8).collect())
+                    .unwrap_or_else(|| "-".to_string()),
+                info.owner.clone().unwrap_or_else(|| "-".to_string()),
+                info.cwd
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                if info.alive { "yes" } else { "no" }.to_string(),
+            ]
+        })
+        .collect();
+    table(&["PANE", "WS", "OWNER", "CWD", "LIVE"], &rows)
 }
 
 pub fn workspace_tree(ws: &Workspace, machine: &Machine) -> String {
@@ -241,6 +280,36 @@ mod tests {
     }
 
     #[test]
+    fn wide_characters_are_padded_by_display_width_not_byte_length() {
+        // "项目" is 6 bytes but occupies 4 columns. Padding by len() would add
+        // 2 spaces too few and skew every column after it.
+        let rendered = table(
+            &["NAME", "TABS"],
+            &[
+                vec!["项目".into(), "3".into()],
+                vec!["api".into(), "1".into()],
+            ],
+        );
+        // Column one is 4 wide: "NAME" and "项目" both fill it exactly, "api"
+        // gets one pad space. Sizing by len() would make it 6 (项目's byte
+        // count) and push the header's second column two places right.
+        assert_eq!(rendered, "NAME  TABS\n项目  3\napi   1\n");
+
+        // The second column starts at the same display offset on every line.
+        let second_column_at: Vec<usize> = rendered
+            .lines()
+            .map(|line| {
+                let split = line.rfind(' ').expect("two columns per line") + 1;
+                UnicodeWidthStr::width(&line[..split])
+            })
+            .collect();
+        assert!(
+            second_column_at.iter().all(|c| *c == second_column_at[0]),
+            "columns must line up on screen: {rendered:?} gave {second_column_at:?}"
+        );
+    }
+
+    #[test]
     fn the_workspace_table_is_one_line_per_workspace() {
         let m = two_workspace_machine();
         let rendered = workspace_table(&m);
@@ -264,7 +333,10 @@ mod tests {
         let rendered = pane_table(&m, None);
         assert!(rendered.contains("%1"), "{rendered}");
         assert!(rendered.contains("%5"), "{rendered}");
-        assert!(rendered.contains("@3"), "web's tab keeps its machine-wide number: {rendered}");
+        assert!(
+            rendered.contains("@3"),
+            "web's tab keeps its machine-wide number: {rendered}"
+        );
 
         let web_only = pane_table(&m, Some(m.workspaces[1].id));
         assert!(!web_only.contains("%1"), "{web_only}");
@@ -306,8 +378,14 @@ mod tests {
             }],
         };
         let rendered = procs_tables(&procs);
-        assert!(rendered.contains("  cargo"), "children are indented: {rendered}");
-        assert!(rendered.contains('*'), "the foreground process is marked: {rendered}");
+        assert!(
+            rendered.contains("  cargo"),
+            "children are indented: {rendered}"
+        );
+        assert!(
+            rendered.contains('*'),
+            "the foreground process is marked: {rendered}"
+        );
         assert!(rendered.contains("3000"), "{rendered}");
     }
 }

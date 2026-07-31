@@ -9,7 +9,7 @@ use tty7_core::core::session::WorkspaceId;
 use tty7_core::daemon::control::{
     ControlEvent, ControlHello, ControlHelloOk, ControlRequest, ReplyOk, RouteInfo,
 };
-use tty7_core::daemon::protocol::{DaemonMsg, PaneProcs, ShellSpec, WinSize};
+use tty7_core::daemon::protocol::{DaemonMsg, PaneInfo, PaneProcs, ShellSpec, WinSize};
 use tty7_core::daemon::router::RouteTarget;
 
 use super::{Backend, RunSpec};
@@ -169,17 +169,24 @@ impl Backend for RealBackend {
             .pane_client()?
             .observe(pane, SESSION_SIZE)
             .with_context(|| format!("observing pane %{pane}"))?;
-        session.set_recv_timeout(Some(REPLAY_FIRST_WAIT))?;
+        // Best effort throughout: once the pane is gone the daemon closes the
+        // connection, and setsockopt on a peerless socket fails (EINVAL on
+        // macOS). That must not turn a completed capture into an error — the
+        // replay we already collected is the answer.
+        let _ = session.set_recv_timeout(Some(REPLAY_FIRST_WAIT));
         let mut snapshots: Vec<Vec<u8>> = Vec::new();
         loop {
             match session.recv() {
                 Ok(DaemonMsg::Snapshot(bytes)) => {
                     snapshots.push(bytes);
-                    session.set_recv_timeout(Some(REPLAY_SETTLE))?;
+                    let _ = session.set_recv_timeout(Some(REPLAY_SETTLE));
                 }
                 Ok(DaemonMsg::Output(_)) | Ok(DaemonMsg::Exited { .. }) => break,
-                Ok(_) => session.set_recv_timeout(Some(REPLAY_SETTLE))?,
+                Ok(_) => {
+                    let _ = session.set_recv_timeout(Some(REPLAY_SETTLE));
+                }
                 Err(e) if timed_out(&e) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(anyhow!(e).context("reading the pane replay")),
             }
         }
@@ -197,6 +204,20 @@ impl Backend for RealBackend {
         Ok(procs)
     }
 
+    fn list_panes(&mut self) -> Result<Vec<PaneInfo>> {
+        let panes = self
+            .pane_client()?
+            .list()
+            .context("asking the server for its running panes")?;
+        Ok(panes)
+    }
+
+    fn kill_pane(&mut self, pane: u64) -> Result<()> {
+        self.pane_client()?
+            .kill(pane)
+            .with_context(|| format!("hanging up pane %{pane}"))?;
+        Ok(())
+    }
 
     fn run_spawn(&mut self, spec: RunSpec) -> Result<u64> {
         let (program, args) = spec
@@ -413,7 +434,10 @@ mod tests {
         let (control, pane) = if cfg!(windows) {
             ("C:\\cfg\\tty7\\control.port", "C:\\cfg\\tty7\\daemon.port")
         } else {
-            ("/run/user/1000/tty7/control.sock", "/run/user/1000/tty7/daemon.sock")
+            (
+                "/run/user/1000/tty7/control.sock",
+                "/run/user/1000/tty7/daemon.sock",
+            )
         };
         assert_eq!(pane_endpoint_for(Path::new(control)), PathBuf::from(pane));
     }

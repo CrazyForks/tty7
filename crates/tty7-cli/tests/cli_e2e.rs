@@ -22,13 +22,31 @@ fn main() {
 
     let tests: &[(&str, fn(&Daemon))] = &[
         ("ls_on_an_empty_server", ls_on_an_empty_server),
-        ("new_builds_a_workspace_with_a_live_pane", new_builds_a_workspace_with_a_live_pane),
-        ("run_streams_output_and_passes_the_exit_code", run_streams_output_and_passes_the_exit_code),
-        ("run_keep_files_the_pane_so_ls_shows_it", run_keep_files_the_pane_so_ls_shows_it),
+        (
+            "new_builds_a_workspace_with_a_live_pane",
+            new_builds_a_workspace_with_a_live_pane,
+        ),
+        (
+            "run_streams_output_and_passes_the_exit_code",
+            run_streams_output_and_passes_the_exit_code,
+        ),
+        (
+            "run_keep_files_the_pane_so_ls_shows_it",
+            run_keep_files_the_pane_so_ls_shows_it,
+        ),
         ("send_then_capture_round_trip", send_then_capture_round_trip),
-        ("status_reports_the_live_server", status_reports_the_live_server),
-        ("status_answers_over_tty7_socket_alone", status_answers_over_tty7_socket_alone),
-        ("events_stream_reports_a_workspace_creation", events_stream_reports_a_workspace_creation),
+        (
+            "status_reports_the_live_server",
+            status_reports_the_live_server,
+        ),
+        (
+            "status_answers_over_tty7_socket_alone",
+            status_answers_over_tty7_socket_alone,
+        ),
+        (
+            "events_stream_reports_a_workspace_creation",
+            events_stream_reports_a_workspace_creation,
+        ),
     ];
 
     let mut failed = 0;
@@ -238,7 +256,9 @@ fn new_builds_a_workspace_with_a_live_pane(daemon: &Daemon) {
     assert!(pane >= 1, "the daemon names panes from 1, got {pane}");
 
     let listed = daemon.run_json(&["ls"]);
-    let workspaces = listed["workspaces"].as_array().expect("ls --json lists workspaces");
+    let workspaces = listed["workspaces"]
+        .as_array()
+        .expect("ls --json lists workspaces");
     assert_eq!(workspaces.len(), 1, "{listed}");
     assert_eq!(workspaces[0]["id"].as_str(), Some(ws_id), "{listed}");
     assert_eq!(workspaces[0]["panes"].as_u64(), Some(1), "{listed}");
@@ -294,7 +314,9 @@ fn run_keep_files_the_pane_so_ls_shows_it(daemon: &Daemon) {
     );
 
     let listed = daemon.run_json(&["ls"]);
-    let workspaces = listed["workspaces"].as_array().expect("ls --json lists workspaces");
+    let workspaces = listed["workspaces"]
+        .as_array()
+        .expect("ls --json lists workspaces");
     let ours = workspaces
         .iter()
         .find(|w| w["id"].as_str() == Some(ws_id.as_str()))
@@ -306,12 +328,11 @@ fn run_keep_files_the_pane_so_ls_shows_it(daemon: &Daemon) {
     );
 
     let panes = daemon.run_json(&["pane", "ls", &ws_id]);
-    let filed = panes["panes"].as_array().expect("pane ls --json lists panes");
+    let filed = panes["panes"]
+        .as_array()
+        .expect("pane ls --json lists panes");
     assert_eq!(filed.len(), 1, "{panes}");
-    assert!(
-        filed[0]["pane"].as_u64().is_some_and(|p| p >= 1),
-        "{panes}"
-    );
+    assert!(filed[0]["pane"].as_u64().is_some_and(|p| p >= 1), "{panes}");
 }
 
 fn status_answers_over_tty7_socket_alone(daemon: &Daemon) {
@@ -363,7 +384,10 @@ fn send_then_capture_round_trip(daemon: &Daemon) {
 
 fn status_reports_the_live_server(daemon: &Daemon) {
     let status = daemon.run_json(&["status"]);
-    assert!(status["pid"].as_u64().is_some_and(|pid| pid > 0), "{status}");
+    assert!(
+        status["pid"].as_u64().is_some_and(|pid| pid > 0),
+        "{status}"
+    );
     assert_eq!(
         status["protocol_version"].as_u64(),
         Some(u64::from(PROTOCOL_VERSION)),

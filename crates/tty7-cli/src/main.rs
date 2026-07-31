@@ -17,23 +17,39 @@ fn main() -> std::process::ExitCode {
     let ctx = address::Context::from_env();
     let mut backend = backend::RealBackend::new(cli.machine.clone(), ctx.socket.clone());
     match commands::execute(cli, &ctx, &mut backend) {
-        Ok(commands::Outcome::Exit(code)) => std::process::exit(code),
+        // `run` stands in for the command it launched, so its exit code is
+        // ours. The report rides along anyway: --json must not go silent just
+        // because the verb also carries an exit code.
+        Ok(commands::Outcome::Exit(code, report)) => {
+            emit(report, json, quiet);
+            // process::exit runs no destructors and flushes nothing; stdout is
+            // a LineWriter, so anything not ending in a newline would be lost.
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            std::process::exit(code)
+        }
         Ok(commands::Outcome::Report(report)) => {
-            if json {
-                if !report.json.is_null() {
-                    println!("{}", report.json);
-                }
-            } else if !quiet && !report.human.is_empty() {
-                print!("{}", ensure_newline(report.human));
-            }
+            emit(report, json, quiet);
             std::process::ExitCode::SUCCESS
         }
+        // --quiet suppresses output on success, not the reason for a failure:
+        // swallowing this leaves a bare exit code and nothing to debug.
         Err(e) => {
-            if !quiet {
-                eprintln!("tty7: {e:#}");
-            }
+            eprintln!("tty7: {e:#}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+fn emit(report: commands::Report, json: bool, quiet: bool) {
+    if quiet {
+        return;
+    }
+    if json {
+        if !report.json.is_null() {
+            println!("{}", report.json);
+        }
+    } else if !report.human.is_empty() {
+        print!("{}", ensure_newline(report.human));
     }
 }
 
