@@ -1428,7 +1428,7 @@ mod sock {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(crate) use sock::socket_path_in;
 #[cfg(unix)]
 pub use sock::{

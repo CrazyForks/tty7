@@ -3973,6 +3973,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_two_endpoints_are_siblings_derived_from_one_config_dir() {
         // The bug this pins: the control socket used to ignore the config dir
