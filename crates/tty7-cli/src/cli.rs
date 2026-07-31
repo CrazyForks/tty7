@@ -12,8 +12,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
                   agents: every verb is non-interactive, and --json makes the output\n\
                   machine-readable.\n\n\
                   An agent reaches the server through this binary, not through a wire\n\
-                  protocol of its own. Inside a tty7 shell, $TTY7_PANE / $TTY7_WS /\n\
-                  $TTY7_SOCKET let the address-taking verbs run with no address given."
+                  protocol of its own. Inside a tty7 shell, $TTY7_CONFIG_DIR points at\n\
+                  the server, and $TTY7_PANE / $TTY7_WS let the address-taking verbs run\n\
+                  with no address given."
 )]
 pub struct Cli {
     #[arg(
@@ -93,7 +94,7 @@ pub enum Command {
 
     #[command(
         subcommand,
-        about = "Workspaces: the named session trees the server keeps alive"
+        about = "Workspaces: the named trees of tabs and panes the server keeps alive"
     )]
     Ws(WsCmd),
 

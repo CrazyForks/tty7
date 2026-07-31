@@ -4481,61 +4481,6 @@ impl Tty7App {
             .into_any_element()
     }
 
-    fn render_session_model(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let (foreground, muted_fg) = (theme.foreground, theme.muted_foreground);
-
-        let entry = |term: &'static str, meaning: &'static str| {
-            v_flex()
-                .gap_0p5()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(foreground)
-                        .child(term),
-                )
-                .child(div().text_xs().text_color(muted_fg).child(meaning))
-        };
-
-        v_flex()
-            .mt_6()
-            .gap_2()
-            .child(self.section_rule(cx))
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(foreground)
-                    .child("How shells work"),
-            )
-            .child(div().text_xs().text_color(muted_fg).child(
-                "Your shells run in tty7's background server, not in this window. That is what lets them outlive a quit or a reboot — and it means \"close\" and \"end\" are different things here.",
-            ))
-            .child(
-                v_flex()
-                    .mt_2()
-                    .gap_3()
-                    .child(entry(
-                        "Closing a window (⌘W on the last tab)",
-                        "Detaches the workspace. Every shell keeps running; the workspace waits on the home page and in the title-bar menu.",
-                    ))
-                    .child(entry(
-                        "Quitting tty7 (⌘Q)",
-                        "Same deal, for every window. Nothing running is interrupted.",
-                    ))
-                    .child(entry(
-                        "Stop Workspace",
-                        "Ends that workspace's shells but keeps its layout, so you can start it again with fresh ones.",
-                    ))
-                    .child(entry(
-                        "Delete Workspace",
-                        "Ends the shells and forgets the layout. The only step here you can't undo.",
-                    )),
-            )
-            .into_any_element()
-    }
-
     fn render_settings_about(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (foreground, muted_fg) = (theme.foreground, theme.muted_foreground);
@@ -4599,7 +4544,6 @@ impl Tty7App {
                             .child("Pure Rust · GPU rendering on Zed's gpui · VT core from Alacritty"),
                     ),
             )
-            .child(self.render_session_model(cx))
             .child(
                 v_flex()
                     .mt_6()

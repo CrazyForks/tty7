@@ -42,7 +42,18 @@ pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Out
     let json_mode = cli.json;
     let machine = cli.machine.clone();
     match cli.command {
-        None => launch_gui(cli.path),
+        None => match cli.path {
+            // clap has no subcommand for this word, so it landed in [PATH].
+            // Treat a word that is not a path as the typo it almost certainly
+            // is: answering "launching the GUI is not wired up yet" to
+            // `tty7 statu` helps nobody.
+            Some(word) if !looks_like_a_path(&word) => bail!(
+                "unknown subcommand '{word}' — run `tty7 --help` for the list. \
+                 (A path in this position would open the GUI there, but \
+                 '{word}' does not name one.)"
+            ),
+            path => launch_gui(path),
+        },
         Some(Command::Ls) | Some(Command::Ws(WsCmd::Ls)) => ws_ls(backend),
         Some(Command::Ws(WsCmd::Tree { ws })) => ws_tree(ws.as_deref(), ctx, backend),
         Some(Command::Ws(WsCmd::New { name })) => ws_new(name, backend),
@@ -111,6 +122,20 @@ fn local_server(
         );
     }
     act()
+}
+
+/// Whether a bare word in the `[PATH]` position was meant as a path.
+///
+/// Anything with a separator, a leading `.`/`~`, or that actually exists on
+/// disk counts. A plain word like `tree` or `statu` does not — it is a
+/// mistyped subcommand, and saying so beats offering to open the GUI there.
+fn looks_like_a_path(s: &str) -> bool {
+    s.starts_with('/')
+        || s.starts_with('.')
+        || s.starts_with('~')
+        || s.contains('/')
+        || s.contains('\\')
+        || std::path::Path::new(s).exists()
 }
 
 fn launch_gui(path: Option<String>) -> Result<Outcome> {
@@ -1400,6 +1425,25 @@ mod tests {
                 backend.control_calls.is_empty(),
                 "the refusal must come before any dial"
             );
+        }
+    }
+
+    #[test]
+    fn a_mistyped_subcommand_is_named_as_one_not_offered_to_the_gui() {
+        for typo in ["tree", "statu", "pnae", "workspace"] {
+            let err = execute(cli(&["tty7", typo]), &Context::default(), &mut mock())
+                .expect_err("a bare word is not a path");
+            let msg = err.to_string();
+            assert!(msg.contains("unknown subcommand"), "{typo}: {msg}");
+            assert!(msg.contains(typo), "{typo}: {msg}");
+        }
+
+        // Things that do look like paths still reach the GUI launcher, and fail
+        // there for the honest reason.
+        for path in ["/tmp", "./src", "~/proj", "a/b"] {
+            let err = execute(cli(&["tty7", path]), &Context::default(), &mut mock())
+                .expect_err("the GUI launcher is not implemented yet");
+            assert!(err.to_string().contains("not wired up"), "{path}: {err}");
         }
     }
 
