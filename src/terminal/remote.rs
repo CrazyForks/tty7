@@ -185,6 +185,17 @@ pub struct RemoteTerminal {
     reader_thread: Option<JoinHandle<()>>,
 }
 
+/// The workspace id a spawn carries, so the pane's shell gets `$TTY7_WS` and a
+/// CLI running in it can use workspace-scoped verbs with no argument.
+///
+/// This is the same id as `owner`, but decided separately: `owner` is also
+/// gated on FEATURE_PANE_OWNER, while the workspace field rides the c4p5 spawn
+/// kind and needs no feature probe. Local routes only — a remote server keeps
+/// its own machine tree, and this id names a workspace in ours.
+fn spawn_workspace(owner: Option<&str>, route: &PaneRoute) -> Option<String> {
+    owner.filter(|_| route.is_local()).map(|id| id.to_string())
+}
+
 impl RemoteTerminal {
     pub fn spawn(
         size: TermSize,
@@ -253,6 +264,8 @@ impl RemoteTerminal {
         let mut stream = connect_routed(route)?;
         let win = win_size(size, cell_w, cell_h);
 
+        let workspace = spawn_workspace(owner.as_deref(), route);
+
         let owner = owner.filter(|_| {
             route.is_local()
                 && crate::daemon::spawn::local_daemon_supports(
@@ -265,7 +278,7 @@ impl RemoteTerminal {
             size: win,
             shell,
             owner,
-            workspace: None,
+            workspace,
         }
         .encode(&mut stream)?;
         let pane_id = match DaemonMsg::read(&mut stream)? {
@@ -1724,6 +1737,30 @@ mod tests {
         assert!(route.header().is_none(), "nothing to route to");
         let err = connect_routed(&route).expect_err("must not reach the local daemon");
         assert!(err.to_string().contains("cannot be routed"), "{err}");
+    }
+
+    #[test]
+    fn a_local_spawn_carries_its_workspace_so_the_shell_gets_tty7_ws() {
+        let ws = "0d4e1a54-0000-4000-8000-000000000001";
+
+        assert_eq!(
+            spawn_workspace(Some(ws), &PaneRoute::Local).as_deref(),
+            Some(ws),
+            "without this the pane's shell has no $TTY7_WS and every \
+             workspace-scoped CLI verb in it needs an explicit address"
+        );
+
+        assert_eq!(
+            spawn_workspace(None, &PaneRoute::Local),
+            None,
+            "a pane outside any workspace must not claim one"
+        );
+
+        assert_eq!(
+            spawn_workspace(Some(ws), &PaneRoute::for_workspace(Some(&ssh_workspace()))),
+            None,
+            "a remote server has its own machine tree; this id names a workspace in ours"
+        );
     }
 
     #[test]
