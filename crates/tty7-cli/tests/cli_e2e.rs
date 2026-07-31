@@ -40,8 +40,8 @@ fn main() {
             status_reports_the_live_server,
         ),
         (
-            "status_answers_over_tty7_socket_alone",
-            status_answers_over_tty7_socket_alone,
+            "config_dir_alone_resolves_both_endpoints",
+            config_dir_alone_resolves_both_endpoints,
         ),
         (
             "events_stream_reports_a_workspace_creation",
@@ -83,7 +83,6 @@ impl Daemon {
             .env(DAEMON_ENV, "1")
             .env("TTY7_CONFIG_DIR", dir.path())
             .env("TTY7_DATA_DIR", dir.path())
-            .env("TTY7_CONTROL_SOCK", dir.path().join("control.sock"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -141,7 +140,6 @@ impl Daemon {
         cmd.args(args)
             .env("TTY7_CONFIG_DIR", self.dir.path())
             .env("TTY7_DATA_DIR", self.dir.path())
-            .env("TTY7_CONTROL_SOCK", self.dir.path().join("control.sock"))
             .env_remove("TTY7_PANE")
             .env_remove("TTY7_WS")
             .env_remove("TTY7_SOCKET");
@@ -335,20 +333,20 @@ fn run_keep_files_the_pane_so_ls_shows_it(daemon: &Daemon) {
     assert!(filed[0]["pane"].as_u64().is_some_and(|p| p >= 1), "{panes}");
 }
 
-fn status_answers_over_tty7_socket_alone(daemon: &Daemon) {
+fn config_dir_alone_resolves_both_endpoints(daemon: &Daemon) {
     let out = Command::new(env!("CARGO_BIN_EXE_tty7"))
         .args(["status", "--json"])
-        .env_remove("TTY7_CONFIG_DIR")
         .env_remove("TTY7_DATA_DIR")
         .env_remove("TTY7_CONTROL_SOCK")
         .env_remove("TTY7_PANE")
         .env_remove("TTY7_WS")
-        .env("TTY7_SOCKET", daemon.control_endpoint())
+        .env_remove("TTY7_SOCKET")
+        .env("TTY7_CONFIG_DIR", daemon.dir.path())
         .output()
-        .expect("run tty7 status with only TTY7_SOCKET");
+        .expect("run tty7 status with only TTY7_CONFIG_DIR");
     assert!(
         out.status.success(),
-        "status over TTY7_SOCKET failed ({}): {}",
+        "status over TTY7_CONFIG_DIR failed ({}): {}",
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
@@ -357,7 +355,28 @@ fn status_answers_over_tty7_socket_alone(daemon: &Daemon) {
     assert_eq!(
         status["pid"].as_u64(),
         Some(u64::from(daemon.child.id())),
-        "the answer must come from the isolated daemon TTY7_SOCKET points at: {status}"
+        "the answer must come from the daemon TTY7_CONFIG_DIR names: {status}"
+    );
+
+    // The control endpoint alone proves nothing: the bug this pins had `status`
+    // working while every pane verb reached the wrong socket, because the two
+    // endpoints were derived by different rules. Exercise a pane verb over the
+    // same lone variable.
+    let out = Command::new(env!("CARGO_BIN_EXE_tty7"))
+        .args(["run", "--json", "--", "sh", "-c", "exit 9"])
+        .env_remove("TTY7_DATA_DIR")
+        .env_remove("TTY7_CONTROL_SOCK")
+        .env_remove("TTY7_PANE")
+        .env_remove("TTY7_WS")
+        .env_remove("TTY7_SOCKET")
+        .env("TTY7_CONFIG_DIR", daemon.dir.path())
+        .output()
+        .expect("run tty7 run with only TTY7_CONFIG_DIR");
+    assert_eq!(
+        out.status.code(),
+        Some(9),
+        "a pane verb must reach the same server the control verb did: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

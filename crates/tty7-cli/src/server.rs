@@ -27,44 +27,12 @@ fn running() -> bool {
     PaneClient::local().version().is_ok()
 }
 
-/// The lifecycle verbs can only drive the server at this machine's default
-/// endpoint: `spawn::stop` dials `transport::connect()`, and `start` launches a
-/// server that opens that same endpoint. Every *other* verb follows
-/// `$TTY7_SOCKET`, so when that names a different endpoint — an isolated dev
-/// instance, a second server — acting on the default one would stop or start a
-/// different server than `tty7 status` just reported on. Refuse and say so
-/// rather than act on the wrong one.
-pub fn only_the_default_endpoint(socket: Option<&str>, verb: &str) -> Result<()> {
-    let Some(socket) = socket else {
-        return Ok(());
-    };
-    if default_control_endpoint().is_some_and(|p| p == PathBuf::from(socket)) {
-        return Ok(());
-    }
-    let env = crate::address::ENV_SOCKET;
-    bail!(
-        "`tty7 server {verb}` drives only the server at this machine's default endpoint, \
-         and {env}={socket} names a different one. Every other verb follows {env}, so \
-         acting here would hit a different server than `tty7 status` reports on. Unset \
-         {env} to manage the default server, or stop that one the way it was started"
-    )
-}
-
-#[cfg(unix)]
-fn default_control_endpoint() -> Option<PathBuf> {
-    tty7_core::host::server::control_socket_path().ok()
-}
-
-#[cfg(windows)]
-fn default_control_endpoint() -> Option<PathBuf> {
-    tty7_core::host::server::control_endpoint_path().ok()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn default_control_endpoint() -> Option<PathBuf> {
-    None
-}
-
+/// Every verb, lifecycle ones included, acts on the server named by
+/// `$TTY7_CONFIG_DIR`: `spawn::stop` dials `transport::connect`, which derives
+/// its endpoint from the config dir, and `start` passes that same dir to the
+/// server it launches. There is nothing left to guard against here — the
+/// endpoint these verbs reach and the one `tty7 status` reports on are one and
+/// the same by construction.
 pub fn start() -> Result<Outcome> {
     if running() {
         return report(

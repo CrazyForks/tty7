@@ -82,37 +82,24 @@ pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Out
             "managing machine links from the CLI is not implemented yet — \
              use the GUI's connection manager for now"
         ),
-        Some(Command::Server(ServerCmd::Start)) => local_server(
-            machine.as_deref(),
-            ctx.socket.as_deref(),
-            "start",
-            crate::server::start,
-        ),
-        Some(Command::Server(ServerCmd::Stop)) => local_server(
-            machine.as_deref(),
-            ctx.socket.as_deref(),
-            "stop",
-            crate::server::stop,
-        ),
-        Some(Command::Server(ServerCmd::Restart)) => local_server(
-            machine.as_deref(),
-            ctx.socket.as_deref(),
-            "restart",
-            crate::server::restart,
-        ),
-        Some(Command::Server(ServerCmd::Logs)) => local_server(
-            machine.as_deref(),
-            ctx.socket.as_deref(),
-            "logs",
-            crate::server::logs,
-        ),
+        Some(Command::Server(ServerCmd::Start)) => {
+            local_server(machine.as_deref(), "start", crate::server::start)
+        }
+        Some(Command::Server(ServerCmd::Stop)) => {
+            local_server(machine.as_deref(), "stop", crate::server::stop)
+        }
+        Some(Command::Server(ServerCmd::Restart)) => {
+            local_server(machine.as_deref(), "restart", crate::server::restart)
+        }
+        Some(Command::Server(ServerCmd::Logs)) => {
+            local_server(machine.as_deref(), "logs", crate::server::logs)
+        }
         Some(Command::Doctor) => doctor(ctx, backend),
     }
 }
 
 fn local_server(
     machine: Option<&str>,
-    socket: Option<&str>,
     verb: &str,
     act: fn() -> Result<Outcome>,
 ) -> Result<Outcome> {
@@ -123,7 +110,6 @@ fn local_server(
              machine's server lifecycle is handled by the install/reconnect flows, not the CLI"
         );
     }
-    crate::server::only_the_default_endpoint(socket, verb)?;
     act()
 }
 
@@ -642,7 +628,7 @@ fn doctor(ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
         None => "missing".to_string(),
     };
     let mut rows = vec![
-        vec![address::ENV_SOCKET.to_string(), mark(&ctx.socket)],
+        vec![address::ENV_CONFIG_DIR.to_string(), mark(&ctx.config_dir)],
         vec![address::ENV_WS.to_string(), mark(&ctx.ws)],
         vec![address::ENV_PANE.to_string(), mark(&ctx.pane)],
     ];
@@ -698,7 +684,7 @@ fn doctor(ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
         }
     }
     let mut human = output::table(&["CHECK", "RESULT"], &rows);
-    if ctx.socket.is_none() && ctx.pane.is_none() {
+    if ctx.config_dir.is_none() && ctx.pane.is_none() {
         human.push_str(
             "\nnot inside a tty7 shell — address commands need an explicit %pane/@tab/workspace\n",
         );
@@ -707,7 +693,7 @@ fn doctor(ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
         human,
         json!({
             "context": {
-                "socket": ctx.socket.is_some(),
+                "config_dir": ctx.config_dir.is_some(),
                 "workspace": ctx.ws.is_some(),
                 "pane": ctx.pane.is_some(),
             },
@@ -1418,46 +1404,6 @@ mod tests {
     }
 
     #[test]
-    fn a_foreign_tty7_socket_refuses_the_server_lifecycle_verbs() {
-        // Inside a shell of an isolated instance every other verb follows
-        // $TTY7_SOCKET, but stop/start can only drive the default endpoint —
-        // so they must refuse rather than act on a different server.
-        let ctx = Context {
-            socket: Some("/tmp/some-other-instance/control.sock".into()),
-            ..Context::default()
-        };
-        for verb in ["start", "stop", "restart", "logs"] {
-            let mut backend = mock();
-            let err = execute(cli(&["tty7", "server", verb]), &ctx, &mut backend)
-                .expect_err("a foreign endpoint must not be managed by accident");
-            let msg = err.to_string();
-            assert!(msg.contains("TTY7_SOCKET"), "{msg}");
-            assert!(msg.contains(verb), "{msg}");
-            assert!(
-                backend.control_calls.is_empty(),
-                "the refusal must come before any dial"
-            );
-        }
-
-        // Read-only status still follows the variable, as every other verb does.
-        let mut backend = mock();
-        backend
-            .replies
-            .push_back(ReplyOk::Status(tty7_core::daemon::control::ServerStatus {
-                pid: 1,
-                uptime_secs: 0,
-                panes: 0,
-                control_version: CONTROL_VERSION,
-                protocol_version: PROTOCOL_VERSION,
-                build: "test".into(),
-                socket: String::new(),
-            }));
-        execute(cli(&["tty7", "server", "status"]), &ctx, &mut backend)
-            .expect("status is a query, not a lifecycle verb");
-        assert_eq!(backend.control_calls, vec![ControlRequest::Status]);
-    }
-
-    #[test]
     fn the_still_missing_verbs_say_so_without_touching_the_wire() {
         for (args, needle) in [
             (vec!["tty7", "ws", "stop", "api"], "not implemented"),
@@ -1554,7 +1500,7 @@ mod tests {
             &Context::default(),
             &mut doctor_backend(),
         ));
-        assert!(out.contains("TTY7_SOCKET"), "{out}");
+        assert!(out.contains("TTY7_CONFIG_DIR"), "{out}");
         assert!(out.contains("missing"), "{out}");
         assert!(out.contains("dialect"), "{out}");
         assert!(
@@ -1567,9 +1513,9 @@ mod tests {
         let ctx = Context {
             pane: Some("7".into()),
             ws: None,
-            socket: Some("sock".into()),
+            config_dir: Some("/cfg/tty7".into()),
         };
         let out = human(run_cli(&["tty7", "doctor"], &ctx, &mut doctor_backend()));
-        assert!(out.contains("set (sock)"), "{out}");
+        assert!(out.contains("set (/cfg/tty7)"), "{out}");
     }
 }

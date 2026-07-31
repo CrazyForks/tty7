@@ -3,7 +3,12 @@ use tty7_core::core::session::WorkspaceId;
 
 pub const ENV_PANE: &str = "TTY7_PANE";
 pub const ENV_WS: &str = "TTY7_WS";
-pub const ENV_SOCKET: &str = "TTY7_SOCKET";
+/// The server's config dir, not a socket path — the server publishes the
+/// directory so both endpoints resolve through tty7_core's own derivation
+/// rather than a second one here. Inherited by this process, so
+/// `ControlClient::connect` / `PaneClient::local` already land on the right
+/// server without the CLI touching a path at all.
+pub const ENV_CONFIG_DIR: &str = "TTY7_CONFIG_DIR";
 
 pub const OUTSIDE_SHELL: &str = "not inside a tty7 shell — pass an explicit %pane/@tab/workspace";
 
@@ -11,7 +16,7 @@ pub const OUTSIDE_SHELL: &str = "not inside a tty7 shell — pass an explicit %p
 pub struct Context {
     pub pane: Option<String>,
     pub ws: Option<String>,
-    pub socket: Option<String>,
+    pub config_dir: Option<String>,
 }
 
 impl Context {
@@ -19,7 +24,7 @@ impl Context {
         Context {
             pane: std::env::var(ENV_PANE).ok().filter(|v| !v.is_empty()),
             ws: std::env::var(ENV_WS).ok().filter(|v| !v.is_empty()),
-            socket: std::env::var(ENV_SOCKET).ok().filter(|v| !v.is_empty()),
+            config_dir: std::env::var(ENV_CONFIG_DIR).ok().filter(|v| !v.is_empty()),
         }
     }
 }
@@ -111,7 +116,7 @@ mod tests {
         Context {
             pane: Some("42".into()),
             ws: Some("0d4e1a54-0000-4000-8000-000000000001".into()),
-            socket: Some("\\\\.\\pipe\\tty7".into()),
+            config_dir: Some("C:\\Users\\me\\AppData\\Roaming\\tty7".into()),
         }
     }
 

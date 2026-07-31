@@ -100,6 +100,7 @@ fn the_derived_remote_socket_is_the_one_the_server_binds() {
     let bound = bound_control_socket(Some(&runtime_path), &home_path);
     let derived = remote_control_socket(&RemoteEnv {
         control_sock: None,
+        config_dir: None,
         xdg_runtime_dir: Some(runtime_path.clone()),
         home: Some(home_path.clone()),
         tmpdir: std::env::var("TMPDIR").ok(),
@@ -109,6 +110,7 @@ fn the_derived_remote_socket_is_the_one_the_server_binds() {
     let bound = bound_control_socket(None, &home_path);
     let derived = remote_control_socket(&RemoteEnv {
         control_sock: None,
+        config_dir: None,
         xdg_runtime_dir: None,
         home: Some(home_path.clone()),
         tmpdir: std::env::var("TMPDIR").ok(),
@@ -117,12 +119,14 @@ fn the_derived_remote_socket_is_the_one_the_server_binds() {
 }
 
 fn bound_control_socket(runtime_dir: Option<&str>, home: &str) -> String {
-    let config = tempfile::TempDir::new().unwrap();
+    // Deliberately no --config-dir: the control socket is derived from the
+    // config dir, and remote_control_socket derives the remote's from $HOME the
+    // same way. Overriding it here would compare two different rules. HOME is
+    // already a temp dir, so this stays isolated.
     let mut cmd = Command::new(EXE);
     cmd.arg("--daemon")
-        .arg("--config-dir")
-        .arg(config.path())
         .env("HOME", home)
+        .env_remove("TTY7_CONFIG_DIR")
         .env_remove("TTY7_CONTROL_SOCK")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

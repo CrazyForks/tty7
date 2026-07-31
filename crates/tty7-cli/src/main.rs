@@ -15,7 +15,7 @@ fn main() -> std::process::ExitCode {
     let json = cli.json;
     let quiet = cli.quiet;
     let ctx = address::Context::from_env();
-    let mut backend = backend::RealBackend::new(cli.machine.clone(), ctx.socket.clone());
+    let mut backend = backend::RealBackend::new(cli.machine.clone());
     match commands::execute(cli, &ctx, &mut backend) {
         // `run` stands in for the command it launched, so its exit code is
         // ours. The report rides along anyway: --json must not go silent just

@@ -1,5 +1,5 @@
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -29,7 +29,6 @@ const NOT_RUNNING: &str =
 
 pub struct RealBackend {
     machine: Option<String>,
-    socket: Option<String>,
     route: Option<RouteTarget>,
     control: Option<ControlClient>,
     panes: Option<PaneClient>,
@@ -42,10 +41,13 @@ struct RunningCommand {
 }
 
 impl RealBackend {
-    pub fn new(machine: Option<String>, socket: Option<String>) -> RealBackend {
+    /// The server's config dir arrives in this process's environment as
+    /// `TTY7_CONFIG_DIR`, which is what `tty7_core`'s own endpoint derivation
+    /// reads. So there is nothing to plumb: `ControlClient::connect` and
+    /// `PaneClient::local` resolve the same two sockets the server opened.
+    pub fn new(machine: Option<String>) -> RealBackend {
         RealBackend {
             machine,
-            socket,
             route: None,
             control: None,
             panes: None,
@@ -58,15 +60,7 @@ impl RealBackend {
     }
 
     fn local_control(&self, hello: &ControlHello) -> Result<ControlClient> {
-        match &self.socket {
-            Some(path) => ControlClient::connect_at(Path::new(path), hello).with_context(|| {
-                format!(
-                    "connecting to the server at {}={path}",
-                    crate::address::ENV_SOCKET
-                )
-            }),
-            None => ControlClient::connect(hello).context(NOT_RUNNING),
-        }
+        ControlClient::connect(hello).context(NOT_RUNNING)
     }
 
     fn route(&mut self) -> Result<Option<RouteTarget>> {
@@ -111,24 +105,12 @@ impl RealBackend {
         if self.panes.is_none() {
             let client = match self.route()? {
                 Some(target) => PaneClient::routed(target),
-                None => match &self.socket {
-                    Some(path) => PaneClient::at(pane_endpoint_for(Path::new(path))),
-                    None => PaneClient::local(),
-                },
+                None => PaneClient::local(),
             };
             self.panes = Some(client);
         }
         Ok(self.panes.as_ref().expect("just filled"))
     }
-}
-
-fn pane_endpoint_for(control: &Path) -> PathBuf {
-    let file = if cfg!(windows) {
-        "daemon.port"
-    } else {
-        "daemon.sock"
-    };
-    control.with_file_name(file)
 }
 
 impl Backend for RealBackend {
@@ -427,19 +409,6 @@ mod tests {
         assert!(err.contains("down"), "{err}");
         assert!(err.contains("reconnect"), "{err}");
         assert!(err.contains("me@build-box:22"), "{err}");
-    }
-
-    #[test]
-    fn the_pane_endpoint_is_the_control_endpoints_sibling() {
-        let (control, pane) = if cfg!(windows) {
-            ("C:\\cfg\\tty7\\control.port", "C:\\cfg\\tty7\\daemon.port")
-        } else {
-            (
-                "/run/user/1000/tty7/control.sock",
-                "/run/user/1000/tty7/daemon.sock",
-            )
-        };
-        assert_eq!(pane_endpoint_for(Path::new(control)), PathBuf::from(pane));
     }
 
     #[test]

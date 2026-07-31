@@ -1275,19 +1275,26 @@ mod sock {
 
     const MAX_SOCKET_PATH_BYTES: usize = 100;
 
+    /// The control endpoint, derived from the config dir exactly the way the
+    /// pane endpoint is (`transport::socket_path_for`).
+    ///
+    /// It used to sit in `$XDG_RUNTIME_DIR/tty7` or `~/.local/share/tty7`,
+    /// which meant it did not follow `--config-dir` while the pane socket did.
+    /// Two consequences, both real: a `--config-dir` instance published the
+    /// *default* control socket to the shells it spawned, so a CLI inside it
+    /// talked to a different server entirely; and because both endpoints were
+    /// named `daemon.sock`, telling them apart depended on their directories
+    /// differing — so deriving one from the other by filename silently yielded
+    /// the wrong socket. They are siblings now, distinguished by name, which is
+    /// what the Windows arm has always done (`control.port`/`daemon.port`).
     pub fn control_socket_path() -> io::Result<PathBuf> {
         if let Some(explicit) = std::env::var_os(CONTROL_SOCK_ENV).filter(|v| !v.is_empty()) {
             return Ok(PathBuf::from(explicit));
         }
 
-        let dir = runtime_dir()
-            .map(|d| d.join("tty7"))
-            .or_else(|| home_dir().map(|h| h.join(".local").join("share").join("tty7")))
-            .ok_or_else(|| {
-                io::Error::other(
-                    "no $XDG_RUNTIME_DIR and no home directory to place the control socket in",
-                )
-            })?;
+        let dir = crate::core::config::config_dir_path().ok_or_else(|| {
+            io::Error::other("no config directory to place the control socket in")
+        })?;
 
         let fallbacks: Vec<PathBuf> = [runtime_dir(), Some(std::env::temp_dir())]
             .into_iter()
@@ -1296,15 +1303,19 @@ mod sock {
         socket_path_in(&dir, &fallbacks)
     }
 
-    pub(super) fn socket_path_in(dir: &Path, fallbacks: &[PathBuf]) -> io::Result<PathBuf> {
-        let inline = dir.join("daemon.sock");
+    pub(super) const CONTROL_SOCK_FILE: &str = "control.sock";
+
+    pub(crate) fn socket_path_in(dir: &Path, fallbacks: &[PathBuf]) -> io::Result<PathBuf> {
+        let inline = dir.join(CONTROL_SOCK_FILE);
         if fits(&inline) {
             return Ok(inline);
         }
 
         use std::os::unix::ffi::OsStrExt as _;
+        // `-control` keeps this clear of the pane socket's fallback name, which
+        // hashes the same directory and would otherwise land on the same file.
         let name = format!(
-            "tty7-{:016x}.sock",
+            "tty7-{:016x}-control.sock",
             crate::host::fnv1a64(dir.as_os_str().as_bytes())
         );
         for base in fallbacks {
@@ -1417,6 +1428,8 @@ mod sock {
     }
 }
 
+#[cfg(unix)]
+pub(crate) use sock::socket_path_in;
 #[cfg(unix)]
 pub use sock::{
     bind_control_socket, control_socket_path, serve_listener, serve_listener_with,
@@ -2583,7 +2596,7 @@ mod tests {
 
         assert_eq!(
             sock::socket_path_in(&short, &[]).unwrap(),
-            PathBuf::from("/tmp/rt/daemon.sock")
+            PathBuf::from("/tmp/rt/control.sock")
         );
 
         let picked = sock::socket_path_in(&long, &[long.clone(), short.clone()]).unwrap();

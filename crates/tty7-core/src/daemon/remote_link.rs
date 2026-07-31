@@ -147,6 +147,7 @@ pub fn choose_entry(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RemoteEnv {
     pub control_sock: Option<String>,
+    pub config_dir: Option<String>,
     pub xdg_runtime_dir: Option<String>,
     pub home: Option<String>,
     pub tmpdir: Option<String>,
@@ -156,7 +157,8 @@ const ENV_MARKER: &str = "__tty7_env__";
 
 pub const REMOTE_ENV_PROBE: &str = concat!(
     "sh -c 'printf \"__tty7_env__ %s\\n\" ",
-    "\"sock=${TTY7_CONTROL_SOCK-}\" \"xdg=${XDG_RUNTIME_DIR-}\" ",
+    "\"sock=${TTY7_CONTROL_SOCK-}\" \"cfg=${TTY7_CONFIG_DIR-}\" ",
+    "\"xdg=${XDG_RUNTIME_DIR-}\" ",
     "\"home=${HOME-}\" \"tmp=${TMPDIR-}\"'"
 );
 
@@ -173,6 +175,7 @@ impl RemoteEnv {
             let value = (!value.is_empty()).then(|| value.to_string());
             match key {
                 "sock" => env.control_sock = value,
+                "cfg" => env.config_dir = value,
                 "xdg" => env.xdg_runtime_dir = value,
                 "home" => env.home = value,
                 "tmp" => env.tmpdir = value,
@@ -188,21 +191,29 @@ pub fn remote_control_socket(env: &RemoteEnv) -> Option<String> {
         return Some(explicit.to_string());
     }
 
-    let runtime = env.xdg_runtime_dir.as_deref().filter(|d| !d.is_empty());
-    let dir = match runtime {
-        Some(runtime) => posix_join(runtime, "tty7"),
+    // The remote server is launched with `--stdio` and no `--config-dir`, so it
+    // opens its control socket in the config dir — `$TTY7_CONFIG_DIR` if the
+    // remote sets one, otherwise `$HOME/.config/tty7`. This has to mirror
+    // `host::server::control_socket_path` exactly: it is the same rule applied
+    // to an environment we probed instead of our own.
+    let dir = match env.config_dir.as_deref().filter(|d| !d.is_empty()) {
+        Some(cfg) => cfg.to_string(),
         None => {
             let home = env.home.as_deref().filter(|h| !h.is_empty())?;
-            posix_join(&posix_join(&posix_join(home, ".local"), "share"), "tty7")
+            posix_join(&posix_join(home, ".config"), "tty7")
         }
     };
+    let runtime = env.xdg_runtime_dir.as_deref().filter(|d| !d.is_empty());
 
-    let inline = posix_join(&dir, "daemon.sock");
+    let inline = posix_join(&dir, "control.sock");
     if fits(&inline) {
         return Some(inline);
     }
 
-    let name = format!("tty7-{:016x}.sock", crate::host::fnv1a64(dir.as_bytes()));
+    let name = format!(
+        "tty7-{:016x}-control.sock",
+        crate::host::fnv1a64(dir.as_bytes())
+    );
     let tmp = env
         .tmpdir
         .as_deref()
@@ -395,23 +406,28 @@ mod tests {
             "an explicit $TTY7_CONTROL_SOCK outranks everything"
         );
 
-        let xdg = RemoteEnv {
+        // $XDG_RUNTIME_DIR no longer places the socket: the server opens it in
+        // its config dir, so the path follows that and only falls back to the
+        // runtime dir when the config dir is too long for sun_path.
+        let explicit_cfg = RemoteEnv {
+            config_dir: Some("/home/me/.config/tty7".into()),
             xdg_runtime_dir: Some("/run/user/1000".into()),
             home: Some("/home/me".into()),
             ..RemoteEnv::default()
         };
         assert_eq!(
-            remote_control_socket(&xdg).as_deref(),
-            Some("/run/user/1000/tty7/daemon.sock")
+            remote_control_socket(&explicit_cfg).as_deref(),
+            Some("/home/me/.config/tty7/control.sock"),
+            "an explicit $TTY7_CONFIG_DIR names the directory"
         );
 
         let trailing = RemoteEnv {
-            xdg_runtime_dir: Some("/run/user/1000/".into()),
+            config_dir: Some("/home/me/.config/tty7/".into()),
             ..RemoteEnv::default()
         };
         assert_eq!(
             remote_control_socket(&trailing).as_deref(),
-            Some("/run/user/1000/tty7/daemon.sock")
+            Some("/home/me/.config/tty7/control.sock")
         );
 
         let home_only = RemoteEnv {
@@ -420,7 +436,8 @@ mod tests {
         };
         assert_eq!(
             remote_control_socket(&home_only).as_deref(),
-            Some("/home/me/.local/share/tty7/daemon.sock")
+            Some("/home/me/.config/tty7/control.sock"),
+            "with no $TTY7_CONFIG_DIR the remote server uses $HOME/.config/tty7"
         );
 
         assert_eq!(remote_control_socket(&RemoteEnv::default()), None);
@@ -431,6 +448,7 @@ mod tests {
         let deep = format!("/run/user/1000/{}", "nested/".repeat(12));
         let env = RemoteEnv {
             control_sock: None,
+            config_dir: Some(deep.clone()),
             xdg_runtime_dir: Some(deep.clone()),
             home: Some("/home/me".into()),
             tmpdir: Some("/tmp".into()),
@@ -448,6 +466,7 @@ mod tests {
 
         let hopeless = RemoteEnv {
             control_sock: None,
+            config_dir: Some(deep.clone()),
             xdg_runtime_dir: Some(deep.clone()),
             home: Some("/home/me".into()),
             tmpdir: Some(deep),

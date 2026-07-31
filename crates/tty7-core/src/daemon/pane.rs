@@ -266,27 +266,22 @@ fn system_locale_identifier() -> Option<String> {
 
 const TERM_PROGRAM_NAME: &str = "tty7";
 
-const TTY7_SOCKET_ENV: &str = "TTY7_SOCKET";
+/// The config dir this server runs on, not a socket path.
+///
+/// A client needs *two* endpoints — control and pane — and they are derived
+/// from the config dir by rules that already live in this crate
+/// (`control_socket_path`, `transport::socket_path_for`), including a hashed
+/// fallback when the directory is too long for `sun_path`. Publishing one
+/// socket path and letting the client reconstruct the other from it means a
+/// second, independent derivation that can and did disagree with the first.
+/// Publishing the directory instead means a CLI in this shell resolves both
+/// endpoints with the very same functions the server used to open them.
+const TTY7_CONFIG_DIR_ENV: &str = "TTY7_CONFIG_DIR";
 const TTY7_PANE_ENV: &str = "TTY7_PANE";
 const TTY7_WS_ENV: &str = "TTY7_WS";
 
-#[cfg(unix)]
-fn control_socket_env() -> Option<String> {
-    crate::host::server::control_socket_path()
-        .ok()
-        .map(|p| p.display().to_string())
-}
-
-#[cfg(windows)]
-fn control_socket_env() -> Option<String> {
-    crate::host::server::control_endpoint_path()
-        .ok()
-        .map(|p| p.display().to_string())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn control_socket_env() -> Option<String> {
-    None
+fn config_dir_env() -> Option<String> {
+    crate::core::config::config_dir_path().map(|p| p.display().to_string())
 }
 
 const CAPABILITY_ENV: [&str; 2] = ["TERM", "COLORTERM"];
@@ -321,8 +316,8 @@ fn pane_environment(
     if let Some(ws) = workspace {
         env.push((TTY7_WS_ENV.to_string(), ws.to_string()));
     }
-    if let Some(socket) = control_socket_env() {
-        env.push((TTY7_SOCKET_ENV.to_string(), socket));
+    if let Some(dir) = config_dir_env() {
+        env.push((TTY7_CONFIG_DIR_ENV.to_string(), dir));
     }
     env.extend(
         extra_env
@@ -3776,15 +3771,16 @@ mod tests {
             Some("ws-main"),
             "the workspace the spawn was filed under rides into the shell"
         );
-        match control_socket_env() {
-            Some(socket) => assert_eq!(
-                env.get(TTY7_SOCKET_ENV),
-                Some(&socket),
-                "the shell is told where this server answers"
+        match config_dir_env() {
+            Some(dir) => assert_eq!(
+                env.get(TTY7_CONFIG_DIR_ENV),
+                Some(&dir),
+                "the shell is told which config dir this server runs on, so a CLI \
+                 there resolves both endpoints the same way the server opened them"
             ),
             None => assert!(
-                !env.contains_key(TTY7_SOCKET_ENV),
-                "no resolvable endpoint must not inject an empty TTY7_SOCKET"
+                !env.contains_key(TTY7_CONFIG_DIR_ENV),
+                "no resolvable config dir must not inject an empty TTY7_CONFIG_DIR"
             ),
         }
 
@@ -3968,13 +3964,35 @@ mod tests {
             Some("ws-main"),
             "the daemon must tell every spawned shell which workspace filed it"
         );
-        if let Some(socket) = control_socket_env() {
+        if let Some(dir) = config_dir_env() {
             assert_eq!(
-                cmd.get_env(TTY7_SOCKET_ENV).and_then(|v| v.to_str()),
-                Some(socket.as_str()),
-                "the daemon must tell every spawned shell where its server answers"
+                cmd.get_env(TTY7_CONFIG_DIR_ENV).and_then(|v| v.to_str()),
+                Some(dir.as_str()),
+                "the daemon must tell every spawned shell which config dir it serves"
             );
         }
+    }
+
+    #[test]
+    fn the_two_endpoints_are_siblings_derived_from_one_config_dir() {
+        // The bug this pins: the control socket used to ignore the config dir
+        // and sit in ~/.local/share/tty7 as `daemon.sock`, the same basename the
+        // pane socket uses. A `--config-dir` server therefore published someone
+        // else's control endpoint, and anything deriving one path from the other
+        // by filename got the wrong socket. Both must come from the config dir,
+        // and they must not collide.
+        let dir = std::path::Path::new("/tmp/tty7-endpoint-test");
+        let pane = crate::daemon::transport::socket_path_for(dir);
+        let control = crate::host::server::socket_path_in(dir, &[]).expect("short enough path");
+
+        assert_eq!(pane.parent(), control.parent(), "one directory, two files");
+        assert_ne!(
+            pane.file_name(),
+            control.file_name(),
+            "same basename is what made them indistinguishable"
+        );
+        assert_eq!(pane, dir.join("daemon.sock"));
+        assert_eq!(control, dir.join("control.sock"));
     }
 
     #[test]

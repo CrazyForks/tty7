@@ -27,7 +27,7 @@ mod imp_unix {
         h
     }
 
-    pub(super) fn socket_path_for(config_dir: &Path) -> PathBuf {
+    pub(crate) fn socket_path_for(config_dir: &Path) -> PathBuf {
         use std::os::unix::ffi::OsStrExt as _;
         let inline = config_dir.join("daemon.sock");
         if inline.as_os_str().as_bytes().len() <= MAX_SOCKET_PATH_BYTES {
