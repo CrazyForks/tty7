@@ -112,13 +112,15 @@ struct SpawnConfig {
 }
 
 fn build_spawn_config(
+    pane: u64,
     cwd: Option<PathBuf>,
     shell: Option<ShellSpec>,
+    workspace: Option<&str>,
 ) -> anyhow::Result<SpawnConfig> {
     let initial_cwd = initial_working_directory(cwd);
     let configured = choose_shell(shell, crate::core::config::shell_command());
     let remote = wsl_remote_context(configured.as_ref());
-    let (cmd, integration_dir) = build_shell_command(configured, &initial_cwd)?;
+    let (cmd, integration_dir) = build_shell_command(configured, &initial_cwd, pane, workspace)?;
     Ok(SpawnConfig {
         cmd,
         initial_cwd,
@@ -149,6 +151,8 @@ fn wsl_remote_context(shell: Option<&ChosenShell>) -> Option<RemoteContext> {
 fn build_shell_command(
     configured: Option<ChosenShell>,
     initial_cwd: &Option<PathBuf>,
+    pane: u64,
+    workspace: Option<&str>,
 ) -> anyhow::Result<(CommandBuilder, Option<PathBuf>)> {
     let mut cmd = match &configured {
         Some(chosen) => {
@@ -172,7 +176,7 @@ fn build_shell_command(
         apply_shell_integration(&mut cmd, &resolved_program, integration);
     }
     let integration_dir = integration.as_ref().and_then(|i| i.dir.clone());
-    apply_common_command_setup(&mut cmd, initial_cwd);
+    apply_common_command_setup(&mut cmd, initial_cwd, pane, workspace);
     Ok((cmd, integration_dir))
 }
 
@@ -260,6 +264,29 @@ fn system_locale_identifier() -> Option<String> {
 
 const TERM_PROGRAM_NAME: &str = "tty7";
 
+const TTY7_SOCKET_ENV: &str = "TTY7_SOCKET";
+const TTY7_PANE_ENV: &str = "TTY7_PANE";
+const TTY7_WS_ENV: &str = "TTY7_WS";
+
+#[cfg(unix)]
+fn control_socket_env() -> Option<String> {
+    crate::host::server::control_socket_path()
+        .ok()
+        .map(|p| p.display().to_string())
+}
+
+#[cfg(windows)]
+fn control_socket_env() -> Option<String> {
+    crate::host::server::control_endpoint_path()
+        .ok()
+        .map(|p| p.display().to_string())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn control_socket_env() -> Option<String> {
+    None
+}
+
 const CAPABILITY_ENV: [&str; 2] = ["TERM", "COLORTERM"];
 
 fn names_capability_env(key: &str) -> bool {
@@ -274,6 +301,8 @@ fn names_capability_env(key: &str) -> bool {
 
 fn pane_environment(
     extra_env: &std::collections::HashMap<String, String>,
+    pane: u64,
+    workspace: Option<&str>,
 ) -> Vec<(String, String)> {
     let version = env!("CARGO_PKG_VERSION");
     let mut env = vec![
@@ -285,7 +314,14 @@ fn pane_environment(
         ),
         ("TERM_PROGRAM".to_string(), TERM_PROGRAM_NAME.to_string()),
         ("TERM_PROGRAM_VERSION".to_string(), version.to_string()),
+        (TTY7_PANE_ENV.to_string(), pane.to_string()),
     ];
+    if let Some(ws) = workspace {
+        env.push((TTY7_WS_ENV.to_string(), ws.to_string()));
+    }
+    if let Some(socket) = control_socket_env() {
+        env.push((TTY7_SOCKET_ENV.to_string(), socket));
+    }
     env.extend(
         extra_env
             .iter()
@@ -295,12 +331,17 @@ fn pane_environment(
     env
 }
 
-fn apply_common_command_setup(cmd: &mut CommandBuilder, initial_cwd: &Option<PathBuf>) {
+fn apply_common_command_setup(
+    cmd: &mut CommandBuilder,
+    initial_cwd: &Option<PathBuf>,
+    pane: u64,
+    workspace: Option<&str>,
+) {
     if let Some(dir) = initial_cwd {
         cmd.cwd(dir);
     }
     let extra_env = crate::core::config::extra_env();
-    for (k, v) in pane_environment(&extra_env) {
+    for (k, v) in pane_environment(&extra_env, pane, workspace) {
         cmd.env(k, v);
     }
 
@@ -379,6 +420,8 @@ struct PaneState {
     ring: ReplayRing,
     subscriber: Option<Sender<DaemonMsg>>,
     subscriber_epoch: u64,
+    observers: Vec<(u64, Sender<DaemonMsg>)>,
+    observer_seq: u64,
     cwd: Option<PathBuf>,
     shell: ShellState,
     remote: Option<RemoteContext>,
@@ -386,6 +429,13 @@ struct PaneState {
     agent_argv: Option<Vec<String>>,
     agent_session: Option<crate::core::cli_agent::AgentSessionState>,
     alive: bool,
+}
+
+fn notify(st: &mut PaneState, msg: DaemonMsg) {
+    if let Some(sub) = &st.subscriber {
+        let _ = sub.send(msg.clone());
+    }
+    st.observers.retain(|(_, tx)| tx.send(msg.clone()).is_ok());
 }
 
 enum PaneBackend {
@@ -450,9 +500,7 @@ impl DeathReporter {
             return;
         }
         let subscribed = st.subscriber.is_some();
-        if let Some(sub) = &st.subscriber {
-            let _ = sub.send(DaemonMsg::Exited { code: None });
-        }
+        notify(&mut st, DaemonMsg::Exited { code: None });
         drop(st);
         crate::core::machine::observe_pane(pane, |p| p.live = false);
         if subscribed {
@@ -471,12 +519,13 @@ impl DaemonPane {
         size: WinSize,
         shell: Option<ShellSpec>,
         owner: Option<String>,
+        workspace: Option<String>,
         on_dead: impl FnOnce() + Send + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         let pty_size = pty_size(size);
 
         let pair = native_pty_system().openpty(pty_size)?;
-        let spawn = build_spawn_config(cwd, shell)?;
+        let spawn = build_spawn_config(id, cwd, shell, workspace.as_deref())?;
 
         let child = pair.slave.spawn_command(spawn.cmd)?;
         let shell_pid = child.process_id();
@@ -491,6 +540,8 @@ impl DaemonPane {
             ring: ReplayRing::new(size),
             subscriber: None,
             subscriber_epoch: 0,
+            observers: Vec::new(),
+            observer_seq: 0,
             cwd: spawn.initial_cwd,
             shell: ShellState::default(),
             remote: spawn.remote.clone(),
@@ -579,6 +630,8 @@ impl DaemonPane {
             ring: ReplayRing::new(size),
             subscriber: None,
             subscriber_epoch: 0,
+            observers: Vec::new(),
+            observer_seq: 0,
             cwd: None,
             shell: ShellState::default(),
             remote: Some(remote),
@@ -759,6 +812,9 @@ impl DaemonPane {
                                     gate.add(n);
                                 }
                             }
+                            st.observers.retain(|(_, tx)| {
+                                tx.send(DaemonMsg::Output(bytes.to_vec())).is_ok()
+                            });
                             apply_signals(&mut st, signals);
                             if let Some(remote) = remote {
                                 apply_remote_context(&mut st, remote);
@@ -816,6 +872,20 @@ impl DaemonPane {
         !st.alive && st.subscriber.is_none()
     }
 
+    pub fn observe(&self, observer: Sender<DaemonMsg>) -> u64 {
+        let mut st = self.state.lock().unwrap();
+        observe_subscriber(&mut st, observer)
+    }
+
+    pub fn unobserve(&self, observer_id: u64) {
+        let mut st = self.state.lock().unwrap();
+        st.observers.retain(|(id, _)| *id != observer_id);
+    }
+
+    pub fn agent_state(&self) -> Option<crate::daemon::control::PaneAgentState> {
+        agent_state_snapshot(&self.state.lock().unwrap())
+    }
+
     pub fn gate(&self) -> Arc<OutputGate> {
         self.gate.clone()
     }
@@ -848,7 +918,12 @@ impl DaemonPane {
     }
 
     pub fn resize(&self, size: WinSize) {
-        self.state.lock().unwrap().ring.resize(size);
+        {
+            let mut st = self.state.lock().unwrap();
+            st.ring.resize(size);
+            st.observers
+                .retain(|(_, tx)| tx.send(DaemonMsg::Size(size)).is_ok());
+        }
         match &self.backend {
             PaneBackend::Pty(p) => {
                 if let Ok(master) = p.master.lock() {
@@ -1160,10 +1235,8 @@ impl ReplayRing {
     }
 }
 
-fn attach_subscriber(st: &mut PaneState, subscriber: Sender<DaemonMsg>) -> u64 {
-    st.subscriber_epoch += 1;
-
-    st.ring.replay(&subscriber);
+fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>) {
+    st.ring.replay(subscriber);
     if let Some(cwd) = &st.cwd {
         let _ = subscriber.send(DaemonMsg::Cwd(cwd.clone()));
     }
@@ -1186,8 +1259,30 @@ fn attach_subscriber(st: &mut PaneState, subscriber: Sender<DaemonMsg>) -> u64 {
     if !st.alive {
         let _ = subscriber.send(DaemonMsg::Exited { code: None });
     }
+}
+
+fn attach_subscriber(st: &mut PaneState, subscriber: Sender<DaemonMsg>) -> u64 {
+    st.subscriber_epoch += 1;
+    replay_state(st, &subscriber);
     st.subscriber = Some(subscriber);
     st.subscriber_epoch
+}
+
+fn observe_subscriber(st: &mut PaneState, observer: Sender<DaemonMsg>) -> u64 {
+    st.observer_seq += 1;
+    replay_state(st, &observer);
+    st.observers.push((st.observer_seq, observer));
+    st.observer_seq
+}
+
+fn agent_state_snapshot(st: &PaneState) -> Option<crate::daemon::control::PaneAgentState> {
+    st.agent_session
+        .clone()
+        .map(|state| crate::daemon::control::PaneAgentState {
+            pane_id: st.id,
+            agent: st.agent,
+            state,
+        })
 }
 
 fn observed_facts(st: &PaneState) -> (Option<String>, Option<crate::core::machine::AgentFacts>) {
@@ -1228,9 +1323,7 @@ fn agent_facts_changed(
 fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
     if let Some(cwd) = signals.cwd {
         if st.cwd.as_ref() != Some(&cwd) {
-            if let Some(sub) = &st.subscriber {
-                let _ = sub.send(DaemonMsg::Cwd(cwd.clone()));
-            }
+            notify(st, DaemonMsg::Cwd(cwd.clone()));
             st.cwd = Some(cwd);
         }
     }
@@ -1244,13 +1337,14 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
             );
         }
         st.shell = shell.clone();
-        if let Some(sub) = &st.subscriber {
-            let _ = sub.send(DaemonMsg::Prompt {
+        notify(
+            st,
+            DaemonMsg::Prompt {
                 active: shell.active,
                 at_prompt: shell.at_prompt,
                 last_exit: shell.last_exit_code,
-            });
-        }
+            },
+        );
     }
     apply_agent_signals(st, signals.agent_events, signals.notification);
 }
@@ -1286,9 +1380,7 @@ fn apply_agent_signals(
     for event in &events {
         if st.agent.is_none() && event.agent.is_some() {
             st.agent = event.agent;
-            if let Some(sub) = &st.subscriber {
-                let _ = sub.send(DaemonMsg::Agent(st.agent));
-            }
+            notify(st, DaemonMsg::Agent(st.agent));
         }
         st.agent_session
             .get_or_insert_with(AgentSessionState::default)
@@ -1312,10 +1404,8 @@ fn apply_agent_signals(
         sess.launch_argv = Some(argv.clone());
     }
 
-    if st.agent_session != before
-        && let Some(sub) = &st.subscriber
-    {
-        let _ = sub.send(DaemonMsg::AgentStatus(st.agent_session.clone()));
+    if st.agent_session != before {
+        notify(st, DaemonMsg::AgentStatus(st.agent_session.clone()));
     }
 }
 
@@ -1329,9 +1419,7 @@ fn apply_probed_cwd(st: &mut PaneState, probed: Option<PathBuf>) {
     if st.cwd.as_deref().is_some_and(|cur| same_dir(cur, &probed)) {
         return;
     }
-    if let Some(sub) = &st.subscriber {
-        let _ = sub.send(DaemonMsg::Cwd(probed.clone()));
-    }
+    notify(st, DaemonMsg::Cwd(probed.clone()));
     st.cwd = Some(probed);
 }
 
@@ -1348,9 +1436,7 @@ fn apply_remote_context(st: &mut PaneState, remote: Option<RemoteContext>) {
         return;
     }
     st.cwd = None;
-    if let Some(sub) = &st.subscriber {
-        let _ = sub.send(DaemonMsg::RemoteContext(remote.clone()));
-    }
+    notify(st, DaemonMsg::RemoteContext(remote.clone()));
     st.remote = remote;
 }
 
@@ -1368,16 +1454,12 @@ fn apply_agent(
     }
     if agent.is_none() && st.agent_session.is_some() {
         st.agent_session = None;
-        if let Some(sub) = &st.subscriber {
-            let _ = sub.send(DaemonMsg::AgentStatus(None));
-        }
+        notify(st, DaemonMsg::AgentStatus(None));
     }
     if agent.is_none() {
         st.agent_argv = None;
     }
-    if let Some(sub) = &st.subscriber {
-        let _ = sub.send(DaemonMsg::Agent(agent));
-    }
+    notify(st, DaemonMsg::Agent(agent));
     st.agent = agent;
     stamp_launch_argv(st, argv);
 }
@@ -1395,9 +1477,7 @@ fn stamp_launch_argv(st: &mut PaneState, argv: Option<Vec<String>>) {
         && sess.launch_argv.as_ref() != Some(&argv)
     {
         sess.launch_argv = Some(argv);
-        if let Some(sub) = &st.subscriber {
-            let _ = sub.send(DaemonMsg::AgentStatus(st.agent_session.clone()));
-        }
+        notify(st, DaemonMsg::AgentStatus(st.agent_session.clone()));
     }
 }
 
@@ -1755,6 +1835,7 @@ mod tests {
                 args: vec!["-c".into(), "cd /usr && exec cat".into()],
                 args_are_tty7_defaults: false,
             }),
+            None,
             None,
             || {},
         )
@@ -2501,6 +2582,8 @@ mod tests {
             ring: ReplayRing::new(ws(80, 24)),
             subscriber: None,
             subscriber_epoch: 0,
+            observers: Vec::new(),
+            observer_seq: 0,
             cwd: None,
             shell: ShellState::default(),
             remote: None,
@@ -2843,6 +2926,158 @@ mod tests {
         ));
     }
 
+    fn drain(rx: &mpsc::Receiver<DaemonMsg>) -> Vec<DaemonMsg> {
+        let mut got = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            got.push(msg);
+        }
+        got
+    }
+
+    #[test]
+    fn observe_replays_state_without_displacing_the_controller() {
+        let mut st = test_state(true);
+        st.ring.append(b"screen");
+        st.cwd = Some(PathBuf::from("/work"));
+
+        let (controller_tx, controller_rx) = mpsc::channel();
+        let epoch = attach_subscriber(&mut st, controller_tx);
+        drain(&controller_rx);
+
+        let (observer_tx, observer_rx) = mpsc::channel();
+        let id = observe_subscriber(&mut st, observer_tx);
+        assert_eq!(st.subscriber_epoch, epoch, "observing must not bump the controller epoch");
+        assert!(st.subscriber.is_some(), "the controller keeps its seat");
+
+        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Size(_))));
+        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"screen"));
+        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/work")));
+        assert!(
+            controller_rx.try_recv().is_err(),
+            "an observer joining must be invisible to the controller"
+        );
+
+        notify(&mut st, DaemonMsg::Output(b"tick".to_vec()));
+        assert!(matches!(controller_rx.try_recv(), Ok(DaemonMsg::Output(b)) if b == b"tick"));
+        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Output(b)) if b == b"tick"));
+
+        st.observers.retain(|(oid, _)| *oid != id);
+        notify(&mut st, DaemonMsg::Output(b"tock".to_vec()));
+        assert!(matches!(controller_rx.try_recv(), Ok(DaemonMsg::Output(_))));
+        assert!(observer_rx.try_recv().is_err(), "a departed observer hears nothing");
+    }
+
+    #[test]
+    fn a_new_controller_preempts_the_old_while_observers_survive() {
+        let mut st = test_state(true);
+
+        let (first_tx, first_rx) = mpsc::channel();
+        let first_epoch = attach_subscriber(&mut st, first_tx);
+        drain(&first_rx);
+
+        let (observer_tx, observer_rx) = mpsc::channel();
+        observe_subscriber(&mut st, observer_tx);
+        drain(&observer_rx);
+
+        let (second_tx, second_rx) = mpsc::channel();
+        let second_epoch = attach_subscriber(&mut st, second_tx);
+        assert!(second_epoch > first_epoch);
+        drain(&second_rx);
+
+        notify(&mut st, DaemonMsg::Output(b"live".to_vec()));
+        assert!(
+            matches!(first_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+            "the preempted controller's channel must be gone, exactly as before"
+        );
+        assert!(matches!(second_rx.try_recv(), Ok(DaemonMsg::Output(b)) if b == b"live"));
+        assert!(
+            matches!(observer_rx.try_recv(), Ok(DaemonMsg::Output(b)) if b == b"live"),
+            "a controller handover must not evict read-only observers"
+        );
+
+        if st.subscriber_epoch == first_epoch {
+            st.subscriber = None;
+        }
+        assert!(
+            st.subscriber.is_some(),
+            "a stale epoch's detach must not unseat the new controller"
+        );
+    }
+
+    #[test]
+    fn a_gone_observer_is_pruned_on_the_next_broadcast() {
+        let mut st = test_state(true);
+        let (observer_tx, observer_rx) = mpsc::channel();
+        observe_subscriber(&mut st, observer_tx);
+        drop(observer_rx);
+
+        notify(&mut st, DaemonMsg::Output(b"x".to_vec()));
+        assert!(st.observers.is_empty(), "a dead observer must not accumulate");
+    }
+
+    #[test]
+    fn death_notifies_observers_but_only_controllers_defer_the_reap() {
+        let with_observer_only = Arc::new(Mutex::new(test_state(true)));
+        let (observer_tx, observer_rx) = mpsc::channel();
+        observe_subscriber(&mut with_observer_only.lock().unwrap(), observer_tx);
+        drain(&observer_rx);
+        let (dead_tx, dead_rx) = mpsc::channel();
+        DeathReporter::new(move || dead_tx.send(()).unwrap())
+            .report(&with_observer_only, &AtomicBool::new(false));
+        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Exited { code: None })));
+        assert!(
+            dead_rx.try_recv().is_ok(),
+            "read-only observers must not keep a dead pane in the registry"
+        );
+
+        let with_both = Arc::new(Mutex::new(test_state(true)));
+        let (controller_tx, controller_rx) = mpsc::channel();
+        let (observer_tx, observer_rx) = mpsc::channel();
+        {
+            let mut st = with_both.lock().unwrap();
+            attach_subscriber(&mut st, controller_tx);
+            observe_subscriber(&mut st, observer_tx);
+        }
+        drain(&controller_rx);
+        drain(&observer_rx);
+        let (dead_tx, dead_rx) = mpsc::channel();
+        DeathReporter::new(move || dead_tx.send(()).unwrap())
+            .report(&with_both, &AtomicBool::new(false));
+        assert!(matches!(controller_rx.try_recv(), Ok(DaemonMsg::Exited { code: None })));
+        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Exited { code: None })));
+        assert!(
+            dead_rx.try_recv().is_err(),
+            "an attached death is still the detach path's to reclaim"
+        );
+    }
+
+    #[test]
+    fn agent_state_snapshot_reports_only_panes_with_a_session() {
+        use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
+
+        let mut st = test_state(true);
+        st.id = 42;
+        assert_eq!(agent_state_snapshot(&st), None);
+
+        st.agent = Some(CLIAgent::Claude);
+        assert_eq!(
+            agent_state_snapshot(&st),
+            None,
+            "a detected agent without session state is not yet a fact worth listing"
+        );
+
+        st.agent_session = Some(AgentSessionState {
+            status: AgentStatus::Waiting,
+            session_id: Some("sess-1".into()),
+            ..Default::default()
+        });
+        let snap = agent_state_snapshot(&st).expect("a session state is the fact");
+        assert_eq!(snap.pane_id, 42);
+        assert_eq!(snap.agent, Some(CLIAgent::Claude));
+        assert_eq!(snap.state.status, AgentStatus::Waiting);
+        assert_eq!(snap.state.session_id.as_deref(), Some("sess-1"));
+    }
+
     #[test]
     fn reader_eof_with_subscriber_sends_exited_not_on_dead() {
         let state = Arc::new(Mutex::new(test_state(true)));
@@ -3008,7 +3243,7 @@ mod tests {
     #[test]
     fn pane_environment_advertises_the_terminal_under_the_standard_names() {
         let env: std::collections::HashMap<_, _> =
-            pane_environment(&std::collections::HashMap::new())
+            pane_environment(&std::collections::HashMap::new(), 7, Some("ws-main"))
                 .into_iter()
                 .collect();
         let version = env!("CARGO_PKG_VERSION");
@@ -3031,6 +3266,45 @@ mod tests {
     }
 
     #[test]
+    fn pane_environment_hands_the_shell_its_own_address() {
+        let env: std::collections::HashMap<_, _> =
+            pane_environment(&std::collections::HashMap::new(), 42, Some("ws-main"))
+                .into_iter()
+                .collect();
+
+        assert_eq!(
+            env.get(TTY7_PANE_ENV).map(String::as_str),
+            Some("42"),
+            "a CLI inside the pane needs its own pane id for address-free verbs"
+        );
+        assert_eq!(
+            env.get(TTY7_WS_ENV).map(String::as_str),
+            Some("ws-main"),
+            "the workspace the spawn was filed under rides into the shell"
+        );
+        match control_socket_env() {
+            Some(socket) => assert_eq!(
+                env.get(TTY7_SOCKET_ENV),
+                Some(&socket),
+                "the shell is told where this server answers"
+            ),
+            None => assert!(
+                !env.contains_key(TTY7_SOCKET_ENV),
+                "no resolvable endpoint must not inject an empty TTY7_SOCKET"
+            ),
+        }
+
+        let unfiled: std::collections::HashMap<_, _> =
+            pane_environment(&std::collections::HashMap::new(), 42, None)
+                .into_iter()
+                .collect();
+        assert!(
+            !unfiled.contains_key(TTY7_WS_ENV),
+            "a pane outside any workspace must not claim one"
+        );
+    }
+
+    #[test]
     fn pane_environment_lets_configured_env_override_identity_but_not_capability() {
         let configured = [
             ("TERM_PROGRAM", "iTerm.app"),
@@ -3044,7 +3318,7 @@ mod tests {
         .collect();
 
         let applied: std::collections::HashMap<_, _> =
-            pane_environment(&configured).into_iter().collect();
+            pane_environment(&configured, 1, None).into_iter().collect();
 
         assert_eq!(
             applied.get("TERM_PROGRAM").map(String::as_str),
@@ -3073,7 +3347,7 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
 
-        let applied = pane_environment(&configured);
+        let applied = pane_environment(&configured, 1, None);
 
         assert!(
             !applied.iter().any(|(k, _)| k == "Term" || k == "ColorTerm"),
@@ -3179,7 +3453,7 @@ mod tests {
 
     #[test]
     fn spawned_shell_carries_the_tty7_marker() {
-        let cmd = build_shell_command(None, &Some(PathBuf::from("/tmp")))
+        let cmd = build_shell_command(None, &Some(PathBuf::from("/tmp")), 42, Some("ws-main"))
             .expect("build default shell command")
             .0;
         let tty7 = cmd
@@ -3190,6 +3464,23 @@ mod tests {
             Some(env!("CARGO_PKG_VERSION")),
             "the daemon must inject TTY7 into every spawned shell"
         );
+        assert_eq!(
+            cmd.get_env(TTY7_PANE_ENV).and_then(|v| v.to_str()),
+            Some("42"),
+            "the daemon must tell every spawned shell which pane it is"
+        );
+        assert_eq!(
+            cmd.get_env(TTY7_WS_ENV).and_then(|v| v.to_str()),
+            Some("ws-main"),
+            "the daemon must tell every spawned shell which workspace filed it"
+        );
+        if let Some(socket) = control_socket_env() {
+            assert_eq!(
+                cmd.get_env(TTY7_SOCKET_ENV).and_then(|v| v.to_str()),
+                Some(socket.as_str()),
+                "the daemon must tell every spawned shell where its server answers"
+            );
+        }
     }
 
     #[test]

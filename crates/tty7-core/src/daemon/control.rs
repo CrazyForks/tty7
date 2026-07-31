@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::protocol::{MAX_FRAME, read_frame, write_frame};
 
-pub const CONTROL_VERSION: u32 = 3;
+pub const CONTROL_VERSION: u32 = 4;
 
 const DIALECT_MARKER: &str = "speaks control v";
 
@@ -24,6 +24,11 @@ pub fn is_dialect_refusal(message: &str) -> bool {
 pub fn server_instance() -> &'static str {
     static INSTANCE: OnceLock<String> = OnceLock::new();
     INSTANCE.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+pub fn server_started() -> Instant {
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    *STARTED.get_or_init(Instant::now)
 }
 
 pub const WATCH_BURST_CAP: usize = 1024;
@@ -226,6 +231,38 @@ pub enum ControlRequest {
         old: u64,
         new: PaneSeed,
     },
+
+    AgentStates,
+    Routes,
+    Status,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneAgentState {
+    pub pane_id: u64,
+    #[serde(default)]
+    pub agent: Option<crate::core::cli_agent::CLIAgent>,
+    pub state: crate::core::cli_agent::AgentSessionState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteInfo {
+    pub key: String,
+    pub kind: String,
+    pub connected: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStatus {
+    pub pid: u32,
+    pub uptime_secs: u64,
+    pub panes: u64,
+    pub control_version: u32,
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub build: String,
+    #[serde(default)]
+    pub socket: String,
 }
 
 impl ControlRequest {
@@ -265,6 +302,7 @@ impl ControlRequest {
             | PaneSetRatio { .. }
             | PaneMove { .. }
             | PaneReplace { .. } => Duration::from_secs(10),
+            AgentStates | Routes | Status => Duration::from_secs(5),
         }
     }
 
@@ -314,6 +352,9 @@ pub enum ReplyOk {
     WorkspaceTree(Box<crate::core::machine::Workspace>),
     TabTree(Box<Tab>),
     Panes(Vec<u64>),
+    AgentStates(Vec<PaneAgentState>),
+    Routes(Vec<RouteInfo>),
+    Status(ServerStatus),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1358,6 +1399,9 @@ mod tests {
                 dirs: vec!["/home/me/proj".into(), "/home/me/proj/src".into()],
             },
             ControlRequest::WatchClose { id: 7 },
+            ControlRequest::AgentStates,
+            ControlRequest::Routes,
+            ControlRequest::Status,
         ]
     }
 
@@ -1404,6 +1448,34 @@ mod tests {
                 stderr: vec![0x00, 0xff, 0xfe, b'\n'],
             })),
             ControlReply::Ok(ReplyOk::WatchId(42)),
+            ControlReply::Ok(ReplyOk::AgentStates(vec![PaneAgentState {
+                pane_id: 9,
+                agent: Some(crate::core::cli_agent::CLIAgent::Claude),
+                state: crate::core::cli_agent::AgentSessionState {
+                    status: crate::core::cli_agent::AgentStatus::Waiting,
+                    message: Some("needs permission".into()),
+                    session_id: Some("sess-1".into()),
+                    launch_argv: Some(vec!["claude".into()]),
+                    rich: true,
+                    cwd: Some("/work/api".into()),
+                    activity: 3,
+                },
+            }])),
+            ControlReply::Ok(ReplyOk::AgentStates(Vec::new())),
+            ControlReply::Ok(ReplyOk::Routes(vec![RouteInfo {
+                key: "me@build-box:22".into(),
+                kind: "ssh".into(),
+                connected: true,
+            }])),
+            ControlReply::Ok(ReplyOk::Status(ServerStatus {
+                pid: 4242,
+                uptime_secs: 61,
+                panes: 3,
+                control_version: CONTROL_VERSION,
+                protocol_version: crate::daemon::protocol::PROTOCOL_VERSION,
+                build: "26.7.5".into(),
+                socket: "/run/user/1000/tty7/daemon.sock".into(),
+            })),
             ControlReply::Err(WireError::new(WireErrorKind::NotFound, "no such file")),
             ControlReply::Err(WireError::new(
                 WireErrorKind::PermissionDenied,
@@ -1468,6 +1540,13 @@ mod tests {
         let first = server_instance();
         assert!(!first.is_empty(), "an empty instance means \"unknown\"");
         assert_eq!(first, server_instance());
+    }
+
+    #[test]
+    fn the_server_start_instant_is_fixed_per_process() {
+        let first = server_started();
+        assert_eq!(first, server_started(), "uptime needs one fixed origin");
+        assert!(first.elapsed() >= Duration::ZERO);
     }
 
     #[test]
@@ -2030,6 +2109,9 @@ mod tests {
                 },
                 s(20),
             ),
+            (R::AgentStates, s(5)),
+            (R::Routes, s(5)),
+            (R::Status, s(5)),
         ];
         assert_eq!(
             cases.len(),

@@ -374,6 +374,26 @@ impl SshManager {
         self.conns.lock().unwrap().remove(key);
     }
 
+    pub fn routes(&self) -> Vec<crate::daemon::control::RouteInfo> {
+        let conns = self.conns.lock().unwrap();
+        let mut routes: Vec<_> = conns
+            .iter()
+            .map(|(key, slot)| {
+                let connected = slot
+                    .try_lock()
+                    .map(|weak| weak.upgrade().is_some_and(|conn| conn.is_alive()))
+                    .unwrap_or(false);
+                crate::daemon::control::RouteInfo {
+                    key: key.as_str().to_string(),
+                    kind: "ssh".to_string(),
+                    connected,
+                }
+            })
+            .collect();
+        routes.sort_by(|a, b| a.key.cmp(&b.key));
+        routes
+    }
+
     async fn remote_bootstrap(&self, conn: &Arc<SshConnection>) -> Option<String> {
         let key = conn.key().clone();
         let cached = { self.probes.lock().unwrap().get(&key).cloned() };
@@ -631,6 +651,44 @@ mod tests {
             !mgr.conns.lock().unwrap().contains_key(&key),
             "evicted key must be gone so the next open creates a new entry"
         );
+    }
+
+    #[test]
+    fn routes_names_each_held_connection_with_its_liveness() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build test runtime");
+        let mgr = SshManager {
+            runtime,
+            conns: Mutex::new(HashMap::new()),
+            forwards: SshForwardRegistry::default(),
+            probes: Mutex::new(HashMap::new()),
+        };
+        assert!(mgr.routes().is_empty());
+
+        let mut other = base_spec();
+        other.host = "build-box".into();
+        for spec in [&base_spec(), &other] {
+            mgr.conns.lock().unwrap().insert(
+                ConnectionKey::from_spec(spec),
+                Arc::new(tokio::sync::Mutex::new(Weak::new())),
+            );
+        }
+
+        let routes = mgr.routes();
+        let keys: Vec<&str> = routes.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["u@build-box:22", "u@h:22"],
+            "every held connection is listed, in a stable order"
+        );
+        for route in &routes {
+            assert_eq!(route.kind, "ssh");
+            assert!(
+                !route.connected,
+                "a dropped connection must read as disconnected, not vanish"
+            );
+        }
     }
 
     #[test]
