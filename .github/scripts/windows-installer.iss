@@ -52,6 +52,15 @@ RestartApplications=no
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+; Builds before the tty7/tty7-app split installed the GUI as tty7.exe. Upgrading
+; only *adds* tty7-app.exe, so the old binary would stay on disk — and a taskbar
+; pin (which Inno cannot rewrite, unlike the [Icons] shortcuts) still points at
+; it. The user would keep launching the previous version from their pinned icon,
+; against the same daemon endpoint as the new one. Delete it on upgrade; a fresh
+; install simply has nothing to remove.
+[InstallDelete]
+Type: files; Name: "{app}\tty7.exe"
+
 [Files]
 Source: "{#StageDir}\tty7-app.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\completions\*"; DestDir: "{app}\completions"; Flags: ignoreversion recursesubdirs
