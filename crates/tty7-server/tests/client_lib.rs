@@ -287,6 +287,34 @@ fn a_spawned_pane_streams_its_output_and_its_exit() {
 }
 
 #[test]
+fn a_one_shot_pane_reports_its_real_exit_code() {
+    let daemon = Daemon::start();
+    let mut session = daemon
+        .panes()
+        .spawn(
+            None,
+            size(),
+            Some(one_shot_shell("exit 5")),
+            Some("client-lib-test".into()),
+            None,
+        )
+        .expect("spawn a failing one-shot pane");
+    session
+        .set_recv_timeout(Some(STREAM_WITHIN))
+        .expect("bound the stream reads");
+    loop {
+        match session.recv() {
+            Ok(DaemonMsg::Exited { code }) => {
+                assert_eq!(code, Some(5), "the child's code must ride the Exited frame");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => panic!("pane stream ended before Exited: {e}"),
+        }
+    }
+}
+
+#[test]
 fn input_reaches_the_shell_and_a_reattach_replays_it() {
     let daemon = Daemon::start();
     let panes = daemon.panes();

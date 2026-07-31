@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod output;
 mod resolve;
+mod server;
 #[cfg(test)]
 mod testbed;
 
@@ -14,7 +15,7 @@ fn main() -> std::process::ExitCode {
     let json = cli.json;
     let quiet = cli.quiet;
     let ctx = address::Context::from_env();
-    let mut backend = backend::StubBackend;
+    let mut backend = backend::RealBackend::new(cli.machine.clone());
     match commands::execute(cli, &ctx, &mut backend) {
         Ok(commands::Outcome::Exit(code)) => std::process::exit(code),
         Ok(commands::Outcome::Report(report)) => {

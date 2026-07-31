@@ -106,6 +106,13 @@ pub struct RunArgs {
     pub cwd: Option<String>,
 
     #[arg(
+        long,
+        value_name = "WORKSPACE",
+        help = "Workspace the pane belongs to; defaults to $TTY7_WS inside a tty7 shell"
+    )]
+    pub ws: Option<String>,
+
+    #[arg(
         last = true,
         required = true,
         value_name = "CMD",

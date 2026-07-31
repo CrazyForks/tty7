@@ -429,6 +429,7 @@ struct PaneState {
     agent_argv: Option<Vec<String>>,
     agent_session: Option<crate::core::cli_agent::AgentSessionState>,
     alive: bool,
+    exit_code: Option<i32>,
 }
 
 fn notify(st: &mut PaneState, msg: DaemonMsg) {
@@ -451,7 +452,7 @@ struct ForegroundProbes {
 
 struct PtyBackend {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    child: Mutex<Box<dyn Child + Send + Sync>>,
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     #[cfg_attr(windows, allow(dead_code))]
     shell_pid: Option<u32>,
     integration_dir: Option<PathBuf>,
@@ -477,6 +478,7 @@ pub struct DaemonPane {
 struct DeathReporter {
     reported: AtomicBool,
     on_dead: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    exit_code: Mutex<Option<Box<dyn FnMut() -> Option<i32> + Send>>>,
 }
 
 impl DeathReporter {
@@ -484,15 +486,27 @@ impl DeathReporter {
         Self {
             reported: AtomicBool::new(false),
             on_dead: Mutex::new(Some(Box::new(on_dead))),
+            exit_code: Mutex::new(None),
         }
+    }
+
+    fn probe_exit_code(&self, probe: impl FnMut() -> Option<i32> + Send + 'static) {
+        *self.exit_code.lock().unwrap() = Some(Box::new(probe));
     }
 
     fn report(&self, state: &Mutex<PaneState>, shutting_down: &AtomicBool) {
         if self.reported.swap(true, Ordering::SeqCst) {
             return;
         }
+        let code = self
+            .exit_code
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|probe| probe());
         let mut st = state.lock().unwrap();
         st.alive = false;
+        st.exit_code = code;
         let pane = st.id;
         if shutting_down.load(Ordering::SeqCst) {
             drop(st);
@@ -500,7 +514,7 @@ impl DeathReporter {
             return;
         }
         let subscribed = st.subscriber.is_some();
-        notify(&mut st, DaemonMsg::Exited { code: None });
+        notify(&mut st, DaemonMsg::Exited { code });
         drop(st);
         crate::core::machine::observe_pane(pane, |p| p.live = false);
         if subscribed {
@@ -529,6 +543,7 @@ impl DaemonPane {
 
         let child = pair.slave.spawn_command(spawn.cmd)?;
         let shell_pid = child.process_id();
+        let child = Arc::new(Mutex::new(child));
 
         drop(pair.slave);
 
@@ -549,6 +564,7 @@ impl DaemonPane {
             agent_session: None,
             agent_argv: None,
             alive: true,
+            exit_code: None,
         }));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(OutputGate::new());
@@ -560,7 +576,7 @@ impl DaemonPane {
             owner,
             backend: PaneBackend::Pty(PtyBackend {
                 master: master.clone(),
-                child: Mutex::new(child),
+                child: child.clone(),
                 shell_pid,
                 integration_dir: spawn.integration_dir,
             }),
@@ -573,6 +589,22 @@ impl DaemonPane {
         });
 
         let death = Arc::new(DeathReporter::new(on_dead));
+        death.probe_exit_code({
+            let child = child.clone();
+            move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let status = child.lock().ok()?.try_wait().ok()?;
+                    if let Some(status) = status {
+                        return Some(status.exit_code() as i32);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
 
         #[cfg(windows)]
         Self::spawn_exit_monitor(
@@ -639,6 +671,7 @@ impl DaemonPane {
             agent_session: None,
             agent_argv: None,
             alive: true,
+            exit_code: None,
         }));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(OutputGate::new());
@@ -1257,7 +1290,7 @@ fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>) {
         let _ = subscriber.send(DaemonMsg::AgentStatus(st.agent_session.clone()));
     }
     if !st.alive {
-        let _ = subscriber.send(DaemonMsg::Exited { code: None });
+        let _ = subscriber.send(DaemonMsg::Exited { code: st.exit_code });
     }
 }
 
@@ -2591,6 +2624,7 @@ mod tests {
             agent_session: None,
             agent_argv: None,
             alive,
+            exit_code: None,
         }
     }
 

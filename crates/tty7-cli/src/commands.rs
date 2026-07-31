@@ -2,7 +2,10 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use tty7_core::core::machine::{Axis, Machine, PaneSeed, Workspace};
 use tty7_core::core::session::WorkspaceId;
-use tty7_core::daemon::control::{ControlRequest, ReplyOk};
+use tty7_core::daemon::control::{
+    CONTROL_VERSION, ControlEvent, ControlRequest, ReplyOk,
+};
+use tty7_core::daemon::protocol::PROTOCOL_VERSION;
 
 use crate::address::{self, Address, Context, WorkspaceAddress};
 use crate::backend::{Backend, RunSpec};
@@ -66,28 +69,19 @@ pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Out
         Some(Command::Pane(PaneCmd::Ls { ws })) => pane_ls(ws.as_deref(), backend),
         Some(Command::Pane(PaneCmd::Close { target })) => pane_close(target.as_deref(), ctx, backend),
         Some(Command::Events) => events(json_mode, backend),
-        Some(Command::Agents) => bail!(
-            "`tty7 agents` needs ControlRequest::AgentStates, which this build's \
-             control dialect does not have yet"
-        ),
-        Some(Command::Status) | Some(Command::Server(ServerCmd::Status)) => bail!(
-            "`tty7 status` needs ControlRequest::Status, which this build's \
-             control dialect does not have yet"
-        ),
-        Some(Command::Machine(MachineCmd::Ls)) => bail!(
-            "`tty7 machine ls` needs ControlRequest::Routes, which this build's \
-             control dialect does not have yet"
-        ),
+        Some(Command::Agents) => agents(backend),
+        Some(Command::Status) | Some(Command::Server(ServerCmd::Status)) => status(backend),
+        Some(Command::Machine(MachineCmd::Ls)) => machine_ls(backend),
         Some(Command::Machine(MachineCmd::Connect { .. }))
         | Some(Command::Machine(MachineCmd::Disconnect { .. })) => bail!(
             "managing machine links from the CLI is not implemented yet — \
              use the GUI's connection manager for now"
         ),
-        Some(Command::Server(_)) => bail!(
-            "managing the local server process from the CLI is not implemented yet — \
-             it arrives once the GUI stops bundling the server role"
-        ),
-        Some(Command::Doctor) => doctor(ctx),
+        Some(Command::Server(ServerCmd::Start)) => crate::server::start(),
+        Some(Command::Server(ServerCmd::Stop)) => crate::server::stop(),
+        Some(Command::Server(ServerCmd::Restart)) => crate::server::restart(),
+        Some(Command::Server(ServerCmd::Logs)) => crate::server::logs(),
+        Some(Command::Doctor) => doctor(ctx, backend),
     }
 }
 
@@ -201,8 +195,6 @@ fn ws_detach(ws: &str, backend: &mut dyn Backend) -> Result<Outcome> {
 }
 
 fn new_workspace(path: Option<String>, backend: &mut dyn Backend) -> Result<Outcome> {
-    let machine = fetch_machine(backend)?;
-    let pane = resolve::next_pane_id(&machine);
     let ws = match backend.control(ControlRequest::WorkspaceCreate {
         name: None,
         workspace: None,
@@ -210,18 +202,18 @@ fn new_workspace(path: Option<String>, backend: &mut dyn Backend) -> Result<Outc
         ReplyOk::WorkspaceTree(ws) => *ws,
         other => bail!("the server answered WorkspaceCreate with {other:?}"),
     };
+    let pane = backend.spawn_shell(ws.id, path.clone())?;
     backend.control(ControlRequest::TabCreate {
         workspace: ws.id,
         at: None,
         pane: PaneSeed {
             pane,
-            cwd: path.clone(),
+            cwd: path,
             ssh_spec: None,
             agent: None,
         },
         tab: None,
     })?;
-    backend.spawn_shell(pane, ws.id, path)?;
     report(
         ws.id.to_string(),
         json!({ "id": ws.id.to_string(), "pane": pane }),
@@ -240,10 +232,13 @@ fn attach(target: &str, backend: &mut dyn Backend) -> Result<Outcome> {
 }
 
 fn run(args: RunArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
-    let workspace = ctx
-        .ws
-        .as_deref()
-        .and_then(|v| v.parse::<WorkspaceId>().ok());
+    let workspace = match args.ws.as_deref() {
+        Some(explicit) => {
+            let machine = fetch_machine(backend)?;
+            Some(resolve::workspace(&machine, &address::parse_workspace(explicit))?.id)
+        }
+        None => ctx.ws.as_deref().and_then(|v| v.parse::<WorkspaceId>().ok()),
+    };
     let code = backend.run(RunSpec {
         workspace,
         cwd: args.cwd,
@@ -257,7 +252,6 @@ fn pane_split(args: SplitArgs, ctx: &Context, backend: &mut dyn Backend) -> Resu
     let pane = address::pane_or_context(args.target.as_deref(), ctx)?;
     let machine = fetch_machine(backend)?;
     let workspace = resolve::workspace_of_pane(&machine, pane)?.id;
-    let new = resolve::next_pane_id(&machine);
     let cwd = machine
         .panes
         .iter()
@@ -268,6 +262,7 @@ fn pane_split(args: SplitArgs, ctx: &Context, backend: &mut dyn Backend) -> Resu
     } else {
         Axis::Vertical
     };
+    let new = backend.spawn_shell(workspace, cwd.clone())?;
     backend.control(ControlRequest::PaneSplit {
         workspace,
         pane,
@@ -275,13 +270,12 @@ fn pane_split(args: SplitArgs, ctx: &Context, backend: &mut dyn Backend) -> Resu
         ratio: args.ratio,
         new: PaneSeed {
             pane: new,
-            cwd: cwd.clone(),
+            cwd,
             ssh_spec: None,
             agent: None,
         },
         first: false,
     })?;
-    backend.spawn_shell(new, workspace, cwd)?;
     report(format!("%{new}"), json!({ "pane": new }))
 }
 
@@ -361,13 +355,13 @@ fn tab_new(
 ) -> Result<Outcome> {
     let machine = fetch_machine(backend)?;
     let id = resolve_ws(explicit, ctx, &machine)?;
-    let pane = resolve::next_pane_id(&machine);
+    let pane = backend.spawn_shell(id, cwd.clone())?;
     let tab = match backend.control(ControlRequest::TabCreate {
         workspace: id,
         at: None,
         pane: PaneSeed {
             pane,
-            cwd: cwd.clone(),
+            cwd,
             ssh_spec: None,
             agent: None,
         },
@@ -376,7 +370,6 @@ fn tab_new(
         ReplyOk::TabTree(tab) => *tab,
         other => bail!("the server answered TabCreate with {other:?}"),
     };
-    backend.spawn_shell(pane, id, cwd)?;
     report(
         format!("%{pane}"),
         json!({ "tab": tab.id.to_string(), "pane": pane }),
@@ -455,31 +448,126 @@ fn events(json_mode: bool, backend: &mut dyn Backend) -> Result<Outcome> {
         if json_mode {
             println!("{}", serde_json::to_string(&event)?);
         } else {
-            println!("{event:?}");
+            println!("{}", event_line(&event));
         }
         Ok(())
     })?;
     report("", Value::Null)
 }
 
-fn doctor(ctx: &Context) -> Result<Outcome> {
+fn event_line(event: &ControlEvent) -> String {
+    match event {
+        ControlEvent::PaneExited { pane_id, code } => match code {
+            Some(code) => format!("pane %{pane_id} exited with code {code}"),
+            None => format!("pane %{pane_id} exited"),
+        },
+        ControlEvent::AgentStatus { pane_id, json } => {
+            format!("pane %{pane_id} agent status: {json}")
+        }
+        ControlEvent::Preempted { workspace, by } => {
+            format!("workspace {workspace} taken over by {by}")
+        }
+        ControlEvent::Layout { workspace, delta } => {
+            format!("workspace {workspace} layout: {delta:?}")
+        }
+        ControlEvent::LayoutResync => "layout resync".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn agents(backend: &mut dyn Backend) -> Result<Outcome> {
+    match backend.control(ControlRequest::AgentStates)? {
+        ReplyOk::AgentStates(states) => report(
+            output::agents_table(&states),
+            json!({ "agents": serde_json::to_value(&states)? }),
+        ),
+        other => bail!("the server answered AgentStates with {other:?}"),
+    }
+}
+
+fn status(backend: &mut dyn Backend) -> Result<Outcome> {
+    match backend.control(ControlRequest::Status)? {
+        ReplyOk::Status(status) => {
+            report(output::status_lines(&status), serde_json::to_value(&status)?)
+        }
+        other => bail!("the server answered Status with {other:?}"),
+    }
+}
+
+fn machine_ls(backend: &mut dyn Backend) -> Result<Outcome> {
+    match backend.control(ControlRequest::Routes)? {
+        ReplyOk::Routes(routes) => report(
+            output::routes_table(&routes),
+            json!({ "machines": serde_json::to_value(&routes)? }),
+        ),
+        other => bail!("the server answered Routes with {other:?}"),
+    }
+}
+
+fn doctor(ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
     let mark = |v: &Option<String>| match v {
         Some(value) => format!("set ({value})"),
         None => "missing".to_string(),
     };
-    let rows = vec![
+    let mut rows = vec![
         vec![address::ENV_SOCKET.to_string(), mark(&ctx.socket)],
         vec![address::ENV_WS.to_string(), mark(&ctx.ws)],
         vec![address::ENV_PANE.to_string(), mark(&ctx.pane)],
     ];
+    let mut server = json!({ "reachable": false });
+    match backend.hello() {
+        Ok(hello) => {
+            let dialect_ok = hello.control_version == CONTROL_VERSION
+                && hello.protocol_version == PROTOCOL_VERSION;
+            let dialect = if dialect_ok {
+                format!("ok (control v{CONTROL_VERSION}, protocol v{PROTOCOL_VERSION})")
+            } else {
+                format!(
+                    "MISMATCH (server speaks control v{} protocol v{}, this build \
+                     v{CONTROL_VERSION}/v{PROTOCOL_VERSION})",
+                    hello.control_version, hello.protocol_version
+                )
+            };
+            rows.push(vec!["server".to_string(), format!("ok (build {})", hello.build)]);
+            rows.push(vec!["dialect".to_string(), dialect]);
+            let status = match backend.control(ControlRequest::Status)? {
+                ReplyOk::Status(status) => status,
+                other => bail!("the server answered Status with {other:?}"),
+            };
+            rows.push(vec![
+                "status".to_string(),
+                format!(
+                    "pid {}, up {}s, {} panes",
+                    status.pid, status.uptime_secs, status.panes
+                ),
+            ]);
+            let routes = match backend.control(ControlRequest::Routes)? {
+                ReplyOk::Routes(routes) => routes,
+                other => bail!("the server answered Routes with {other:?}"),
+            };
+            let connected = routes.iter().filter(|r| r.connected).count();
+            rows.push(vec![
+                "machine links".to_string(),
+                format!("{} known, {connected} connected", routes.len()),
+            ]);
+            server = json!({
+                "reachable": true,
+                "dialect_ok": dialect_ok,
+                "build": hello.build,
+                "status": serde_json::to_value(&status)?,
+                "routes": serde_json::to_value(&routes)?,
+            });
+        }
+        Err(e) => {
+            rows.push(vec!["server".to_string(), format!("unreachable — {e:#}")]);
+        }
+    }
     let mut human = output::table(&["CHECK", "RESULT"], &rows);
     if ctx.socket.is_none() && ctx.pane.is_none() {
-        human.push_str("\nnot inside a tty7 shell — address commands need an explicit %pane/@tab/workspace\n");
+        human.push_str(
+            "\nnot inside a tty7 shell — address commands need an explicit %pane/@tab/workspace\n",
+        );
     }
-    human.push_str(
-        "\nsocket reachability, dialect handshake, config parse, version skew, agent hooks \
-         and remote links are checked once the transport client lands\n",
-    );
     report(
         human,
         json!({
@@ -488,9 +576,7 @@ fn doctor(ctx: &Context) -> Result<Outcome> {
                 "workspace": ctx.ws.is_some(),
                 "pane": ctx.pane.is_some(),
             },
-            "pending": [
-                "socket", "dialect", "config", "versions", "agent-hooks", "remote-links",
-            ],
+            "server": server,
         }),
     )
 }
@@ -569,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn new_creates_workspace_first_tab_and_spawns_the_shell() {
+    fn new_spawns_first_and_seeds_the_tab_with_the_daemons_pane_id() {
         let mut backend = mock();
         let created = Workspace::default();
         backend
@@ -582,7 +668,6 @@ mod tests {
         assert_eq!(
             backend.control_calls,
             vec![
-                ControlRequest::MachineGet,
                 ControlRequest::WorkspaceCreate {
                     name: None,
                     workspace: None,
@@ -598,11 +683,12 @@ mod tests {
                     },
                     tab: None,
                 },
-            ]
+            ],
+            "the daemon-assigned pane id (6) lands in the tree op, so the spawn came first"
         );
         assert_eq!(
             backend.spawned,
-            vec![(6, created.id, Some("C:\\newproj".to_string()))],
+            vec![(created.id, Some("C:\\newproj".to_string()))],
             "the tree op alone leaves a dead pane — the shell must be spawned"
         );
         assert_eq!(human(out), created.id.to_string());
@@ -745,7 +831,7 @@ mod tests {
                 tab: None,
             }
         );
-        assert_eq!(backend.spawned, vec![(6, api.id, Some("C:\\elsewhere".to_string()))]);
+        assert_eq!(backend.spawned, vec![(api.id, Some("C:\\elsewhere".to_string()))]);
     }
 
     #[test]
@@ -777,7 +863,7 @@ mod tests {
             ],
             "the new pane inherits the split pane's cwd"
         );
-        assert_eq!(backend.spawned, vec![(6, api, Some("C:\\proj".to_string()))]);
+        assert_eq!(backend.spawned, vec![(api, Some("C:\\proj".to_string()))]);
         assert_eq!(human(out), "%6", "the new pane address is the printed result");
     }
 
@@ -908,15 +994,11 @@ mod tests {
     }
 
     #[test]
-    fn the_missing_protocol_verbs_say_which_request_they_wait_for() {
+    fn the_still_missing_verbs_say_so_without_touching_the_wire() {
         for (args, needle) in [
-            (vec!["tty7", "agents"], "AgentStates"),
-            (vec!["tty7", "status"], "Status"),
-            (vec!["tty7", "server", "status"], "Status"),
-            (vec!["tty7", "machine", "ls"], "Routes"),
             (vec!["tty7", "ws", "stop", "api"], "not implemented"),
-            (vec!["tty7", "server", "start"], "not implemented"),
             (vec!["tty7", "machine", "connect", "devbox"], "not implemented"),
+            (vec!["tty7", "machine", "disconnect", "devbox"], "not implemented"),
         ] {
             let mut backend = mock();
             let err = execute(cli(&args), &Context::default(), &mut backend)
@@ -933,17 +1015,77 @@ mod tests {
     }
 
     #[test]
-    fn doctor_reports_the_injected_context() {
-        let out = human(run_cli(&["tty7", "doctor"], &Context::default(), &mut mock()));
+    fn agents_status_and_machine_ls_are_single_aggregate_requests() {
+        use tty7_core::daemon::control::{RouteInfo, ServerStatus};
+
+        let mut backend = mock();
+        backend.replies.push_back(ReplyOk::AgentStates(Vec::new()));
+        let out = run_cli(&["tty7", "agents"], &Context::default(), &mut backend);
+        assert_eq!(backend.control_calls, vec![ControlRequest::AgentStates]);
+        assert!(human(out).contains("no agents"), "an empty panel says so");
+
+        let mut backend = mock();
+        backend.replies.push_back(ReplyOk::Status(ServerStatus {
+            pid: 4242,
+            uptime_secs: 61,
+            panes: 3,
+            control_version: CONTROL_VERSION,
+            protocol_version: PROTOCOL_VERSION,
+            build: "26.7.5".into(),
+            socket: "127.0.0.1:5555".into(),
+        }));
+        let out = run_cli(&["tty7", "status"], &Context::default(), &mut backend);
+        assert_eq!(backend.control_calls, vec![ControlRequest::Status]);
+        let rendered = human(out);
+        assert!(rendered.contains("4242"), "{rendered}");
+        assert!(rendered.contains("61s"), "{rendered}");
+
+        let mut backend = mock();
+        backend.replies.push_back(ReplyOk::Routes(vec![RouteInfo {
+            key: "me@build-box:22".into(),
+            kind: "ssh".into(),
+            connected: true,
+        }]));
+        let out = run_cli(&["tty7", "machine", "ls"], &Context::default(), &mut backend);
+        assert_eq!(backend.control_calls, vec![ControlRequest::Routes]);
+        let rendered = human(out);
+        assert!(rendered.contains("local"), "machine 0 is always listed: {rendered}");
+        assert!(rendered.contains("me@build-box:22"), "{rendered}");
+    }
+
+    fn doctor_backend() -> MockBackend {
+        use tty7_core::daemon::control::ServerStatus;
+
+        let mut backend = mock();
+        backend.replies.push_back(ReplyOk::Status(ServerStatus {
+            pid: 4242,
+            uptime_secs: 61,
+            panes: 3,
+            control_version: CONTROL_VERSION,
+            protocol_version: PROTOCOL_VERSION,
+            build: "26.7.5".into(),
+            socket: "127.0.0.1:5555".into(),
+        }));
+        backend.replies.push_back(ReplyOk::Routes(Vec::new()));
+        backend
+    }
+
+    #[test]
+    fn doctor_reports_the_injected_context_and_the_server_half() {
+        let out = human(run_cli(&["tty7", "doctor"], &Context::default(), &mut doctor_backend()));
         assert!(out.contains("TTY7_SOCKET"), "{out}");
         assert!(out.contains("missing"), "{out}");
+        assert!(out.contains("dialect"), "{out}");
+        assert!(out.contains(&format!("control v{CONTROL_VERSION}")), "{out}");
+        assert!(out.contains("pid 4242"), "{out}");
+        assert!(out.contains("0 known"), "{out}");
 
         let ctx = Context {
             pane: Some("7".into()),
             ws: None,
             socket: Some("sock".into()),
         };
-        let out = human(run_cli(&["tty7", "doctor"], &ctx, &mut mock()));
+        let out = human(run_cli(&["tty7", "doctor"], &ctx, &mut doctor_backend()));
         assert!(out.contains("set (sock)"), "{out}");
     }
 }

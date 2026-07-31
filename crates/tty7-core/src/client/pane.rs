@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::daemon::protocol::{
-    ClientMsg, DaemonMsg, DaemonVersion, PaneInfo, ShellSpec, WinSize, is_error_kind,
+    ClientMsg, DaemonMsg, DaemonVersion, PaneInfo, PaneProcs, ShellSpec, WinSize, is_error_kind,
     peek_frame_kind, take_frame,
 };
+use crate::daemon::router::{RouteAction, RouteChannel, RouteHeader, RouteTarget, negotiate};
 use crate::daemon::transport;
 
 const OPEN_REPLY_WAIT: Duration = Duration::from_secs(15);
@@ -15,6 +16,7 @@ enum PaneEndpoint {
     #[default]
     Local,
     At(PathBuf),
+    Routed(RouteTarget),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -35,10 +37,27 @@ impl PaneClient {
         }
     }
 
+    pub fn routed(target: RouteTarget) -> PaneClient {
+        PaneClient {
+            endpoint: PaneEndpoint::Routed(target),
+        }
+    }
+
     fn open(&self) -> io::Result<transport::Stream> {
         match &self.endpoint {
             PaneEndpoint::Local => transport::connect(),
             PaneEndpoint::At(path) => transport::connect_endpoint_at(path),
+            PaneEndpoint::Routed(target) => {
+                let mut stream = transport::connect()?;
+                let header = RouteHeader {
+                    target: target.clone(),
+                    server_command: None,
+                    channel: RouteChannel::Pane,
+                    action: RouteAction::Forward,
+                };
+                negotiate(&mut stream, &header)?;
+                Ok(stream)
+            }
         }
     }
 
@@ -67,6 +86,16 @@ impl PaneClient {
         ClientMsg::Kill { pane_id }.encode(&mut stream)
     }
 
+    pub fn procs(&self, pane_id: u64) -> io::Result<PaneProcs> {
+        let mut stream = self.open()?;
+        ClientMsg::QueryProcs { pane_id }.encode(&mut stream)?;
+        match DaemonMsg::read(&mut stream)? {
+            DaemonMsg::Procs(procs) => Ok(procs),
+            DaemonMsg::Error(message) => Err(io::Error::other(message)),
+            other => Err(unexpected_reply("QueryProcs", &other)),
+        }
+    }
+
     pub fn spawn(
         &self,
         cwd: Option<PathBuf>,
@@ -80,6 +109,10 @@ impl PaneClient {
 
     pub fn attach(&self, pane_id: u64, size: WinSize) -> io::Result<PaneSession> {
         PaneSession::attach_over(self.open()?, pane_id, size, OPEN_REPLY_WAIT)
+    }
+
+    pub fn observe(&self, pane_id: u64, size: WinSize) -> io::Result<PaneSession> {
+        PaneSession::observe_over(self.open()?, pane_id, size, OPEN_REPLY_WAIT)
     }
 }
 
@@ -135,9 +168,28 @@ impl PaneSession {
         reply_wait: Duration,
     ) -> io::Result<PaneSession> {
         ClientMsg::Attach { pane_id, size }.encode(&mut stream)?;
+        PaneSession::checked(stream, "Attach", pane_id, reply_wait)
+    }
+
+    pub(crate) fn observe_over(
+        mut stream: transport::Stream,
+        pane_id: u64,
+        size: WinSize,
+        reply_wait: Duration,
+    ) -> io::Result<PaneSession> {
+        ClientMsg::Observe { pane_id, size }.encode(&mut stream)?;
+        PaneSession::checked(stream, "Observe", pane_id, reply_wait)
+    }
+
+    fn checked(
+        stream: transport::Stream,
+        request: &str,
+        pane_id: u64,
+        reply_wait: Duration,
+    ) -> io::Result<PaneSession> {
         let mut session = PaneSession::over(stream, pane_id)?;
         session.set_recv_timeout(Some(reply_wait))?;
-        let verdict = session.output.refusal_check(pane_id);
+        let verdict = session.output.refusal_check(request, pane_id);
         session.set_recv_timeout(None)?;
         verdict?;
         Ok(session)
@@ -252,14 +304,14 @@ impl PaneOutput {
         self.reader.set_read_timeout(wait)
     }
 
-    fn refusal_check(&mut self, pane_id: u64) -> io::Result<()> {
+    fn refusal_check(&mut self, request: &str, pane_id: u64) -> io::Result<()> {
         let mut scratch = [0u8; 4096];
         loop {
             if let Some(kind) = peek_frame_kind(&self.buffered) {
                 if !is_error_kind(kind) {
                     return Ok(());
                 }
-                return Err(self.refusal(pane_id));
+                return Err(self.refusal(request, pane_id));
             }
             match self.reader.read(&mut scratch) {
                 Ok(0) => {
@@ -267,7 +319,7 @@ impl PaneOutput {
                         io::ErrorKind::UnexpectedEof,
                         format!(
                             "the daemon closed the connection without answering \
-                             Attach for pane {pane_id}"
+                             {request} for pane {pane_id}"
                         ),
                     ));
                 }
@@ -279,13 +331,13 @@ impl PaneOutput {
         }
     }
 
-    fn refusal(&mut self, pane_id: u64) -> io::Error {
+    fn refusal(&mut self, request: &str, pane_id: u64) -> io::Error {
         match self.recv() {
             Ok(DaemonMsg::Error(message)) => {
-                io::Error::other(format!("daemon refused Attach: {message}"))
+                io::Error::other(format!("daemon refused {request}: {message}"))
             }
-            Ok(other) => unexpected_reply("Attach", &other),
-            Err(_) => io::Error::other(format!("daemon refused Attach for pane {pane_id}")),
+            Ok(other) => unexpected_reply(request, &other),
+            Err(_) => io::Error::other(format!("daemon refused {request} for pane {pane_id}")),
         }
     }
 }
@@ -406,6 +458,59 @@ mod tests {
 
         let err = PaneSession::attach_over(client_end, 42, size(), REPLY_WAIT)
             .expect_err("attaching to a missing pane must fail");
+        assert!(
+            err.to_string().contains("no such pane 42"),
+            "the daemon's reason was lost: {err}"
+        );
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn observe_opens_read_only_and_keeps_the_replay() {
+        let (client_end, server_end) = stream_pair();
+        let server = std::thread::spawn(move || {
+            let mut r = server_end.try_clone().expect("clone server end");
+            let mut w = server_end;
+            match ClientMsg::read(&mut r).expect("read Observe") {
+                ClientMsg::Observe { pane_id, .. } => assert_eq!(pane_id, 9),
+                other => panic!("expected Observe, got {other:?}"),
+            }
+            DaemonMsg::Size(size()).encode(&mut w).expect("replay size");
+            DaemonMsg::Snapshot(b"ring contents".to_vec())
+                .encode(&mut w)
+                .expect("replay snapshot");
+        });
+
+        let mut session =
+            PaneSession::observe_over(client_end, 9, size(), REPLY_WAIT).expect("observe");
+        match session.recv().expect("replayed size") {
+            DaemonMsg::Size(_) => {}
+            other => panic!("expected Size, got {other:?}"),
+        }
+        match session.recv().expect("replayed snapshot") {
+            DaemonMsg::Snapshot(bytes) => assert_eq!(bytes, b"ring contents"),
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn an_observe_refusal_carries_the_daemons_message() {
+        let (client_end, server_end) = stream_pair();
+        let server = std::thread::spawn(move || {
+            let mut r = server_end.try_clone().expect("clone server end");
+            let mut w = server_end;
+            match ClientMsg::read(&mut r).expect("read Observe") {
+                ClientMsg::Observe { pane_id, .. } => assert_eq!(pane_id, 42),
+                other => panic!("expected Observe, got {other:?}"),
+            }
+            DaemonMsg::Error("no such pane 42".into())
+                .encode(&mut w)
+                .expect("refuse the observe");
+        });
+
+        let err = PaneSession::observe_over(client_end, 42, size(), REPLY_WAIT)
+            .expect_err("observing a missing pane must fail");
         assert!(
             err.to_string().contains("no such pane 42"),
             "the daemon's reason was lost: {err}"
