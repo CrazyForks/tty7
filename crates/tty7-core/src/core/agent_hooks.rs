@@ -136,7 +136,7 @@ fn write_to_controlling_tty(bytes: &[u8]) -> bool {
             .iter()
             .find(|p| p.pid == pid)
             .and_then(|p| name_of(p.parent))
-            .is_some_and(|n| n == "tty7-app.exe")
+            .is_some_and(|n| is_tty7_host_exe(&n))
     });
 
     if let Some(pid) = shell {
@@ -150,6 +150,11 @@ fn write_to_controlling_tty(bytes: &[u8]) -> bool {
         any |= attach_and_write(pid, bytes);
     }
     any
+}
+
+#[cfg(any(not(unix), test))]
+fn is_tty7_host_exe(name: &str) -> bool {
+    matches!(name, "tty7-app.exe" | "tty7-server.exe" | "tty7.exe")
 }
 
 #[cfg(not(unix))]
@@ -868,6 +873,16 @@ export default function (pi: ExtensionAPI) {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tty7_daemon_host_takes_the_console_fast_path() {
+        for name in ["tty7-app.exe", "tty7-server.exe", "tty7.exe"] {
+            assert!(is_tty7_host_exe(name), "{name} hosts tty7 shells");
+        }
+        for name in ["explorer.exe", "cmd.exe", "tty7", "tty7-app", "wt.exe"] {
+            assert!(!is_tty7_host_exe(name), "{name} is not a tty7 host process");
+        }
+    }
 
     #[test]
     fn hook_sequence_round_trips_through_the_daemon_parser() {

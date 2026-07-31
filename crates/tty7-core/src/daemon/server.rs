@@ -556,6 +556,21 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             Ok(())
         }
 
+        ClientMsg::SendInput { pane_id, bytes } => {
+            let mut w = write_stream;
+            match registry.get(pane_id) {
+                Some(pane) if pane.alive() => {
+                    pane.write_input(&bytes);
+                    DaemonMsg::InputAck { pane_id }.encode(&mut w)?;
+                }
+                Some(_) => {
+                    DaemonMsg::Error(format!("pane {pane_id} is not running")).encode(&mut w)?
+                }
+                None => DaemonMsg::Error(format!("no such pane {pane_id}")).encode(&mut w)?,
+            }
+            Ok(())
+        }
+
         ClientMsg::ListForwards { pane_id } => {
             let mut w = write_stream;
             let list = crate::daemon::ssh::SshManager::global().list_forwards(pane_id);
@@ -618,12 +633,9 @@ fn stream_observer(
 ) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<DaemonMsg>();
     let refusals = tx.clone();
-    let observer_id = pane.observe(tx);
-    let writer = spawn_writer(
-        rx,
-        write_stream,
-        Arc::new(crate::daemon::pane::OutputGate::new()),
-    );
+    let gate = Arc::new(crate::daemon::pane::OutputGate::new());
+    let observer_id = pane.observe(tx, gate.clone());
+    let writer = spawn_writer(rx, write_stream, gate);
 
     observe_loop(&mut read_stream, &refusals);
 
@@ -651,6 +663,8 @@ fn observe_loop<R: std::io::Read>(read_stream: &mut R, refusals: &mpsc::Sender<D
     }
 }
 
+const CONTROL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 fn run_stream(
     pane: Arc<DaemonPane>,
     id: u64,
@@ -660,32 +674,81 @@ fn run_stream(
     write_stream: Stream,
     registry: Arc<Registry>,
 ) -> anyhow::Result<()> {
+    use std::io::Read as _;
+
     let writer = spawn_writer(rx, write_stream, pane.gate());
+    let _ = read_stream.set_read_timeout(Some(CONTROL_POLL_INTERVAL));
 
     let mut killed = false;
-    loop {
-        match ClientMsg::read(&mut read_stream) {
-            Ok(ClientMsg::Input(bytes)) => pane.write_input(&bytes),
-            Ok(ClientMsg::Resize(size)) => pane.resize(size),
-            Ok(ClientMsg::AuthResponse {
-                request_id,
-                response,
-            }) => pane.deliver_auth_response(request_id, response),
-            Ok(ClientMsg::Detach) => break,
-            Ok(ClientMsg::Kill { pane_id }) => {
-                if pane_id == id {
-                    killed = true;
-                    break;
-                } else if let Some(other) = registry.remove(pane_id) {
-                    other.kill();
+    let mut displaced = false;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 65536];
+    'conn: loop {
+        if !pane.controls(epoch) {
+            displaced = true;
+            break;
+        }
+        loop {
+            let (kind, payload) = match crate::daemon::protocol::take_frame(&mut pending) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(_) => break 'conn,
+            };
+            let Ok(msg) = ClientMsg::from_frame(kind, payload) else {
+                break 'conn;
+            };
+            match msg {
+                ClientMsg::Input(bytes) => {
+                    if !pane.controls(epoch) {
+                        displaced = true;
+                        break 'conn;
+                    }
+                    pane.write_input(&bytes);
                 }
+                ClientMsg::Resize(size) => {
+                    if !pane.controls(epoch) {
+                        displaced = true;
+                        break 'conn;
+                    }
+                    pane.resize(size);
+                }
+                ClientMsg::AuthResponse {
+                    request_id,
+                    response,
+                } => pane.deliver_auth_response(request_id, response),
+                ClientMsg::Detach => break 'conn,
+                ClientMsg::Kill { pane_id } => {
+                    if pane_id == id {
+                        killed = true;
+                        break 'conn;
+                    } else if let Some(other) = registry.remove(pane_id) {
+                        other.kill();
+                    }
+                }
+                _ => {}
             }
-            Ok(_) => {}
+        }
+        match read_stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => pending.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
             Err(_) => break,
         }
     }
 
     let reclaimable = pane.detach(epoch);
+    if displaced {
+        let _ = read_stream.shutdown(std::net::Shutdown::Both);
+    }
     let _ = writer.join();
 
     if killed {

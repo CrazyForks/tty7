@@ -398,6 +398,10 @@ impl OutputGate {
         self.drained.notify_all();
     }
 
+    pub(crate) fn queued_bytes(&self) -> i64 {
+        self.queued.load(Ordering::Relaxed)
+    }
+
     fn wait_below_high_water(&self) {
         if self.queued.load(Ordering::Relaxed) < Self::HIGH_WATER {
             return;
@@ -415,12 +419,20 @@ impl OutputGate {
     }
 }
 
+pub(crate) const OBSERVER_BUDGET: i64 = 8 * 1024 * 1024;
+
+struct Observer {
+    id: u64,
+    tx: Sender<DaemonMsg>,
+    gate: Arc<OutputGate>,
+}
+
 struct PaneState {
     id: u64,
     ring: ReplayRing,
     subscriber: Option<Sender<DaemonMsg>>,
     subscriber_epoch: u64,
-    observers: Vec<(u64, Sender<DaemonMsg>)>,
+    observers: Vec<Observer>,
     observer_seq: u64,
     cwd: Option<PathBuf>,
     shell: ShellState,
@@ -436,7 +448,25 @@ fn notify(st: &mut PaneState, msg: DaemonMsg) {
     if let Some(sub) = &st.subscriber {
         let _ = sub.send(msg.clone());
     }
-    st.observers.retain(|(_, tx)| tx.send(msg.clone()).is_ok());
+    st.observers.retain(|obs| obs.tx.send(msg.clone()).is_ok());
+}
+
+fn fan_out_output(st: &mut PaneState, bytes: &[u8], gate: &OutputGate) {
+    if let Some(sub) = &st.subscriber {
+        if sub.send(DaemonMsg::Output(bytes.to_vec())).is_ok() {
+            gate.add(bytes.len());
+        }
+    }
+    st.observers.retain(|obs| {
+        if obs.gate.queued_bytes() + bytes.len() as i64 > OBSERVER_BUDGET {
+            return false;
+        }
+        if obs.tx.send(DaemonMsg::Output(bytes.to_vec())).is_err() {
+            return false;
+        }
+        obs.gate.add(bytes.len());
+        true
+    });
 }
 
 enum PaneBackend {
@@ -840,14 +870,7 @@ impl DaemonPane {
                             let mut st = state.lock().unwrap();
                             let facts_before = may_change_facts.then(|| observed_facts(&st));
                             st.ring.append(bytes);
-                            if let Some(sub) = &st.subscriber {
-                                if sub.send(DaemonMsg::Output(bytes.to_vec())).is_ok() {
-                                    gate.add(n);
-                                }
-                            }
-                            st.observers.retain(|(_, tx)| {
-                                tx.send(DaemonMsg::Output(bytes.to_vec())).is_ok()
-                            });
+                            fan_out_output(&mut st, bytes, &gate);
                             apply_signals(&mut st, signals);
                             if let Some(remote) = remote {
                                 apply_remote_context(&mut st, remote);
@@ -905,14 +928,18 @@ impl DaemonPane {
         !st.alive && st.subscriber.is_none()
     }
 
-    pub fn observe(&self, observer: Sender<DaemonMsg>) -> u64 {
+    pub fn observe(&self, observer: Sender<DaemonMsg>, gate: Arc<OutputGate>) -> u64 {
         let mut st = self.state.lock().unwrap();
-        observe_subscriber(&mut st, observer)
+        observe_subscriber(&mut st, observer, gate)
     }
 
     pub fn unobserve(&self, observer_id: u64) {
         let mut st = self.state.lock().unwrap();
-        st.observers.retain(|(id, _)| *id != observer_id);
+        st.observers.retain(|obs| obs.id != observer_id);
+    }
+
+    pub fn controls(&self, epoch: u64) -> bool {
+        self.state.lock().unwrap().subscriber_epoch == epoch
     }
 
     pub fn agent_state(&self) -> Option<crate::daemon::control::PaneAgentState> {
@@ -955,7 +982,7 @@ impl DaemonPane {
             let mut st = self.state.lock().unwrap();
             st.ring.resize(size);
             st.observers
-                .retain(|(_, tx)| tx.send(DaemonMsg::Size(size)).is_ok());
+                .retain(|obs| obs.tx.send(DaemonMsg::Size(size)).is_ok());
         }
         match &self.backend {
             PaneBackend::Pty(p) => {
@@ -967,7 +994,6 @@ impl DaemonPane {
         }
     }
 
-    #[allow(dead_code)]
     pub fn alive(&self) -> bool {
         self.state.lock().unwrap().alive
     }
@@ -1301,10 +1327,14 @@ fn attach_subscriber(st: &mut PaneState, subscriber: Sender<DaemonMsg>) -> u64 {
     st.subscriber_epoch
 }
 
-fn observe_subscriber(st: &mut PaneState, observer: Sender<DaemonMsg>) -> u64 {
+fn observe_subscriber(st: &mut PaneState, observer: Sender<DaemonMsg>, gate: Arc<OutputGate>) -> u64 {
     st.observer_seq += 1;
     replay_state(st, &observer);
-    st.observers.push((st.observer_seq, observer));
+    st.observers.push(Observer {
+        id: st.observer_seq,
+        tx: observer,
+        gate,
+    });
     st.observer_seq
 }
 
@@ -2979,7 +3009,7 @@ mod tests {
         drain(&controller_rx);
 
         let (observer_tx, observer_rx) = mpsc::channel();
-        let id = observe_subscriber(&mut st, observer_tx);
+        let id = observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
         assert_eq!(st.subscriber_epoch, epoch, "observing must not bump the controller epoch");
         assert!(st.subscriber.is_some(), "the controller keeps its seat");
 
@@ -2995,7 +3025,7 @@ mod tests {
         assert!(matches!(controller_rx.try_recv(), Ok(DaemonMsg::Output(b)) if b == b"tick"));
         assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Output(b)) if b == b"tick"));
 
-        st.observers.retain(|(oid, _)| *oid != id);
+        st.observers.retain(|obs| obs.id != id);
         notify(&mut st, DaemonMsg::Output(b"tock".to_vec()));
         assert!(matches!(controller_rx.try_recv(), Ok(DaemonMsg::Output(_))));
         assert!(observer_rx.try_recv().is_err(), "a departed observer hears nothing");
@@ -3010,7 +3040,7 @@ mod tests {
         drain(&first_rx);
 
         let (observer_tx, observer_rx) = mpsc::channel();
-        observe_subscriber(&mut st, observer_tx);
+        observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
         drain(&observer_rx);
 
         let (second_tx, second_rx) = mpsc::channel();
@@ -3042,7 +3072,7 @@ mod tests {
     fn a_gone_observer_is_pruned_on_the_next_broadcast() {
         let mut st = test_state(true);
         let (observer_tx, observer_rx) = mpsc::channel();
-        observe_subscriber(&mut st, observer_tx);
+        observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
         drop(observer_rx);
 
         notify(&mut st, DaemonMsg::Output(b"x".to_vec()));
@@ -3050,10 +3080,84 @@ mod tests {
     }
 
     #[test]
+    fn a_stalled_observer_is_dropped_at_its_budget_while_the_controller_streams_on() {
+        let mut st = test_state(true);
+        let (controller_tx, controller_rx) = mpsc::channel();
+        attach_subscriber(&mut st, controller_tx);
+        drain(&controller_rx);
+
+        let (observer_tx, observer_rx) = mpsc::channel();
+        observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
+        drain(&observer_rx);
+
+        let pane_gate = OutputGate::new();
+        let chunk = vec![b'x'; 1024 * 1024];
+        let sends = (OBSERVER_BUDGET / chunk.len() as i64) as usize + 2;
+        for _ in 0..sends {
+            fan_out_output(&mut st, &chunk, &pane_gate);
+            pane_gate.sub(chunk.len());
+        }
+
+        assert!(
+            st.observers.is_empty(),
+            "an observer past its budget must be pruned"
+        );
+        let mut controller_bytes = 0usize;
+        while let Ok(DaemonMsg::Output(b)) = controller_rx.try_recv() {
+            controller_bytes += b.len();
+        }
+        assert_eq!(
+            controller_bytes,
+            sends * chunk.len(),
+            "the controller stream must stay complete"
+        );
+        let mut observer_bytes = 0i64;
+        while let Ok(DaemonMsg::Output(b)) = observer_rx.try_recv() {
+            observer_bytes += b.len() as i64;
+        }
+        assert!(
+            observer_bytes <= OBSERVER_BUDGET,
+            "a stalled observer must never hold more than its budget, held {observer_bytes}"
+        );
+    }
+
+    #[test]
+    fn a_draining_observer_under_the_cap_stays_subscribed() {
+        let mut st = test_state(true);
+        let (observer_tx, observer_rx) = mpsc::channel();
+        let observer_gate = Arc::new(OutputGate::new());
+        observe_subscriber(&mut st, observer_tx, observer_gate.clone());
+        drain(&observer_rx);
+
+        let pane_gate = OutputGate::new();
+        let chunk = vec![b'y'; 1024 * 1024];
+        let sends = (OBSERVER_BUDGET / chunk.len() as i64) as usize * 3;
+        let mut got = 0usize;
+        for _ in 0..sends {
+            fan_out_output(&mut st, &chunk, &pane_gate);
+            pane_gate.sub(chunk.len());
+            while let Ok(DaemonMsg::Output(b)) = observer_rx.try_recv() {
+                observer_gate.sub(b.len());
+                got += b.len();
+            }
+        }
+        assert_eq!(
+            st.observers.len(),
+            1,
+            "an observer that keeps draining must stay subscribed"
+        );
+        assert_eq!(got, sends * chunk.len(), "and must miss no bytes");
+    }
+
+    #[test]
     fn death_notifies_observers_but_only_controllers_defer_the_reap() {
         let with_observer_only = Arc::new(Mutex::new(test_state(true)));
         let (observer_tx, observer_rx) = mpsc::channel();
-        observe_subscriber(&mut with_observer_only.lock().unwrap(), observer_tx);
+        observe_subscriber(
+            &mut with_observer_only.lock().unwrap(),
+            observer_tx,
+            Arc::new(OutputGate::new()),
+        );
         drain(&observer_rx);
         let (dead_tx, dead_rx) = mpsc::channel();
         DeathReporter::new(move || dead_tx.send(()).unwrap())
@@ -3070,7 +3174,7 @@ mod tests {
         {
             let mut st = with_both.lock().unwrap();
             attach_subscriber(&mut st, controller_tx);
-            observe_subscriber(&mut st, observer_tx);
+            observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
         }
         drain(&controller_rx);
         drain(&observer_rx);
