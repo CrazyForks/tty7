@@ -60,7 +60,7 @@ pub enum Command {
     #[command(about = "Type text into a pane")]
     Send(SendArgs),
 
-    #[command(about = "Print what a pane is showing")]
+    #[command(about = "Print a pane's raw output (ANSI bytes): the newest scrollback segment by default")]
     Capture(CaptureArgs),
 
     #[command(about = "Processes and listening ports inside a pane")]
@@ -108,7 +108,8 @@ pub struct RunArgs {
     #[arg(
         long,
         value_name = "WORKSPACE",
-        help = "Workspace the pane belongs to; defaults to $TTY7_WS inside a tty7 shell"
+        help = "Sets the pane's TTY7_WS and, with --keep, the workspace the kept pane is \
+                filed into; defaults to $TTY7_WS inside a tty7 shell"
     )]
     pub ws: Option<String>,
 
@@ -154,7 +155,12 @@ pub struct CaptureArgs {
     #[arg(value_name = "%PANE", help = "Pane to read; defaults to $TTY7_PANE inside a tty7 shell")]
     pub target: Option<String>,
 
-    #[arg(long, help = "Include the server-side scrollback ring, not just the screen")]
+    #[arg(
+        long,
+        help = "Print the whole scrollback ring, raw ANSI bytes; the ring splits into \
+                segments on resize, and without this flag only the last segment is \
+                printed (for a never-resized pane the two are identical)"
+    )]
     pub scrollback: bool,
 }
 

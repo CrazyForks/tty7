@@ -1,10 +1,10 @@
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde_json::json;
-use tty7_core::client::{ControlClient, PaneClient};
+use tty7_core::client::{ControlClient, PaneClient, PaneSession};
 use tty7_core::core::session::WorkspaceId;
 use tty7_core::daemon::control::{
     ControlEvent, ControlHello, ControlHelloOk, ControlRequest, ReplyOk, RouteInfo,
@@ -29,23 +29,44 @@ const NOT_RUNNING: &str =
 
 pub struct RealBackend {
     machine: Option<String>,
+    socket: Option<String>,
     route: Option<RouteTarget>,
     control: Option<ControlClient>,
     panes: Option<PaneClient>,
+    running: Option<RunningCommand>,
+}
+
+struct RunningCommand {
+    session: PaneSession,
+    keep: bool,
 }
 
 impl RealBackend {
-    pub fn new(machine: Option<String>) -> RealBackend {
+    pub fn new(machine: Option<String>, socket: Option<String>) -> RealBackend {
         RealBackend {
             machine,
+            socket,
             route: None,
             control: None,
             panes: None,
+            running: None,
         }
     }
 
     fn hello_msg() -> ControlHello {
         ControlHello::host_rpc(format!("tty7-cli-{}", std::process::id()), hostname())
+    }
+
+    fn local_control(&self, hello: &ControlHello) -> Result<ControlClient> {
+        match &self.socket {
+            Some(path) => ControlClient::connect_at(Path::new(path), hello).with_context(|| {
+                format!(
+                    "connecting to the server at {}={path}",
+                    crate::address::ENV_SOCKET
+                )
+            }),
+            None => ControlClient::connect(hello).context(NOT_RUNNING),
+        }
     }
 
     fn route(&mut self) -> Result<Option<RouteTarget>> {
@@ -55,7 +76,7 @@ impl RealBackend {
         if let Some(target) = &self.route {
             return Ok(Some(target.clone()));
         }
-        let local = ControlClient::connect(&Self::hello_msg()).context(NOT_RUNNING)?;
+        let local = self.local_control(&Self::hello_msg())?;
         let routes = match local
             .request(ControlRequest::Routes)
             .context("asking the local server for its machine links")?
@@ -79,7 +100,7 @@ impl RealBackend {
                         self.machine.as_deref().unwrap_or_default()
                     )
                 })?,
-                None => ControlClient::connect(&hello).context(NOT_RUNNING)?,
+                None => self.local_control(&hello)?,
             };
             self.control = Some(client);
         }
@@ -90,12 +111,24 @@ impl RealBackend {
         if self.panes.is_none() {
             let client = match self.route()? {
                 Some(target) => PaneClient::routed(target),
-                None => PaneClient::local(),
+                None => match &self.socket {
+                    Some(path) => PaneClient::at(pane_endpoint_for(Path::new(path))),
+                    None => PaneClient::local(),
+                },
             };
             self.panes = Some(client);
         }
         Ok(self.panes.as_ref().expect("just filled"))
     }
+}
+
+fn pane_endpoint_for(control: &Path) -> PathBuf {
+    let file = if cfg!(windows) {
+        "daemon.port"
+    } else {
+        "daemon.sock"
+    };
+    control.with_file_name(file)
 }
 
 impl Backend for RealBackend {
@@ -171,7 +204,7 @@ impl Backend for RealBackend {
         bail!("interactive `tty7 attach %pane` is not wired yet — it lands in the next slice")
     }
 
-    fn run(&mut self, spec: RunSpec) -> Result<i32> {
+    fn run_spawn(&mut self, spec: RunSpec) -> Result<u64> {
         let (program, args) = spec
             .command
             .split_first()
@@ -181,7 +214,7 @@ impl Backend for RealBackend {
             args: args.to_vec(),
             args_are_tty7_defaults: false,
         };
-        let mut session = self
+        let session = self
             .pane_client()?
             .spawn(
                 spec.cwd.map(PathBuf::from),
@@ -191,6 +224,19 @@ impl Backend for RealBackend {
                 spec.workspace.map(|ws| ws.to_string()),
             )
             .with_context(|| format!("spawning `{program}`"))?;
+        let pane = session.pane_id();
+        self.running = Some(RunningCommand {
+            session,
+            keep: spec.keep,
+        });
+        Ok(pane)
+    }
+
+    fn run_wait(&mut self) -> Result<Option<i32>> {
+        let RunningCommand { mut session, keep } = self
+            .running
+            .take()
+            .ok_or_else(|| anyhow!("run_wait without a spawned command"))?;
         let mut stdout = std::io::stdout().lock();
         let code = loop {
             match session.recv() {
@@ -198,12 +244,12 @@ impl Backend for RealBackend {
                     stdout.write_all(&bytes)?;
                     stdout.flush()?;
                 }
-                Ok(DaemonMsg::Exited { code }) => break code.unwrap_or(1),
+                Ok(DaemonMsg::Exited { code }) => break code,
                 Ok(_) => {}
                 Err(e) => return Err(anyhow!(e).context("streaming the command's output")),
             }
         };
-        if spec.keep {
+        if keep {
             session.detach()?;
         } else {
             session.kill()?;
@@ -236,6 +282,12 @@ fn hostname() -> String {
 fn resolve_route(name: &str, routes: &[RouteInfo]) -> Result<RouteTarget> {
     let matches: Vec<&RouteInfo> = routes.iter().filter(|r| route_matches(name, r)).collect();
     match matches.as_slice() {
+        [one] if !one.connected => bail!(
+            "the link to machine '{}' is down — the CLI will not dial a fresh connection of \
+             its own (that would guess at auth instead of using the profile's credentials); \
+             reconnect the link from the GUI or its SSH profile, then retry",
+            one.key
+        ),
         [one] => target_for(one),
         [] if routes.is_empty() => bail!(
             "the local server holds no machine links — connect one from the GUI first \
@@ -320,7 +372,7 @@ mod tests {
     fn a_machine_resolves_by_full_key_or_bare_host() {
         let routes = vec![
             route("me@build-box:22", "ssh", true),
-            route("me@web-box:2222", "ssh", false),
+            route("me@web-box:2222", "ssh", true),
         ];
         for name in ["me@build-box:22", "build-box"] {
             let RouteTarget::Ssh(spec) = resolve_route(name, &routes).unwrap() else {
@@ -351,6 +403,25 @@ mod tests {
 
         let err = resolve_route("anything", &[]).unwrap_err().to_string();
         assert!(err.contains("no machine links"), "{err}");
+    }
+
+    #[test]
+    fn a_down_link_is_refused_instead_of_dialed_fresh() {
+        let routes = vec![route("me@build-box:22", "ssh", false)];
+        let err = resolve_route("build-box", &routes).unwrap_err().to_string();
+        assert!(err.contains("down"), "{err}");
+        assert!(err.contains("reconnect"), "{err}");
+        assert!(err.contains("me@build-box:22"), "{err}");
+    }
+
+    #[test]
+    fn the_pane_endpoint_is_the_control_endpoints_sibling() {
+        let (control, pane) = if cfg!(windows) {
+            ("C:\\cfg\\tty7\\control.port", "C:\\cfg\\tty7\\daemon.port")
+        } else {
+            ("/run/user/1000/tty7/control.sock", "/run/user/1000/tty7/daemon.sock")
+        };
+        assert_eq!(pane_endpoint_for(Path::new(control)), PathBuf::from(pane));
     }
 
     #[test]

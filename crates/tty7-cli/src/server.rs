@@ -44,15 +44,30 @@ pub fn start() -> Result<Outcome> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     detach(&mut cmd);
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("could not start {}: {e}", exe.display()))?;
     let pid = child.id();
     let deadline = Instant::now() + START_TIMEOUT;
     while !running() {
         if Instant::now() >= deadline {
+            let fate = match child.try_wait() {
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    "it was still running and has been killed"
+                }
+                Ok(Some(status)) => {
+                    if status.success() {
+                        "it had already exited cleanly"
+                    } else {
+                        "it had already exited with an error"
+                    }
+                }
+                Err(_) => "its state could not be checked, so it was left alone",
+            };
             bail!(
-                "{} (pid {pid}) did not open its endpoints within {START_TIMEOUT:?}",
+                "{} (pid {pid}) did not open its endpoints within {START_TIMEOUT:?} — {fate}",
                 exe.display()
             );
         }

@@ -201,10 +201,10 @@ workspace = true
 # ---- caches are shared and versions stay aligned. ----
 [workspace]
 members = ["crates/*"]
-# The root `tty7` package is a member implicitly; naming all three here is what
-# makes a bare `cargo build` / `cargo test` at the root cover the whole
+# The root `tty7` package is a member implicitly; naming every crate here is
+# what makes a bare `cargo build` / `cargo test` at the root cover the whole
 # workspace, which is how CI invokes them.
-default-members = [".", "crates/tty7-core", "crates/tty7-server"]
+default-members = [".", "crates/tty7-core", "crates/tty7-server", "crates/tty7-cli"]
 
 [workspace.package]
 edition = "2024"

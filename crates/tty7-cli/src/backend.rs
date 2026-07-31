@@ -30,7 +30,9 @@ pub trait Backend {
 
     fn attach_pane(&mut self, pane: u64) -> Result<()>;
 
-    fn run(&mut self, spec: RunSpec) -> Result<i32>;
+    fn run_spawn(&mut self, spec: RunSpec) -> Result<u64>;
+
+    fn run_wait(&mut self) -> Result<Option<i32>>;
 
     fn events(&mut self, on_event: &mut dyn FnMut(ControlEvent) -> Result<()>) -> Result<()>;
 }
@@ -61,6 +63,7 @@ pub mod mock {
         pub procs_calls: Vec<u64>,
         pub procs_reply: PaneProcs,
         pub runs: Vec<RunSpec>,
+        pub run_exit: Option<i32>,
         pub events: Vec<ControlEvent>,
     }
 
@@ -78,6 +81,7 @@ pub mod mock {
                 procs_calls: Vec::new(),
                 procs_reply: PaneProcs::default(),
                 runs: Vec::new(),
+                run_exit: Some(0),
                 events: Vec::new(),
             }
         }
@@ -140,9 +144,15 @@ pub mod mock {
             Err(anyhow!("the mock backend cannot attach"))
         }
 
-        fn run(&mut self, spec: RunSpec) -> Result<i32> {
+        fn run_spawn(&mut self, spec: RunSpec) -> Result<u64> {
             self.runs.push(spec);
-            Ok(0)
+            let id = self.next_spawn_id;
+            self.next_spawn_id += 1;
+            Ok(id)
+        }
+
+        fn run_wait(&mut self) -> Result<Option<i32>> {
+            Ok(self.run_exit)
         }
 
         fn events(&mut self, on_event: &mut dyn FnMut(ControlEvent) -> Result<()>) -> Result<()> {
