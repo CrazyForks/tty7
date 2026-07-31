@@ -49,6 +49,35 @@ enum VersionProbe {
     Unresponsive,
 }
 
+const DAEMON_EXE_STEMS: [&str; 3] = ["tty7-app", "tty7-server", "tty7"];
+
+fn strip_exe_suffix(name: &str) -> &str {
+    match name.len().checked_sub(4) {
+        Some(i) if name.is_char_boundary(i) && name[i..].eq_ignore_ascii_case(".exe") => {
+            &name[..i]
+        }
+        _ => name,
+    }
+}
+
+fn exe_names_equal(a: &str, b: &str) -> bool {
+    let a = strip_exe_suffix(a);
+    let b = strip_exe_suffix(b);
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+fn is_reapable_daemon_name(name: &str) -> bool {
+    let own = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+    own.as_deref().is_some_and(|own| exe_names_equal(own, name))
+        || DAEMON_EXE_STEMS.iter().any(|stem| exe_names_equal(stem, name))
+}
+
 pub fn ensure_running() -> anyhow::Result<()> {
     if let Ok(mut stream) = transport::connect() {
         match query_daemon_version(&mut stream) {
@@ -174,7 +203,7 @@ fn reap_recorded_daemon() {
         pidfile::remove();
         return;
     }
-    if process_matches_own_exe(pid as libc::pid_t) {
+    if process_matches_daemon_exe(pid as libc::pid_t) {
         log::warn!("reaping unreachable daemon (pid {pid}); its sessions will be hung up");
         reap_process(pid as libc::pid_t);
     }
@@ -182,12 +211,10 @@ fn reap_recorded_daemon() {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn process_matches_own_exe(pid: libc::pid_t) -> bool {
-    let ours = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_os_string()));
-    let theirs = process_path(pid).and_then(|p| p.file_name().map(|n| n.to_os_string()));
-    matches!((ours, theirs), (Some(a), Some(b)) if a == b)
+fn process_matches_daemon_exe(pid: libc::pid_t) -> bool {
+    process_path(pid)
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .is_some_and(|name| is_reapable_daemon_name(&name))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -228,14 +255,10 @@ fn reap_recorded_daemon() {
         return;
     }
     let procs = winproc::snapshot();
-    let ours = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
     let matches = procs
         .iter()
         .find(|p| p.pid == pid)
-        .zip(ours)
-        .is_some_and(|(entry, name)| entry.name.eq_ignore_ascii_case(&name));
+        .is_some_and(|entry| is_reapable_daemon_name(&entry.name));
     if matches {
         log::warn!("reaping unreachable daemon (pid {pid}); its sessions will be hung up");
         for descendant in winproc::descendants(&procs, pid) {
@@ -345,6 +368,74 @@ fn detach(cmd: &mut Command) {
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
+#[cfg(test)]
+mod exe_name_tests {
+    use super::*;
+
+    #[test]
+    fn every_legitimate_daemon_name_is_reapable_with_and_without_exe() {
+        for name in [
+            "tty7-app",
+            "tty7-server",
+            "tty7",
+            "tty7-app.exe",
+            "tty7-server.exe",
+            "tty7.exe",
+        ] {
+            assert!(is_reapable_daemon_name(name), "{name} is a daemon of ours");
+        }
+    }
+
+    #[test]
+    fn the_current_executable_name_remains_reapable() {
+        let own = std::env::current_exe()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            is_reapable_daemon_name(&own),
+            "{own} launched this process and must stay in the set"
+        );
+    }
+
+    #[test]
+    fn foreign_process_names_are_never_reapable() {
+        for name in [
+            "explorer.exe",
+            "sleep",
+            "tty7d",
+            "nottty7",
+            "tty7-app2",
+            "tty7.",
+            "",
+        ] {
+            assert!(
+                !is_reapable_daemon_name(name),
+                "{name:?} must be protected from the reap"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_matches_daemon_names_case_insensitively() {
+        assert!(is_reapable_daemon_name("TTY7-APP.EXE"));
+        assert!(is_reapable_daemon_name("Tty7-Server"));
+        assert!(is_reapable_daemon_name("TTY7"));
+    }
+
+    #[test]
+    fn strip_exe_suffix_only_strips_a_trailing_exe() {
+        assert_eq!(strip_exe_suffix("tty7-app.exe"), "tty7-app");
+        assert_eq!(strip_exe_suffix("tty7-app.EXE"), "tty7-app");
+        assert_eq!(strip_exe_suffix("tty7-app"), "tty7-app");
+        assert_eq!(strip_exe_suffix(".exe"), "");
+        assert_eq!(strip_exe_suffix("exe"), "exe");
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -387,8 +478,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            !process_matches_own_exe(pid),
-            "sleep must not match the test binary; matching here would mean the reap could kill it"
+            !process_matches_daemon_exe(pid),
+            "sleep must not match any daemon name; matching here would mean the reap could kill it"
         );
 
         let _ = child.kill();

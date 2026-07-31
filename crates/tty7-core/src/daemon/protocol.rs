@@ -584,6 +584,10 @@ pub enum ClientMsg {
         size: WinSize,
     },
     Input(Vec<u8>),
+    SendInput {
+        pane_id: u64,
+        bytes: Vec<u8>,
+    },
     Resize(WinSize),
     Detach,
     Kill {
@@ -656,6 +660,9 @@ pub enum DaemonMsg {
         code: Option<i32>,
     },
     PaneList(Vec<PaneInfo>),
+    InputAck {
+        pane_id: u64,
+    },
     RemoteContext(Option<RemoteContext>),
     Agent(Option<crate::core::cli_agent::CLIAgent>),
     AgentStatus(Option<crate::core::cli_agent::AgentSessionState>),
@@ -711,6 +718,7 @@ mod kind {
     pub const ON_WORKSPACE: u8 = 52;
     pub const SPAWN_OWNED: u8 = 53;
     pub const OBSERVE: u8 = 54;
+    pub const SEND_INPUT: u8 = 55;
 
     pub const SPAWNED: u8 = 1;
     pub const SNAPSHOT: u8 = 2;
@@ -736,6 +744,7 @@ mod kind {
     pub const AGENT_STATUS: u8 = 22;
     pub const VERSION_REPLY: u8 = 40;
     pub const PROCS: u8 = 50;
+    pub const INPUT_ACK: u8 = 51;
 }
 
 pub fn write_frame<W: Write>(w: &mut W, kind: u8, payload: &[u8]) -> io::Result<()> {
@@ -860,6 +869,9 @@ impl ClientMsg {
                 write_frame(w, kind::OBSERVE, &to_json(&(pane_id, size))?)
             }
             ClientMsg::Input(bytes) => write_frame(w, kind::INPUT, bytes),
+            ClientMsg::SendInput { pane_id, bytes } => {
+                write_frame(w, kind::SEND_INPUT, &to_json(&(pane_id, bytes))?)
+            }
             ClientMsg::Resize(size) => write_frame(w, kind::RESIZE, &to_json(size)?),
             ClientMsg::Detach => write_frame(w, kind::DETACH, &[]),
             ClientMsg::Kill { pane_id } => write_frame(w, kind::KILL, &to_json(pane_id)?),
@@ -963,6 +975,10 @@ impl ClientMsg {
                 ClientMsg::Observe { pane_id, size }
             }
             kind::INPUT => ClientMsg::Input(payload),
+            kind::SEND_INPUT => {
+                let (pane_id, bytes) = from_json(&payload)?;
+                ClientMsg::SendInput { pane_id, bytes }
+            }
             kind::RESIZE => ClientMsg::Resize(from_json(&payload)?),
             kind::DETACH => ClientMsg::Detach,
             kind::KILL => ClientMsg::Kill {
@@ -1050,6 +1066,7 @@ impl DaemonMsg {
             } => write_frame(w, kind::PROMPT, &to_json(&(active, at_prompt, last_exit))?),
             DaemonMsg::Exited { code } => write_frame(w, kind::EXITED, &to_json(code)?),
             DaemonMsg::PaneList(list) => write_frame(w, kind::PANE_LIST, &to_json(list)?),
+            DaemonMsg::InputAck { pane_id } => write_frame(w, kind::INPUT_ACK, &to_json(pane_id)?),
             DaemonMsg::RemoteContext(remote) => {
                 write_frame(w, kind::REMOTE_CONTEXT, &to_json(remote)?)
             }
@@ -1108,6 +1125,9 @@ impl DaemonMsg {
                 code: from_json(&payload)?,
             },
             kind::PANE_LIST => DaemonMsg::PaneList(from_json(&payload)?),
+            kind::INPUT_ACK => DaemonMsg::InputAck {
+                pane_id: from_json(&payload)?,
+            },
             kind::REMOTE_CONTEXT => DaemonMsg::RemoteContext(from_json(&payload)?),
             kind::AGENT => DaemonMsg::Agent(from_json(&payload)?),
             kind::AGENT_STATUS => DaemonMsg::AgentStatus(from_json(&payload)?),
@@ -1269,6 +1289,14 @@ mod tests {
                 size: SIZE,
             },
             ClientMsg::Input(vec![0x1b, b'[', b'A', 0, 255]),
+            ClientMsg::SendInput {
+                pane_id: 42,
+                bytes: vec![b'l', b's', b'\r', 0, 255],
+            },
+            ClientMsg::SendInput {
+                pane_id: 7,
+                bytes: Vec::new(),
+            },
             ClientMsg::Resize(SIZE),
             ClientMsg::Detach,
             ClientMsg::Kill { pane_id: 7 },
@@ -1405,6 +1433,7 @@ mod tests {
                     owner: Some("ffe038d0-9ad6-40c0-815d-1fcc43c17ec0".into()),
                 },
             ]),
+            DaemonMsg::InputAck { pane_id: 42 },
             DaemonMsg::RemoteContext(Some(RemoteContext {
                 kind: RemoteKind::Ssh,
                 argv: vec!["ssh".into(), "-p".into(), "2222".into(), "dev".into()],

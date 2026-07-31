@@ -86,6 +86,20 @@ impl PaneClient {
         ClientMsg::Kill { pane_id }.encode(&mut stream)
     }
 
+    pub fn send_input(&self, pane_id: u64, bytes: &[u8]) -> io::Result<()> {
+        let mut stream = self.open()?;
+        ClientMsg::SendInput {
+            pane_id,
+            bytes: bytes.to_vec(),
+        }
+        .encode(&mut stream)?;
+        match DaemonMsg::read(&mut stream)? {
+            DaemonMsg::InputAck { .. } => Ok(()),
+            DaemonMsg::Error(message) => Err(io::Error::other(message)),
+            other => Err(unexpected_reply("SendInput", &other)),
+        }
+    }
+
     pub fn procs(&self, pane_id: u64) -> io::Result<PaneProcs> {
         let mut stream = self.open()?;
         ClientMsg::QueryProcs { pane_id }.encode(&mut stream)?;
