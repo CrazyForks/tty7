@@ -379,10 +379,16 @@ impl SshManager {
         let mut routes: Vec<_> = conns
             .iter()
             .map(|(key, slot)| {
-                let connected = slot
-                    .try_lock()
-                    .map(|weak| weak.upgrade().is_some_and(|conn| conn.is_alive()))
-                    .unwrap_or(false);
+                let connected = match slot.try_lock() {
+                    Ok(weak) => weak.upgrade().is_some_and(|conn| conn.is_alive()),
+                    // The slot is held by whoever is opening or using this link
+                    // right now. Busy is not down — and callers act on this:
+                    // the CLI's `-m <machine>` refuses to route over a link it
+                    // is told is down, so guessing false here fails a perfectly
+                    // live connection the moment it gets used. SshConnection::
+                    // is_alive resolves its own lock contention the same way.
+                    Err(_) => true,
+                };
                 crate::daemon::control::RouteInfo {
                     key: key.as_str().to_string(),
                     kind: "ssh".to_string(),
@@ -689,6 +695,36 @@ mod tests {
                 "a dropped connection must read as disconnected, not vanish"
             );
         }
+    }
+
+    #[test]
+    fn a_busy_link_reads_as_connected_rather_than_down() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build test runtime");
+        let mgr = SshManager {
+            runtime,
+            conns: Mutex::new(HashMap::new()),
+            forwards: SshForwardRegistry::default(),
+            probes: Mutex::new(HashMap::new()),
+        };
+        let slot: ConnSlot = Arc::new(tokio::sync::Mutex::new(Weak::new()));
+        mgr.conns
+            .lock()
+            .unwrap()
+            .insert(ConnectionKey::from_spec(&base_spec()), slot.clone());
+
+        // Someone is mid-operation on this link: opening a channel, running the
+        // remote bootstrap probe, anything that holds the slot for a moment.
+        let _busy = slot.try_lock().expect("nobody else holds it in this test");
+
+        let routes = mgr.routes();
+        assert_eq!(routes.len(), 1, "a busy link must still be listed");
+        assert!(
+            routes[0].connected,
+            "a link whose slot is momentarily held is busy, not down — calling it \
+             down makes `tty7 -m <machine>` refuse to route over a live connection"
+        );
     }
 
     #[test]

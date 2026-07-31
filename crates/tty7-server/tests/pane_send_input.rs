@@ -227,9 +227,12 @@ fn a_preempting_attach_closes_the_displaced_controller_and_drops_its_input() {
 
     let _ = first.input(b"echo tty7_stale_input\r");
 
-    first
-        .set_recv_timeout(Some(EOF_WITHIN))
-        .expect("bound the displaced reads");
+    // Best effort: the handover closes this connection immediately, and
+    // setsockopt on a socket whose peer is gone fails (EINVAL on macOS). Not a
+    // problem — the earlier STREAM_WITHIN bound is still in force, so the reads
+    // below stay bounded either way, and an already-closed connection is
+    // precisely what this test wants to see.
+    let _ = first.set_recv_timeout(Some(EOF_WITHIN));
     let deadline = Instant::now() + EOF_WITHIN + Duration::from_secs(5);
     let eof = loop {
         match first.recv() {

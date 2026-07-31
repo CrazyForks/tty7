@@ -421,6 +421,15 @@ impl OutputGate {
 
 pub(crate) const OBSERVER_BUDGET: i64 = 8 * 1024 * 1024;
 
+/// How long the death path will chase a child's exit status before giving up
+/// and reporting `Exited { code: None }`. The pty hits EOF when the last slave
+/// fd closes, which can land a few milliseconds ahead of the child becoming
+/// reapable — that race is all this window exists to cover. Everything past it
+/// is a pane that looks frozen to every attached client, so it stays short.
+const EXIT_CODE_PROBE_WINDOW: Duration = Duration::from_millis(500);
+
+const EXIT_CODE_PROBE_INTERVAL: Duration = Duration::from_millis(10);
+
 struct Observer {
     id: u64,
     tx: Sender<DaemonMsg>,
@@ -448,7 +457,13 @@ fn notify(st: &mut PaneState, msg: DaemonMsg) {
     if let Some(sub) = &st.subscriber {
         let _ = sub.send(msg.clone());
     }
-    st.observers.retain(|obs| obs.tx.send(msg.clone()).is_ok());
+    // Status traffic is charged the same budget as output. These messages are
+    // small, but an agent pane emits AgentStatus often enough that an observer
+    // which stopped draining would still queue without bound. Being over the
+    // line already disqualifies it; the message is not sized individually.
+    st.observers.retain(|obs| {
+        obs.gate.queued_bytes() < OBSERVER_BUDGET && obs.tx.send(msg.clone()).is_ok()
+    });
 }
 
 fn fan_out_output(st: &mut PaneState, bytes: &[u8], gate: &OutputGate) {
@@ -622,16 +637,25 @@ impl DaemonPane {
         death.probe_exit_code({
             let child = child.clone();
             move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let deadline = std::time::Instant::now() + EXIT_CODE_PROBE_WINDOW;
                 loop {
-                    let status = child.lock().ok()?.try_wait().ok()?;
-                    if let Some(status) = status {
-                        return Some(status.exit_code() as i32);
+                    // try_lock, never lock: DaemonPane::drop holds this very
+                    // mutex across a blocking child.wait(), and this probe runs
+                    // on the reader thread on its way to announcing the death.
+                    // Blocking for the lock would park the Exited notification
+                    // behind a wait() with no bound of its own; the deadline
+                    // below is the only thing clients should ever wait on.
+                    if let Ok(mut child) = child.try_lock() {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Some(status.exit_code() as i32),
+                            Ok(None) => {}
+                            Err(_) => return None,
+                        }
                     }
                     if std::time::Instant::now() >= deadline {
                         return None;
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                    std::thread::sleep(EXIT_CODE_PROBE_INTERVAL);
                 }
             }
         });
@@ -1327,9 +1351,18 @@ fn attach_subscriber(st: &mut PaneState, subscriber: Sender<DaemonMsg>) -> u64 {
     st.subscriber_epoch
 }
 
-fn observe_subscriber(st: &mut PaneState, observer: Sender<DaemonMsg>, gate: Arc<OutputGate>) -> u64 {
+fn observe_subscriber(
+    st: &mut PaneState,
+    observer: Sender<DaemonMsg>,
+    gate: Arc<OutputGate>,
+) -> u64 {
     st.observer_seq += 1;
     replay_state(st, &observer);
+    // The replay just queued the whole ring into this channel. Charge it, or
+    // the first budget check would read zero while a full scrollback is already
+    // sitting there unread — an observer that never drains would be allowed a
+    // ring plus a full budget before anyone noticed.
+    gate.add(st.ring.len);
     st.observers.push(Observer {
         id: st.observer_seq,
         tx: observer,
@@ -3010,12 +3043,17 @@ mod tests {
 
         let (observer_tx, observer_rx) = mpsc::channel();
         let id = observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
-        assert_eq!(st.subscriber_epoch, epoch, "observing must not bump the controller epoch");
+        assert_eq!(
+            st.subscriber_epoch, epoch,
+            "observing must not bump the controller epoch"
+        );
         assert!(st.subscriber.is_some(), "the controller keeps its seat");
 
         assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Size(_))));
         assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"screen"));
-        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/work")));
+        assert!(
+            matches!(observer_rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/work"))
+        );
         assert!(
             controller_rx.try_recv().is_err(),
             "an observer joining must be invisible to the controller"
@@ -3028,7 +3066,10 @@ mod tests {
         st.observers.retain(|obs| obs.id != id);
         notify(&mut st, DaemonMsg::Output(b"tock".to_vec()));
         assert!(matches!(controller_rx.try_recv(), Ok(DaemonMsg::Output(_))));
-        assert!(observer_rx.try_recv().is_err(), "a departed observer hears nothing");
+        assert!(
+            observer_rx.try_recv().is_err(),
+            "a departed observer hears nothing"
+        );
     }
 
     #[test]
@@ -3076,7 +3117,10 @@ mod tests {
         drop(observer_rx);
 
         notify(&mut st, DaemonMsg::Output(b"x".to_vec()));
-        assert!(st.observers.is_empty(), "a dead observer must not accumulate");
+        assert!(
+            st.observers.is_empty(),
+            "a dead observer must not accumulate"
+        );
     }
 
     #[test]
@@ -3162,7 +3206,10 @@ mod tests {
         let (dead_tx, dead_rx) = mpsc::channel();
         DeathReporter::new(move || dead_tx.send(()).unwrap())
             .report(&with_observer_only, &AtomicBool::new(false));
-        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Exited { code: None })));
+        assert!(matches!(
+            observer_rx.try_recv(),
+            Ok(DaemonMsg::Exited { code: None })
+        ));
         assert!(
             dead_rx.try_recv().is_ok(),
             "read-only observers must not keep a dead pane in the registry"
@@ -3181,8 +3228,14 @@ mod tests {
         let (dead_tx, dead_rx) = mpsc::channel();
         DeathReporter::new(move || dead_tx.send(()).unwrap())
             .report(&with_both, &AtomicBool::new(false));
-        assert!(matches!(controller_rx.try_recv(), Ok(DaemonMsg::Exited { code: None })));
-        assert!(matches!(observer_rx.try_recv(), Ok(DaemonMsg::Exited { code: None })));
+        assert!(matches!(
+            controller_rx.try_recv(),
+            Ok(DaemonMsg::Exited { code: None })
+        ));
+        assert!(matches!(
+            observer_rx.try_recv(),
+            Ok(DaemonMsg::Exited { code: None })
+        ));
         assert!(
             dead_rx.try_recv().is_err(),
             "an attached death is still the detach path's to reclaim"

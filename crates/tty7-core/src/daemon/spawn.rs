@@ -53,9 +53,7 @@ const DAEMON_EXE_STEMS: [&str; 3] = ["tty7-app", "tty7-server", "tty7"];
 
 fn strip_exe_suffix(name: &str) -> &str {
     match name.len().checked_sub(4) {
-        Some(i) if name.is_char_boundary(i) && name[i..].eq_ignore_ascii_case(".exe") => {
-            &name[..i]
-        }
+        Some(i) if name.is_char_boundary(i) && name[i..].eq_ignore_ascii_case(".exe") => &name[..i],
         _ => name,
     }
 }
@@ -75,7 +73,9 @@ fn is_reapable_daemon_name(name: &str) -> bool {
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
     own.as_deref().is_some_and(|own| exe_names_equal(own, name))
-        || DAEMON_EXE_STEMS.iter().any(|stem| exe_names_equal(stem, name))
+        || DAEMON_EXE_STEMS
+            .iter()
+            .any(|stem| exe_names_equal(stem, name))
 }
 
 pub fn ensure_running() -> anyhow::Result<()> {

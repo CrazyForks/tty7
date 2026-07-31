@@ -372,6 +372,11 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             }
         },
 
+        // The size is accepted but deliberately not applied: an observer is
+        // read-only, and resizing the pty for it would reflow the grid under
+        // the controller. The replay tells the observer the pane's real size;
+        // the field stays on the wire so a future observer-side viewport does
+        // not need another message kind.
         ClientMsg::Observe { pane_id, size: _ } => match registry.get(pane_id) {
             Some(pane) => stream_observer(pane, read_stream, write_stream),
             None => {
@@ -663,8 +668,6 @@ fn observe_loop<R: std::io::Read>(read_stream: &mut R, refusals: &mpsc::Sender<D
     }
 }
 
-const CONTROL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
-
 fn run_stream(
     pane: Arc<DaemonPane>,
     id: u64,
@@ -676,18 +679,15 @@ fn run_stream(
 ) -> anyhow::Result<()> {
     use std::io::Read as _;
 
+    // Blocking reads: when this controller is displaced its writer's channel
+    // closes, and the writer shuts our read side down on its way out (see
+    // spawn_writer), so the read below returns instead of hanging.
     let writer = spawn_writer(rx, write_stream, pane.gate());
-    let _ = read_stream.set_read_timeout(Some(CONTROL_POLL_INTERVAL));
 
     let mut killed = false;
-    let mut displaced = false;
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 65536];
     'conn: loop {
-        if !pane.controls(epoch) {
-            displaced = true;
-            break;
-        }
         loop {
             let (kind, payload) = match crate::daemon::protocol::take_frame(&mut pending) {
                 Ok(Some(frame)) => frame,
@@ -700,14 +700,12 @@ fn run_stream(
             match msg {
                 ClientMsg::Input(bytes) => {
                     if !pane.controls(epoch) {
-                        displaced = true;
                         break 'conn;
                     }
                     pane.write_input(&bytes);
                 }
                 ClientMsg::Resize(size) => {
                     if !pane.controls(epoch) {
-                        displaced = true;
                         break 'conn;
                     }
                     pane.resize(size);
@@ -731,20 +729,14 @@ fn run_stream(
         match read_stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => pending.extend_from_slice(&chunk[..n]),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::Interrupted
-                ) =>
-            {
-                continue;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
 
+    // Asked after the loop, before detach clears the seat: whoever no longer
+    // holds the epoch was preempted rather than having hung up on their own.
+    let displaced = !pane.controls(epoch);
     let reclaimable = pane.detach(epoch);
     if displaced {
         let _ = read_stream.shutdown(std::net::Shutdown::Both);
@@ -809,6 +801,14 @@ fn spawn_writer(
                 }
                 let _ = write_stream.flush();
             }
+            // This half and the connection's read half are try_clone'd views of
+            // one socket, so shutting the read side down here unblocks whoever
+            // is parked in read() on the other handle. The writer's channel
+            // closing IS the handover signal — a new controller replaces the
+            // subscriber, the old Sender drops, rx.recv() fails, and we land
+            // here — so the displaced reader wakes at once and nobody has to
+            // poll for it.
+            let _ = write_stream.shutdown(std::net::Shutdown::Read);
         })
         .expect("spawn daemon writer thread")
 }
@@ -1131,6 +1131,41 @@ mod tests {
             );
             writer.join().unwrap();
             drop(tx);
+        }
+
+        #[test]
+        fn a_closed_writer_channel_wakes_the_controller_parked_in_read() {
+            let (client, server) = UnixStream::pair().unwrap();
+            let mut reader = server.try_clone().expect("clone the read half");
+            let (tx, rx) = mpsc::channel::<DaemonMsg>();
+            let writer = spawn_writer(rx, server, Arc::new(crate::daemon::pane::OutputGate::new()));
+
+            // Exactly where run_stream sits between frames.
+            let parked = thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                std::io::Read::read(&mut reader, &mut buf).ok()
+            });
+
+            // A handover: the pane seats a new controller and drops this one's
+            // Sender. Nothing else happens — no poll, no timeout.
+            drop(tx);
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !parked.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                parked.is_finished(),
+                "a displaced controller must be woken by the writer's shutdown; \
+                 if this hangs, run_stream is back to polling for the handover"
+            );
+            assert_eq!(
+                parked.join().unwrap(),
+                Some(0),
+                "the woken read must report EOF, not a partial frame"
+            );
+            writer.join().unwrap();
+            drop(client);
         }
     }
 }

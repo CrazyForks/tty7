@@ -1403,6 +1403,11 @@ mod sock {
         host: SharedHost,
         services: Services,
     ) -> io::Result<PathBuf> {
+        // Anchor uptime here, not at the first Status request. The GUI can host
+        // the control listener too, and there `run_with` never runs — so
+        // without this the OnceLock is first set by whoever asks, and every
+        // answer reports a server that just started.
+        super::server_started();
         let path = control_socket_path()?;
         let listener = bind_control_socket(&path)?;
         std::thread::Builder::new()
@@ -1436,6 +1441,9 @@ mod wsock {
         host: SharedHost,
         services: Services,
     ) -> io::Result<PathBuf> {
+        // See the unix arm: uptime is anchored where the listener opens, so a
+        // GUI-hosted control server does not report itself as freshly started.
+        super::server_started();
         let path = control_endpoint_path()?;
         if let Ok(live) = transport::connect_endpoint(CONTROL_PORT_FILE) {
             drop(live);
@@ -1585,8 +1593,7 @@ mod aggregate_tests {
         };
         let client = client_with(services);
 
-        let ReplyOk::AgentStates(states) = client.call(ControlRequest::AgentStates).unwrap()
-        else {
+        let ReplyOk::AgentStates(states) = client.call(ControlRequest::AgentStates).unwrap() else {
             panic!("AgentStates must answer with ReplyOk::AgentStates");
         };
         assert_eq!(states.len(), 1);
@@ -1600,8 +1607,7 @@ mod aggregate_tests {
     fn aggregates_still_answer_when_this_process_serves_no_panes() {
         let client = client_with(Services::none());
 
-        let ReplyOk::AgentStates(states) = client.call(ControlRequest::AgentStates).unwrap()
-        else {
+        let ReplyOk::AgentStates(states) = client.call(ControlRequest::AgentStates).unwrap() else {
             panic!("AgentStates must answer with ReplyOk::AgentStates");
         };
         assert!(states.is_empty());
