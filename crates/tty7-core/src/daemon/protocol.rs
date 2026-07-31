@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 pub const FEATURE_PANE_OWNER: &str = "pane-owner";
 
@@ -573,8 +573,13 @@ pub enum ClientMsg {
         size: WinSize,
         shell: Option<ShellSpec>,
         owner: Option<String>,
+        workspace: Option<String>,
     },
     Attach {
+        pane_id: u64,
+        size: WinSize,
+    },
+    Observe {
         pane_id: u64,
         size: WinSize,
     },
@@ -705,6 +710,7 @@ mod kind {
     pub const QUERY_PROCS: u8 = 50;
     pub const ON_WORKSPACE: u8 = 52;
     pub const SPAWN_OWNED: u8 = 53;
+    pub const OBSERVE: u8 = 54;
 
     pub const SPAWNED: u8 = 1;
     pub const SNAPSHOT: u8 = 2;
@@ -809,6 +815,8 @@ struct OwnedSpawn {
     shell: Option<ShellSpec>,
     #[serde(default)]
     owner: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 impl ClientMsg {
@@ -819,18 +827,21 @@ impl ClientMsg {
                 size,
                 shell: None,
                 owner: None,
+                workspace: None,
             } => write_frame(w, kind::SPAWN, &to_json(&(cwd, size))?),
             ClientMsg::Spawn {
                 cwd,
                 size,
                 shell: shell @ Some(_),
                 owner: None,
+                workspace: None,
             } => write_frame(w, kind::SPAWN_SHELL, &to_json(&(cwd, size, shell))?),
             ClientMsg::Spawn {
                 cwd,
                 size,
                 shell,
-                owner: owner @ Some(_),
+                owner,
+                workspace,
             } => write_frame(
                 w,
                 kind::SPAWN_OWNED,
@@ -839,10 +850,14 @@ impl ClientMsg {
                     size: *size,
                     shell: shell.clone(),
                     owner: owner.clone(),
+                    workspace: workspace.clone(),
                 })?,
             ),
             ClientMsg::Attach { pane_id, size } => {
                 write_frame(w, kind::ATTACH, &to_json(&(pane_id, size))?)
+            }
+            ClientMsg::Observe { pane_id, size } => {
+                write_frame(w, kind::OBSERVE, &to_json(&(pane_id, size))?)
             }
             ClientMsg::Input(bytes) => write_frame(w, kind::INPUT, bytes),
             ClientMsg::Resize(size) => write_frame(w, kind::RESIZE, &to_json(size)?),
@@ -910,6 +925,7 @@ impl ClientMsg {
                     size,
                     shell: None,
                     owner: None,
+                    workspace: None,
                 }
             }
             kind::SPAWN_SHELL => {
@@ -919,6 +935,7 @@ impl ClientMsg {
                     size,
                     shell,
                     owner: None,
+                    workspace: None,
                 }
             }
             kind::SPAWN_OWNED => {
@@ -927,17 +944,23 @@ impl ClientMsg {
                     size,
                     shell,
                     owner,
+                    workspace,
                 } = from_json(&payload)?;
                 ClientMsg::Spawn {
                     cwd,
                     size,
                     shell,
                     owner,
+                    workspace,
                 }
             }
             kind::ATTACH => {
                 let (pane_id, size) = from_json(&payload)?;
                 ClientMsg::Attach { pane_id, size }
+            }
+            kind::OBSERVE => {
+                let (pane_id, size) = from_json(&payload)?;
+                ClientMsg::Observe { pane_id, size }
             }
             kind::INPUT => ClientMsg::Input(payload),
             kind::RESIZE => ClientMsg::Resize(from_json(&payload)?),
@@ -1149,6 +1172,7 @@ mod tests {
                 size: SIZE,
                 shell: None,
                 owner: None,
+                workspace: None,
             },
             ClientMsg::Resize(SIZE),
             ClientMsg::Input(vec![b'l', b's', b'\r']),
@@ -1202,12 +1226,14 @@ mod tests {
                 size: SIZE,
                 shell: None,
                 owner: None,
+                workspace: None,
             },
             ClientMsg::Spawn {
                 cwd: None,
                 size: SIZE,
                 shell: None,
                 owner: None,
+                workspace: None,
             },
             ClientMsg::Spawn {
                 cwd: Some(PathBuf::from("/tmp/x")),
@@ -1218,12 +1244,25 @@ mod tests {
                     args_are_tty7_defaults: true,
                 }),
                 owner: None,
+                workspace: None,
             },
             ClientMsg::Spawn {
                 cwd: Some(PathBuf::from("/tmp/x")),
                 size: SIZE,
                 shell: None,
                 owner: Some("bda10e44-02de-44a0-8412-ec1cda2b5f5b".into()),
+                workspace: None,
+            },
+            ClientMsg::Spawn {
+                cwd: Some(PathBuf::from("/tmp/x")),
+                size: SIZE,
+                shell: None,
+                owner: None,
+                workspace: Some("ws-main".into()),
+            },
+            ClientMsg::Observe {
+                pane_id: 42,
+                size: SIZE,
             },
             ClientMsg::Attach {
                 pane_id: 42,
@@ -1513,6 +1552,7 @@ mod tests {
             size: SIZE,
             shell: None,
             owner: None,
+            workspace: None,
         };
         let mut buf = Vec::new();
         msg.encode(&mut buf).unwrap();
@@ -1531,6 +1571,7 @@ mod tests {
                 size: SIZE,
                 shell: None,
                 owner: None,
+                workspace: None,
             }
         );
     }
@@ -1547,6 +1588,7 @@ mod tests {
             size: SIZE,
             shell: Some(shell.clone()),
             owner: None,
+            workspace: None,
         };
         let mut buf = Vec::new();
         msg.encode(&mut buf).unwrap();
@@ -1560,6 +1602,7 @@ mod tests {
                 size: SIZE,
                 shell: Some(shell),
                 owner: None,
+                workspace: None,
             }
         );
     }
@@ -1575,6 +1618,7 @@ mod tests {
                 args_are_tty7_defaults: false,
             }),
             owner: Some("bda10e44-02de-44a0-8412-ec1cda2b5f5b".into()),
+            workspace: Some("ws-7".into()),
         };
         let mut buf = Vec::new();
         msg.encode(&mut buf).unwrap();
@@ -1603,8 +1647,43 @@ mod tests {
                 },
                 shell: None,
                 owner: None,
+                workspace: None,
             }
         );
+    }
+
+    #[test]
+    fn a_workspace_spawn_uses_the_owned_kind_and_round_trips() {
+        let msg = ClientMsg::Spawn {
+            cwd: None,
+            size: SIZE,
+            shell: None,
+            owner: None,
+            workspace: Some("ws-main".into()),
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+        let (k, payload) = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(
+            k,
+            kind::SPAWN_OWNED,
+            "a workspace-tagged spawn must not ride the legacy kinds, which drop the field"
+        );
+        assert_eq!(ClientMsg::from_frame(k, payload).unwrap(), msg);
+    }
+
+    #[test]
+    fn observe_uses_its_own_kind_and_round_trips() {
+        let msg = ClientMsg::Observe {
+            pane_id: 42,
+            size: SIZE,
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+        let (k, payload) = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(k, kind::OBSERVE);
+        assert_ne!(k, kind::ATTACH, "observing must never preempt an attach");
+        assert_eq!(ClientMsg::from_frame(k, payload).unwrap(), msg);
     }
 
     #[test]
@@ -1993,7 +2072,7 @@ mod tests {
     #[test]
     fn the_local_daemon_does_not_claim_the_control_dialect() {
         let v = DaemonVersion::current();
-        assert_eq!(v.protocol, 4);
+        assert_eq!(v.protocol, 5);
         assert!(
             !v.has_feature(crate::daemon::control::feature::CONTROL),
             "the session daemon must not advertise a dialect it cannot serve"

@@ -252,6 +252,7 @@ impl RemoteTerminal {
             size: win,
             shell,
             owner,
+            workspace: None,
         }
         .encode(&mut stream)?;
         let pane_id = match DaemonMsg::read(&mut stream)? {

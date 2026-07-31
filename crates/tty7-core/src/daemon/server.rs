@@ -79,6 +79,19 @@ impl Registry {
     }
 }
 
+impl crate::host::server::PaneDirectory for Registry {
+    fn pane_count(&self) -> u64 {
+        self.panes.lock().unwrap().len() as u64
+    }
+
+    fn agent_states(&self) -> Vec<crate::daemon::control::PaneAgentState> {
+        let panes: Vec<Arc<DaemonPane>> = self.panes.lock().unwrap().values().cloned().collect();
+        let mut states: Vec<_> = panes.iter().filter_map(|p| p.agent_state()).collect();
+        states.sort_by_key(|s| s.pane_id);
+        states
+    }
+}
+
 const ORPHAN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 fn spawn_orphan_sweep(registry: Arc<Registry>) {
@@ -131,18 +144,24 @@ fn ssh_connection_for(
 }
 
 pub fn run_daemon() -> anyhow::Result<()> {
+    let registry = Arc::new(Registry::new());
+
     #[cfg(any(unix, windows))]
-    match crate::host::server::spawn_control_listener_with(
-        crate::host::local::LocalHost::shared(),
-        control_services(),
-    ) {
-        Ok(path) => eprintln!("tty7-server: control socket at {}", path.display()),
-        Err(e) => eprintln!("tty7-server: control listener unavailable: {e}"),
+    {
+        let mut services = control_services();
+        services.panes = Some(registry.clone());
+        match crate::host::server::spawn_control_listener_with(
+            crate::host::local::LocalHost::shared(),
+            services,
+        ) {
+            Ok(path) => eprintln!("tty7-server: control socket at {}", path.display()),
+            Err(e) => eprintln!("tty7-server: control listener unavailable: {e}"),
+        }
     }
     #[cfg(not(any(unix, windows)))]
     log::info!("no control listener on this platform; serving panes only");
 
-    run()
+    run_with(registry)
 }
 
 pub fn control_services() -> crate::host::server::Services {
@@ -161,6 +180,12 @@ pub fn control_services() -> crate::host::server::Services {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    run_with(Arc::new(Registry::new()))
+}
+
+fn run_with(registry: Arc<Registry>) -> anyhow::Result<()> {
+    crate::daemon::control::server_started();
+
     if transport::endpoint_exists() {
         match transport::connect() {
             Ok(_) => {
@@ -179,8 +204,6 @@ pub fn run() -> anyhow::Result<()> {
     log::info!("daemon listening on {}", transport::endpoint_display());
 
     crate::daemon::pidfile::write_current();
-
-    let registry = Arc::new(Registry::new());
 
     #[cfg(unix)]
     serve_sigterm(registry.clone());
@@ -277,6 +300,7 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             size,
             shell,
             owner,
+            workspace,
         } => {
             let id = registry.alloc_id();
             let on_dead = {
@@ -290,7 +314,7 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
                         .ok();
                 }
             };
-            let pane = match DaemonPane::spawn(id, cwd, size, shell, owner, on_dead) {
+            let pane = match DaemonPane::spawn(id, cwd, size, shell, owner, workspace, on_dead) {
                 Ok(p) => p,
                 Err(e) => {
                     let mut w = write_stream;
@@ -341,6 +365,15 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             Some(pane) => {
                 stream_pane_with_attach(pane, pane_id, read_stream, write_stream, registry)
             }
+            None => {
+                let mut w = write_stream;
+                DaemonMsg::Error(format!("no such pane {pane_id}")).encode(&mut w)?;
+                Ok(())
+            }
+        },
+
+        ClientMsg::Observe { pane_id, size: _ } => match registry.get(pane_id) {
+            Some(pane) => stream_observer(pane, read_stream, write_stream),
             None => {
                 let mut w = write_stream;
                 DaemonMsg::Error(format!("no such pane {pane_id}")).encode(&mut w)?;
@@ -578,6 +611,46 @@ fn stream_pane(
     run_stream(pane, id, epoch, rx, read_stream, write_stream, registry)
 }
 
+fn stream_observer(
+    pane: Arc<DaemonPane>,
+    mut read_stream: Stream,
+    write_stream: Stream,
+) -> anyhow::Result<()> {
+    let (tx, rx) = mpsc::channel::<DaemonMsg>();
+    let refusals = tx.clone();
+    let observer_id = pane.observe(tx);
+    let writer = spawn_writer(
+        rx,
+        write_stream,
+        Arc::new(crate::daemon::pane::OutputGate::new()),
+    );
+
+    observe_loop(&mut read_stream, &refusals);
+
+    pane.unobserve(observer_id);
+    drop(refusals);
+    let _ = writer.join();
+    Ok(())
+}
+
+fn observe_loop<R: std::io::Read>(read_stream: &mut R, refusals: &mpsc::Sender<DaemonMsg>) {
+    loop {
+        match ClientMsg::read(read_stream) {
+            Ok(ClientMsg::Input(_)) | Ok(ClientMsg::Resize(_)) => {
+                let refused = refusals.send(DaemonMsg::Error(
+                    "this connection is a read-only observer; attach to write".to_string(),
+                ));
+                if refused.is_err() {
+                    break;
+                }
+            }
+            Ok(ClientMsg::Detach) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
 fn run_stream(
     pane: Arc<DaemonPane>,
     id: u64,
@@ -726,6 +799,61 @@ mod tests {
         assert!(reg.list().is_empty());
     }
 
+    #[test]
+    fn an_empty_registry_serves_empty_aggregates() {
+        use crate::host::server::PaneDirectory as _;
+        let reg = Registry::new();
+        assert_eq!(reg.pane_count(), 0);
+        assert!(reg.agent_states().is_empty());
+    }
+
+    #[test]
+    fn the_observer_loop_refuses_writes_and_honors_detach() {
+        let size = crate::daemon::protocol::WinSize {
+            cols: 80,
+            rows: 24,
+            cell_w: 8,
+            cell_h: 17,
+        };
+        let mut wire = Vec::new();
+        ClientMsg::Input(b"echo hijack\r".to_vec())
+            .encode(&mut wire)
+            .unwrap();
+        ClientMsg::Resize(size).encode(&mut wire).unwrap();
+        ClientMsg::QueryProcs { pane_id: 1 }
+            .encode(&mut wire)
+            .unwrap();
+        ClientMsg::Detach.encode(&mut wire).unwrap();
+        ClientMsg::Input(b"too late".to_vec())
+            .encode(&mut wire)
+            .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        observe_loop(&mut std::io::Cursor::new(wire), &tx);
+        drop(tx);
+
+        assert!(
+            matches!(rx.try_recv(), Ok(DaemonMsg::Error(m)) if m.contains("read-only")),
+            "an observer's Input must be answered with an Error, not forwarded"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(DaemonMsg::Error(m)) if m.contains("read-only")),
+            "an observer's Resize must be answered with an Error, not applied"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "Detach ends the loop; frames after it are never read"
+        );
+    }
+
+    #[test]
+    fn the_observer_loop_ends_at_stream_eof() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        observe_loop(&mut std::io::Cursor::new(Vec::<u8>::new()), &tx);
+        drop(tx);
+        assert!(rx.try_recv().is_err());
+    }
+
     #[cfg(unix)]
     mod conn {
         use super::super::{OUTPUT_COALESCE_CAP, Registry, handle_conn, spawn_writer};
@@ -765,6 +893,22 @@ mod tests {
         fn attach_to_missing_pane_reports_error() {
             let (mut client, h) = serve();
             ClientMsg::Attach {
+                pane_id: 999,
+                size: SIZE,
+            }
+            .encode(&mut client)
+            .unwrap();
+            match DaemonMsg::read(&mut client).unwrap() {
+                DaemonMsg::Error(msg) => assert!(msg.contains("999"), "error names the id"),
+                other => panic!("expected Error, got {other:?}"),
+            }
+            h.join().unwrap();
+        }
+
+        #[test]
+        fn observe_of_a_missing_pane_reports_error() {
+            let (mut client, h) = serve();
+            ClientMsg::Observe {
                 pane_id: 999,
                 size: SIZE,
             }

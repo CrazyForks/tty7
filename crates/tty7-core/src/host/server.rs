@@ -9,7 +9,8 @@ use crate::core::machine::{self, Attachment, MachineStore};
 use crate::daemon::control::{
     CONTROL_VERSION, ControlClientMsg, ControlEvent, ControlHello, ControlHelloOk, ControlReply,
     ControlRequest, ControlServerMsg, GIT_STREAM_CHUNK, GIT_STREAM_CHUNK_MAX, LinkShutdown,
-    MAX_CONCURRENT_GIT_STREAMS, ReplyOk, WATCH_BURST_CAP, WireError, WireErrorKind, feature,
+    MAX_CONCURRENT_GIT_STREAMS, PaneAgentState, ReplyOk, ServerStatus, WATCH_BURST_CAP, WireError,
+    WireErrorKind, feature, server_started,
 };
 use crate::daemon::duplex::{Duplex, Halves};
 use crate::host::{Host, SearchHit, SharedHost, WatchSub};
@@ -22,10 +23,16 @@ pub const MAX_QUEUED: usize = 1024;
 
 pub const LAYOUT_EVENT_QUEUE: usize = 1024;
 
+pub trait PaneDirectory: Send + Sync {
+    fn pane_count(&self) -> u64;
+    fn agent_states(&self) -> Vec<PaneAgentState>;
+}
+
 #[derive(Clone, Default)]
 pub struct Services {
     pub machine: Option<Arc<MachineStore>>,
     pub attachments: Arc<AttachRegistry>,
+    pub panes: Option<Arc<dyn PaneDirectory>>,
 }
 
 impl Services {
@@ -37,6 +44,7 @@ impl Services {
         Services {
             machine: Some(store),
             attachments: Arc::new(AttachRegistry::default()),
+            panes: None,
         }
     }
 }
@@ -232,6 +240,7 @@ where
         machine: services.machine.clone(),
         machine_origin: machine_sub.as_ref().map(machine::Subscription::id),
         attachments: Arc::clone(&services.attachments),
+        panes: services.panes.clone(),
         id: NEXT_CONN.fetch_add(1, Ordering::Relaxed),
         holder: Holder {
             token: hello.client_token.clone(),
@@ -722,7 +731,52 @@ fn run_request(
                 .pane_replace(workspace, old, new, conn.machine_origin)?;
             (ReplyOk::Unit, Vec::new())
         }
+
+        ControlRequest::AgentStates => (
+            ReplyOk::AgentStates(
+                conn.panes
+                    .as_ref()
+                    .map(|p| p.agent_states())
+                    .unwrap_or_default(),
+            ),
+            Vec::new(),
+        ),
+        ControlRequest::Routes => (
+            ReplyOk::Routes(crate::daemon::ssh::SshManager::global().routes()),
+            Vec::new(),
+        ),
+        ControlRequest::Status => (
+            ReplyOk::Status(ServerStatus {
+                pid: std::process::id(),
+                uptime_secs: server_started().elapsed().as_secs(),
+                panes: conn.panes.as_ref().map(|p| p.pane_count()).unwrap_or(0),
+                control_version: CONTROL_VERSION,
+                protocol_version: crate::daemon::protocol::PROTOCOL_VERSION,
+                build: env!("CARGO_PKG_VERSION").to_string(),
+                socket: control_endpoint_display(),
+            }),
+            Vec::new(),
+        ),
     })
+}
+
+#[cfg(unix)]
+fn control_endpoint_display() -> String {
+    control_socket_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn control_endpoint_display() -> String {
+    control_endpoint_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn control_endpoint_display() -> String {
+    String::new()
 }
 
 fn paths(v: &[String]) -> Vec<PathBuf> {
@@ -745,6 +799,7 @@ struct Conn {
     machine: Option<Arc<MachineStore>>,
     machine_origin: Option<machine::SubscriberId>,
     attachments: Arc<AttachRegistry>,
+    panes: Option<Arc<dyn PaneDirectory>>,
     id: u64,
     holder: Holder,
 }
@@ -1450,6 +1505,121 @@ pub use wsock::{
     CONTROL_PORT_FILE, connect_control, control_endpoint_path, remove_control_endpoint,
     spawn_control_listener, spawn_control_listener_with,
 };
+
+#[cfg(test)]
+mod aggregate_tests {
+    use super::*;
+    use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
+    use crate::daemon::control::ControlClient;
+    use crate::host::local::LocalHost;
+    use std::net::{TcpListener, TcpStream};
+
+    struct ThreePanesOneAgent;
+
+    impl PaneDirectory for ThreePanesOneAgent {
+        fn pane_count(&self) -> u64 {
+            3
+        }
+
+        fn agent_states(&self) -> Vec<PaneAgentState> {
+            vec![PaneAgentState {
+                pane_id: 7,
+                agent: Some(CLIAgent::Claude),
+                state: AgentSessionState {
+                    status: AgentStatus::Working,
+                    session_id: Some("sess-7".into()),
+                    ..Default::default()
+                },
+            }]
+        }
+    }
+
+    fn client_with(services: Services) -> ControlClient {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = serve_with(stream, LocalHost::new(), services);
+        });
+        let sock = TcpStream::connect(addr).unwrap();
+        ControlClient::over_tcp(
+            sock,
+            &ControlHello::host_rpc("tok", "test-host"),
+            Box::new(|_| {}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn status_answers_with_this_servers_facts() {
+        let services = Services {
+            panes: Some(Arc::new(ThreePanesOneAgent)),
+            ..Services::none()
+        };
+        let client = client_with(services);
+
+        let ReplyOk::Status(status) = client.call(ControlRequest::Status).unwrap() else {
+            panic!("Status must answer with ReplyOk::Status");
+        };
+        assert_eq!(status.pid, std::process::id());
+        assert_eq!(status.panes, 3);
+        assert_eq!(status.control_version, CONTROL_VERSION);
+        assert_eq!(
+            status.protocol_version,
+            crate::daemon::protocol::PROTOCOL_VERSION
+        );
+        assert_eq!(status.build, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            status.socket,
+            control_endpoint_display(),
+            "the CLI dials whatever path Status names"
+        );
+        assert!(status.uptime_secs <= server_started().elapsed().as_secs());
+    }
+
+    #[test]
+    fn agent_states_are_the_pane_directorys_snapshot() {
+        let services = Services {
+            panes: Some(Arc::new(ThreePanesOneAgent)),
+            ..Services::none()
+        };
+        let client = client_with(services);
+
+        let ReplyOk::AgentStates(states) = client.call(ControlRequest::AgentStates).unwrap()
+        else {
+            panic!("AgentStates must answer with ReplyOk::AgentStates");
+        };
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].pane_id, 7);
+        assert_eq!(states[0].agent, Some(CLIAgent::Claude));
+        assert_eq!(states[0].state.status, AgentStatus::Working);
+        assert_eq!(states[0].state.session_id.as_deref(), Some("sess-7"));
+    }
+
+    #[test]
+    fn aggregates_still_answer_when_this_process_serves_no_panes() {
+        let client = client_with(Services::none());
+
+        let ReplyOk::AgentStates(states) = client.call(ControlRequest::AgentStates).unwrap()
+        else {
+            panic!("AgentStates must answer with ReplyOk::AgentStates");
+        };
+        assert!(states.is_empty());
+
+        let ReplyOk::Status(status) = client.call(ControlRequest::Status).unwrap() else {
+            panic!("Status must answer with ReplyOk::Status");
+        };
+        assert_eq!(status.panes, 0);
+
+        let ReplyOk::Routes(routes) = client.call(ControlRequest::Routes).unwrap() else {
+            panic!("Routes must answer with ReplyOk::Routes");
+        };
+        assert!(
+            routes.iter().all(|r| !r.key.is_empty()),
+            "whatever links exist are named; none are blank"
+        );
+    }
+}
 
 #[cfg(test)]
 mod pool_tests {
