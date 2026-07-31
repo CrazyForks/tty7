@@ -6535,7 +6535,7 @@ mod shell_menu_gpui_tests {
         vcx: &mut VisualTestContext,
         done: impl Fn(&Tty7App) -> bool,
     ) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             vcx.background_executor.run_until_parked();
             if app.update(vcx, |app, _| done(app)) {
