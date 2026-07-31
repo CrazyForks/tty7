@@ -92,7 +92,7 @@ impl Tty7App {
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Close this SSH session?"),
+                    .child("Close this SSH connection?"),
             )
             .child(
                 div()

@@ -388,9 +388,9 @@ impl Command {
             Command::new("Switch Workspace…", OpenWorkspacePicker),
             Command::new("Rename Workspace…", RenameWorkspace),
             Command::new("Stop Workspace…", StopWorkspace)
-                .with_subtitle("ends its sessions, keeps the layout"),
+                .with_subtitle("ends its shells, keeps the layout"),
             Command::new("Delete Workspace…", DeleteWorkspace)
-                .with_subtitle("ends its sessions and forgets the layout"),
+                .with_subtitle("ends its shells and forgets the layout"),
         ];
 
         let view = [
@@ -448,7 +448,7 @@ impl Command {
         let ssh = [
             Command::new("SSH: Add Connection…", OpenSshConnectInput),
             Command::new("SSH: Manage Profiles…", OpenSshProfiles),
-            Command::new("SSH: Reconnect Session", RestartSshSession),
+            Command::new("SSH: Reconnect", RestartSshSession),
             Command::new("SSH: Remote Files", ToggleSftp),
             Command::new("SSH: Port Forwarding", ShowSshForwards),
         ];
@@ -468,9 +468,9 @@ impl Command {
             Command::new("Documentation", OpenDocumentation),
             Command::new("Join the Discord", OpenDiscord),
             Command::new("Report an Issue…", ReportIssue),
-            Command::new("Restart Daemon…", RestartDaemon)
+            Command::new("Restart Server…", RestartDaemon)
                 .with_subtitle("ends every running shell; layout is kept"),
-            Command::new("Quit tty7", Quit).with_subtitle("sessions keep running"),
+            Command::new("Quit tty7", Quit).with_subtitle("shells keep running"),
         ];
 
         let mut out = Vec::new();

@@ -1260,7 +1260,7 @@ fn row_menu(
     )
     .separator()
     .item(
-        PopupMenuItem::new("End Sessions…")
+        PopupMenuItem::new("Stop Workspace…")
             .disabled(adopt || !stoppable)
             .on_click(move |_, window, cx| {
                 let _ = a3.update(cx, |this, cx| {
@@ -1270,7 +1270,7 @@ fn row_menu(
             }),
     )
     .item(
-        PopupMenuItem::new("Remove from List…")
+        PopupMenuItem::new("Delete Workspace…")
             .disabled(adopt)
             .on_click(move |_, window, cx| {
                 let _ = a4.update(cx, |this, cx| {

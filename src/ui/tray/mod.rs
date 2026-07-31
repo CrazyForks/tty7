@@ -132,7 +132,7 @@ pub(crate) fn menu_spec(snap: &TraySnapshot) -> Vec<SpecItem> {
     items.push(item("updates", "Check for Updates…".into()));
     items.push(SpecItem::Separator);
     items.push(item("quit", "Quit tty7".into()));
-    items.push(item("quit-stop", "Quit and Stop Daemon…".into()));
+    items.push(item("quit-stop", "Quit and Stop Server…".into()));
     items
 }
 
@@ -228,7 +228,7 @@ mod tests {
                 "Settings…",
                 "Check for Updates…",
                 "Quit tty7",
-                "Quit and Stop Daemon…"
+                "Quit and Stop Server…"
             ]
         );
         assert!(

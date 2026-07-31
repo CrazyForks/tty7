@@ -261,10 +261,10 @@ pub fn connect_blocking(
 ) -> Result<Connected, String> {
     note_origin(&header.target, target);
     crate::daemon::spawn::ensure_running()
-        .map_err(|e| format!("tty7's local daemon could not be started: {e}"))?;
+        .map_err(|e| format!("tty7's local server could not be started: {e}"))?;
 
     let stream = crate::daemon::transport::connect()
-        .map_err(|e| format!("could not reach tty7's local daemon: {e}"))?;
+        .map_err(|e| format!("could not reach tty7's local server: {e}"))?;
 
     let mut stream = stream;
     crate::daemon::router::negotiate(&mut stream, &header)
@@ -647,9 +647,9 @@ pub fn mismatch_target(m: &MismatchedRemoteDaemon) -> Option<RemoteTarget> {
 pub fn restart_server_blocking(header: RouteHeader, label: &str) -> Result<(), String> {
     let action = header.action;
     crate::daemon::spawn::ensure_running()
-        .map_err(|e| format!("tty7's local daemon could not be started: {e}"))?;
+        .map_err(|e| format!("tty7's local server could not be started: {e}"))?;
     let mut stream = crate::daemon::transport::connect()
-        .map_err(|e| format!("could not reach tty7's local daemon: {e}"))?;
+        .map_err(|e| format!("could not reach tty7's local server: {e}"))?;
     let ack = crate::daemon::router::negotiate(&mut stream, &header)
         .map_err(|e| format!("could not restart tty7's server on {label}: {e}"))?;
     if !ack.performed(action) {

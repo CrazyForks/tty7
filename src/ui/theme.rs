@@ -98,7 +98,7 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::action("Join the Discord", OpenDiscord),
             MenuItem::action("Report an Issue…", ReportIssue),
             MenuItem::separator(),
-            MenuItem::action("Restart Daemon…", RestartDaemon),
+            MenuItem::action("Restart Server…", RestartDaemon),
         ]),
     ]);
 }

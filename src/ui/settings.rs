@@ -366,8 +366,8 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: About,
-            title: "How sessions work",
-            keywords: "session daemon detach persist background close quit stop delete workspace layout survive reboot tmux",
+            title: "How shells work",
+            keywords: "shell session daemon server detach persist background close quit stop delete workspace layout survive reboot tmux",
         },
     ]
 }
@@ -2761,8 +2761,8 @@ impl Tty7App {
             .count();
         let summary = match count {
             0 => "none".to_string(),
-            1 => "1 rule, opened with the session".to_string(),
-            n => format!("{n} rules, opened with the session"),
+            1 => "1 rule, opened with the connection".to_string(),
+            n => format!("{n} rules, opened with the connection"),
         };
         let mut section = v_flex().child(self.disclosure_header(
             "ssh-sec-fwd",
@@ -2986,7 +2986,7 @@ impl Tty7App {
             .child(
                 self.settings_row(
                     "Agent forwarding",
-                    "Forward the local ssh-agent to the session.",
+                    "Forward the local ssh-agent to the connection.",
                     crate::ui::theme::switch("ssh-form-agent", cx)
                         .checked(form.agent_forward)
                         .on_click(cx.listener(|this, on: &bool, _w, cx| {
@@ -4507,10 +4507,10 @@ impl Tty7App {
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(foreground)
-                    .child("How sessions work"),
+                    .child("How shells work"),
             )
             .child(div().text_xs().text_color(muted_fg).child(
-                "Your shells run in a background daemon, not in this window. That is what lets them outlive a quit or a reboot — and it means \"close\" and \"end\" are different things here.",
+                "Your shells run in tty7's background server, not in this window. That is what lets them outlive a quit or a reboot — and it means \"close\" and \"end\" are different things here.",
             ))
             .child(
                 v_flex()
@@ -4587,10 +4587,10 @@ impl Tty7App {
                         div()
                             .text_sm()
                             .text_color(foreground)
-                            .child("A terminal workbench: shells, sessions, SSH, coding agents."),
+                            .child("A terminal workbench: shells, workspaces, SSH, coding agents."),
                     )
                     .child(div().text_sm().text_color(muted_fg).child(
-                        "Editor-grade input in every shell, sessions that survive quits and reboots without tmux, a native SSH stack with profiles and port forwarding, and live status for panes running coding agents.",
+                        "Editor-grade input in every shell, shells that outlive quits and reboots without tmux, a native SSH stack with profiles and port forwarding, and live status for panes running coding agents.",
                     ))
                     .child(
                         div()
@@ -4662,15 +4662,15 @@ impl Tty7App {
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(foreground)
-                            .child("Daemon"),
+                            .child("Server"),
                     )
                     .child(div().text_sm().text_color(muted_fg).child(
-                        "Restart the daemon on this computer to pick up a newly granted macOS permission, recover if it stops responding, or start from a clean slate. This ends all running sessions here; your tabs and layout reopen with fresh shells. A remote machine's server is restarted from its own menu in the workspace switcher.",
+                        "Restart the server on this computer to pick up a newly granted macOS permission, recover if it stops responding, or start from a clean slate. This ends all running shells here; your tabs and layout reopen with fresh shells. A remote machine's server is restarted from its own menu in the workspace switcher.",
                     ))
                     .child(
                         h_flex().child(
                             Button::new("restart-daemon")
-                                .label("Restart daemon…")
+                                .label("Restart server…")
                                 .small()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.restart_daemon(window, cx)

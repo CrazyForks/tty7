@@ -471,26 +471,26 @@ impl Tty7App {
         let ours = crate::daemon::protocol::PROTOCOL_VERSION;
         let detail = match mismatch.version {
             Some(v) => format!(
-                "The daemon holding your sessions is from another build \
+                "The server holding your shells is from another build \
                  (v{}, protocol {} — this app speaks {}). You can keep using it and \
-                 your sessions stay, but features whose wire format changed may \
-                 misbehave until it's restarted. Restarting starts a clean daemon: \
+                 your shells stay, but features whose wire format changed may \
+                 misbehave until it's restarted. Restarting starts a clean server: \
                  tabs reopen with fresh shells and anything running in them is \
                  terminated.",
                 v.build, v.protocol, ours
             ),
-            None => "The daemon holding your sessions is from an older \
-                 version of the app. You can keep using it and your sessions stay, \
+            None => "The server holding your shells is from an older \
+                 version of the app. You can keep using it and your shells stay, \
                  but newer features may misbehave until it's restarted. Restarting \
-                 starts a clean daemon: tabs reopen with fresh shells and anything \
+                 starts a clean server: tabs reopen with fresh shells and anything \
                  running in them is terminated."
                 .to_string(),
         };
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Restart Daemon?",
+            "Restart Server?",
             Some(&detail),
-            &["Keep Sessions", "Restart"],
+            &["Keep Shells", "Restart"],
             cx,
         );
         cx.spawn(async move |this, cx| {
@@ -1086,12 +1086,12 @@ impl Tty7App {
         window.activate_window();
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Quit and Stop Daemon?",
+            "Quit and Stop Server?",
             Some(
-                "This quits tty7 and stops the background daemon — anything \
-                 still running in your sessions is terminated. Your tabs and \
+                "This quits tty7 and stops the background server — anything \
+                 still running in your shells is terminated. Your tabs and \
                  layout are kept and reopen with fresh shells next launch. \
-                 (Plain Quit keeps sessions running.)",
+                 (Plain Quit keeps shells running.)",
             ),
             &["Cancel", "Quit and Stop"],
             cx,
@@ -1118,7 +1118,7 @@ impl Tty7App {
             window.push_notification(
                 format!(
                     "tty7 can only restart the server on machines it reaches over SSH. \
-                     {label} is served from this computer — end its sessions instead."
+                     {label} is served from this computer — stop its workspace instead."
                 ),
                 cx,
             );
@@ -1130,9 +1130,9 @@ impl Tty7App {
     pub(crate) fn restart_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Restart Daemon?",
+            "Restart Server?",
             Some(
-                "This stops every running terminal session — anything still \
+                "This stops every running shell on this computer — anything still \
                  running in them will be terminated. Your tabs and layout are kept \
                  and reopened with fresh shells.",
             ),
@@ -5543,7 +5543,7 @@ pub(crate) fn new_terminal(
         .workspace
         .as_ref()
         .map(|w| w.target.to_string())
-        .unwrap_or_else(|| "the daemon".to_string());
+        .unwrap_or_else(|| "the local server".to_string());
     let pending = cx.new(|cx| crate::ui::pending_pane::PendingPane::new(machine, spawn, cx));
     cx.subscribe_in(
         &pending,

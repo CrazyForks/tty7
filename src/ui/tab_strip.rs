@@ -522,7 +522,7 @@ impl Tty7App {
         let raw = tab.leaf_title(window, cx);
         let label = short_title(&raw);
         if label.trim().is_empty() {
-            format!("Session {}", index + 1)
+            format!("Shell {}", index + 1)
         } else {
             label
         }

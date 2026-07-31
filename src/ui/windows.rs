@@ -223,22 +223,22 @@ pub fn confirm_and_delete(cx: &mut App, window: &mut Window, workspace: Workspac
 
 fn destructive_detail(live: Option<usize>, verb: &str) -> String {
     match (live, verb) {
-        (None, "Delete") => "Its machine could not be reached. Any sessions still running there \
+        (None, "Delete") => "Its machine could not be reached. Any shells still running there \
                              will be ended, and the layout forgotten."
             .to_string(),
         (None, _) => {
-            "Its machine could not be reached. Any sessions still running there will be ended."
+            "Its machine could not be reached. Any shells still running there will be ended."
                 .to_string()
         }
         (Some(0), _) => "Its layout and working directories will be forgotten.".to_string(),
         (Some(1), "Delete") => {
-            "1 running session will be ended and its layout forgotten.".to_string()
+            "1 running shell will be ended and its layout forgotten.".to_string()
         }
         (Some(n), "Delete") => {
-            format!("{n} running sessions will be ended and the layout forgotten.")
+            format!("{n} running shells will be ended and the layout forgotten.")
         }
-        (Some(1), _) => "1 running session will be ended.".to_string(),
-        (Some(n), _) => format!("{n} running sessions will be ended."),
+        (Some(1), _) => "1 running shell will be ended.".to_string(),
+        (Some(n), _) => format!("{n} running shells will be ended."),
     }
 }
 
@@ -495,19 +495,19 @@ mod tests {
     fn the_confirmation_says_which_of_the_three_answers_it_got() {
         assert_eq!(
             destructive_detail(Some(1), "Stop"),
-            "1 running session will be ended."
+            "1 running shell will be ended."
         );
         assert_eq!(
             destructive_detail(Some(3), "Stop"),
-            "3 running sessions will be ended."
+            "3 running shells will be ended."
         );
         assert_eq!(
             destructive_detail(Some(1), "Delete"),
-            "1 running session will be ended and its layout forgotten."
+            "1 running shell will be ended and its layout forgotten."
         );
         assert_eq!(
             destructive_detail(Some(3), "Delete"),
-            "3 running sessions will be ended and the layout forgotten."
+            "3 running shells will be ended and the layout forgotten."
         );
         assert_eq!(
             destructive_detail(Some(0), "Delete"),
@@ -565,7 +565,7 @@ mod tests {
             assert_eq!(
                 doomed,
                 vec![1, 2, 3],
-                "every session the confirm prompt counted must be on the kill list"
+                "every shell the confirm prompt counted must be on the kill list"
             );
             assert!(
                 doomed_pane_ids(cx, id).is_empty(),

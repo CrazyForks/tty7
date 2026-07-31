@@ -506,8 +506,8 @@ impl Tty7App {
             PromptLevel::Warning,
             &format!("Restart tty7's server on \u{201c}{label}\u{201d}?"),
             Some(&format!(
-                "This stops every session on {label} — anything still running in them \
-                 will be terminated, including sessions this window is not showing. \
+                "This stops every shell on {label} — anything still running in them \
+                 will be terminated, including shells this window is not showing. \
                  Workspaces and layouts are kept and come back with fresh shells."
             )),
             &["Cancel", "Restart Server"],
