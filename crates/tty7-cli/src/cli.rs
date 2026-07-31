@@ -39,12 +39,6 @@ pub enum Command {
     #[command(about = "This machine on one screen (= tty7 ws ls)")]
     Ls,
 
-    #[command(about = "Take over a pane or workspace, raw mode (detach: C-\\ C-\\)")]
-    Attach {
-        #[arg(value_name = "%PANE|WORKSPACE")]
-        target: String,
-    },
-
     #[command(about = "Start a pane running a command, stream it, pass through the exit code")]
     Run(RunArgs),
 
@@ -333,10 +327,6 @@ mod tests {
     #[test]
     fn every_top_level_verb_parses() {
         assert!(matches!(parse(&["tty7", "ls"]).command, Some(Command::Ls)));
-        assert!(matches!(
-            parse(&["tty7", "attach", "%42"]).command,
-            Some(Command::Attach { target }) if target == "%42"
-        ));
         assert!(matches!(parse(&["tty7", "new"]).command, Some(Command::New { path: None })));
         assert!(matches!(
             parse(&["tty7", "new", "C:\\proj"]).command,

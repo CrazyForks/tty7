@@ -197,9 +197,6 @@ impl Backend for RealBackend {
         Ok(procs)
     }
 
-    fn attach_pane(&mut self, _pane: u64) -> Result<()> {
-        bail!("interactive `tty7 attach %pane` is not wired yet — it lands in the next slice")
-    }
 
     fn run_spawn(&mut self, spec: RunSpec) -> Result<u64> {
         let (program, args) = spec

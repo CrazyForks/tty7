@@ -26,13 +26,6 @@ impl Context {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Address {
-    Pane(u64),
-    Tab(TabAddress),
-    Workspace(WorkspaceAddress),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub enum TabAddress {
     Ordinal(u64),
     Id(String),
@@ -42,16 +35,6 @@ pub enum TabAddress {
 pub enum WorkspaceAddress {
     Id(WorkspaceId),
     Named(String),
-}
-
-pub fn parse(s: &str) -> Result<Address> {
-    if s.starts_with('%') {
-        return parse_pane(s).map(Address::Pane);
-    }
-    if s.starts_with('@') {
-        return parse_tab(s).map(Address::Tab);
-    }
-    Ok(Address::Workspace(parse_workspace(s)))
 }
 
 pub fn parse_pane(s: &str) -> Result<u64> {
@@ -135,16 +118,16 @@ mod tests {
 
     #[test]
     fn the_three_address_shapes_parse_apart() {
-        assert_eq!(parse("%42").unwrap(), Address::Pane(42));
-        assert_eq!(parse("@7").unwrap(), Address::Tab(TabAddress::Ordinal(7)));
+        assert_eq!(parse_pane("%42").unwrap(), 42);
+        assert_eq!(parse_tab("@7").unwrap(), TabAddress::Ordinal(7));
         assert_eq!(
-            parse("api").unwrap(),
-            Address::Workspace(WorkspaceAddress::Named("api".into()))
+            parse_workspace("api"),
+            WorkspaceAddress::Named("api".into())
         );
         let id = "0d4e1a54-0000-4000-8000-000000000001";
         assert_eq!(
-            parse(id).unwrap(),
-            Address::Workspace(WorkspaceAddress::Id(id.parse().unwrap()))
+            parse_workspace(id),
+            WorkspaceAddress::Id(id.parse().unwrap())
         );
     }
 

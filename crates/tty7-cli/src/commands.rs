@@ -7,7 +7,7 @@ use tty7_core::daemon::control::{
 };
 use tty7_core::daemon::protocol::PROTOCOL_VERSION;
 
-use crate::address::{self, Address, Context, WorkspaceAddress};
+use crate::address::{self, Context, WorkspaceAddress};
 use crate::backend::{Backend, RunSpec};
 use crate::cli::{
     CaptureArgs, Cli, Command, MachineCmd, PaneCmd, RunArgs, SendArgs, ServerCmd, SplitArgs,
@@ -58,7 +58,6 @@ pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Out
         }
         Some(Command::Ws(WsCmd::Detach { ws })) => ws_detach(&ws, backend),
         Some(Command::New { path }) => new_workspace(path, backend),
-        Some(Command::Attach { target }) => attach(&target, backend),
         Some(Command::Run(args)) => run(args, ctx, backend),
         Some(Command::Split(args)) | Some(Command::Pane(PaneCmd::Split(args))) => {
             pane_split(args, ctx, backend)
@@ -246,17 +245,6 @@ fn new_workspace(path: Option<String>, backend: &mut dyn Backend) -> Result<Outc
         ws.id.to_string(),
         json!({ "id": ws.id.to_string(), "pane": pane }),
     )
-}
-
-fn attach(target: &str, backend: &mut dyn Backend) -> Result<Outcome> {
-    match address::parse(target)? {
-        Address::Pane(pane) => {
-            backend.attach_pane(pane)?;
-            report("", json!({ "attached": pane }))
-        }
-        Address::Workspace(addr) => ws_attach(addr, backend),
-        Address::Tab(_) => bail!("attach takes a %pane or a workspace, not a tab"),
-    }
 }
 
 fn run(args: RunArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
@@ -792,29 +780,6 @@ mod tests {
                 id: api.to_string(),
             }
         );
-    }
-
-    #[test]
-    fn top_level_attach_routes_by_address_shape() {
-        let mut backend = mock();
-        backend.replies.push_back(ReplyOk::Attached {
-            took_over_from: None,
-        });
-        run_cli(&["tty7", "attach", "web"], &Context::default(), &mut backend);
-        let id = backend.machine.workspaces[1].id;
-        assert_eq!(
-            backend.control_calls[1],
-            ControlRequest::WorkspaceAttach { id: id.to_string() }
-        );
-
-        let mut backend = mock();
-        let err = execute(cli(&["tty7", "attach", "%42"]), &Context::default(), &mut backend)
-            .expect_err("the mock cannot attach a pane");
-        assert!(
-            err.to_string().contains("attach"),
-            "pane attach reached the backend seam: {err}"
-        );
-        assert!(backend.control_calls.is_empty(), "pane attach is not a control request");
     }
 
     #[test]

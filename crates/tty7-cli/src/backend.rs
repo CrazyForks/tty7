@@ -28,7 +28,6 @@ pub trait Backend {
 
     fn procs(&mut self, pane: u64) -> Result<PaneProcs>;
 
-    fn attach_pane(&mut self, pane: u64) -> Result<()>;
 
     fn run_spawn(&mut self, spec: RunSpec) -> Result<u64>;
 
@@ -41,7 +40,7 @@ pub trait Backend {
 pub mod mock {
     use std::collections::VecDeque;
 
-    use anyhow::{Result, anyhow};
+    use anyhow::Result;
     use tty7_core::core::machine::Machine;
     use tty7_core::core::session::WorkspaceId;
     use tty7_core::daemon::control::{
@@ -140,9 +139,6 @@ pub mod mock {
             Ok(self.procs_reply.clone())
         }
 
-        fn attach_pane(&mut self, _pane: u64) -> Result<()> {
-            Err(anyhow!("the mock backend cannot attach"))
-        }
 
         fn run_spawn(&mut self, spec: RunSpec) -> Result<u64> {
             self.runs.push(spec);
