@@ -9691,7 +9691,7 @@ dependencies = [
 
 [[package]]
 name = "tty7-cli"
-version = "26.8.0"
+version = "26.8.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -9706,7 +9706,7 @@ dependencies = [
 
 [[package]]
 name = "tty7-core"
-version = "26.8.0"
+version = "26.8.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -9735,7 +9735,7 @@ dependencies = [
 
 [[package]]
 name = "tty7-server"
-version = "26.8.0"
+version = "26.8.1"
 dependencies = [
  "tempfile",
  "tty7-core",
