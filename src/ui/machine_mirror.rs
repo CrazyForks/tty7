@@ -257,9 +257,6 @@ pub fn display_name_of(ws: &Workspace, panes: &[PaneRecord]) -> String {
     if let Some(name) = ws.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         return name.to_string();
     }
-    if let Some(title) = pane_title_of(ws, panes) {
-        return title.to_string();
-    }
     subject_path_of(ws, panes)
         .and_then(|path| {
             std::path::Path::new(&path)
@@ -268,15 +265,6 @@ pub fn display_name_of(ws: &Workspace, panes: &[PaneRecord]) -> String {
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Untitled".to_string())
-}
-
-fn pane_title_of<'a>(ws: &Workspace, panes: &'a [PaneRecord]) -> Option<&'a str> {
-    ws.tabs
-        .iter()
-        .flat_map(|t| t.root.pane_ids())
-        .filter_map(|id| panes.iter().find(|p| p.id == id))
-        .map(|p| p.title.trim())
-        .find(|title| !title.is_empty() && !tty7_core::core::shells::is_bare_shell_name(title))
 }
 
 pub fn subject_path_of(ws: &Workspace, panes: &[PaneRecord]) -> Option<String> {
@@ -521,20 +509,17 @@ mod tests {
         assert_eq!(display_name_of(&ws, &panes), "scratch");
 
         panes[0].title = "nvim".into();
-        assert_eq!(display_name_of(&ws, &panes), "nvim");
+        assert_eq!(
+            display_name_of(&ws, &panes),
+            "scratch",
+            "a pane's process title must not rename its workspace"
+        );
 
         ws.tabs[0].sidebar_group = Some("/repo/tty7".into());
         assert_eq!(
             display_name_of(&ws, &panes),
-            "nvim",
-            "a live process name is more distinctive than the cwd group"
-        );
-
-        panes[0].title = "zsh".into();
-        assert_eq!(
-            display_name_of(&ws, &panes),
             "tty7",
-            "an idle shell prompt is not distinctive — cwd/repo name should win"
+            "the repo group wins over the raw cwd"
         );
 
         ws.name = Some("  Release prep  ".into());

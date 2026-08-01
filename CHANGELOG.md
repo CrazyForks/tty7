@@ -535,17 +535,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Double-click word/smart-select is unaffected; only link click and hover
   bridge hard wraps. (by @ayamir in #258)
 
-- **A sidebar title no longer shows "zsh" over your repo name** — pane
-  titles were allowed to fall back to the foreground process name before
-  falling back to cwd/repo, but an idle terminal's foreground process is
-  just the shell itself, so nearly every idle workspace displayed as "zsh"
-  or "bash" instead of the more useful cwd-derived name — the opposite of
-  what that fallback chain was for. Bare interactive-shell names (`zsh`,
-  `bash`, `fish`, `pwsh`, `cmd`, and similar, matched case- and
-  extension-insensitively) are now skipped when picking a title, so the
-  process-name fallback only fires for something actually distinctive
-  (`nvim`, a coding agent) and an idle shell falls all the way through to
-  the cwd/repo name as intended. (by @ayamir in #285)
+- **A workspace title stays tied to the workspace** — foreground process and
+  agent names no longer replace the workspace title in the sidebar or its
+  switcher button. An explicit workspace name wins; otherwise the title is
+  derived from the workspace's repo/cwd, with `Untitled` as the final fallback.
 
 - **Fullwidth CJK punctuation no longer overlaps, and prompt-mark scanning
   is faster** — wide glyphs are now shaped independently instead of being
