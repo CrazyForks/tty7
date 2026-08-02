@@ -206,6 +206,21 @@ pub enum WaitState {
     Exit,
 }
 
+impl WaitState {
+    /// The wire spelling: what `--until` accepts and what `--json` reports.
+    /// Written out rather than derived from the variant name so renaming a
+    /// variant cannot silently rewrite the JSON contract.
+    pub fn name(self) -> &'static str {
+        match self {
+            WaitState::Idle => "idle",
+            WaitState::Working => "working",
+            WaitState::Waiting => "waiting",
+            WaitState::Done => "done",
+            WaitState::Exit => "exit",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct WaitArgs {
     #[arg(
@@ -233,10 +248,24 @@ pub struct WaitArgs {
     )]
     pub timeout: Option<u64>,
 
+    // The agent status the server keeps is a level, not an edge: `done` stands
+    // until the next turn starts, `waiting` until the agent moves again. So a
+    // wait issued right after a `send` would answer with last turn's status
+    // before the agent has even read the input. `--changed` refuses the state
+    // the pane was already in, which is what a delegation loop wants on every
+    // round after the first.
+    #[arg(
+        long,
+        help = "Ignore the state the pane was already in — only wake on a state it \
+                moved into after the wait began (use this after `send`)"
+    )]
+    pub changed: bool,
+
     #[arg(
         long,
         value_name = "MS",
         default_value_t = 500,
+        value_parser = clap::value_parser!(u64).range(50..=3_600_000),
         help = "Poll every this many milliseconds"
     )]
     pub interval: u64,
