@@ -4317,6 +4317,21 @@ impl Tty7App {
         Some((host, Some(home)))
     }
 
+    /// Settings → Agents: the "Orchestration skill" switch — install or
+    /// remove the Claude Code skill that teaches a primary agent the
+    /// delegation workflow over the session CLI.
+    pub(crate) fn set_orchestration_skill(&mut self, on: bool, cx: &mut Context<Self>) {
+        let result = if on {
+            crate::core::orchestration_skill::install()
+        } else {
+            crate::core::orchestration_skill::uninstall()
+        };
+        if let Err(e) = result {
+            log::warn!("orchestration-skill change failed: {e}");
+        }
+        cx.notify();
+    }
+
     pub(crate) fn settings_install_agent_hooks(
         &mut self,
         agent: crate::core::agent_hooks::HookAgent,

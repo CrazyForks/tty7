@@ -3567,6 +3567,26 @@ impl Tty7App {
             cx,
         ));
 
+        // The orchestration skill (see `core::orchestration_skill`): a Claude
+        // Code skill a primary agent invokes explicitly to delegate work to
+        // worker panes over the session CLI. State is read from the file
+        // itself — like the hook rows, the filesystem is the truth, so an
+        // edit made outside this panel shows up here. Above the machine
+        // picker: the skill lives on this machine's disk regardless of which
+        // host's hooks are managed below.
+        let skill_switch = crate::ui::theme::switch("orchestration-skill", cx)
+            .checked(crate::core::orchestration_skill::installed())
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_orchestration_skill(*on, cx)))
+            .into_any_element();
+        page = page.child(self.settings_row(
+            "Orchestration skill",
+            "Install a Claude Code skill (~/.claude/skills/tty7-orchestration) that teaches a \
+             primary agent to delegate work to worker panes over the `tty7` CLI — spawn, send, \
+             wait, capture — invoked explicitly, never injected globally",
+            skill_switch,
+            cx,
+        ));
+
         page = page.children(self.agent_hooks_machine_picker(selected_host, cx));
 
         match view {
