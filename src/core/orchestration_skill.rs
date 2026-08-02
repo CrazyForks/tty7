@@ -49,16 +49,28 @@ pane. Every verb takes `--json`.
 ## The delegation loop
 
 1. Create a worker pane: `tty7 tab new --cwd DIR` — prints the pane id (`%N`)
-2. Start the worker: `tty7 send %N 'claude -p \"one bounded task\"' --enter`
-3. Sleep until it needs you: `tty7 wait %N --until waiting,done --timeout 600`
+2. Start the worker: `tty7 send %N 'claude \"one bounded task\"' --enter`
+   - interactive, not `claude -p`: headless print mode never stops to ask,
+     so the `waiting` state this loop turns on would never arrive
+3. Sleep until it needs you:
+   `tty7 wait %N --until waiting,done --changed --timeout 600`
    - exit 0: the JSON report names the matched state, with the agent's
      message and native session id
    - exit 124: still working — wait again, or look in on it
+   - exit 1 with `\"status\": \"exit\"`: the worker died; do not wait again
 4. If it is *waiting* (a permission prompt or question), read and answer it:
    `tty7 capture %N --plain`, then `tty7 send %N 'y' --enter` (or whatever
-   the prompt asks)
+   the prompt asks) — then go back to step 3
 5. When *done*, collect the result: `tty7 capture %N --plain`
 6. Clean up: `tty7 pane close %N`
+
+Always pass `--changed` when you wait after sending something. The status the
+server keeps is a level, not an event: `done` stands until the next turn
+begins and `waiting` stands until the agent moves, so a plain `wait` issued
+right after a `send` answers with the *previous* turn's state before the
+worker has even read your input. `--changed` ignores the state the pane was
+already in. Without it, check `\"stale\": true` in the JSON before trusting a
+wake-up.
 
 Run workers in parallel by repeating steps 1–2, then waiting on each pane.
 `tty7 ls` shows every workspace, tab and pane; `tty7 agents` shows every
@@ -147,6 +159,43 @@ mod tests {
         for verb in ["tab new", "send %N", "wait %N", "capture %N", "pane close"] {
             assert!(SKILL.contains(verb), "skill body lost `{verb}`");
         }
+        // The whole loop rests on `--changed`: without it a wait issued right
+        // after a send answers with the previous turn's status.
+        assert!(SKILL.contains("--changed"), "the loop lost --changed");
+        // And the worker must be *launched* interactively — `claude -p` never
+        // reaches the `waiting` state steps 3–4 are built on. The prose may
+        // still name it; the command in step 2 may not start with it.
+        assert!(
+            !SKILL.contains("'claude -p"),
+            "headless print mode cannot produce the `waiting` state this loop waits for"
+        );
+    }
+
+    /// Owns `CLAUDE_CONFIG_DIR` and a scratch directory for the length of a
+    /// test, and puts both back on the way out — including on a panic, which
+    /// a plain tail cleanup would skip, leaving the var set for whatever runs
+    /// next in this process.
+    struct ScratchConfigDir(PathBuf);
+
+    impl ScratchConfigDir {
+        fn new(tag: &str) -> ScratchConfigDir {
+            let dir =
+                std::env::temp_dir().join(format!("tty7-skill-test-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // SAFETY: test-scoped env mutation. `skill_path` is the only
+            // reader of this var in this binary, and the guard restores it.
+            unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };
+            ScratchConfigDir(dir)
+        }
+    }
+
+    impl Drop for ScratchConfigDir {
+        fn drop(&mut self) {
+            // SAFETY: as above — undoing what `new` did.
+            unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// Install → installed → uninstall round-trips against a scratch
@@ -154,10 +203,8 @@ mod tests {
     /// deleted. Env-var scoped: this test owns the var for its duration.
     #[test]
     fn install_roundtrip_and_foreign_file_safety() {
-        let scratch = std::env::temp_dir().join(format!("tty7-skill-test-{}", std::process::id()));
-        std::fs::create_dir_all(&scratch).unwrap();
-        // SAFETY: test-scoped env mutation; no other test reads this var.
-        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &scratch) };
+        let guard = ScratchConfigDir::new("roundtrip");
+        let scratch = guard.0.clone();
 
         assert!(!installed());
         install().unwrap();
@@ -180,8 +227,5 @@ mod tests {
         assert!(!installed(), "a foreign file is not a tty7 install");
         assert!(uninstall().is_err());
         assert!(path.exists(), "the user's file was deleted");
-
-        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
-        let _ = std::fs::remove_dir_all(&scratch);
     }
 }
