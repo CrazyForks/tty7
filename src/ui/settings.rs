@@ -434,6 +434,10 @@ pub(crate) struct SettingsState {
     pub(crate) agent_hooks_states: AgentHooksView,
     pub(crate) agent_hooks_seq: u64,
     pub(crate) agent_hooks_note: Option<(crate::core::agent_hooks::HookAgent, String)>,
+    /// Whether the orchestration skill is on disk. `None` until the first
+    /// read lands — cached rather than probed per frame, like the hook rows.
+    pub(crate) orchestration_skill: Option<bool>,
+    pub(crate) orchestration_skill_note: Option<String>,
     pub(crate) _subs: Vec<Subscription>,
 }
 
@@ -3559,6 +3563,13 @@ impl Tty7App {
             ),
             None => (AgentHooksView::Loading, None, HostId::LOCAL),
         };
+        let (skill_on, skill_note) = match self.active_settings() {
+            Some(s) => (
+                s.orchestration_skill.unwrap_or(false),
+                s.orchestration_skill_note.clone(),
+            ),
+            None => (false, None),
+        };
 
         let mut page = v_flex().child(self.section_intro(
             "Agents",
@@ -3569,15 +3580,33 @@ impl Tty7App {
 
         // The orchestration skill (see `core::orchestration_skill`): a Claude
         // Code skill a primary agent invokes explicitly to delegate work to
-        // worker panes over the session CLI. State is read from the file
-        // itself — like the hook rows, the filesystem is the truth, so an
-        // edit made outside this panel shows up here. Above the machine
-        // picker: the skill lives on this machine's disk regardless of which
-        // host's hooks are managed below.
-        let skill_switch = crate::ui::theme::switch("orchestration-skill", cx)
-            .checked(crate::core::orchestration_skill::installed())
-            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_orchestration_skill(*on, cx)))
-            .into_any_element();
+        // worker panes over the session CLI. The filesystem stays the truth —
+        // an edit made outside this panel shows up here — but it is read into
+        // `SettingsState` when the page opens, not probed once per frame.
+        // Above the machine picker: the skill lives on this machine's disk
+        // regardless of which host's hooks are managed below.
+        let skill_switch =
+            v_flex()
+                .items_end()
+                .gap_1()
+                .child(
+                    crate::ui::theme::switch("orchestration-skill", cx)
+                        .checked(skill_on)
+                        .on_click(cx.listener(|this, on: &bool, _w, cx| {
+                            this.set_orchestration_skill(*on, cx)
+                        })),
+                )
+                .when_some(skill_note, |col, text| {
+                    col.child(
+                        div()
+                            .max_w_80()
+                            .text_xs()
+                            .text_right()
+                            .text_color(muted_fg)
+                            .child(text),
+                    )
+                })
+                .into_any_element();
         page = page.child(self.settings_row(
             "Orchestration skill",
             "Install a Claude Code skill (~/.claude/skills/tty7-orchestration) that teaches a \
