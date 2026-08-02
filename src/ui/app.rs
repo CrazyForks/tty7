@@ -4598,10 +4598,6 @@ impl Tty7App {
             log::warn!("failed to open {}: {e}", path.display());
         }
     }
-
-    pub(crate) fn open_releases_page(&self) {
-        crate::core::update::open_releases_page();
-    }
 }
 
 #[cfg(test)]
