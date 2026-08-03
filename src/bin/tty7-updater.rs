@@ -204,12 +204,18 @@ mod macos {
         stage: &Path,
         launch: impl Fn(&Path) -> Result<(), String>,
     ) -> Result<(), String> {
-        let name = current
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("tty7.app");
-        let backup = current.with_file_name(format!(".{name}.tty7-update-backup"));
-        remove_path(&backup)?;
+        // The staging directory is a fresh TempDir created beside the current
+        // bundle, so a backup here stays on the same filesystem without using a
+        // predictable sibling path.  In particular, never delete a fixed-name
+        // path beside the app: it may be a recovery copy left by an interrupted
+        // update (or simply an unrelated user-owned path).
+        let backup = stage.join("previous.app");
+        if backup.exists() {
+            return Err(format!(
+                "the update staging backup already exists: {}",
+                backup.display()
+            ));
+        }
         fs::rename(current, &backup)
             .map_err(|error| format!("moving the current app aside: {error}"))?;
 
@@ -354,6 +360,23 @@ mod macos {
             assert_eq!(launches.get(), 2);
             assert_eq!(fs::read_to_string(current.join("marker")).unwrap(), "old");
             assert!(!stage.exists());
+        }
+
+        #[test]
+        fn replacement_does_not_remove_a_fixed_name_sibling() {
+            let root = tempfile::tempdir().unwrap();
+            let current = root.path().join("tty7.app");
+            let stage = root.path().join("stage");
+            let replacement = stage.join("tty7.app");
+            let sibling = root.path().join(".tty7.app.tty7-update-backup");
+            bundle(&current, "old");
+            bundle(&replacement, "new");
+            bundle(&sibling, "keep");
+
+            replace_and_relaunch(&current, &replacement, &stage, |_| Ok(())).unwrap();
+
+            assert_eq!(fs::read_to_string(current.join("marker")).unwrap(), "new");
+            assert_eq!(fs::read_to_string(sibling.join("marker")).unwrap(), "keep");
         }
 
         #[test]
