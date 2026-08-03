@@ -36,6 +36,10 @@ use crate::ui::presets;
 use crate::ui::rounding;
 use crate::ui::rounding::RoundedCorners as _;
 
+fn settings_row_id(label: &str, _desc: &str) -> SharedString {
+    SharedString::from(format!("settings-row-{label}"))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsSection {
     Appearance,
@@ -958,10 +962,15 @@ impl Tty7App {
         desc: impl Into<String>,
         control: AnyElement,
         cx: &Context<Self>,
-    ) -> Div {
+    ) -> Stateful<Div> {
         let theme = cx.theme();
+        let label = label.into();
         let desc = desc.into();
+        // Descriptions can contain live status (for example an agent hook target), so they
+        // must not participate in the identity that preserves GPUI's hover state.
+        let element_id = settings_row_id(&label, &desc);
         h_flex()
+            .id(element_id)
             .items_center()
             .justify_between()
             .gap_8()
@@ -970,6 +979,7 @@ impl Tty7App {
             .mx_neg_2p5()
             .rounded_lg()
             .hover(|h| h.bg(gpui::rgb(cx.global::<presets::Surfaces>().window.hover)))
+            .on_hover(cx.listener(|_this, _hovered, _window, cx| cx.notify()))
             .child(
                 v_flex()
                     .gap_0p5()
@@ -979,7 +989,7 @@ impl Tty7App {
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme.foreground)
-                            .child(label.into()),
+                            .child(label),
                     )
                     .when(!desc.is_empty(), |col| {
                         col.child(
@@ -4668,6 +4678,18 @@ impl Tty7App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_row_identity_depends_only_on_its_stable_label() {
+        assert_eq!(
+            settings_row_id("Claude Code", "Installingâ€¦"),
+            settings_row_id("Claude Code", "Installed in C:\\tools")
+        );
+        assert_ne!(
+            settings_row_id("Claude Code", "Installed"),
+            settings_row_id("Codex", "Installed")
+        );
+    }
 
     #[test]
     fn every_section_has_search_entries() {
