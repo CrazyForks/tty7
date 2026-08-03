@@ -4499,9 +4499,31 @@ impl Tty7App {
         let theme = cx.theme();
         let (foreground, muted_fg) = (theme.foreground, theme.muted_foreground);
 
-        let update = cx
+        let update_status = cx
             .try_global::<crate::core::update::UpdateStatus>()
-            .and_then(|s| s.available.clone());
+            .cloned()
+            .unwrap_or_default();
+        let update = update_status.available.clone();
+        let update_busy = matches!(
+            update_status.phase,
+            crate::core::update::UpdatePhase::Checking
+                | crate::core::update::UpdatePhase::Downloading
+                | crate::core::update::UpdatePhase::Installing
+        );
+        let phase_text = match &update_status.phase {
+            crate::core::update::UpdatePhase::Idle => None,
+            crate::core::update::UpdatePhase::Checking => Some("Checking for updates…".to_string()),
+            crate::core::update::UpdatePhase::UpToDate => {
+                Some("You're running the latest version.".to_string())
+            }
+            crate::core::update::UpdatePhase::Downloading => {
+                Some("Downloading and verifying the update…".to_string())
+            }
+            crate::core::update::UpdatePhase::Installing => {
+                Some("Relaunching with the update…".to_string())
+            }
+            crate::core::update::UpdatePhase::Failed(message) => Some(message.clone()),
+        };
         let check_for_updates = cx.global::<Config>().check_for_updates;
         let install_cli_on_path = cx.global::<Config>().install_cli_on_path;
 
@@ -4572,26 +4594,60 @@ impl Tty7App {
                             .child("Updates"),
                     )
                     .when_some(update, |this, upd| {
+                        let button_label = if upd.installable {
+                            "Update and Relaunch"
+                        } else {
+                            "View Release"
+                        };
                         this.child(
-                            h_flex()
-                                .gap_3()
-                                .items_center()
-                                .child(div().text_sm().text_color(foreground).child(
-                                    format!("Version {} is available.", upd.version),
-                                ))
+                            v_flex()
+                                .gap_1()
                                 .child(
-                                    Button::new("download-update")
-                                        .label("Download")
-                                        .small()
-                                        .on_click(cx.listener(|this, _, _w, _cx| {
-                                            this.open_releases_page()
-                                        })),
-                                ),
+                                    h_flex()
+                                        .gap_3()
+                                        .items_center()
+                                        .child(div().text_sm().text_color(foreground).child(
+                                            format!("Version {} is available.", upd.version),
+                                        ))
+                                        .child(
+                                            Button::new("install-update")
+                                                .label(button_label)
+                                                .small()
+                                                .disabled(update_busy)
+                                                .on_click(cx.listener(|_, _, _window, cx| {
+                                                    crate::core::update::install_available(cx)
+                                                })),
+                                        ),
+                                )
+                                .when_some(upd.install_hint, |this, hint| {
+                                    this.child(div().text_xs().text_color(muted_fg).child(hint))
+                                }),
                         )
                     })
+                    .when_some(phase_text, |this, text| {
+                        this.child(div().text_sm().text_color(muted_fg).child(text))
+                    })
                     .child(div().text_sm().text_color(muted_fg).child(
-                        "Check GitHub for a newer release on launch and show it here. tty7 never updates itself — downloading happens on the Releases page.",
+                        "tty7 checks stable releases and can update packaged macOS app bundles without opening a browser. A dedicated helper verifies checksums, version, and code signing before replacement, then relaunches the GUI. Compatible servers and shells stay running; if the wire protocol changed, tty7 asks whether to restart the server after relaunch. Other platforms and unsupported layouts fall back to the release page.",
                     ))
+                    .child(
+                        h_flex().child(
+                            Button::new("check-update-now")
+                                .label(if matches!(
+                                    update_status.phase,
+                                    crate::core::update::UpdatePhase::Checking
+                                ) {
+                                    "Checking…"
+                                } else {
+                                    "Check Now"
+                                })
+                                .small()
+                                .disabled(update_busy)
+                                .on_click(cx.listener(|_, _, _window, cx| {
+                                    crate::core::update::spawn_check_forced(cx)
+                                })),
+                        ),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
