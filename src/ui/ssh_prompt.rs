@@ -555,6 +555,11 @@ impl Tty7App {
             div()
                 .absolute()
                 .inset_0()
+                // This is the one modal that must not be dismissed by a stray
+                // click — a mis-aimed click would abandon an authentication
+                // attempt mid-handshake. It gets the scrim, so it reads as
+                // modal, and Escape stays the only way out.
+                .bg(crate::ui::presets::scrim_fill(cx))
                 .flex()
                 .flex_col()
                 .items_center()
