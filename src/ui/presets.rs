@@ -132,14 +132,23 @@ impl Theme {
         let bg = self.background_color();
         let fg = legible_foreground(bg, self.foreground);
         let sidebar = mix(bg, fg, 0.03);
+        let popover = mix(bg, fg, 0.05);
+        // One hairline value divides all three neutral fills — it is handed to
+        // `sidebar_border` too, and popover chrome draws with it. Floor it on
+        // each of them, not only on the window.
+        let border = [bg, sidebar, popover]
+            .into_iter()
+            .fold(mix(bg, fg, 0.16), |hairline, surface| {
+                at_least(hairline, fg, surface, BORDER_FLOOR)
+            });
         Neutrals {
             background: bg,
             foreground: fg,
-            border: at_least(mix(bg, fg, 0.16), fg, bg, BORDER_FLOOR),
+            border,
             secondary: mix(bg, fg, 0.09),
             muted: mix(bg, fg, 0.06),
             muted_foreground: dim(fg, bg, state::TEXT_RESTING),
-            popover: mix(bg, fg, 0.05),
+            popover,
             caret: legible_ink(bg, self.caret.unwrap_or(self.accent), ACCENT_FLOOR),
             selection: self.selection.unwrap_or_else(|| mix(bg, fg, 0.20)),
             sidebar,
@@ -1406,21 +1415,27 @@ mod tests {
     fn hairlines_are_worth_the_same_in_every_theme() {
         for t in builtins() {
             let m = t.neutrals();
-            let ratio = contrast(m.border, m.background);
-            assert!(
-                ratio >= BORDER_FLOOR - 0.01,
-                "{}: border {:#08x} is only {ratio:.2}:1 on the background",
-                t.id,
-                m.border
-            );
-            // A floor, not a target — a hairline that shouts is worse than one
-            // that whispers.
-            assert!(
-                ratio <= 2.0,
-                "{}: border {:#08x} is {ratio:.2}:1 and reads as a frame",
-                t.id,
-                m.border
-            );
+            for (name, surface) in [
+                ("background", m.background),
+                ("sidebar", m.sidebar),
+                ("popover", m.popover),
+            ] {
+                let ratio = contrast(m.border, surface);
+                assert!(
+                    ratio >= BORDER_FLOOR - 0.01,
+                    "{}: border {:#08x} is only {ratio:.2}:1 on the {name}",
+                    t.id,
+                    m.border
+                );
+                // A floor, not a target — a hairline that shouts is worse than
+                // one that whispers.
+                assert!(
+                    ratio <= 2.2,
+                    "{}: border {:#08x} is {ratio:.2}:1 on the {name} and reads as a frame",
+                    t.id,
+                    m.border
+                );
+            }
         }
     }
 
