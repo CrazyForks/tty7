@@ -26,6 +26,22 @@ impl Tty7App {
             .or_else(|| view.remote_context().map(|c| c.target))
             .unwrap_or_default();
 
+        // Why it ended. The strip used to say only that it *had* ended, so a
+        // rejected key and a dropped network read identically — and the reason
+        // scrolled away with the pane's own output.
+        let reason = match view.ssh_phase() {
+            Some(crate::daemon::protocol::SshPhase::Failed { reason }) if !reason.is_empty() => {
+                Some(reason)
+            }
+            _ => None,
+        };
+        // A saved connection is editable; a one-off `user@host` is not, and
+        // offering to edit one would open an empty page.
+        let profile = view
+            .ssh_spec()
+            .and_then(|s| s.profile_id.clone())
+            .and_then(|id| uuid::Uuid::parse_str(&id).ok());
+
         let theme = cx.theme();
 
         let bar = h_flex()
@@ -51,6 +67,13 @@ impl Tty7App {
                         t_fmt(L10nKey::ForwardDisconnectedFrom, &[("host", &host)])
                     }),
             )
+            .children(reason.map(|reason| {
+                div()
+                    .max_w(px(360.))
+                    .truncate()
+                    .text_color(theme.danger)
+                    .child(reason)
+            }))
             .child(div().child("· ⌘⇧R"))
             .child(
                 Button::new("ssh-reconnect")
@@ -60,7 +83,16 @@ impl Tty7App {
                     .on_click(
                         cx.listener(|this, _, window, cx| this.restart_ssh_session(window, cx)),
                     ),
-            );
+            )
+            .children(profile.map(|id| {
+                Button::new("ssh-edit-profile")
+                    .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::SshEditProfile))
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_ssh_profile_in_settings(id, window, cx)
+                    }))
+            }));
         Some(
             div()
                 .absolute()

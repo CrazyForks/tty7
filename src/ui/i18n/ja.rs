@@ -800,6 +800,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::ForwardPanelTitle => "ポートフォワード",
         L10nKey::ForwardDisconnected => "切断済み",
         L10nKey::ForwardDisconnectedFrom => "{host} から切断されました",
+        L10nKey::SshEditProfile => "接続を編集…",
         L10nKey::ForwardTooltipAdd => "フォワードを追加",
         L10nKey::ForwardTooltipRemove => "削除",
         L10nKey::ForwardLocal => "ローカル",
