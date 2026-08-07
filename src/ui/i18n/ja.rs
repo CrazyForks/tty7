@@ -1026,6 +1026,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SshPromptUnlock => "ロック解除",
         L10nKey::SshPromptSubmit => "送信",
         L10nKey::HostOpsError => "{context}: {error}",
+        L10nKey::TreeWindowOpenedEmpty => {
+            "このウィンドウのサーバーがタブを渡さなかったため、空のまま開きました。失われたものはありません。サーバーが応答すればタブは戻ります。戻らない場合はコマンドパレットの「サーバーを再起動」を使ってください"
+        }
         L10nKey::CmdGroupTabsPanes => "タブとペイン",
         L10nKey::CmdGroupWorkspaces => "ワークスペース",
         L10nKey::CmdGroupView => "表示",
@@ -1119,6 +1122,12 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::AppRestartServerTitle => "サーバーを再起動しますか？",
         L10nKey::AppRestartServerMismatchDetail => {
             "シェルを保持中のサーバーは別のビルドです（v{build}、プロトコル {protocol} — このアプリは {ours} を使用）。そのまま使ってもシェルは残せますが、プロトコルが変わった機能は再起動まで正しく動かない可能性があります。再起動すると新しいサーバーが起動します。タブは新しいシェルで開きます。実行中のものはすべて終了します"
+        }
+        L10nKey::AppRestartServerDialectDetail => {
+            "シェルを保持中のサーバーは古いビルドです（v{build}）。制御方言 v{dialect} を使用し、このアプリは v{ours} を使用しています。シェルはそのまま動き続けますが、タブをこのアプリに渡せないため、再起動するまでウィンドウは空のまま開きます。再起動すると新しいサーバーが起動します。タブは新しいシェルで開きます。実行中のものはすべて終了します"
+        }
+        L10nKey::AppRestartServerDialectNewerDetail => {
+            "シェルを保持中のサーバーは新しいビルドです（v{build}）。制御方言 v{dialect} を使用し、このアプリは v{ours} を使用しています。シェルはそのまま動き続けますが、タブをこのアプリに渡せないため、ウィンドウは空のまま開きます。根本的な解決はこのアプリを更新することです。サーバーを再起動すればこのアプリと話せるものに入れ替わりますが、タブは新しいシェルで開き、実行中のものはすべて終了します"
         }
         L10nKey::AppRestartServerOldDetail => {
             "シェルを保持中のサーバーは、アプリの古いバージョンのものです。そのまま使ってもシェルは残せますが、新しい機能は再起動まで正しく動かない可能性があります。再起動すると新しいサーバーが起動します。タブは新しいシェルで開きます。実行中のものはすべて終了します"
