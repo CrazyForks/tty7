@@ -691,10 +691,14 @@ impl Tty7App {
             PromptLevel::Warning,
             &t_fmt(L10nKey::EditorUnsavedChanges, &[("name", &name)]),
             None,
+            // Cancel sits between Save and Discard on purpose. The platform
+            // renders the first button as the default and lays the rest out
+            // beside it, so Discard was landing directly next to the key that
+            // Return presses. Apple separates them for exactly this reason.
             &[
                 t(L10nKey::Save),
-                t(L10nKey::EditorDiscard),
                 t(L10nKey::Cancel),
+                t(L10nKey::EditorDiscard),
             ],
             cx,
         );
@@ -703,7 +707,7 @@ impl Tty7App {
             let Ok(choice) = answer.await else { return };
             let _ = app.update_in(cx, |app, window, cx| match choice {
                 0 => app.editor_save_file(id, true, window, cx),
-                1 => {
+                2 => {
                     if let Some((tab_ix, ix)) = app.editor_file_position(id) {
                         app.editor_remove_file_in(tab_ix, ix, cx);
                     }
