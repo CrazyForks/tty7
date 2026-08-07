@@ -971,6 +971,14 @@ fn invert_cursor_cell(
     colors: &PaintColors,
 ) {
     let ink = crate::ui::presets::caret_ink(colors.caret, colors.default_bg, colors.default_fg);
+    // A TUI can park the cursor on the second half of a wide character. The
+    // glyph lives on the lead cell, so inverting the spacer would fill half a
+    // character with the caret and leave the glyph in its own colour across
+    // both halves. Step back to the cell that owns the glyph.
+    let col = match buf.get(row * cols + col) {
+        Some(c) if c.spacer && col > 0 => col - 1,
+        _ => col,
+    };
     let Some(cell) = buf.get_mut(row * cols + col) else {
         return;
     };
@@ -1807,6 +1815,28 @@ mod tests {
                 assert!(!other.draw_bg, "cell {i} was not the cursor cell");
             }
         }
+    }
+
+    #[test]
+    fn a_cursor_parked_on_a_wide_char_inverts_the_half_that_holds_the_glyph() {
+        let colors = caret_colors();
+        let mut buf = vec![RenderCell::default(); 4];
+        buf[1].c = '世';
+        buf[2].spacer = true;
+
+        // Cursor reported on the trailing spacer: the lead cell is the one
+        // that gets the fill, so it can absorb the spacer into its run.
+        invert_cursor_cell(&mut buf, 4, 0, 2, &colors);
+        assert!(buf[1].draw_bg, "the glyph's own cell carries the caret");
+        assert!(!buf[2].draw_bg, "the spacer is absorbed, not painted");
+        assert_eq!(buf[1].bg, colors.caret);
+
+        // A spacer in column 0 has no lead to step back to; leave it alone
+        // rather than wrapping to the previous row.
+        let mut edge = vec![RenderCell::default(); 4];
+        edge[0].spacer = true;
+        invert_cursor_cell(&mut edge, 4, 0, 0, &colors);
+        assert!(edge[0].draw_bg);
     }
 
     #[test]
