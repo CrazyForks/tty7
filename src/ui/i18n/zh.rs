@@ -147,6 +147,9 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsDuplicate => "复制",
         L10nKey::SettingsForgetPassword => "清除已保存的密码",
         L10nKey::SettingsForgotPasswordFor => "已清除 {endpoint} 的已保存密码",
+        L10nKey::SettingsDeleteProfileBody => {
+            "为它保存的密码也会一并删除，除非还有别的连接用着同一个地址。"
+        }
         L10nKey::SettingsCouldntForgetPassword => "无法清除 {endpoint} 的已保存密码：{error}",
         L10nKey::SettingsSecurity => "安全",
         L10nKey::SettingsSecurityIntro => "主机可以在自己的高级选项中覆盖这些设置。",
@@ -399,6 +402,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
             "启用前缀后，单独按前缀键约 1 秒后会传给 shell，前缀 + 未绑定的按键会直接发送到终端。"
         }
         L10nKey::SettingsRestoreAllDefaults => "恢复全部默认值",
+        L10nKey::SettingsRestoreAllDefaultsBody => "你改过的每一个按键都会退回默认值，且无法撤销。",
         L10nKey::SettingsAboutDesc1 => "终端工作台：常驻会话、远程工作、agent。",
         L10nKey::SettingsVersion => "版本",
         L10nKey::SettingsUpdates => "更新",
@@ -717,6 +721,10 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::FileTreeDeleteTitle => "删除\"{name}\"？",
         L10nKey::FileTreeDeleteFolderBody => "该文件夹及其中的所有内容都将被删除。",
         L10nKey::FileTreeDeleteFileBody => "该文件将被删除。",
+        L10nKey::SftpDeleteFolderBody => {
+            "该文件夹及其中所有内容将在 {host} 上被删除。远端没有回收站。"
+        }
+        L10nKey::SftpDeleteFileBody => "该文件将在 {host} 上被删除。远端没有回收站。",
         L10nKey::FileTreeDeleteFailed => "删除失败",
         L10nKey::FileTreeContextOpen => "打开",
         L10nKey::FileTreeContextCdHere => "cd 到此处",

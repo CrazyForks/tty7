@@ -534,17 +534,51 @@ impl Tty7App {
         self.sftp_start_polling(cx);
     }
 
-    pub(crate) fn sftp_delete_entry(&mut self, entry: SftpEntry, cx: &mut Context<Self>) {
+    pub(crate) fn sftp_delete_entry(
+        &mut self,
+        entry: SftpEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(pane_id) = self.sftp_panel.open_pane_id else {
             return;
         };
         let path = remote_join(&self.sftp_panel.cwd, &entry.name);
-        let op = if matches!(entry.kind, SftpEntryKind::Dir) {
-            SftpOp::RemoveDir { path }
-        } else {
-            SftpOp::RemoveFile { path }
-        };
-        self.sftp_run_op(pane_id, op, cx);
+        let is_dir = matches!(entry.kind, SftpEntryKind::Dir);
+        // The local file tree asks before it deletes. This is the same red
+        // Delete in the same shape of menu, on a machine the user cannot walk
+        // over to, and it used to go straight through.
+        let host = self
+            .remote_files_host(window, cx)
+            .unwrap_or_else(|| t(L10nKey::AppLocalServerName).to_string());
+        let body = t_fmt(
+            match is_dir {
+                true => L10nKey::SftpDeleteFolderBody,
+                false => L10nKey::SftpDeleteFileBody,
+            },
+            &[("host", &host)],
+        );
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &t_fmt(L10nKey::FileTreeDeleteTitle, &[("name", &entry.name)]),
+            Some(&body),
+            &[t(L10nKey::Cancel), t(L10nKey::Delete)],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(1) = answer.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                if this.sftp_panel.open_pane_id != Some(pane_id) {
+                    return;
+                }
+                let op = match is_dir {
+                    true => SftpOp::RemoveDir { path },
+                    false => SftpOp::RemoveFile { path },
+                };
+                this.sftp_run_op(pane_id, op, cx);
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn sftp_follow_symlink(&mut self, entry: SftpEntry, cx: &mut Context<Self>) {
@@ -1308,9 +1342,9 @@ impl Tty7App {
             .on_click({
                 let app = app.clone();
                 let entry = entry.clone();
-                move |_, _window, cx| {
+                move |_, window, cx| {
                     let entry = entry.clone();
-                    let _ = app.update(cx, |this, cx| this.sftp_delete_entry(entry, cx));
+                    let _ = app.update(cx, |this, cx| this.sftp_delete_entry(entry, window, cx));
                 }
             }),
         )

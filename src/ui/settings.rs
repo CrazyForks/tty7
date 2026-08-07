@@ -2214,8 +2214,8 @@ impl Tty7App {
             })
             .on_click({
                 let app = app.clone();
-                move |_, _window, cx| {
-                    let _ = app.update(cx, |this, cx| this.delete_profile(id, cx));
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| this.delete_profile(id, window, cx));
                 }
             }),
         )
@@ -2513,7 +2513,50 @@ impl Tty7App {
         self.ssh_form_load(&profile, window, cx);
     }
 
-    pub(crate) fn delete_profile(&mut self, id: Uuid, cx: &mut Context<Self>) {
+    pub(crate) fn delete_profile(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = cx
+            .global::<Config>()
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+        else {
+            return;
+        };
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &t_fmt(L10nKey::FileTreeDeleteTitle, &[("name", &name)]),
+            Some(t(L10nKey::SettingsDeleteProfileBody)),
+            &[t(L10nKey::Cancel), t(L10nKey::Delete)],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(1) = answer.await else { return };
+            let _ = this.update(cx, |this, cx| this.delete_profile_confirmed(id, cx));
+        })
+        .detach();
+    }
+
+    fn delete_profile_confirmed(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        // "Forget password" lives on the menu that is about to stop existing,
+        // so deleting the profile used to strand its keychain entry with no UI
+        // left to remove it. Only let go of the secret when nothing else on the
+        // list still points at the same endpoint.
+        let cfg = cx.global::<Config>();
+        let endpoint = cfg
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (p.user.clone(), p.host.clone(), p.port));
+        let shared = endpoint.as_ref().is_some_and(|(user, host, port)| {
+            cfg.ssh_profiles
+                .iter()
+                .any(|p| p.id != id && (&p.user, &p.host, p.port) == (user, host, *port))
+        });
+        if let Some((user, host, port)) = endpoint.filter(|_| !shared) {
+            use crate::core::keychain::{CredentialStore, OsCredentialStore};
+            let _ = OsCredentialStore.delete_password(&user, &host, port);
+        }
         self.update_config(cx, |cfg| {
             cfg.ssh_profiles.retain(|p| p.id != id);
             cfg.ssh_profile_frecency.remove(&id);
@@ -4650,9 +4693,9 @@ impl Tty7App {
                     Button::new("kb-restore-all")
                         .label(t(L10nKey::SettingsRestoreAllDefaults))
                         .small()
-                        .on_click(
-                            cx.listener(|this, _, _w, cx| this.restore_default_keybindings(cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.restore_default_keybindings(window, cx)
+                        })),
                 ),
             )
             .child(list)
