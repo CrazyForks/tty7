@@ -969,6 +969,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SwitcherTabCountOne => "1 个标签页",
         L10nKey::SwitcherActiveTab => "当前",
         L10nKey::SwitcherHoldToSwitch => "按 Tab 移动 · 松开切换",
+        L10nKey::SwitcherTabToCrossColumns => "按 Tab 换到另一列",
         L10nKey::SshPromptPasswordFor => "{user}@{host} 的密码",
         L10nKey::SshPromptPassphraseFor => "{key_path} 的密码短语",
         L10nKey::SshPromptTwoFactor => "双因素认证",

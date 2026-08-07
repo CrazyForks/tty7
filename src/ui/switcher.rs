@@ -1162,6 +1162,13 @@ impl Tty7App {
         );
         let hover = hover_fill(cx);
         let holding = self.switcher.as_ref().is_some_and(|sw| sw.hold.is_some());
+        // With a query in the box, ← and → belong to the caret and Tab becomes
+        // the way across. That remap is deliberate, and until now it was also
+        // silent: arrows simply stopped working with nothing said.
+        let filtering = self
+            .switcher
+            .as_ref()
+            .is_some_and(|sw| !sw.text(cx).trim().is_empty());
         h_flex()
             .items_center()
             .justify_between()
@@ -1201,7 +1208,10 @@ impl Tty7App {
                     .pr(px(ROW_PAD))
                     .text_xs()
                     .text_color(dim)
-                    .when(!holding, |hint| {
+                    .when(!holding && filtering, |hint| {
+                        hint.child(t(L10nKey::SwitcherTabToCrossColumns))
+                    })
+                    .when(!holding && !filtering, |hint| {
                         hint.child(
                             div()
                                 .px(px(5.))
