@@ -28,7 +28,7 @@ use crate::daemon::protocol::{RemoteContext, ShellSpec, ssh_option_takes_value};
 use crate::daemon::spawn::DaemonMismatch;
 use crate::terminal::view::{ChildExited, TerminalView};
 use crate::ui::host_registry::HostId;
-use crate::ui::i18n::{L10nKey, set_locale, t, t_fmt};
+use crate::ui::i18n::{L10nKey, set_locale, t, t_fmt, t_plural};
 use crate::ui::palette::{
     ChromeState, Command, CommandGroup, CommandKind, PaletteEvent, PaletteView,
 };
@@ -695,7 +695,18 @@ impl Tty7App {
                     (Vec::new(), 0)
                 }
             },
-            some => tabs_from_session(pane_ws.as_ref(), workspace, some, font_size, window, cx),
+            some => {
+                let (tabs, active, dropped) =
+                    tabs_from_session(pane_ws.as_ref(), workspace, some, font_size, window, cx);
+                if dropped > 0 {
+                    startup_error = Some(gpui::SharedString::from(t_plural(
+                        L10nKey::AppTabsNotRestored,
+                        dropped,
+                        &[],
+                    )));
+                }
+                (tabs, active)
+            }
         };
         let sidebar_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t(crate::ui::i18n::L10nKey::SearchTabs))
@@ -985,7 +996,7 @@ impl Tty7App {
         self.refresh_shells(cx);
         let font_size = self.font_size;
         let pane_ws = self.window_workspace(cx);
-        let (tabs, active) = tabs_from_session(
+        let (tabs, active, dropped) = tabs_from_session(
             pane_ws.as_ref(),
             self.workspace,
             Some(session),
@@ -993,6 +1004,9 @@ impl Tty7App {
             window,
             cx,
         );
+        if dropped > 0 {
+            window.push_notification(t_plural(L10nKey::AppTabsNotRestored, dropped, &[]), cx);
+        }
         self.tabs = tabs;
         self.active = active;
         self.maximized = None;
@@ -5755,16 +5769,20 @@ fn tabs_from_session(
     font_size: f32,
     window: &mut Window,
     cx: &mut Context<Tty7App>,
-) -> (Vec<Tab>, usize) {
+) -> (Vec<Tab>, usize, usize) {
     let Some(session) = session.filter(|s| !s.tabs.is_empty()) else {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, 0);
     };
     let alive = alive_panes_on(&crate::terminal::PaneRoute::for_workspace(workspace));
     let mut tabs: Vec<Tab> = Vec::with_capacity(session.tabs.len());
+    let mut dropped = 0usize;
     for st in &session.tabs {
         let Some(pane) = session_to_pane(workspace, owner, &st.pane, &alive, font_size, window, cx)
         else {
+            // The layout coming back is the product's headline claim, so a tab
+            // that quietly does not is worth a sentence rather than a log line.
             log::error!("dropping a restored tab: no pane in it could be started");
+            dropped += 1;
             continue;
         };
         tabs.push(Tab {
@@ -5783,7 +5801,7 @@ fn tabs_from_session(
         });
     }
     let active = session.active.min(tabs.len().saturating_sub(1));
-    (tabs, active)
+    (tabs, active, dropped)
 }
 
 fn leaf_shares_the_window_daemon(window_is_remote: bool, leaf_is_native_ssh: bool) -> bool {
@@ -6431,6 +6449,20 @@ mod tests {
         TabAgentSession, leaf_shares_the_window_daemon, mru_order, pane_attachable,
         parse_ssh_connect_input, parse_ssh_option_words,
     };
+
+    #[test]
+    fn a_layout_that_came_back_short_says_how_short() {
+        crate::ui::i18n::set_locale("en");
+        for n in [1usize, 2, 9] {
+            let text =
+                crate::ui::i18n::t_plural(crate::ui::i18n::L10nKey::AppTabsNotRestored, n, &[]);
+            assert!(text.contains(&n.to_string()), "{n}: {text}");
+            assert!(!text.contains("{count}"), "the placeholder leaked: {text}");
+        }
+        // Singular is not "1 tabs".
+        let one = crate::ui::i18n::t_plural(crate::ui::i18n::L10nKey::AppTabsNotRestored, 1, &[]);
+        assert!(one.contains("1 tab "), "{one}");
+    }
 
     #[test]
     fn mru_puts_the_active_tab_first_and_the_last_one_used_behind_it() {

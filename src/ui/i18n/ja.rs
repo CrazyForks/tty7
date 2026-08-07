@@ -1156,6 +1156,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::AppWorktreeKeep => "保持",
         L10nKey::AppReopenTabFailed => "タブを開き直せませんでした: ターミナルが起動しませんでした",
         L10nKey::AppOpenTerminalFailed => "ターミナルを開けませんでした: {error}",
+        L10nKey::AppTabsNotRestored => "前回のタブ {count} 個を開き直せませんでした",
         L10nKey::AppSshConnectionFailed => "SSH 接続に失敗しました: {error}",
         L10nKey::AppSshReconnectFailed => "SSH 再接続に失敗しました: {error}",
         L10nKey::AppSplitPaneFailed => "ペインを分割できませんでした: {error}",
@@ -1332,6 +1333,8 @@ pub fn translate_variant_ja(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::SettingsOfflineMachines, "other") => {
             "未接続の保存済みマシンがさらに {count} 台あります — いずれかでワークスペースを開くと、そこにフックをインストールできます"
         }
+        (L10nKey::AppTabsNotRestored, "one") => "前回のタブ 1 個を開き直せませんでした",
+        (L10nKey::AppTabsNotRestored, "other") => "前回のタブ {count} 個を開き直せませんでした",
         (L10nKey::PanelUntracked, "zero") => "未追跡 0",
         (L10nKey::PanelUntracked, "one") => "未追跡 1",
         (L10nKey::PanelUntracked, "other") => "未追跡 {count}",

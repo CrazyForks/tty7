@@ -1121,6 +1121,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::AppWorktreeKeep => "Keep",
         L10nKey::AppReopenTabFailed => "Could not reopen the tab: no terminal started",
         L10nKey::AppOpenTerminalFailed => "Could not open a terminal: {error}",
+        L10nKey::AppTabsNotRestored => "{count} tabs from last time could not be reopened",
         L10nKey::AppSshConnectionFailed => "SSH connection failed: {error}",
         L10nKey::AppSshReconnectFailed => "SSH reconnect failed: {error}",
         L10nKey::AppSplitPaneFailed => "Could not split the pane: {error}",
@@ -1290,6 +1291,10 @@ pub fn translate_variant_en(key: L10nKey, branch: &'static str) -> Option<&'stat
         }
         (L10nKey::SettingsOfflineMachines, "other") => {
             "{count} more saved machines are not connected — open a workspace on one to install its hooks there."
+        }
+        (L10nKey::AppTabsNotRestored, "one") => "1 tab from last time could not be reopened",
+        (L10nKey::AppTabsNotRestored, "other") => {
+            "{count} tabs from last time could not be reopened"
         }
         (L10nKey::PanelUntracked, "zero") => "0 untracked",
         (L10nKey::PanelUntracked, "one") => "1 untracked",

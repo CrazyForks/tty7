@@ -1068,6 +1068,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::AppWorktreeKeep => "保留",
         L10nKey::AppReopenTabFailed => "无法重新打开标签页：没有启动终端",
         L10nKey::AppOpenTerminalFailed => "无法打开终端：{error}",
+        L10nKey::AppTabsNotRestored => "上次的 {count} 个标签页没能重新打开",
         L10nKey::AppSshConnectionFailed => "SSH 连接失败：{error}",
         L10nKey::AppSshReconnectFailed => "SSH 重新连接失败：{error}",
         L10nKey::AppSplitPaneFailed => "无法拆分窗格：{error}",
@@ -1230,6 +1231,8 @@ pub fn translate_variant_zh(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::SettingsOfflineMachines, "other") => {
             "还有 {count} 台已保存的机器未连接——在其中一台上打开工作区，即可在那台机器上安装 hook。"
         }
+        (L10nKey::AppTabsNotRestored, "one") => "上次的 1 个标签页没能重新打开",
+        (L10nKey::AppTabsNotRestored, "other") => "上次的 {count} 个标签页没能重新打开",
         (L10nKey::PanelUntracked, "zero") => "0 个未跟踪文件",
         (L10nKey::PanelUntracked, "one") => "1 个未跟踪文件",
         (L10nKey::PanelUntracked, "other") => "{count} 个未跟踪文件",
