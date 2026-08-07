@@ -428,8 +428,8 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsUpdateChannelDesc => {
             "Stable 跟随正式发布的版本，Nightly 跟随每晚从最新代码构建的版本——更新更快，但没有经过发布测试。"
         }
-        L10nKey::SettingsUpdateChannelStable => "Stable",
-        L10nKey::SettingsUpdateChannelNightly => "Nightly",
+        L10nKey::SettingsUpdateChannelStable => "稳定版",
+        L10nKey::SettingsUpdateChannelNightly => "每夜构建",
         L10nKey::SettingsDaemonStale => "后台服务仍运行在 {build}。",
         L10nKey::SettingsDaemonStaleDesc => {
             "tty7 是原地升级的，界面已经是新版本，但各个 pane 仍由旧版本的后台服务托管。重启服务才能用上新版本，代价是 pane 里正在跑的进程全部结束——shell、agent、SSH 会话都算。不急，挑个 pane 空闲的时候再重启。"
