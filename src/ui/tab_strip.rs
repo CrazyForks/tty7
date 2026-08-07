@@ -177,6 +177,19 @@ pub(crate) fn chrome_tile_sized(
         .h(px(tile))
 }
 
+/// The words behind the status dot's colour.
+pub(crate) fn agent_status_label(
+    status: Option<crate::core::cli_agent::AgentStatus>,
+) -> Option<&'static str> {
+    use crate::core::cli_agent::AgentStatus;
+    match status? {
+        AgentStatus::Idle => None,
+        AgentStatus::Working => Some(t(L10nKey::AgentStatusWorking)),
+        AgentStatus::Waiting => Some(t(L10nKey::AgentStatusWaiting)),
+        AgentStatus::Done => Some(t(L10nKey::AgentStatusDone)),
+    }
+}
+
 pub(crate) const LIVE_DOT: u32 = 0x22C55E;
 
 pub(crate) const UNKNOWN_DOT: u32 = 0x9AA0A6;
@@ -217,7 +230,7 @@ pub(crate) fn workspace_avatar(
                 .child(initial)
                 .when(!current, |disc| disc.opacity(0.55)),
         )
-        .children(dot.map(|rgb| Tty7App::status_dot(rgb, 0, size, cx.theme().popover)))
+        .children(dot.map(|rgb| Tty7App::status_dot(rgb, 0, size, cx.theme().popover, false)))
 }
 
 pub(crate) fn select_workspace_action(index: usize) -> Option<Box<dyn gpui::Action>> {
@@ -441,7 +454,17 @@ impl Tty7App {
         .collect()
     }
 
-    fn status_dot(rgb: u32, unread: usize, size: f32, ring: gpui::Hsla) -> gpui::AnyElement {
+    /// Working and Done differ only in hue (blue vs green), and Waiting vs Done
+    /// — the pair that actually decides whether you go and look — is amber vs
+    /// green, the pair red-green colour vision separates worst. Give Waiting a
+    /// hole so it is a different *shape*, not just a different colour.
+    fn status_dot(
+        rgb: u32,
+        unread: usize,
+        size: f32,
+        ring: gpui::Hsla,
+        hollow: bool,
+    ) -> gpui::AnyElement {
         let d = (size * 0.42).max(7.);
         let bg = ring;
         if unread > 0 {
@@ -474,12 +497,19 @@ impl Tty7App {
                 .border_2()
                 .border_color(bg)
                 .bg(gpui::rgb(rgb))
+                .when(hollow, |dot| {
+                    dot.flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().size(px((d * 0.36).max(2.5))).rounded_full().bg(bg))
+                })
                 .into_any_element()
         }
     }
 
     pub(crate) fn tab_avatar(
         &self,
+        id: impl Into<gpui::ElementId>,
         agent: Option<crate::core::cli_agent::CLIAgent>,
         status: Option<crate::core::cli_agent::AgentStatus>,
         unread: usize,
@@ -488,6 +518,7 @@ impl Tty7App {
         cx: &App,
     ) -> gpui::AnyElement {
         let base = div()
+            .id(id)
             .flex_shrink_0()
             .size(px(size))
             .flex()
@@ -495,12 +526,26 @@ impl Tty7App {
             .justify_center();
         match agent {
             Some(agent) => {
+                let hollow = status == Some(crate::core::cli_agent::AgentStatus::Waiting);
                 let dot = status
                     .and_then(|s| s.dot_rgb())
-                    .map(|rgb| Self::status_dot(rgb, unread, size, cx.theme().background));
+                    .map(|rgb| Self::status_dot(rgb, unread, size, cx.theme().background, hollow));
+                // Which agent this is, and what it wants, were carried entirely
+                // by a brand hue and a nine-pixel dot. Say it in words too.
+                let tip = match agent_status_label(status) {
+                    Some(state) => format!("{} — {state}", agent.display_name()),
+                    None => agent.display_name().to_string(),
+                };
                 base.relative()
                     .rounded_full()
                     .bg(gpui::rgb(agent.accent_rgb()))
+                    // Codex and Grok are both pure black, which is the window
+                    // fill on a dark theme — the disc dissolves and leaves the
+                    // glyph floating. A hairline keeps it a disc in any theme.
+                    .when(
+                        crate::ui::presets::needs_edge(agent.accent_rgb(), cx.theme().background),
+                        |d| d.border_1().border_color(cx.theme().border),
+                    )
                     .child(
                         gpui::svg()
                             .path(agent.icon_path())
@@ -508,6 +553,9 @@ impl Tty7App {
                             .text_color(gpui::white()),
                     )
                     .when_some(dot, |b, dot| b.child(dot))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                    })
                     .into_any_element()
             }
             None => base
@@ -521,7 +569,7 @@ impl Tty7App {
                         .text_color(cx.theme().foreground.opacity(0.65)),
                 )
                 .when_some(ssh, |b, rgb| {
-                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background))
+                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background, false))
                 })
                 .into_any_element(),
         }
@@ -926,6 +974,7 @@ impl Tty7App {
                 })
                 .when_some(agent, |chip, agent| {
                     chip.child(self.tab_avatar(
+                        ("tab-avatar", i),
                         Some(agent),
                         agent_status,
                         agent_unread,
@@ -1107,6 +1156,49 @@ impl Tty7App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_visible_agent_state_has_words_for_it() {
+        use crate::core::cli_agent::AgentStatus;
+        crate::ui::i18n::set_locale("en");
+        // Idle draws no dot, so it has nothing to name.
+        assert_eq!(agent_status_label(None), None);
+        assert_eq!(agent_status_label(Some(AgentStatus::Idle)), None);
+        // Every state that does draw a dot can be read out loud.
+        for status in [
+            AgentStatus::Working,
+            AgentStatus::Waiting,
+            AgentStatus::Done,
+        ] {
+            assert!(status.dot_rgb().is_some());
+            assert!(
+                agent_status_label(Some(status)).is_some_and(|s| !s.is_empty()),
+                "{status:?} paints a dot with no words behind it"
+            );
+        }
+        // Waiting is the state worth acting on; it must not read as Done.
+        assert_ne!(
+            agent_status_label(Some(AgentStatus::Waiting)),
+            agent_status_label(Some(AgentStatus::Done))
+        );
+    }
+
+    #[test]
+    fn a_brand_disc_that_matches_the_window_gets_an_edge() {
+        use crate::ui::presets::needs_edge;
+        let dark: gpui::Hsla = gpui::rgb(0x111111).into();
+        let light: gpui::Hsla = gpui::rgb(0xffffff).into();
+        let codex = crate::core::cli_agent::CLIAgent::Codex.accent_rgb();
+        let claude = crate::core::cli_agent::CLIAgent::Claude.accent_rgb();
+
+        assert_eq!(codex, 0x000000, "Codex's disc is pure black");
+        assert!(
+            needs_edge(codex, dark),
+            "a black disc on a dark window is not a disc"
+        );
+        assert!(!needs_edge(codex, light));
+        assert!(!needs_edge(claude, dark) && !needs_edge(claude, light));
+    }
 
     #[test]
     fn short_title_strips_user_host_and_shows_shallow_path_in_full() {

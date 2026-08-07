@@ -2015,9 +2015,15 @@ impl Tty7App {
                     .cursor_pointer()
                     .when(picked, |r| r.bg(picked_bg))
                     .hover(move |r| r.bg(hover))
-                    .child(
-                        self.tab_avatar(tab.agent, tab.status, tab.unread, tab.ssh, ROW_AVATAR, cx),
-                    )
+                    .child(self.tab_avatar(
+                        ("switcher-avatar", index),
+                        tab.agent,
+                        tab.status,
+                        tab.unread,
+                        tab.ssh,
+                        ROW_AVATAR,
+                        cx,
+                    ))
                     .child(
                         v_flex()
                             .flex_1()
