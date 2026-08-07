@@ -456,9 +456,7 @@ fn close_prompt(ends_the_tab: bool, reason: &CloseReason) -> (String, String) {
                 false => t(L10nKey::ClosePaneBusyTitle),
             };
             let body = match busy {
-                PaneBusy::Command { what, .. } => {
-                    t_fmt(L10nKey::CloseBusyCommandBody, &[("what", what)])
-                }
+                PaneBusy::Command(what) => t_fmt(L10nKey::CloseBusyCommandBody, &[("what", what)]),
                 PaneBusy::Agent(name) => t_fmt(L10nKey::CloseBusyAgentBody, &[("agent", name)]),
             };
             (title.to_string(), body)
@@ -6583,10 +6581,7 @@ mod tests {
         use crate::terminal::view::PaneBusy;
         crate::ui::i18n::set_locale("en");
 
-        let build = CloseReason::Busy(PaneBusy::Command {
-            what: "cargo build".into(),
-            secs: 42,
-        });
+        let build = CloseReason::Busy(PaneBusy::Command("cargo build".into()));
         // The command is in the body, not a generic "are you sure".
         let (title, body) = close_prompt(true, &build);
         assert!(body.contains("cargo build"), "{body}");

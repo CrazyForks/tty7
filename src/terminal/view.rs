@@ -1202,14 +1202,13 @@ impl TerminalView {
         if !self.terminal.shell_active() {
             return None;
         }
-        let started = self.running_since?;
-        Some(PaneBusy::Command {
-            what: match self.running_title.trim().is_empty() {
+        self.running_since?;
+        Some(PaneBusy::Command(
+            match self.running_title.trim().is_empty() {
                 true => self.title.clone(),
                 false => self.running_title.clone(),
             },
-            secs: started.elapsed().as_secs(),
-        })
+        ))
     }
 
     pub fn agent_result_unread(&self) -> bool {
@@ -4957,7 +4956,7 @@ fn observe_typeahead_for_owner(
 /// Why closing a pane would end work that is still going on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaneBusy {
-    Command { what: String, secs: u64 },
+    Command(String),
     Agent(&'static str),
 }
 
