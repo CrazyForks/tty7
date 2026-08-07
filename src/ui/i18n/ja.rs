@@ -55,6 +55,12 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::QuitAndStop => "終了して停止",
         L10nKey::CloseSshConnectionTitle => "この SSH 接続を閉じますか？",
         L10nKey::CloseSshConnectionBody => "接続中です。閉じると切断されます",
+        L10nKey::ClosePaneBusyTitle => "このペインを閉じますか？",
+        L10nKey::CloseTabBusyTitle => "このタブを閉じますか？",
+        L10nKey::CloseBusyCommandBody => "{what} はまだ実行中です。閉じると終了します。",
+        L10nKey::CloseBusyAgentBody => {
+            "{agent} はまだ作業中です。閉じるとこのターンは中断されます。"
+        }
         L10nKey::Keep => "保持",
         L10nKey::SettingsNavAppearance => "外観",
         L10nKey::SettingsNavTerminal => "ターミナル",
