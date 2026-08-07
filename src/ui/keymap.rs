@@ -315,6 +315,13 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         ("ToggleSftp", ""),
         ("ShowSshForwards", ""),
         ("ToggleCodePanel", "secondary-shift-e"),
+        // Implemented, dispatchable, and until now unbindable: `set_binding`
+        // only fills slots that exist here, so `"ShowRightPanelInfo": "ctrl-1"`
+        // in config.json was dropped without a word, and the Keybindings page —
+        // which reads this list — never showed them at all.
+        ("ShowRightPanelInfo", ""),
+        ("ShowRightPanelChanges", ""),
+        ("ShowRightPanelFiles", ""),
         ("EditorSave", "secondary-s"),
         ("OpenSshProfiles", ""),
         ("RestartSshSession", "secondary-shift-r"),
@@ -493,6 +500,18 @@ fn authored_entry(action: &str) -> Option<(CommandGroup, String)> {
             t(L10nKey::AppMenuRightPanel).to_string(),
         ),
         "ToggleCodePanel" => (CommandGroup::View, t(L10nKey::AppMenuCodePanel).to_string()),
+        "ShowRightPanelInfo" => (
+            CommandGroup::View,
+            t(L10nKey::CmdRightPanelInfo).to_string(),
+        ),
+        "ShowRightPanelChanges" => (
+            CommandGroup::View,
+            t(L10nKey::CmdRightPanelChanges).to_string(),
+        ),
+        "ShowRightPanelFiles" => (
+            CommandGroup::View,
+            t(L10nKey::CmdRightPanelFiles).to_string(),
+        ),
         "FindInTerminal" => (
             CommandGroup::Terminal,
             t(L10nKey::CmdFindInTerminal).to_string(),
@@ -620,8 +639,11 @@ pub(crate) fn effective_bindings(cx: &App) -> Vec<(String, String)> {
 }
 
 fn set_binding(effective: &mut [(String, String)], action: &str, key: String) {
-    if let Some(slot) = effective.iter_mut().find(|(a, _)| a == action) {
-        slot.1 = key;
+    match effective.iter_mut().find(|(a, _)| a == action) {
+        Some(slot) => slot.1 = key,
+        // A hand-edited config.json with a typo used to vanish into this
+        // branch. The Keybindings page lists every name that works.
+        None => log::warn!("keybinding for unknown action {action:?} ignored"),
     }
 }
 
@@ -911,6 +933,28 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_dispatchable_action_has_a_slot_to_bind_it_in() {
+        // `make_binding` is what turns an action name into a real binding, and
+        // `default_bindings` is the only list `set_binding` will write into. An
+        // action in the first but not the second cannot be bound at all — not
+        // from config.json, which drops it silently, and not from the
+        // Keybindings page, which reads the second.
+        let bindable: std::collections::HashSet<&str> =
+            default_bindings().into_iter().map(|(a, _)| a).collect();
+        for action in [
+            "ShowRightPanelInfo",
+            "ShowRightPanelChanges",
+            "ShowRightPanelFiles",
+        ] {
+            assert!(bindable.contains(action), "{action} has nowhere to bind to");
+            assert!(
+                make_binding(action, "ctrl-1").is_some(),
+                "{action} has a slot but nothing to dispatch"
+            );
+        }
+    }
 
     #[test]
     fn every_action_has_an_authored_name() {
