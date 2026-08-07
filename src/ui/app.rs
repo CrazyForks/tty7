@@ -4485,26 +4485,6 @@ impl Tty7App {
         per_profile.unwrap_or(cfg.ssh_warn_on_close)
     }
 
-    pub(crate) fn tab_has_warn_ssh(&self, index: usize, cx: &App) -> bool {
-        self.tabs
-            .get(index)
-            .map(|t| {
-                t.pane
-                    .terminals()
-                    .iter()
-                    .any(|l| self.leaf_is_warn_ssh(l, cx))
-            })
-            .unwrap_or(false)
-    }
-
-    pub(crate) fn focused_pane_is_warn_ssh(&self, window: &Window, cx: &App) -> bool {
-        self.tabs
-            .get(self.active)
-            .and_then(|t| t.pane.focused_or_first(window, cx))
-            .map(|l| self.leaf_is_warn_ssh(&l, cx))
-            .unwrap_or(false)
-    }
-
     /// The app asks every other question of this class through the platform's
     /// own dialog. This one used to be a bespoke in-app card with no scrim, no
     /// Escape and no click-outside — the two buttons were the only way out.
