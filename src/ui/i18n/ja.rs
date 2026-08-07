@@ -39,6 +39,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::TreeDirEmpty => "空",
         L10nKey::TreeDirHiddenOnly => "隠しファイルのみ",
         L10nKey::TreeDirUnreadable => "読み取れません",
+        L10nKey::TreeSearchCapped => "最初の {n} 件のみ",
         L10nKey::FileChangedOnDisk => "ディスク上でファイルが変更されました",
         L10nKey::Reload => "再読み込み",
         L10nKey::KeepMine => "自分の変更を保持",

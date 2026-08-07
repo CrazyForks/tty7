@@ -106,6 +106,7 @@ l10n_keys! {
     TreeDirEmpty,
     TreeDirHiddenOnly,
     TreeDirUnreadable,
+    TreeSearchCapped,
     FileChangedOnDisk,
     Reload,
     KeepMine,

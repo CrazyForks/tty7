@@ -57,6 +57,9 @@ pub(crate) enum TreeNote {
     Empty,
     HiddenOnly,
     Unreadable,
+    /// The search stopped at `SEARCH_LIMIT`; the list is a prefix, not the
+    /// whole answer, and has to say so.
+    SearchCapped,
 }
 
 /// `landed` is how many entries the listing returned, or `None` when nothing
@@ -452,7 +455,8 @@ impl FileTreeState {
     }
 
     fn search_rows(&self) -> Vec<TreeRow> {
-        self.search
+        let mut rows: Vec<TreeRow> = self
+            .search
             .hits
             .iter()
             .map(|e| TreeRow {
@@ -462,7 +466,22 @@ impl FileTreeState {
                 expanded: false,
                 note: None,
             })
-            .collect()
+            .collect();
+        if rows.len() >= SEARCH_LIMIT {
+            rows.push(TreeRow {
+                entry: TreeEntry {
+                    name: String::new(),
+                    path: PathBuf::new(),
+                    is_dir: false,
+                    ignored: false,
+                },
+                depth: 0,
+                is_root: false,
+                expanded: false,
+                note: Some(TreeNote::SearchCapped),
+            });
+        }
+        rows
     }
 
     pub(crate) fn visible_rows(
@@ -1318,6 +1337,7 @@ impl Tty7App {
                 TreeNote::Empty => (L10nKey::TreeDirEmpty, muted),
                 TreeNote::HiddenOnly => (L10nKey::TreeDirHiddenOnly, muted),
                 TreeNote::Unreadable => (L10nKey::TreeDirUnreadable, cx.theme().danger),
+                TreeNote::SearchCapped => (L10nKey::TreeSearchCapped, muted),
             };
             return vec![
                 h_flex()
@@ -1330,7 +1350,10 @@ impl Tty7App {
                     .text_xs()
                     .italic()
                     .text_color(ink)
-                    .child(t(key))
+                    .child(match note {
+                        TreeNote::SearchCapped => t_fmt(key, &[("n", &SEARCH_LIMIT.to_string())]),
+                        _ => t(key).to_string(),
+                    })
                     .into_any_element(),
             ];
         }

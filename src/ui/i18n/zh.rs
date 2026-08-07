@@ -39,6 +39,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::TreeDirEmpty => "空",
         L10nKey::TreeDirHiddenOnly => "只有隐藏文件",
         L10nKey::TreeDirUnreadable => "无法读取",
+        L10nKey::TreeSearchCapped => "只显示前 {n} 个匹配",
         L10nKey::FileChangedOnDisk => "文件在磁盘上已被修改",
         L10nKey::Reload => "重新加载",
         L10nKey::KeepMine => "保留我的版本",
