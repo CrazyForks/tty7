@@ -40,6 +40,13 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::action(t(L10nKey::AppMenuNewWorkspace), NewWorkspace),
             MenuItem::action(t(L10nKey::AppMenuNewWorktreeTab), NewWorktreeTab),
             MenuItem::separator(),
+            // SSH is one of the reasons to pick tty7 and it had no entry in the
+            // menu bar at all — the only routes were ⌘P and Settings, both of
+            // which you have to already know about. Same labels as the palette,
+            // so there is still one name per thing.
+            MenuItem::action(t(L10nKey::CmdSshManageProfiles), OpenSshProfiles),
+            MenuItem::action(t(L10nKey::CmdSshReconnect), RestartSshSession),
+            MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuSplitRight), SplitRight),
             MenuItem::action(t(L10nKey::AppMenuSplitDown), SplitDown),
             MenuItem::separator(),
@@ -86,13 +93,18 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::action(t(L10nKey::AppMenuCodePanel), ToggleCodePanel),
             MenuItem::action(t(L10nKey::AppMenuTabBarPosition), ToggleTabSidebar),
             MenuItem::separator(),
+            MenuItem::action(t(L10nKey::CmdSshRemoteFiles), ToggleSftp),
+            MenuItem::action(t(L10nKey::CmdSshPortForwarding), ShowSshForwards),
+            MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuFocusNextPane), FocusNextPane),
             MenuItem::action(t(L10nKey::AppMenuFocusPreviousPane), FocusPrevPane),
             MenuItem::action(t(L10nKey::AppMenuZoomPane), ToggleMaximizePane),
             MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuClearScrollback), ClearScrollback),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuEnterFullscreen), ToggleFullscreen),
+            // No "Enter Full Screen" here: AppKit puts its own at the bottom of
+            // any menu named View, so ours sat directly above it — the same
+            // command twice, under two different shortcuts. ⌘↵ still works and
+            // is listed on the Keybindings page.
         ]),
         Menu::new(t(L10nKey::AppMenuWindow)).items(window_menu_items(cx)),
         Menu::new(t(L10nKey::AppMenuHelp)).items([

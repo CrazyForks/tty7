@@ -1184,7 +1184,6 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::AppMenuFocusPreviousPane => "聚焦上一个窗格",
         L10nKey::AppMenuZoomPane => "缩放窗格",
         L10nKey::AppMenuClearScrollback => "清除 scrollback",
-        L10nKey::AppMenuEnterFullscreen => "进入全屏",
         L10nKey::AppMenuDocumentation => "tty7 文档",
         L10nKey::AppMenuKeyboardShortcuts => "键盘快捷键",
         L10nKey::AppMenuJoinDiscord => "加入 Discord",

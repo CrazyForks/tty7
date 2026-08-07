@@ -1241,7 +1241,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::AppMenuFocusPreviousPane => "Focus Previous Pane",
         L10nKey::AppMenuZoomPane => "Zoom Pane",
         L10nKey::AppMenuClearScrollback => "Clear Scrollback",
-        L10nKey::AppMenuEnterFullscreen => "Enter Full Screen",
         L10nKey::AppMenuDocumentation => "tty7 Documentation",
         L10nKey::AppMenuKeyboardShortcuts => "Keyboard Shortcuts",
         L10nKey::AppMenuJoinDiscord => "Join the Discord",
