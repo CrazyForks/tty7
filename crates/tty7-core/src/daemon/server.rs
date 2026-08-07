@@ -364,7 +364,10 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
                 Ok(p) => p,
                 Err(e) => {
                     let mut w = write_stream;
-                    let _ = DaemonMsg::Error(format!("spawn failed: {e}")).encode(&mut w);
+                    // The daemon's own error is already a sentence; a second
+                    // "spawn failed:" in front of it only pads the one the
+                    // window ends up showing.
+                    let _ = DaemonMsg::Error(format!("{e}")).encode(&mut w);
                     return Err(e);
                 }
             };

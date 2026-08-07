@@ -170,6 +170,14 @@ impl Tty7App {
         }
 
         let status = self.render_remote_status_strip(cx);
+        let failure = self.startup_error.clone().map(|text| {
+            div()
+                .max_w(px(420.))
+                .text_sm()
+                .text_center()
+                .text_color(cx.theme().danger)
+                .child(text)
+        });
 
         v_flex()
             .id("home-page")
@@ -188,6 +196,7 @@ impl Tty7App {
                 }
             }))
             .child(logo)
+            .children(failure)
             .children(status)
             .child(list)
             .with_animation(
