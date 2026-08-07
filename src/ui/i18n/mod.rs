@@ -983,6 +983,9 @@ pub enum L10nKey {
     SettingsShellDefaultLoginShell,
     SftpErrorUnexpectedReply,
     SftpErrorUnsafeRemoteName,
+    SftpReplaceTitle,
+    SftpReplaceBody,
+    Replace,
     SftpErrorInvalidOctalMode,
 }
 
@@ -2005,6 +2008,9 @@ mod tests {
             L10nKey::SettingsShellDefaultLoginShell,
             L10nKey::SftpErrorUnexpectedReply,
             L10nKey::SftpErrorUnsafeRemoteName,
+            L10nKey::SftpReplaceTitle,
+            L10nKey::SftpReplaceBody,
+            L10nKey::Replace,
             L10nKey::SftpErrorInvalidOctalMode,
         ] {
             assert!(

@@ -1229,6 +1229,11 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsShellDefaultLoginShell => "あなたのログインシェル",
         L10nKey::SftpErrorUnexpectedReply => "予期しない応答: {reply}",
         L10nKey::SftpErrorUnsafeRemoteName => "安全でないリモート名 {name} を拒否しました",
+        L10nKey::SftpReplaceTitle => "既にあるファイルを置き換えますか？",
+        L10nKey::SftpReplaceBody => {
+            "{names} はこのフォルダに既に存在します。アップロードすると上書きされます。"
+        }
+        L10nKey::Replace => "置き換える",
         L10nKey::SftpErrorInvalidOctalMode => "無効な 8 進数モードです",
         L10nKey::PanelMoreChangedFiles => {
             "… さらに変更されたファイル {count} 個 — 表示するには `git diff` を実行してください"
@@ -1331,6 +1336,12 @@ pub fn translate_variant_ja(key: L10nKey, branch: &'static str) -> Option<&'stat
         }
         (L10nKey::SettingsOfflineMachines, "other") => {
             "未接続の保存済みマシンがさらに {count} 台あります — いずれかでワークスペースを開くと、そこにフックをインストールできます"
+        }
+        (L10nKey::SftpReplaceBody, "one") => {
+            "{names} はこのフォルダに既に存在します。アップロードすると上書きされます。"
+        }
+        (L10nKey::SftpReplaceBody, "other") => {
+            "{names} はこのフォルダに既に存在します。アップロードすると上書きされます。"
         }
         (L10nKey::PanelUntracked, "zero") => "未追跡 0",
         (L10nKey::PanelUntracked, "one") => "未追跡 1",
