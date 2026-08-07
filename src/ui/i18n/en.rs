@@ -176,6 +176,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsDuplicate => "Duplicate",
         L10nKey::SettingsForgetPassword => "Forget password",
         L10nKey::SettingsForgotPasswordFor => "Forgot saved password for {endpoint}",
+        L10nKey::SettingsDeleteProfileBody => {
+            "The password saved for it goes too, unless another connection still uses the same address."
+        }
         L10nKey::SettingsCouldntForgetPassword => {
             "Couldn't forget password for {endpoint}: {error}"
         }
@@ -463,6 +466,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "With a prefix active, a bare prefix key reaches the shell after a ~1s pause, and prefix + an unbound key is sent through to the terminal."
         }
         L10nKey::SettingsRestoreAllDefaults => "Restore all defaults",
+        L10nKey::SettingsRestoreAllDefaultsBody => {
+            "Every key you have rebound goes back to its default. There is no undo."
+        }
         L10nKey::SettingsAboutDesc1 => {
             "A terminal workbench: persistent sessions, remote work, agents."
         }
@@ -759,6 +765,12 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::FileTreeDeleteTitle => "Delete \"{name}\"?",
         L10nKey::FileTreeDeleteFolderBody => "The folder and everything inside it will be deleted.",
         L10nKey::FileTreeDeleteFileBody => "The file will be deleted.",
+        L10nKey::SftpDeleteFolderBody => {
+            "The folder and everything inside it will be deleted on {host}. There is no trash on the far side."
+        }
+        L10nKey::SftpDeleteFileBody => {
+            "The file will be deleted on {host}. There is no trash on the far side."
+        }
         L10nKey::FileTreeDeleteFailed => "Delete failed",
         L10nKey::FileTreeContextOpen => "Open",
         L10nKey::FileTreeContextCdHere => "cd Here",

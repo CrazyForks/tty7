@@ -4993,7 +4993,36 @@ impl Tty7App {
         cx.notify();
     }
 
-    pub(crate) fn restore_default_keybindings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn restore_default_keybindings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Nothing here is recoverable: the overrides are dropped from config
+        // and the only record of them was the config.
+        if cx.global::<Config>().keybindings.is_empty() {
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaults),
+            Some(t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaultsBody)),
+            &[
+                t(crate::ui::i18n::L10nKey::Cancel),
+                t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaults),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(1) = answer.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.restore_default_keybindings_confirmed(cx)
+            });
+        })
+        .detach();
+    }
+
+    fn restore_default_keybindings_confirmed(&mut self, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.keybindings.clear());
         crate::ui::keymap::rebind(cx);
         if let Some(s) = self.active_settings_mut() {

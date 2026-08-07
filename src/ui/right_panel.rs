@@ -924,6 +924,16 @@ impl Tty7App {
             .into_any_element()
     }
 
+    /// The host label for whatever the Files panel is currently showing over
+    /// SFTP, for copy that has to name the machine it is about to change.
+    pub(crate) fn remote_files_host(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        self.remote_files_pane(window, cx).map(|(_, host)| host)
+    }
+
     fn remote_files_pane(
         &self,
         window: &mut Window,

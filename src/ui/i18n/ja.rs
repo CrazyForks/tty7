@@ -178,6 +178,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsDuplicate => "複製",
         L10nKey::SettingsForgetPassword => "パスワードを消去",
         L10nKey::SettingsForgotPasswordFor => "{endpoint} の保存されたパスワードを消去しました",
+        L10nKey::SettingsDeleteProfileBody => {
+            "保存されたパスワードも一緒に削除されます。同じアドレスを使う接続が他にある場合は残ります。"
+        }
         L10nKey::SettingsCouldntForgetPassword => {
             "{endpoint} のパスワードを消去できませんでした: {error}"
         }
@@ -463,6 +466,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
             "プレフィックスが有効な場合、プレフィックスキーを単独で押すと約 1 秒後にシェルに渡され、プレフィックス + 未割り当てのキーはターミナルへそのまま送信されます"
         }
         L10nKey::SettingsRestoreAllDefaults => "すべてのデフォルトを復元",
+        L10nKey::SettingsRestoreAllDefaultsBody => {
+            "変更したキーはすべてデフォルトに戻ります。元に戻すことはできません。"
+        }
         L10nKey::SettingsAboutDesc1 => {
             "ターミナルワークベンチ: 常駐セッション、リモート作業、エージェント"
         }
@@ -802,6 +808,12 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::FileTreeDeleteTitle => "「{name}」を削除しますか？",
         L10nKey::FileTreeDeleteFolderBody => "フォルダとその中のすべての項目が削除されます",
         L10nKey::FileTreeDeleteFileBody => "ファイルが削除されます",
+        L10nKey::SftpDeleteFolderBody => {
+            "{host} 上でフォルダとその中身がすべて削除されます。リモート側にゴミ箱はありません。"
+        }
+        L10nKey::SftpDeleteFileBody => {
+            "{host} 上でファイルが削除されます。リモート側にゴミ箱はありません。"
+        }
         L10nKey::FileTreeDeleteFailed => "削除に失敗しました",
         L10nKey::FileTreeContextOpen => "開く",
         L10nKey::FileTreeContextCdHere => "ここで cd",
