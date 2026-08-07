@@ -195,6 +195,11 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "Ask for confirmation before closing a tab or pane with a live SSH session."
         }
         L10nKey::SettingsNewHost => "New host",
+        L10nKey::SettingsDiscardChangesTitle => "Discard unsaved changes?",
+        L10nKey::SettingsDiscardChangesBody => {
+            "The connection you are editing has changes that were never saved."
+        }
+        L10nKey::SettingsKeepEditing => "Keep Editing",
         L10nKey::SettingsName => "Name",
         L10nKey::SettingsNameDesc => "A label for this connection.",
         L10nKey::SettingsHost => "Host",

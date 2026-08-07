@@ -3640,7 +3640,7 @@ impl Tty7App {
 
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.is_some() {
-            self.close_settings(window, cx);
+            self.close_settings_checked(window, cx);
             return;
         }
         self.remember_active_pane(window, cx);

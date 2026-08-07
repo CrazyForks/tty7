@@ -195,6 +195,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
             "アクティブな SSH セッションのあるタブやペインを閉じる前に確認を求めます"
         }
         L10nKey::SettingsNewHost => "新規ホスト",
+        L10nKey::SettingsDiscardChangesTitle => "保存していない変更を破棄しますか？",
+        L10nKey::SettingsDiscardChangesBody => "編集中の接続に、まだ保存していない変更があります。",
+        L10nKey::SettingsKeepEditing => "編集を続ける",
         L10nKey::SettingsName => "名前",
         L10nKey::SettingsNameDesc => "この接続の表示名",
         L10nKey::SettingsHost => "ホスト名",
