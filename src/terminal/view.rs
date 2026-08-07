@@ -4471,12 +4471,17 @@ impl TerminalView {
 
         let cursor_on = self.cursor_visible;
         let cursor_style = cx.global::<Config>().cursor_style;
+        let block_cursor = cursor_style == crate::core::config::CursorStyle::Block;
+        // A block caret is drawn as reverse video on the cell it covers, not as
+        // a translucent tint over it — the way every other terminal draws one,
+        // and the only way the caret keeps the contrast the theme gave it.
+        let caret_ink = crate::ui::presets::caret_ink(caret_col, theme.background, fg);
         let caret_bar = move || {
             use crate::core::config::CursorStyle;
             let base = div().absolute().left_0().bg(caret_col);
             match cursor_style {
                 CursorStyle::Bar => base.top(caret_top).w(px(1.5)).h(caret_h),
-                CursorStyle::Block => base.top(px(0.)).w_full().h(lh).bg(caret_col.opacity(0.5)),
+                CursorStyle::Block => base.top(px(0.)).w_full().h(lh),
                 CursorStyle::Underline => {
                     let uh = px(2.);
                     base.top(lh - uh).w_full().h(uh)
@@ -4484,6 +4489,7 @@ impl TerminalView {
             }
         };
         let cell = |color: gpui::Hsla, ch: char, selected: bool, caret: bool, underline: bool| {
+            let inverted = caret && block_cursor;
             let w = cell_w * (display_width(ch) as f32);
             let mut d = div()
                 .relative()
@@ -4492,15 +4498,17 @@ impl TerminalView {
                 .h(lh)
                 .flex()
                 .items_center()
-                .text_color(color);
-            if selected {
+                .text_color(if inverted { caret_ink } else { color });
+            if inverted {
+                d = d.bg(caret_col);
+            } else if selected {
                 d = d.bg(sel_bg);
             }
             if underline {
                 d = d.border_b_1().border_color(fg);
             }
             d = d.child(ch.to_string());
-            if caret {
+            if caret && !inverted {
                 d = d.child(caret_bar());
             }
             d.into_any_element()

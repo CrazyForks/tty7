@@ -334,6 +334,23 @@ fn ink_on(fill: u32, fg: u32, target: f32) -> u32 {
     }
 }
 
+/// The colour a glyph is redrawn in once an opaque block caret sits under it.
+/// The terminal's own background is the conventional choice and wins in every
+/// shipped theme; the foreground is the fallback for a caret close enough to
+/// the background to swallow it.
+pub(crate) fn caret_ink(caret: Hsla, background: Hsla, foreground: Hsla) -> Hsla {
+    let pack = |c: Hsla| {
+        let rgb = crate::terminal::palette::hsla_to_rgb(c);
+        (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32
+    };
+    let (caret, bg, fg) = (pack(caret), pack(background), pack(foreground));
+    if contrast(caret, bg) >= contrast(caret, fg) {
+        background
+    } else {
+        foreground
+    }
+}
+
 pub(crate) fn mix(a: u32, b: u32, t: f32) -> u32 {
     let (ar, ag, ab) = (a >> 16 & 0xff, a >> 8 & 0xff, a & 0xff);
     let (br, bg, bb) = (b >> 16 & 0xff, b >> 8 & 0xff, b & 0xff);

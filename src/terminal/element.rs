@@ -934,30 +934,55 @@ fn paint_cursor(
     };
     let rect = geom.cell_rect(row, col, 1);
     if !focused {
-        let mut c = caret;
-        c.a = 0.5;
-        window.paint_quad(outline(rect, c, BorderStyle::Solid));
+        window.paint_quad(outline(rect, caret, BorderStyle::Solid));
         return;
     }
     if !cursor_visible {
         return;
     }
-    let mut c = caret;
-    c.a = 0.55;
     match style {
-        CursorStyle::Block => window.paint_quad(fill(rect, c)),
+        // A focused block is drawn as reverse video by `invert_cursor_cell`
+        // before the glyphs go down, so the caret is opaque and the character
+        // under it stays readable. Nothing left to paint here.
+        CursorStyle::Block => {}
         CursorStyle::Bar => {
             let w = (geom.cell_width * 0.15).max(px(1.)).min(px(3.));
             let bar = Bounds::new(rect.origin, size(w, rect.size.height));
-            window.paint_quad(fill(bar, c));
+            window.paint_quad(fill(bar, caret));
         }
         CursorStyle::Underline => {
             let h = (geom.line_height * 0.12).max(px(1.)).min(px(3.));
             let y = rect.origin.y + rect.size.height - h;
             let line = Bounds::new(point(rect.origin.x, y), size(rect.size.width, h));
-            window.paint_quad(fill(line, c));
+            window.paint_quad(fill(line, caret));
         }
     }
+}
+
+/// Turn the cell under a focused block cursor into reverse video: opaque caret
+/// fill, glyph redrawn on top of it. Every other terminal paints a block this
+/// way, and a translucent tint would give back most of the contrast the theme
+/// conditioned the caret to carry.
+fn invert_cursor_cell(
+    buf: &mut [RenderCell],
+    cols: usize,
+    row: usize,
+    col: usize,
+    colors: &PaintColors,
+) {
+    let ink = crate::ui::presets::caret_ink(colors.caret, colors.default_bg, colors.default_fg);
+    let Some(cell) = buf.get_mut(row * cols + col) else {
+        return;
+    };
+    cell.bg = colors.caret;
+    cell.draw_bg = true;
+    cell.fg = ink;
+    if let Some(under) = cell.underline_color.as_mut() {
+        *under = ink;
+    }
+    // A wide character's trailing spacer is absorbed into the lead cell's
+    // background run by `paint_backgrounds`, so the fill already covers both
+    // columns and only the lead cell carries the glyph.
 }
 
 fn cursor_style_from_shape(shape: CursorShape) -> crate::core::config::CursorStyle {
@@ -1476,6 +1501,18 @@ impl Element for TerminalElement {
             .filter(|c| !c.hidden)
             .map(|c| (c.row, c.col, c.style));
 
+        // Reverse-video the block cursor's cell up front, so it rides the
+        // normal background-then-glyph path instead of being tinted on top of
+        // the finished frame. `paint_cursor` skips the focused block for the
+        // same reason.
+        if !editor_active
+            && focused
+            && cursor_visible
+            && let Some((row, col, crate::core::config::CursorStyle::Block)) = render_cursor
+        {
+            invert_cursor_cell(&mut buf, geom.cols, row, col, &colors);
+        }
+
         let cursor_bounds = cursor_cell.map(|(row, col)| geom.cell_rect(row, col, 1));
         let focus_handle = self.view.read(cx).focus_handle.clone();
         window.handle_input(
@@ -1712,6 +1749,83 @@ fn drag_overshoot(y: Pixels, bounds: Bounds<Pixels>, line_height: Pixels) -> f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caret_colors() -> PaintColors {
+        PaintColors {
+            default_fg: to_hsla(Rgb {
+                r: 17,
+                g: 17,
+                b: 17,
+            }),
+            default_bg: to_hsla(Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            caret: to_hsla(Rgb {
+                r: 0xf5,
+                g: 0xa1,
+                b: 0x5c,
+            }),
+            selection_bg: Hsla::default(),
+            match_bg: Hsla::default(),
+            current_match_bg: Hsla::default(),
+            current_match_border: Hsla::default(),
+            fg_rgb: Rgb {
+                r: 17,
+                g: 17,
+                b: 17,
+            },
+            bg_rgb: Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+        }
+    }
+
+    #[test]
+    fn a_block_cursor_turns_its_cell_into_reverse_video() {
+        let colors = caret_colors();
+        let mut buf = vec![RenderCell::default(); 6];
+        buf[3].c = 'o';
+        buf[3].fg = to_hsla(Rgb { r: 1, g: 2, b: 3 });
+        invert_cursor_cell(&mut buf, 3, 1, 0, &colors);
+
+        let cell = &buf[3];
+        assert!(cell.draw_bg, "the caret fill has to be painted");
+        assert_eq!(cell.bg, colors.caret);
+        assert_ne!(
+            cell.fg,
+            to_hsla(Rgb { r: 1, g: 2, b: 3 }),
+            "the glyph is redrawn on the caret, not left in its own colour"
+        );
+        assert_eq!(cell.c, 'o', "the character itself survives");
+
+        for (i, other) in buf.iter().enumerate() {
+            if i != 3 {
+                assert!(!other.draw_bg, "cell {i} was not the cursor cell");
+            }
+        }
+    }
+
+    #[test]
+    fn caret_ink_takes_whichever_of_the_two_reads_on_the_caret() {
+        let colors = caret_colors();
+        // A pale caret on a white background: the foreground wins.
+        let ink = crate::ui::presets::caret_ink(colors.caret, colors.default_bg, colors.default_fg);
+        assert_eq!(ink, colors.default_fg);
+
+        // A caret far from the background: the background wins, which is the
+        // conventional reverse-video pairing.
+        let deep = to_hsla(Rgb {
+            r: 0x20,
+            g: 0x20,
+            b: 0x80,
+        });
+        let ink = crate::ui::presets::caret_ink(deep, colors.default_bg, colors.default_fg);
+        assert_eq!(ink, colors.default_bg);
+    }
 
     #[test]
     fn to_hsla_normalizes_channels_and_alpha() {
