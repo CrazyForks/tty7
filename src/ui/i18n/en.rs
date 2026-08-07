@@ -986,6 +986,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SwitcherTabCountOne => "1 tab",
         L10nKey::SwitcherActiveTab => "active",
         L10nKey::SwitcherHoldToSwitch => "Tab to move · release to switch",
+        L10nKey::SwitcherTabToCrossColumns => "Tab to cross columns",
         L10nKey::SshPromptPasswordFor => "Password for {user}@{host}",
         L10nKey::SshPromptPassphraseFor => "Passphrase for {key_path}",
         L10nKey::SshPromptTwoFactor => "Two-factor authentication",

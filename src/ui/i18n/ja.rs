@@ -1017,6 +1017,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SwitcherTabCountOne => "1 個のタブ",
         L10nKey::SwitcherActiveTab => "アクティブ",
         L10nKey::SwitcherHoldToSwitch => "Tab で移動 · 離して切り替え",
+        L10nKey::SwitcherTabToCrossColumns => "Tab で列を移動",
         L10nKey::SshPromptPasswordFor => "{user}@{host} のパスワード",
         L10nKey::SshPromptPassphraseFor => "{key_path} のパスフレーズ",
         L10nKey::SshPromptTwoFactor => "二要素認証",
