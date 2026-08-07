@@ -978,8 +978,17 @@ impl PaletteView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ListState<PaletteDelegate>> {
+        let first = delegate.first_row();
         let list = cx.new(|cx| ListState::new(delegate, window, cx).searchable(true));
-        list.update(cx, |state, cx| state.focus(window, cx));
+        list.update(cx, |state, cx| {
+            // `ListState::new` starts with nothing selected, and it only picks a
+            // row once a query changes. Opening the palette and pressing Return
+            // therefore did nothing at all, and until then no row showed what
+            // Return was aimed at. Every palette anywhere else arms the first
+            // row on open.
+            state.set_selected_index(first, window, cx);
+            state.focus(window, cx);
+        });
         list
     }
 
