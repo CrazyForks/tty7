@@ -284,7 +284,7 @@ pub enum CommandGroup {
 }
 
 impl CommandGroup {
-    const ORDER: [CommandGroup; 7] = [
+    pub(crate) const ORDER: [CommandGroup; 7] = [
         CommandGroup::TabsPanes,
         CommandGroup::Workspaces,
         CommandGroup::View,
@@ -294,7 +294,7 @@ impl CommandGroup {
         CommandGroup::Application,
     ];
 
-    fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         match self {
             CommandGroup::TabsPanes => t(L10nKey::CmdGroupTabsPanes),
             CommandGroup::Workspaces => t(L10nKey::CmdGroupWorkspaces),

@@ -469,6 +469,13 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsRestoreAllDefaultsBody => {
             "変更したキーはすべてデフォルトに戻ります。元に戻すことはできません。"
         }
+        L10nKey::KeybindGoToTab => "タブ {n} へ移動",
+        L10nKey::KeybindGoToWorkspace => "ワークスペース {n} へ移動",
+        L10nKey::KeybindInsertNewline => "改行を挿入",
+        L10nKey::KeybindForkSessionRight => "右にセッションをフォーク",
+        L10nKey::KeybindForkSessionLeft => "左にセッションをフォーク",
+        L10nKey::KeybindForkSessionDown => "下にセッションをフォーク",
+        L10nKey::KeybindForkSessionUp => "上にセッションをフォーク",
         L10nKey::SettingsAboutDesc1 => {
             "ターミナルワークベンチ: 常駐セッション、リモート作業、エージェント"
         }

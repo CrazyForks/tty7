@@ -414,6 +414,13 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsRestoreAllDefaults => "恢复全部默认值",
         L10nKey::SettingsRestoreAllDefaultsBody => "你改过的每一个按键都会退回默认值，且无法撤销。",
+        L10nKey::KeybindGoToTab => "跳到第 {n} 个标签页",
+        L10nKey::KeybindGoToWorkspace => "跳到第 {n} 个工作区",
+        L10nKey::KeybindInsertNewline => "插入换行",
+        L10nKey::KeybindForkSessionRight => "向右 Fork 会话",
+        L10nKey::KeybindForkSessionLeft => "向左 Fork 会话",
+        L10nKey::KeybindForkSessionDown => "向下 Fork 会话",
+        L10nKey::KeybindForkSessionUp => "向上 Fork 会话",
         L10nKey::SettingsAboutDesc1 => "终端工作台：常驻会话、远程工作、agent。",
         L10nKey::SettingsVersion => "版本",
         L10nKey::SettingsUpdates => "更新",
