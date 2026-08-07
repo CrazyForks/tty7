@@ -285,9 +285,9 @@ impl RemoteTerminal {
         .encode(&mut stream)?;
         let pane_id = match DaemonMsg::read(&mut stream)? {
             DaemonMsg::Spawned { pane_id } => pane_id,
-            DaemonMsg::Error(msg) => {
-                return Err(anyhow::anyhow!("daemon refused Spawn: {msg}"));
-            }
+            // Passed through, not wrapped: the caller already logs which
+            // spawn this was, and the window shows only this text.
+            DaemonMsg::Error(msg) => return Err(anyhow::anyhow!(msg)),
             other => {
                 return Err(anyhow::anyhow!(
                     "unexpected daemon reply to Spawn: {other:?}"

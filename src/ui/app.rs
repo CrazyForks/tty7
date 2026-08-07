@@ -420,6 +420,9 @@ pub struct Tty7App {
     /// Errors reported for a remote host that should be shown inside that host's
     /// switcher group instead of as a global modal or toast.
     pub(crate) remote_host_errors: std::collections::HashMap<String, String>,
+    /// Why the window opened with no terminal in it. Shown on the home screen,
+    /// which is otherwise indistinguishable from having closed everything.
+    pub(crate) startup_error: Option<gpui::SharedString>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -699,6 +702,7 @@ impl Tty7App {
         });
         apply_theme(Some(window), cx);
         set_menus(cx);
+        let mut startup_error: Option<gpui::SharedString> = None;
         let (tabs, active) = match session {
             None => match new_terminal(
                 pane_ws.clone(),
@@ -713,6 +717,14 @@ impl Tty7App {
                 Ok(first) => (vec![Tab::new(Pane::leaf(first))], 0),
                 Err(e) => {
                     log::error!("first terminal failed to start: {e}");
+                    // The home screen is what a user sees when they have closed
+                    // everything, and it used to be what they saw when tty7
+                    // could not open anything — silently, on the very first
+                    // launch, with the cause only in a log file.
+                    startup_error = Some(gpui::SharedString::from(t_fmt(
+                        L10nKey::AppOpenTerminalFailed,
+                        &[("error", &e.to_string())],
+                    )));
                     (Vec::new(), 0)
                 }
             },
@@ -807,6 +819,7 @@ impl Tty7App {
             switcher: None,
             host_snapshots: std::collections::HashMap::new(),
             remote_host_errors: std::collections::HashMap::new(),
+            startup_error,
         };
         if !cfg!(test) && crate::ui::windows::WindowRegistry::count(cx) == 0 {
             crate::ui::tray::init(cx);
@@ -2359,13 +2372,17 @@ impl Tty7App {
             Ok(view) => view,
             Err(e) => {
                 log::error!("new tab spawn failed: {e}");
-                window.push_notification(
-                    t_fmt(L10nKey::AppOpenTerminalFailed, &[("error", &e.to_string())]),
-                    cx,
-                );
+                let text = t_fmt(L10nKey::AppOpenTerminalFailed, &[("error", &e.to_string())]);
+                // A retry from the home screen fails the same way; keep the
+                // reason on screen rather than only in a toast that leaves.
+                self.startup_error = Some(gpui::SharedString::from(text.clone()));
+                window.push_notification(text, cx);
+                cx.notify();
                 return;
             }
         };
+        // Something opened, so whatever the last failure was is stale.
+        self.startup_error = None;
         self.remember_active_pane(window, cx);
         self.maximized = None;
         let insert_at = self.new_tab_insert_at(cx);
