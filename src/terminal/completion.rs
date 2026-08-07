@@ -67,12 +67,28 @@ const MAX_CANDIDATES: usize = 400;
 
 const DIR_ONLY_COMMANDS: &[&str] = &["cd", "pushd", "popd", "rmdir"];
 
-fn current_command(chars: &[char], word_start: usize) -> Option<String> {
-    let prefix: String = chars[..word_start].iter().collect();
-    let seg_start = prefix
+/// Where the pipeline segment holding the cursor begins. `foo | bar baz` is two
+/// segments, and each one starts a fresh command position.
+fn segment_start(prefix: &str) -> usize {
+    prefix
         .rfind(['|', '&', ';', '\n', '('])
         .map(|i| i + 1)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// True when the word being completed is the first word of its segment, so it
+/// names a command rather than an argument. `ls | gre` completes `grep`, not
+/// files called `gre*` — every shell does it this way.
+fn at_command_position(chars: &[char], word_start: usize) -> bool {
+    let prefix: String = chars[..word_start].iter().collect();
+    prefix[segment_start(&prefix)..]
+        .chars()
+        .all(char::is_whitespace)
+}
+
+fn current_command(chars: &[char], word_start: usize) -> Option<String> {
+    let prefix: String = chars[..word_start].iter().collect();
+    let seg_start = segment_start(&prefix);
     let cmd = prefix[seg_start..].split_whitespace().next()?;
     let base = cmd
         .rfind(std::path::is_separator)
@@ -87,7 +103,7 @@ pub fn complete(line: &str, cursor: usize, cwd: Option<&Path>) -> Option<Complet
     let word_start = shell_word_start(&chars, cursor);
     let word: String = chars[word_start..cursor].iter().collect();
 
-    let is_command = chars[..word_start].iter().all(|c| c.is_whitespace());
+    let is_command = at_command_position(&chars, word_start);
     let (word_cands, pending) = if is_command && !word.contains('/') {
         (complete_command(&word, cwd.is_some()), Vec::new())
     } else {
@@ -229,7 +245,7 @@ pub fn remote_path_request(
     let word_start = shell_word_start(&chars, cursor);
     let word: String = chars[word_start..cursor].iter().collect();
 
-    let is_command = chars[..word_start].iter().all(|c| c.is_whitespace());
+    let is_command = at_command_position(&chars, word_start);
     if is_command && !word.contains('/') {
         return None;
     }
@@ -377,11 +393,9 @@ fn complete_signature(
     cwd: Option<&Path>,
 ) -> Option<SigResult> {
     let prefix: String = chars[..word_start].iter().collect();
-    let seg_start = prefix
-        .rfind(['|', '&', ';', '\n', '('])
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let tokens: Vec<&str> = prefix[seg_start..].split_whitespace().collect();
+    let tokens: Vec<&str> = prefix[segment_start(&prefix)..]
+        .split_whitespace()
+        .collect();
     let cmd = tokens.first()?;
     let sig = signature::signature(cmd)?;
 
@@ -713,6 +727,44 @@ mod tests {
         complete(line, line.chars().count(), Some(Path::new("/")))
             .map(|c| c.candidates.into_iter().map(|c| c.text).collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_word_after_a_pipe_completes_as_a_command() {
+        // `ls |ech` — no space — stays a path lookup: `shell_word_start` only
+        // breaks words on whitespace, so the word is `|ech`. Teaching it to
+        // break on metacharacters too would have to respect quoting first, or
+        // `grep "a|b"` would start completing `b"`.
+        for line in ["ls | ech", "ls && ech", "ls; ech"] {
+            let t = texts(line);
+            assert!(
+                t.iter().any(|s| s == "echo"),
+                "{line} should reach commands: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_argument_after_a_pipe_still_completes_as_a_path() {
+        // Only the *first* word of the segment is a command position; every word
+        // after it keeps the path fallback it always had.
+        let c = complete("ls | grep et", 12, Some(Path::new("/"))).unwrap();
+        assert!(
+            c.candidates
+                .iter()
+                .all(|c| c.kind != CandidateKind::Command),
+            "path candidates, not commands: {:?}",
+            c.candidates
+        );
+        assert!(c.candidates.iter().any(|c| c.text == "etc"));
+    }
+
+    #[test]
+    fn a_command_position_never_asks_the_remote_for_a_listing() {
+        // Each request is an SSH round trip; asking for `gre*` in the remote cwd
+        // when the user is typing `grep` is both wrong and slow.
+        assert!(remote_path_request("ls | gre", 8, "/home/me").is_none());
+        assert!(remote_path_request("ls | grep /et", 13, "/home/me").is_some());
     }
 
     #[test]
