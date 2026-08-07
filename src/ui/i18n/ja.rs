@@ -212,6 +212,12 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsAdvancedSummary => {
             "アルゴリズム / キープアライブ / プロキシ / X11 / ログインスクリプト"
         }
+        L10nKey::SettingsGroupAuthentication => "認証",
+        L10nKey::SettingsGroupProxies => "プロキシ",
+        L10nKey::SettingsGroupAlgorithms => "アルゴリズム",
+        L10nKey::SettingsGroupConnection => "接続",
+        L10nKey::SettingsGroupSession => "セッション",
+        L10nKey::SettingsGroupSecurity => "セキュリティ",
         L10nKey::SettingsIdentityFiles => "秘密鍵ファイル",
         L10nKey::SettingsIdentityFilesDesc => "秘密鍵のパス（1 行に 1 つ。%h/%r は展開されます）",
         L10nKey::SettingsAgentForwarding => "エージェント転送",

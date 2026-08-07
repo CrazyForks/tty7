@@ -953,6 +953,18 @@ impl Tty7App {
             .child(title.to_string())
     }
 
+    /// A heading *inside* a section — quieter than `section_header`, for
+    /// breaking a long run of rows into groups you can scan.
+    fn subgroup_header(&self, key: L10nKey, cx: &Context<Self>) -> Div {
+        div()
+            .pt_4()
+            .pb_1()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(cx.theme().muted_foreground)
+            .child(t(key))
+    }
+
     pub(crate) fn section_header(&self, title: &str, cx: &Context<Self>) -> Div {
         self.header_text(title, cx).mb_4()
     }
@@ -3058,6 +3070,7 @@ impl Tty7App {
         };
 
         section = section
+            .child(self.subgroup_header(L10nKey::SettingsGroupAuthentication, cx))
             .child(text_row(
                 self,
                 t(L10nKey::SettingsIdentityFiles),
@@ -3081,6 +3094,7 @@ impl Tty7App {
                     cx,
                 ),
             )
+            .child(self.subgroup_header(L10nKey::SettingsGroupProxies, cx))
             .child(text_row(
                 self,
                 t(L10nKey::SettingsProxyCommand),
@@ -3102,6 +3116,7 @@ impl Tty7App {
                 &form.http,
                 cx,
             ))
+            .child(self.subgroup_header(L10nKey::SettingsGroupAlgorithms, cx))
             .child(text_row(
                 self,
                 t(L10nKey::SettingsKexAlgorithms),
@@ -3130,6 +3145,7 @@ impl Tty7App {
                 &form.hostkey,
                 cx,
             ))
+            .child(self.subgroup_header(L10nKey::SettingsGroupConnection, cx))
             .child(text_row(
                 self,
                 t(L10nKey::SettingsCompression),
@@ -3158,6 +3174,7 @@ impl Tty7App {
                 &form.connect_timeout,
                 cx,
             ))
+            .child(self.subgroup_header(L10nKey::SettingsGroupSession, cx))
             .child(
                 self.settings_row(
                     t(L10nKey::SettingsX11Forwarding),
@@ -3213,6 +3230,7 @@ impl Tty7App {
                     cx,
                 ),
             )
+            .child(self.subgroup_header(L10nKey::SettingsGroupSecurity, cx))
             .child(self.settings_row(
                 t(L10nKey::SettingsVerifyHostKeys),
                 t_fmt(
