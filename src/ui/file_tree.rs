@@ -1445,6 +1445,7 @@ impl Tty7App {
                 let path = path.clone();
                 let is_root = row.is_root;
                 let show_hidden = self.file_tree.show_hidden;
+                let paths_are_local = self.spawn_host(cx).is_local();
                 move |menu, _window, cx| {
                     let danger = cx.theme().danger;
                     Self::tree_row_context_menu(
@@ -1453,6 +1454,7 @@ impl Tty7App {
                         is_dir,
                         is_root,
                         show_hidden,
+                        paths_are_local,
                         danger,
                         &app,
                     )
@@ -1489,6 +1491,12 @@ impl Tty7App {
         is_dir: bool,
         is_root: bool,
         show_hidden: bool,
+        // The tree lists whatever host the workspace spawns on. Everything else
+        // in this menu goes through that host; the file manager only knows this
+        // machine, so over SSH the item would hand Finder a path that is not
+        // here — silently opening nothing, or the wrong thing if a local path
+        // happens to collide.
+        paths_are_local: bool,
         danger: gpui::Hsla,
         app: &gpui::WeakEntity<Self>,
     ) -> PopupMenu {
@@ -1588,19 +1596,16 @@ impl Tty7App {
             );
         }
 
-        menu = menu
-            .separator()
-            .item(
-                PopupMenuItem::new(t(L10nKey::FileTreeContextCopyPath)).on_click({
-                    let p = p.clone();
-                    move |_, _window, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                            p.display().to_string(),
-                        ));
-                    }
-                }),
-            )
-            .item(
+        menu = menu.separator().item(
+            PopupMenuItem::new(t(L10nKey::FileTreeContextCopyPath)).on_click({
+                let p = p.clone();
+                move |_, _window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(p.display().to_string()));
+                }
+            }),
+        );
+        if paths_are_local {
+            menu = menu.item(
                 PopupMenuItem::new(crate::ui::right_panel::reveal_label()).on_click({
                     let p = p.clone();
                     move |_, _window, cx| {
@@ -1608,6 +1613,7 @@ impl Tty7App {
                     }
                 }),
             );
+        }
 
         menu = menu.separator().item(dotfiles_menu_item(show_hidden, app));
 

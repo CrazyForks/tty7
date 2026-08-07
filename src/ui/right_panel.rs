@@ -357,7 +357,7 @@ impl Tty7App {
     fn render_panel_info(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let title = self.panel_title(t(L10nKey::PanelInfoTitle), None, None, window, cx);
         let mut rows: Vec<(&'static str, String)> = Vec::new();
-        let mut cwd_for_actions: Option<PathBuf> = None;
+        let mut cwd_for_actions: Option<(PathBuf, bool)> = None;
         let mut pane_id: Option<u64> = None;
         let mut forwards_pane: Option<u64> = None;
 
@@ -371,7 +371,9 @@ impl Tty7App {
                     .or_else(|| view.cwd())
                 {
                     rows.push((t(L10nKey::PanelCwd), compact_path(&cwd)));
-                    cwd_for_actions = Some(cwd);
+                    // Copy Path is right either way; Reveal only means anything
+                    // when the path is on the machine the file manager can see.
+                    cwd_for_actions = Some((cwd, view.local_cwd().is_some()));
                 }
                 let shell = match view.shell_spec().map(|s| s.program.clone()) {
                     Some(program) => crate::core::shells::default_shell_name(Some(&program)),
@@ -454,8 +456,8 @@ impl Tty7App {
         let inner = v_flex()
             .child(self.panel_subtitle(t(L10nKey::PanelSessionSubtitle), false, None, cx))
             .child(list)
-            .when_some(cwd_for_actions, |this, cwd| {
-                this.child(self.cwd_actions(cwd, cx))
+            .when_some(cwd_for_actions, |this, (cwd, local)| {
+                this.child(self.cwd_actions(cwd, local, cx))
             })
             .children(self.procs_section(pane_id, cx))
             .children(self.ports_section(pane_id, cx))
@@ -464,27 +466,29 @@ impl Tty7App {
         self.panel_scroll(inner, title)
     }
 
-    fn cwd_actions(&self, cwd: PathBuf, cx: &mut Context<Self>) -> AnyElement {
+    fn cwd_actions(&self, cwd: PathBuf, local: bool, cx: &mut Context<Self>) -> AnyElement {
         let reveal_label = reveal_label();
         h_flex()
             .gap(px(2.))
             .px(px(tile_trailing_inset_sm()))
             .pt(px(6.))
-            .child(
-                crate::ui::tab_strip::chrome_tile_sized(
-                    Button::new("panel-info-reveal").icon(Icon::new(IconName::FolderOpen)),
-                    TILE_SIZE_SM,
-                    TILE_GLYPH_SM,
-                    false,
-                    cx,
+            .when(local, |this| {
+                this.child(
+                    crate::ui::tab_strip::chrome_tile_sized(
+                        Button::new("panel-info-reveal").icon(Icon::new(IconName::FolderOpen)),
+                        TILE_SIZE_SM,
+                        TILE_GLYPH_SM,
+                        false,
+                        cx,
+                    )
+                    .rounded_md()
+                    .tooltip(reveal_label)
+                    .on_click({
+                        let cwd = cwd.clone();
+                        move |_, _window, cx| cx.reveal_path(&cwd)
+                    }),
                 )
-                .rounded_md()
-                .tooltip(reveal_label)
-                .on_click({
-                    let cwd = cwd.clone();
-                    move |_, _window, cx| cx.reveal_path(&cwd)
-                }),
-            )
+            })
             .child(
                 crate::ui::tab_strip::chrome_tile_sized(
                     Button::new("panel-info-copy-path").icon(Icon::new(IconName::Copy)),
