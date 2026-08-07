@@ -233,6 +233,12 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsAdvancedSummary => {
             "algorithms / keepalive / proxies / X11 / login scripts"
         }
+        L10nKey::SettingsGroupAuthentication => "Authentication",
+        L10nKey::SettingsGroupProxies => "Proxies",
+        L10nKey::SettingsGroupAlgorithms => "Algorithms",
+        L10nKey::SettingsGroupConnection => "Connection",
+        L10nKey::SettingsGroupSession => "Session",
+        L10nKey::SettingsGroupSecurity => "Security",
         L10nKey::SettingsIdentityFiles => "Identity files",
         L10nKey::SettingsIdentityFilesDesc => "Private-key paths, one per line (%h/%r expand).",
         L10nKey::SettingsAgentForwarding => "Agent forwarding",
