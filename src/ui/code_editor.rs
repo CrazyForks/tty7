@@ -623,7 +623,18 @@ impl Tty7App {
                     Ok(mtime) => {
                         f.disk_mtime = mtime;
                     }
-                    Err(e) => HostOps::notify_err(window, cx, t(L10nKey::EditorSaveFailed), &e),
+                    Err(e) => {
+                        // "Save failed" did not say which file, and with more
+                        // than one editor tab open that is the first thing you
+                        // need to know.
+                        let name = f
+                            .path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| f.path.display().to_string());
+                        let context = t_fmt(L10nKey::EditorSaveFailed, &[("name", &name)]);
+                        HostOps::notify_err(window, cx, &context, &e);
+                    }
                 }
                 if landing.clean {
                     f.dirty = false;

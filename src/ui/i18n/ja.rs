@@ -802,7 +802,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::EditorCantOpen => "{path} を開けません: {e}",
         L10nKey::EditorCantRead => "{path} を読み取れません: {e}",
         L10nKey::EditorNotUtf8 => "「{path}」は有効な UTF-8 ではありません",
-        L10nKey::EditorSaveFailed => "保存に失敗しました",
+        L10nKey::EditorSaveFailed => "{name} を保存できませんでした",
         L10nKey::EditorUnsavedChanges => "「{name}」には保存されていない変更があります",
         L10nKey::EditorDiscard => "破棄",
         L10nKey::EditorNoFileOpen => "開かれているファイルはありません",
@@ -1031,6 +1031,12 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SshPromptUnlock => "ロック解除",
         L10nKey::SshPromptSubmit => "送信",
         L10nKey::HostOpsError => "{context}: {error}",
+        L10nKey::IoDenied => "権限がありません。",
+        L10nKey::IoGone => "もう存在しません。",
+        L10nKey::IoNoSpace => "ディスクに空き容量がありません。",
+        L10nKey::IoReadOnly => "その場所は読み取り専用です。",
+        L10nKey::IoBusy => "他のプログラムが使用中です。",
+        L10nKey::IoTimedOut => "時間内に応答がありませんでした。",
         L10nKey::TreeWindowOpenedEmpty => {
             "このウィンドウのサーバーがタブを渡さなかったため、空のまま開きました。失われたものはなく、応答すれば戻ります。戻らない場合はコマンドパレットの「サーバーを再起動」を実行してください"
         }
