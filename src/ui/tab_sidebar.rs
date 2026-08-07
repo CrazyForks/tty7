@@ -51,6 +51,9 @@ impl Tty7App {
             .max(MIN_SIDEBAR_WIDTH);
         let width = self.sidebar_width.get().clamp(MIN_SIDEBAR_WIDTH, max_width);
         let query = self.sidebar_search.read(cx).value().trim().to_lowercase();
+        // Every group drops itself when its rows filter out, so a query that
+        // matches nothing left the sidebar showing only its own search box.
+        let mut any_rows = false;
 
         let mut list = v_flex()
             .id("tab-sidebar-list")
@@ -497,6 +500,7 @@ impl Tty7App {
                     )
                 });
 
+            any_rows = true;
             list = list.child(match (&group_preview, group_slot) {
                 (Some(p), Some(slot)) if p.from == slot => {
                     deferred(block.relative().top(p.held)).into_any_element()
@@ -517,6 +521,20 @@ impl Tty7App {
                 }
                 _ => block.into_any_element(),
             });
+        }
+
+        if !any_rows && !query.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_3()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(crate::ui::i18n::t_fmt(
+                        crate::ui::i18n::L10nKey::SettingsNothingMatches,
+                        &[("query", &query)],
+                    )),
+            );
         }
 
         let controls = h_flex()
