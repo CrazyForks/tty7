@@ -351,6 +351,15 @@ pub(crate) fn caret_ink(caret: Hsla, background: Hsla, foreground: Hsla) -> Hsla
     }
 }
 
+/// Whether a filled shape needs a hairline to stay a shape. A brand colour is a
+/// fixed value; a theme background is not, and pure black on a dark window is
+/// no shape at all.
+pub(crate) fn needs_edge(fill: u32, surface: Hsla) -> bool {
+    let rgb = crate::terminal::palette::hsla_to_rgb(surface);
+    let packed = (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32;
+    contrast(fill, packed) < 1.25
+}
+
 pub(crate) fn mix(a: u32, b: u32, t: f32) -> u32 {
     let (ar, ag, ab) = (a >> 16 & 0xff, a >> 8 & 0xff, a & 0xff);
     let (br, bg, bb) = (b >> 16 & 0xff, b >> 8 & 0xff, b & 0xff);

@@ -296,7 +296,15 @@ impl Tty7App {
                             this.activate(i, window, cx);
                         }),
                     )
-                    .child(self.tab_avatar(agent, agent_status, agent_unread, ssh_dot, 22., cx))
+                    .child(self.tab_avatar(
+                        ("sidebar-avatar", i),
+                        agent,
+                        agent_status,
+                        agent_unread,
+                        ssh_dot,
+                        22.,
+                        cx,
+                    ))
                     .child(label_region)
                     .when(show_badges && badge_pos < 9, |row| {
                         row.child(
