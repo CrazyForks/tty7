@@ -586,6 +586,18 @@ fn command_score(query: &str, cmd: &Command) -> Option<i32> {
     }
 }
 
+/// A bounded nudge, not a re-ranking. Two commands that match the query about
+/// equally well should come out in the order they actually get run, but a
+/// command used daily must not outrank a plainly better match — a single extra
+/// matched character is worth 16 before bonuses.
+fn frecency_bonus(used: f64) -> i32 {
+    const CEILING: f64 = 24.0;
+    if used <= 0.0 {
+        return 0;
+    }
+    (used.ln_1p() * 8.0).min(CEILING).round() as i32
+}
+
 #[derive(Clone)]
 struct Section {
     title: Option<SharedString>,
@@ -645,6 +657,10 @@ impl PaletteDelegate {
             .collect();
         recent.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         recent.truncate(RECENT_ROWS);
+        // Promoting a command to Recent moves it; it does not clone it. Leaving
+        // it in its group too meant the five rows you use most were the five
+        // rows the list showed twice.
+        let promoted: Vec<&str> = recent.iter().filter_map(|(_, c)| c.kind.id()).collect();
         if !recent.is_empty() {
             sections.push(Section {
                 title: Some(t(L10nKey::CmdRecent).into()),
@@ -657,6 +673,7 @@ impl PaletteDelegate {
                 .commands
                 .iter()
                 .filter(|c| c.group == group)
+                .filter(|c| !c.kind.id().is_some_and(|id| promoted.contains(&id)))
                 .cloned()
                 .collect();
             if !commands.is_empty() {
@@ -757,10 +774,25 @@ impl ListDelegate for PaletteDelegate {
                 }]
             };
         } else {
+            let cfg = cx.global::<Config>();
+            let now = crate::core::config::unix_now();
             let mut scored: Vec<(i32, Command)> = self
                 .commands
                 .iter()
-                .filter_map(|c| command_score(query, c).map(|s| (s, c.clone())))
+                .filter_map(|c| {
+                    let score = command_score(query, c)?;
+                    // Frecency ordered the zero-query list and was then thrown
+                    // away the moment a character was typed, so the command
+                    // someone runs every day stopped floating exactly when
+                    // they started reaching for it.
+                    let used = c
+                        .kind
+                        .id()
+                        .and_then(|id| cfg.command_frecency.get(id))
+                        .map(|u| u.score(now))
+                        .unwrap_or(0.0);
+                    Some((score + frecency_bonus(used), c.clone()))
+                })
                 .collect();
             scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
             let mut commands: Vec<Command> = Vec::new();
@@ -1093,6 +1125,21 @@ mod tests {
             .into_iter()
             .map(|c| c.title)
             .collect()
+    }
+
+    #[test]
+    fn frecency_nudges_without_overruling_the_match() {
+        assert_eq!(frecency_bonus(0.0), 0, "an unused command gets nothing");
+        assert!(frecency_bonus(1.0) > 0, "one use is worth something");
+        // Monotone in usage.
+        assert!(frecency_bonus(20.0) > frecency_bonus(1.0));
+        // Bounded: never worth more than one and a half matched characters,
+        // so a command run a thousand times still loses to a better match.
+        assert!(
+            frecency_bonus(1_000.0) <= 24,
+            "frecency is a tiebreak, not a ranking"
+        );
+        assert_eq!(frecency_bonus(1_000.0), frecency_bonus(10_000.0));
     }
 
     #[test]
