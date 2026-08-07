@@ -806,7 +806,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::EditorCantOpen => "Can't open {path}: {e}",
         L10nKey::EditorCantRead => "Can't read {path}: {e}",
         L10nKey::EditorNotUtf8 => "\"{path}\" is not valid UTF-8",
-        L10nKey::EditorSaveFailed => "Save failed",
+        L10nKey::EditorSaveFailed => "Could not save {name}",
         L10nKey::EditorUnsavedChanges => "\"{name}\" has unsaved changes",
         L10nKey::EditorDiscard => "Discard",
         L10nKey::EditorNoFileOpen => "No file open",
@@ -1048,6 +1048,12 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SshPromptUnlock => "Unlock",
         L10nKey::SshPromptSubmit => "Submit",
         L10nKey::HostOpsError => "{context}: {error}",
+        L10nKey::IoDenied => "You do not have permission.",
+        L10nKey::IoGone => "It is not there any more.",
+        L10nKey::IoNoSpace => "There is no space left on the disk.",
+        L10nKey::IoReadOnly => "That location is read-only.",
+        L10nKey::IoBusy => "Something else has it open.",
+        L10nKey::IoTimedOut => "The machine did not answer in time.",
         L10nKey::TreeWindowOpenedEmpty => {
             "This window's server never handed over its tabs, so it opened empty. Nothing was lost — they come back when it answers. If it doesn't, run \"Restart Server\" from the command palette."
         }

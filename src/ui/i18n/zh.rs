@@ -772,7 +772,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::EditorCantOpen => "无法打开 {path}：{e}",
         L10nKey::EditorCantRead => "无法读取 {path}：{e}",
         L10nKey::EditorNotUtf8 => "\"{path}\" 不是有效的 UTF-8",
-        L10nKey::EditorSaveFailed => "保存失败",
+        L10nKey::EditorSaveFailed => "保存 {name} 失败",
         L10nKey::EditorUnsavedChanges => "\"{name}\" 有未保存的更改",
         L10nKey::EditorDiscard => "放弃",
         L10nKey::EditorNoFileOpen => "没有打开的文件",
@@ -986,6 +986,12 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SshPromptUnlock => "解锁",
         L10nKey::SshPromptSubmit => "提交",
         L10nKey::HostOpsError => "{context}：{error}",
+        L10nKey::IoDenied => "没有权限。",
+        L10nKey::IoGone => "它已经不在了。",
+        L10nKey::IoNoSpace => "磁盘没有空间了。",
+        L10nKey::IoReadOnly => "那个位置是只读的。",
+        L10nKey::IoBusy => "有别的程序正占着它。",
+        L10nKey::IoTimedOut => "对方没有在规定时间内响应。",
         L10nKey::TreeWindowOpenedEmpty => {
             "这个窗口的服务器没有交出标签页，所以窗口是空的。什么都没丢，它一响应就会回来。如果一直不回来，在命令面板里执行「重启服务器」。"
         }
