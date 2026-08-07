@@ -330,20 +330,26 @@ impl Tty7App {
                                 .group_hover(SharedString::from(format!("tab-row-{i}")), |s| {
                                     s.opacity(1.)
                                 })
-                                .child(div().w(px(10.)).h(px(20.)).bg(linear_gradient(
-                                    90.,
-                                    linear_color_stop(fade_from, 0.),
-                                    linear_color_stop(backing, 1.),
-                                )))
+                                .child(div().w(px(10.)).h(px(crate::ui::tab_strip::MIN_TARGET)).bg(
+                                    linear_gradient(
+                                        90.,
+                                        linear_color_stop(fade_from, 0.),
+                                        linear_color_stop(backing, 1.),
+                                    ),
+                                ))
                                 .child(
                                     div().bg(backing).child(
-                                        Button::new(("sidebar-close", i))
-                                            .icon(IconName::Close)
-                                            .ghost()
-                                            .xsmall()
-                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                        crate::ui::tab_strip::hit_target(
+                                            Button::new(("sidebar-close", i))
+                                                .icon(IconName::Close)
+                                                .ghost()
+                                                .xsmall(),
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
                                                 this.close_tab(i, window, cx);
-                                            })),
+                                            }),
+                                        ),
                                     ),
                                 ),
                         )

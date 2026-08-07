@@ -3015,13 +3015,15 @@ impl Tty7App {
                             .child(Input::new(&row.description).xsmall()),
                     )
                     .child(
-                        Button::new(("ssh-fwd-remove", idx))
-                            .icon(Icon::new(IconName::Close))
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(move |this, _, _w, cx| {
-                                this.remove_forward_rule(idx, cx)
-                            })),
+                        crate::ui::tab_strip::hit_target(
+                            Button::new(("ssh-fwd-remove", idx))
+                                .icon(Icon::new(IconName::Close))
+                                .ghost()
+                                .xsmall(),
+                        )
+                        .on_click(
+                            cx.listener(move |this, _, _w, cx| this.remove_forward_rule(idx, cx)),
+                        ),
                     ),
             )
             .when(incomplete, |col| {

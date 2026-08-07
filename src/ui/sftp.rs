@@ -1412,8 +1412,8 @@ impl Tty7App {
                             false,
                             cx,
                         )
-                        .w(px(18.))
-                        .h(px(18.))
+                        .w(px(crate::ui::tab_strip::MIN_TARGET))
+                        .h(px(crate::ui::tab_strip::MIN_TARGET))
                         .rounded(px(4.))
                         .tooltip(t(L10nKey::Dismiss))
                         .on_click(cx.listener(|this, _, _w, cx| this.sftp_dismiss_tray(cx))),
@@ -1531,14 +1531,16 @@ impl Tty7App {
                     )
                     .when(done_download, |this| {
                         this.child(
-                            Button::new(("sftp-reveal-job", job_id as usize))
-                                .icon(IconName::FolderOpen)
-                                .xsmall()
-                                .ghost()
-                                .tooltip(crate::ui::right_panel::reveal_label())
-                                .on_click(cx.listener(move |this, _, _w, cx| {
-                                    this.sftp_reveal_download(local.clone(), cx)
-                                })),
+                            crate::ui::tab_strip::hit_target(
+                                Button::new(("sftp-reveal-job", job_id as usize))
+                                    .icon(IconName::FolderOpen)
+                                    .xsmall()
+                                    .ghost(),
+                            )
+                            .tooltip(crate::ui::right_panel::reveal_label())
+                            .on_click(cx.listener(
+                                move |this, _, _w, cx| this.sftp_reveal_download(local.clone(), cx),
+                            )),
                         )
                     })
                     .when(running, |this| {
