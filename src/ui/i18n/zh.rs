@@ -1087,6 +1087,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::CmdQuickConnectSaveProfile => "将 \"{target}\" 保存为主机配置…",
         L10nKey::CmdRecent => "最近使用",
         L10nKey::AppRestartServerTitle => "重启服务器？",
+        L10nKey::AppRestartServerFailed => "无法重启后台服务器：{error}",
         L10nKey::AppRestartServerMismatchDetail => {
             "服务器是 v{build}，协议 {protocol}；此应用使用 {ours}。两者无法对话，标签页取不出来。\n\n退出：什么都不变，服务器和 shell 继续运行。\n重启：标签页带全新 shell 回来，现在跑着的东西会被杀掉。"
         }
@@ -1116,6 +1117,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::AppWorktreeKeep => "保留",
         L10nKey::AppReopenTabFailed => "无法重新打开标签页：没有启动终端",
         L10nKey::AppOpenTerminalFailed => "无法打开终端：{error}",
+        L10nKey::AppTabsNotRestored => "上次的 {count} 个标签页没能重新打开",
         L10nKey::AppSshConnectionFailed => "SSH 连接失败：{error}",
         L10nKey::AppSshReconnectFailed => "SSH 重新连接失败：{error}",
         L10nKey::AppSplitPaneFailed => "无法拆分窗格：{error}",
@@ -1287,6 +1289,8 @@ pub fn translate_variant_zh(key: L10nKey, branch: &'static str) -> Option<&'stat
         }
         (L10nKey::SftpReplaceBody, "one") => "{names} 在这个文件夹里已经存在，上传会覆盖它。",
         (L10nKey::SftpReplaceBody, "other") => "{names} 在这个文件夹里已经存在，上传会覆盖它们。",
+        (L10nKey::AppTabsNotRestored, "one") => "上次的 1 个标签页没能重新打开",
+        (L10nKey::AppTabsNotRestored, "other") => "上次的 {count} 个标签页没能重新打开",
         (L10nKey::PanelUntracked, "zero") => "0 个未跟踪文件",
         (L10nKey::PanelUntracked, "one") => "1 个未跟踪文件",
         (L10nKey::PanelUntracked, "other") => "{count} 个未跟踪文件",

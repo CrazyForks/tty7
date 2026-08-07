@@ -1179,6 +1179,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::CmdQuickConnectSaveProfile => "「{target}」をプロファイルとして保存…",
         L10nKey::CmdRecent => "最近",
         L10nKey::AppRestartServerTitle => "サーバーを再起動しますか？",
+        L10nKey::AppRestartServerFailed => {
+            "バックグラウンドサーバーを再起動できませんでした: {error}"
+        }
         L10nKey::AppRestartServerMismatchDetail => {
             "サーバーは v{build}、プロトコル {protocol}。このアプリは {ours} です。噛み合わないため、タブを取り出せません。\n\n終了：何も変わりません。サーバーもシェルも動き続けます。\n再起動：タブは新しいシェルで戻り、いま実行中のものは終了します"
         }
@@ -1210,6 +1213,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::AppWorktreeKeep => "保持",
         L10nKey::AppReopenTabFailed => "タブを開き直せませんでした: ターミナルが起動しませんでした",
         L10nKey::AppOpenTerminalFailed => "ターミナルを開けませんでした: {error}",
+        L10nKey::AppTabsNotRestored => "前回のタブ {count} 個を開き直せませんでした",
         L10nKey::AppSshConnectionFailed => "SSH 接続に失敗しました: {error}",
         L10nKey::AppSshReconnectFailed => "SSH 再接続に失敗しました: {error}",
         L10nKey::AppSplitPaneFailed => "ペインを分割できませんでした: {error}",
@@ -1401,6 +1405,8 @@ pub fn translate_variant_ja(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::SftpReplaceBody, "other") => {
             "{names} はこのフォルダに既に存在します。アップロードすると上書きされます。"
         }
+        (L10nKey::AppTabsNotRestored, "one") => "前回のタブ 1 個を開き直せませんでした",
+        (L10nKey::AppTabsNotRestored, "other") => "前回のタブ {count} 個を開き直せませんでした",
         (L10nKey::PanelUntracked, "zero") => "未追跡 0",
         (L10nKey::PanelUntracked, "one") => "未追跡 1",
         (L10nKey::PanelUntracked, "other") => "未追跡 {count}",

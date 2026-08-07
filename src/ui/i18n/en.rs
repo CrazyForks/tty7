@@ -1149,6 +1149,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::CmdQuickConnectSaveProfile => "Save \"{target}\" as profile…",
         L10nKey::CmdRecent => "Recent",
         L10nKey::AppRestartServerTitle => "Restart Server?",
+        L10nKey::AppRestartServerFailed => "Could not restart the background server: {error}",
         L10nKey::AppRestartServerMismatchDetail => {
             "The server holding your shells is build v{build}, protocol {protocol}; this app speaks {ours}. They can't talk, so your tabs are out of reach.\n\nQuit: nothing changes — the server and your shells keep running.\nRestart: tabs come back with fresh shells, and anything running now is killed."
         }
@@ -1178,6 +1179,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::AppWorktreeKeep => "Keep",
         L10nKey::AppReopenTabFailed => "Could not reopen the tab: no terminal started",
         L10nKey::AppOpenTerminalFailed => "Could not open a terminal: {error}",
+        L10nKey::AppTabsNotRestored => "{count} tabs from last time could not be reopened",
         L10nKey::AppSshConnectionFailed => "SSH connection failed: {error}",
         L10nKey::AppSshReconnectFailed => "SSH reconnect failed: {error}",
         L10nKey::AppSplitPaneFailed => "Could not split the pane: {error}",
@@ -1362,6 +1364,9 @@ pub fn translate_variant_en(key: L10nKey, branch: &'static str) -> Option<&'stat
         }
         (L10nKey::SftpReplaceBody, "other") => {
             "{names} already exist in this folder. Uploading overwrites them."
+        (L10nKey::AppTabsNotRestored, "one") => "1 tab from last time could not be reopened",
+        (L10nKey::AppTabsNotRestored, "other") => {
+            "{count} tabs from last time could not be reopened"
         }
         (L10nKey::PanelUntracked, "zero") => "0 untracked",
         (L10nKey::PanelUntracked, "one") => "1 untracked",
