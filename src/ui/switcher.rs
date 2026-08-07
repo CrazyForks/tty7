@@ -1921,7 +1921,7 @@ impl Tty7App {
             .unwrap_or_default();
         let hits = visible_tabs(row, &query);
         if hits.is_empty() {
-            return note(t(L10nKey::SwitcherNoMatch).to_string());
+            return note(t(L10nKey::SwitcherNoTabMatch).to_string());
         }
 
         let sf = rungs(cx);

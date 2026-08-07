@@ -2906,7 +2906,16 @@ impl Tty7App {
             h_flex()
                 .gap_1()
                 .items_center()
-                .child(div().w(px(104.)).child(Input::new(host).xsmall()))
+                // Was pinned at 104px, which does not hold
+                // `ip-10-0-3-217.eu-west-1.compute.internal`. Same floor, but
+                // the field now takes a share of the row's slack instead of
+                // handing all of it to the free-text description beside it.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(104.))
+                        .child(Input::new(host).xsmall()),
+                )
                 .child(div().text_xs().text_color(muted).child(":"))
                 .child(div().w(px(58.)).child(Input::new(port).xsmall()))
         };
@@ -2937,10 +2946,15 @@ impl Tty7App {
                             }
                         },
                     ))
-                    .child(endpoint(&row.bind_host, &row.bind_port))
-                    .child(div().text_xs().text_color(muted).child("→"))
                     .child(
                         div()
+                            .flex_1()
+                            .child(endpoint(&row.bind_host, &row.bind_port)),
+                    )
+                    .child(div().flex_shrink_0().text_xs().text_color(muted).child("→"))
+                    .child(
+                        div()
+                            .flex_1()
                             .opacity(if needs_target { 1.0 } else { 0.35 })
                             .child(endpoint(&row.target_host, &row.target_port)),
                     )

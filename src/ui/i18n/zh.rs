@@ -930,6 +930,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SwitcherRename => "重命名…",
         L10nKey::SwitcherPickAWorkspace => "选一个工作区查看它的标签页",
         L10nKey::SwitcherNoTabs => "这个工作区没有标签页",
+        L10nKey::SwitcherNoTabMatch => "没有匹配的标签页。",
         L10nKey::SwitcherTabsAfterOpening => "打开这个工作区后才能看到它的标签页",
         L10nKey::SwitcherTabCount => "{n} 个标签页",
         L10nKey::SwitcherTabCountOne => "1 个标签页",

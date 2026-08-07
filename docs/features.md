@@ -95,12 +95,13 @@ Keys are shown in macOS notation — on Windows and Linux, read <kbd>⌘</kbd> a
 | | |
 |---|---|
 | <kbd>⌘ T</kbd> · <kbd>⌘ W</kbd> · <kbd>⌘ ⇧ T</kbd> | new tab · close tab · reopen closed tab |
-| <kbd>⌘ 1</kbd>…<kbd>⌘ 9</kbd> · <kbd>⌃ ⇥</kbd> · <kbd>⌃ ⇧ ⇥</kbd> | jump to tab 1–9 · next tab · previous tab |
+| <kbd>⌘ 1</kbd>…<kbd>⌘ 9</kbd> | jump to tab 1–9 |
+| <kbd>⌃ ⇥</kbd> · <kbd>⌃ ⇧ ⇥</kbd> | hold to walk the switcher forwards · backwards; it commits when you let go |
 | <kbd>⌘ D</kbd> · <kbd>⌘ ⇧ D</kbd> | split right · split down |
 | <kbd>⌘ ]</kbd> · <kbd>⌘ [</kbd> | next pane · previous pane |
 | <kbd>⌘ ⌥ ←→↑↓</kbd> | focus the pane in that direction |
-| <kbd>⌘ ⏎</kbd> · <kbd>⌘ ⇧ ⏎</kbd> | toggle fullscreen · maximize / restore the pane |
-| <kbd>⌘ K</kbd> | clear the screen and scrollback |
+| <kbd>⌘ ⏎</kbd> · <kbd>⌘ ⇧ ⏎</kbd> | toggle fullscreen · zoom pane |
+| <kbd>⌘ K</kbd> | clear scrollback |
 | <kbd>⌘ P</kbd> | command palette |
 | <kbd>⌘ F</kbd> | search the scrollback |
 | <kbd>⌃ R</kbd> | fuzzy-search shell history |

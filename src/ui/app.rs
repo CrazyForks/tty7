@@ -2480,7 +2480,7 @@ impl Tty7App {
     fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.ssh_close_confirm.is_none() && self.focused_pane_is_warn_ssh(window, cx) {
             self.ssh_close_confirm = Some(SshCloseKind::Pane);
-            cx.notify();
+            self.ask_ssh_close(window, cx);
             return;
         }
         self.ssh_close_confirm = None;
@@ -2732,7 +2732,7 @@ impl Tty7App {
         let already_confirming = self.ssh_close_confirm == Some(SshCloseKind::Tab(index));
         if !already_confirming && self.tab_has_warn_ssh(index, cx) {
             self.ssh_close_confirm = Some(SshCloseKind::Tab(index));
-            cx.notify();
+            self.ask_ssh_close(window, cx);
             return;
         }
         self.ssh_close_confirm = None;
@@ -4449,6 +4449,32 @@ impl Tty7App {
             .unwrap_or(false)
     }
 
+    /// The app asks every other question of this class through the platform's
+    /// own dialog. This one used to be a bespoke in-app card with no scrim, no
+    /// Escape and no click-outside — the two buttons were the only way out.
+    fn ask_ssh_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            t(crate::ui::i18n::L10nKey::CloseSshConnectionTitle),
+            Some(t(crate::ui::i18n::L10nKey::CloseSshConnectionBody)),
+            &[
+                t(crate::ui::i18n::L10nKey::Keep),
+                t(crate::ui::i18n::L10nKey::Close),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let close = matches!(answer.await, Ok(1));
+            let _ = this.update_in(cx, |this, window, cx| match close {
+                true => this.confirm_ssh_close(window, cx),
+                // Cancelled, or the window went away with the question open:
+                // either way the connection stays up.
+                false => this.cancel_ssh_close(cx),
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn confirm_ssh_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.ssh_close_confirm {
             Some(SshCloseKind::Tab(i)) => self.close_tab(i, window, cx),
@@ -5202,9 +5228,6 @@ impl Render for Tty7App {
                 this.child(el)
             })
             .when_some(self.render_remote_input_notice(cx), |this, el| {
-                this.child(el)
-            })
-            .when_some(self.render_ssh_close_confirm_overlay(cx), |this, el| {
                 this.child(el)
             })
             .when_some(self.render_worktree_prompt_overlay(cx), |this, el| {
