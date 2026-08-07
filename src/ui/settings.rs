@@ -1472,7 +1472,7 @@ impl Tty7App {
         let folder_button = Button::new("open-themes-folder")
             .label(t(L10nKey::SettingsOpenThemesFolder))
             .small()
-            .on_click(cx.listener(|this, _, _w, cx| this.open_themes_folder(cx)));
+            .on_click(cx.listener(|this, _, w, cx| this.open_themes_folder(w, cx)));
 
         if let Some(editor) = editor {
             let seed: Vec<_> = editor

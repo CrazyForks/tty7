@@ -1438,11 +1438,20 @@ impl Tty7App {
         }
     }
 
-    pub(crate) fn open_themes_folder(&self, cx: &mut Context<Self>) {
-        if let Some(dir) = crate::ui::presets::themes_dir() {
-            let _ = std::fs::create_dir_all(&dir);
-            cx.open_with_system(&dir);
+    pub(crate) fn open_themes_folder(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = crate::ui::presets::themes_dir() else {
+            log::warn!("no config directory, so no themes folder to open");
+            return;
+        };
+        // The folder is created on demand, so the first click on a fresh
+        // install is also the one that can fail. Handing an absent path to the
+        // file manager just opens nothing.
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!("could not create {}: {e}", dir.display());
+            crate::ui::host_ops::HostOps::notify_err(window, cx, t(L10nKey::ThemeFolderFailed), &e);
+            return;
         }
+        cx.open_with_system(&dir);
     }
 
     pub(crate) fn fork_active_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
