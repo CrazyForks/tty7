@@ -894,7 +894,7 @@ impl Tty7App {
             .track_focus(&focus_handle)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key.as_str() == "escape" {
-                    this.close_settings(window, cx);
+                    this.close_settings_checked(window, cx);
                 }
             }))
             .child(sidebar)
@@ -933,7 +933,7 @@ impl Tty7App {
                                 .h(px(TILE_SIZE))
                                 .rounded_lg()
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.close_settings(window, cx)
+                                    this.close_settings_checked(window, cx)
                                 })),
                         ),
                 )
@@ -2478,6 +2478,44 @@ impl Tty7App {
     pub(crate) fn save_ssh_form(&mut self, cx: &mut Context<Self>) {
         self.save_editing_profile(cx);
         cx.notify();
+    }
+
+    /// Whether the SSH profile form on screen holds edits that were never
+    /// saved. Save is enabled off exactly this, so closing on it is the same
+    /// question the button already answers.
+    pub(crate) fn ssh_form_dirty(&self, cx: &App) -> bool {
+        let Some(form) = self.active_settings().and_then(|s| s.ssh_form.as_ref()) else {
+            return false;
+        };
+        let saved = cx
+            .global::<Config>()
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == form.editing)
+            .cloned();
+        self.ssh_form_collect(cx) != saved
+    }
+
+    /// Closing from Escape or the X is the user leaving; every other caller
+    /// closes as the tail of something they explicitly chose, and has already
+    /// saved or does not care.
+    pub(crate) fn close_settings_checked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ssh_form_dirty(cx) {
+            self.close_settings(window, cx);
+            return;
+        }
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            t(L10nKey::SettingsDiscardChangesTitle),
+            Some(t(L10nKey::SettingsDiscardChangesBody)),
+            &[t(L10nKey::SettingsKeepEditing), t(L10nKey::EditorDiscard)],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(1) = answer.await else { return };
+            let _ = this.update_in(cx, |this, window, cx| this.close_settings(window, cx));
+        })
+        .detach();
     }
 
     pub(crate) fn save_and_connect_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {

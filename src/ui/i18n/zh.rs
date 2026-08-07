@@ -159,6 +159,9 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
             "在关闭带有活动 SSH 会话的标签页或窗格前请求确认。"
         }
         L10nKey::SettingsNewHost => "新主机",
+        L10nKey::SettingsDiscardChangesTitle => "丢弃未保存的改动？",
+        L10nKey::SettingsDiscardChangesBody => "你正在编辑的连接有还没保存的改动。",
+        L10nKey::SettingsKeepEditing => "继续编辑",
         L10nKey::SettingsName => "名称",
         L10nKey::SettingsNameDesc => "此连接的标签。",
         L10nKey::SettingsHost => "主机",
