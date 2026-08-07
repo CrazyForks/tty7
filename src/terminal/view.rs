@@ -28,6 +28,7 @@ use crate::core::actions::{
 };
 use crate::core::config::{BellMode, Config, NotifyMode};
 use crate::daemon::protocol::{RemoteContext, ShellSpec};
+use crate::ui::i18n::{L10nKey, t, t_fmt};
 
 const GRID_PAD_X: f32 = 8.;
 const GRID_PAD_Y: f32 = 4.;
@@ -293,21 +294,72 @@ fn integration_notice_message(wrapper: Option<&str>) -> String {
     }
 }
 
-fn notify_command_finished(label: &str, elapsed: std::time::Duration) {
-    let secs = elapsed.as_secs();
-    let label = label.trim();
-    let body = if label.is_empty() {
-        format!("Command finished after {secs}s")
-    } else {
-        format!("{label} — finished after {secs}s")
-    };
-    super::remote::notify_desktop(Some("tty7"), &body);
+/// Join whatever context a pane has into a notification title, most specific
+/// part first: an agent name if one is running, otherwise the machine the pane
+/// lives on, then the workspace it belongs to. Kept to two segments — Windows
+/// toast titles are a single line and ellipsize anything longer.
+fn compose_notification_title(
+    lead: Option<String>,
+    host: Option<String>,
+    workspace: Option<String>,
+) -> String {
+    match (lead.or(host), workspace) {
+        (Some(lead), Some(workspace)) => format!("{lead} · {workspace}"),
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => "tty7".to_string(),
+    }
 }
 
-fn notify_agent_finished(agent: crate::core::cli_agent::CLIAgent, elapsed: std::time::Duration) {
-    let secs = elapsed.as_secs();
-    let body = format!("Finished after {secs}s");
-    super::remote::notify_desktop(Some(agent.display_name()), &body);
+impl TerminalView {
+    fn notify_command_finished(
+        &self,
+        label: &str,
+        elapsed: std::time::Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let secs = elapsed.as_secs().to_string();
+        let command = label.trim();
+        let body = if command.is_empty() {
+            t_fmt(L10nKey::NotifyCommandFinished, &[("secs", &secs)])
+        } else {
+            t_fmt(
+                L10nKey::NotifyCommandFinishedWithCommand,
+                &[("command", command), ("secs", &secs)],
+            )
+        };
+        self.notify_pane(None, &body, cx);
+    }
+
+    fn notify_agent_finished(
+        &self,
+        agent: crate::core::cli_agent::CLIAgent,
+        elapsed: std::time::Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let secs = elapsed.as_secs().to_string();
+        let body = t_fmt(L10nKey::NotifyAgentFinished, &[("secs", &secs)]);
+        self.notify_pane(Some(agent.display_name()), &body, cx);
+    }
+
+    /// Notify about this pane, with a title describing where it lives and a
+    /// click that reveals it. The id has to be the pane's *gpui entity id*:
+    /// that is what `TrayAction::RevealPane` matches leaves on, and it is a
+    /// different number from `pane_id`, which the daemon assigns.
+    fn notify_pane(&self, lead: Option<&str>, body: &str, cx: &mut Context<Self>) {
+        let title = self.notification_title(lead, cx);
+        super::remote::notify_desktop_for_pane(Some(&title), body, Some(cx.entity_id()));
+    }
+
+    fn notification_title(&self, lead: Option<&str>, cx: &App) -> String {
+        let host = self
+            .workspace
+            .as_ref()
+            .map(|w| crate::ui::remote_connect::label_for(&w.target, cx));
+        let workspace = self
+            .owner_workspace
+            .and_then(|id| crate::ui::machine_mirror::display_name_for(cx, id));
+        compose_notification_title(lead.map(str::to_string), host, workspace)
+    }
 }
 
 /// Ring the platform's alert sound, reporting whether one was actually made —
@@ -2462,13 +2514,13 @@ impl TerminalView {
                 if notify_allowed {
                     match agent {
                         Some(_) if self.agent_was_rich => {}
-                        Some(agent) => notify_agent_finished(agent, elapsed),
+                        Some(agent) => self.notify_agent_finished(agent, elapsed, cx),
                         None => {
                             let threshold = std::time::Duration::from_secs(
                                 cx.global::<Config>().notify_threshold_secs,
                             );
                             if elapsed >= threshold {
-                                notify_command_finished(&title, elapsed);
+                                self.notify_command_finished(&title, elapsed, cx);
                             }
                         }
                     }
@@ -2705,8 +2757,8 @@ impl TerminalView {
                 let body = session
                     .as_ref()
                     .and_then(|s| s.message.clone())
-                    .unwrap_or_else(|| "Waiting for your input".to_string());
-                super::remote::notify_desktop(Some(agent_name), &body);
+                    .unwrap_or_else(|| t(L10nKey::NotifyAgentWaiting).to_string());
+                self.notify_pane(Some(agent_name), &body, cx);
             }
             Some(AgentStatus::Done)
                 if rich
@@ -2717,10 +2769,13 @@ impl TerminalView {
                     ) =>
             {
                 let body = match self.agent_turn_started.take() {
-                    Some(start) => format!("Finished after {}s", start.elapsed().as_secs()),
-                    None => "Turn finished".to_string(),
+                    Some(start) => {
+                        let secs = start.elapsed().as_secs().to_string();
+                        t_fmt(L10nKey::NotifyAgentFinished, &[("secs", &secs)])
+                    }
+                    None => t(L10nKey::NotifyTurnFinished).to_string(),
                 };
-                super::remote::notify_desktop(Some(agent_name), &body);
+                self.notify_pane(Some(agent_name), &body, cx);
             }
             _ => {}
         }
@@ -5311,8 +5366,8 @@ fn drag_scroll_step(overshoot: f32) -> i32 {
 mod tests {
     use super::{
         LoopbackPlan, RawInput, SelectEndCopy, Typeahead, WheelRoute, clipboard_paste_text,
-        cwd_is_on_host, display_width, is_typeahead_interrupt, loopback_plan,
-        observe_typeahead_for_owner,
+        compose_notification_title, cwd_is_on_host, display_width, is_typeahead_interrupt,
+        loopback_plan, observe_typeahead_for_owner,
     };
     use super::{
         drag_scroll_step, encode_mouse, escape_candidate, expand_file_command_template,
@@ -5331,6 +5386,27 @@ mod tests {
     use crate::core::session::{RemoteTarget, WorkspaceId};
     use crate::daemon::protocol::RemoteKind;
     use crate::terminal::PaneWorkspace;
+
+    #[test]
+    fn a_notification_title_keeps_at_most_two_segments() {
+        let ws = || Some("tty7".to_string());
+        assert_eq!(
+            compose_notification_title(None, Some("build-box".into()), ws()),
+            "build-box · tty7"
+        );
+        // An agent takes the machine's place rather than adding a third part.
+        assert_eq!(
+            compose_notification_title(Some("Claude".into()), Some("build-box".into()), ws()),
+            "Claude · tty7"
+        );
+        // A local pane has no machine label; a nameless workspace has no name.
+        assert_eq!(compose_notification_title(None, None, ws()), "tty7");
+        assert_eq!(
+            compose_notification_title(Some("Claude".into()), None, None),
+            "Claude"
+        );
+        assert_eq!(compose_notification_title(None, None, None), "tty7");
+    }
 
     #[test]
     fn alt_screen_exit_discards_the_boundary_input_before_recording_shell_text() {
