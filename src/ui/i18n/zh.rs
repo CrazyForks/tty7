@@ -33,7 +33,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::Delete => "删除",
         L10nKey::NoMatchingCommands => "没有匹配的命令",
         L10nKey::ConnectSshHint => "输入 user@host 改为通过 SSH 连接。",
-        L10nKey::EditHint => "→ 编辑",
+        L10nKey::EditHint => "编辑",
         L10nKey::OpenFileFromTree => "从文件树打开文件",
         L10nKey::TreeDirLoading => "读取中…",
         L10nKey::TreeDirEmpty => "空",

@@ -33,7 +33,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::Delete => "Delete",
         L10nKey::NoMatchingCommands => "No matching commands",
         L10nKey::ConnectSshHint => "Type user@host to connect over SSH instead.",
-        L10nKey::EditHint => "→ edit",
+        L10nKey::EditHint => "edit",
         L10nKey::OpenFileFromTree => "Open a file from the file tree",
         L10nKey::TreeDirLoading => "Reading…",
         L10nKey::TreeDirEmpty => "Empty",

@@ -878,10 +878,13 @@ impl ListDelegate for PaletteDelegate {
             .child(left);
         if cmd.kind.edit_variant().is_some() {
             row = row.child(
-                div()
+                h_flex()
+                    .items_center()
+                    .gap_1()
                     .text_xs()
                     .text_color(muted)
-                    .child(crate::ui::i18n::t(crate::ui::i18n::L10nKey::EditHint)),
+                    .child(crate::ui::i18n::t(crate::ui::i18n::L10nKey::EditHint))
+                    .child(crate::ui::keymap::key_tokens(EDIT_GESTURE).join("")),
             );
         }
         if let Some(tokens) = keys {
@@ -1070,6 +1073,29 @@ impl PaletteView {
 impl EventEmitter<PaletteEvent> for PaletteView {}
 
 const PALETTE_ROW_H: f32 = 30.;
+
+/// The chord that opens the selected row for editing instead of running it.
+///
+/// It cannot be `→`: gpui-component's `Input` binds bare `right` to MoveRight
+/// in its own key context, so with the query field focused the palette never
+/// sees the key — the old `→ edit` badge was advertising a gesture that could
+/// not fire. `⌘↵` is no better; the app binds it to ToggleFullscreen, which
+/// wins for the same reason. `secondary-e` is claimed by neither.
+const EDIT_GESTURE: &str = "secondary-e";
+
+/// Matches `EDIT_GESTURE` against a live keystroke. Keep the two in step.
+fn is_edit_gesture(ks: &gpui::Keystroke) -> bool {
+    if ks.key != "e" {
+        return false;
+    }
+    let m = &ks.modifiers;
+    let secondary = if cfg!(target_os = "macos") {
+        m.platform
+    } else {
+        m.control
+    };
+    secondary && !m.shift && !m.alt
+}
 const PALETTE_VISIBLE_ROWS: f32 = 12.;
 const RECENT_ROWS: usize = 5;
 
@@ -1106,9 +1132,7 @@ impl Render for PaletteView {
             .bg(scrim)
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
                 let ks = &ev.keystroke;
-                let is_edit_gesture = (ks.key == "enter" && ks.modifiers.platform)
-                    || (ks.key == "right" && !ks.modifiers.platform);
-                if is_edit_gesture {
+                if is_edit_gesture(ks) {
                     if let Some(edit) = this.selected_edit_command(cx) {
                         cx.stop_propagation();
                         cx.emit(PaletteEvent::Confirm(edit));

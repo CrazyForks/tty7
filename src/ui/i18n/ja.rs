@@ -33,7 +33,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::Delete => "削除",
         L10nKey::NoMatchingCommands => "一致するコマンドがありません",
         L10nKey::ConnectSshHint => "SSH で接続するには user@host を入力してください",
-        L10nKey::EditHint => "→ 編集",
+        L10nKey::EditHint => "編集",
         L10nKey::OpenFileFromTree => "ファイルツリーからファイルを開く",
         L10nKey::TreeDirLoading => "読み込み中…",
         L10nKey::TreeDirEmpty => "空",
