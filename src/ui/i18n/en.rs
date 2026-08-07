@@ -36,6 +36,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::TreeDirEmpty => "Empty",
         L10nKey::TreeDirHiddenOnly => "Only hidden files",
         L10nKey::TreeDirUnreadable => "Could not be read",
+        L10nKey::TreeSearchCapped => "First {n} matches",
         L10nKey::FileChangedOnDisk => "File changed on disk",
         L10nKey::Reload => "Reload",
         L10nKey::KeepMine => "Keep mine",
