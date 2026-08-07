@@ -158,6 +158,16 @@ pub(crate) fn chrome_tile_variant_for(selected: bool, cx: &gpui::App) -> ButtonC
 
 pub(crate) const BUTTON_ICON_SCALE: f32 = 0.75;
 
+/// WCAG 2.2 SC 2.5.8 puts the desktop floor for a pointer target at 24×24, and
+/// gpui-component renders an icon-only `.xsmall()` button as a 20×20 box (18×18
+/// where the chrome overrode it). Grow only the box: the glyph keeps its size,
+/// so the chrome looks unchanged and simply stops being fiddly to hit.
+pub(crate) const MIN_TARGET: f32 = 24.;
+
+pub(crate) fn hit_target(button: Button) -> Button {
+    button.w(px(MIN_TARGET)).h(px(MIN_TARGET))
+}
+
 pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> Button {
     chrome_tile_sized(button, TILE_SIZE, TILE_GLYPH, selected, cx)
 }
@@ -964,26 +974,31 @@ impl Tty7App {
                     chip.child(
                         h_flex()
                             .absolute()
-                            .top(px(5.))
+                            // 3 + MIN_TARGET + 3 centres the button in the 30px chip.
+                            .top(px(3.))
                             .right(px(6.))
                             .opacity(0.)
                             .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
                                 s.opacity(1.)
                             })
-                            .child(div().w(px(10.)).h(px(20.)).bg(linear_gradient(
+                            .child(div().w(px(10.)).h(px(MIN_TARGET)).bg(linear_gradient(
                                 90.,
                                 linear_color_stop(fade_from, 0.),
                                 linear_color_stop(backing, 1.),
                             )))
                             .child(
                                 div().bg(backing).child(
-                                    Button::new(("tab-close", i))
-                                        .icon(IconName::Close)
-                                        .ghost()
-                                        .xsmall()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                    hit_target(
+                                        Button::new(("tab-close", i))
+                                            .icon(IconName::Close)
+                                            .ghost()
+                                            .xsmall(),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
                                             this.close_tab(i, window, cx);
-                                        })),
+                                        },
+                                    )),
                                 ),
                             ),
                     )

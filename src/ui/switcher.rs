@@ -1560,13 +1560,15 @@ impl Tty7App {
                     .flex_shrink_0()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
-                        Button::new(gpui::SharedString::from(format!(
-                            "switcher-host-more:{}",
-                            group.key
-                        )))
-                        .icon(IconName::Ellipsis)
-                        .ghost()
-                        .xsmall()
+                        crate::ui::tab_strip::hit_target(
+                            Button::new(gpui::SharedString::from(format!(
+                                "switcher-host-more:{}",
+                                group.key
+                            )))
+                            .icon(IconName::Ellipsis)
+                            .ghost()
+                            .xsmall(),
+                        )
                         .dropdown_menu(move |menu, _window, _cx| {
                             group_menu(menu, &menu_ref, app.clone())
                         }),
@@ -1722,13 +1724,15 @@ impl Tty7App {
                     .group_hover("switcher-row", |x| x.visible())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
-                        Button::new(("switcher-row-more", key))
-                            .icon(IconName::Ellipsis)
-                            .ghost()
-                            .xsmall()
-                            .dropdown_menu(move |menu, _window, _cx| {
-                                row_menu(menu, &menu_ref, app.clone())
-                            }),
+                        crate::ui::tab_strip::hit_target(
+                            Button::new(("switcher-row-more", key))
+                                .icon(IconName::Ellipsis)
+                                .ghost()
+                                .xsmall(),
+                        )
+                        .dropdown_menu(move |menu, _window, _cx| {
+                            row_menu(menu, &menu_ref, app.clone())
+                        }),
                     ),
             )
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {

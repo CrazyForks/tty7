@@ -295,8 +295,8 @@ impl Tty7App {
                             false,
                             cx,
                         )
-                        .w(px(18.))
-                        .h(px(18.))
+                        .w(px(crate::ui::tab_strip::MIN_TARGET))
+                        .h(px(crate::ui::tab_strip::MIN_TARGET))
                         .rounded(px(4.))
                         .tooltip(t(L10nKey::ForwardTooltipRemove))
                         .on_click(cx.listener(
