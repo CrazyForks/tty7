@@ -149,7 +149,6 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsAnsiColors => "ANSI カラー",
         L10nKey::SettingsCustomThemes => "カスタムテーマ",
         L10nKey::SettingsThemesRejected => "テーマフォルダから読み込めなかったもの",
-        L10nKey::ThemeFolderFailed => "テーマフォルダを開けませんでした",
         L10nKey::ThemeDuplicateFailed => "テーマを複製できませんでした",
         L10nKey::ThemeSaveFailed => "テーマを保存できませんでした",
         L10nKey::OpenInFileManagerFailed => "{path} を開けませんでした",

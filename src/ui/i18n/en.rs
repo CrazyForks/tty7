@@ -147,7 +147,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsAnsiColors => "ANSI colors",
         L10nKey::SettingsCustomThemes => "Custom themes",
         L10nKey::SettingsThemesRejected => "Not loaded from the themes folder",
-        L10nKey::ThemeFolderFailed => "Could not open the themes folder",
         L10nKey::ThemeDuplicateFailed => "Could not duplicate the theme",
         L10nKey::ThemeSaveFailed => "Could not save the theme",
         L10nKey::OpenInFileManagerFailed => "Could not open {path}",

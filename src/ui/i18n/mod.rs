@@ -191,7 +191,6 @@ l10n_keys! {
     SettingsCustomThemes,
     SettingsThemesRejected,
     ThemeDuplicateFailed,
-    ThemeFolderFailed,
     ThemeSaveFailed,
     OpenInFileManagerFailed,
     SettingsCustomThemesIntro,

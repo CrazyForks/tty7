@@ -1448,7 +1448,15 @@ impl Tty7App {
         // file manager just opens nothing.
         if let Err(e) = std::fs::create_dir_all(&dir) {
             log::warn!("could not create {}: {e}", dir.display());
-            crate::ui::host_ops::HostOps::notify_err(window, cx, t(L10nKey::ThemeFolderFailed), &e);
+            crate::ui::host_ops::HostOps::notify_err(
+                window,
+                cx,
+                &t_fmt(
+                    L10nKey::OpenInFileManagerFailed,
+                    &[("path", &dir.display().to_string())],
+                ),
+                &e,
+            );
             return;
         }
         cx.open_with_system(&dir);
