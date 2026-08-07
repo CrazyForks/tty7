@@ -6595,6 +6595,9 @@ mod tests {
         let (ssh_title, ssh_body) = close_prompt(true, &CloseReason::LiveSsh);
         assert_ne!(ssh_title, title);
         assert!(!ssh_body.is_empty());
+    }
+
+    #[test]
     fn a_layout_that_came_back_short_says_how_short() {
         crate::ui::i18n::set_locale("en");
         for n in [1usize, 2, 9] {
