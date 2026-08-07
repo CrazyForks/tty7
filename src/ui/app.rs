@@ -65,7 +65,7 @@ const MAX_CLOSED_TABS: usize = 20;
 
 const RESIZE_STEP: f32 = 0.05;
 
-const RECORD_COMMIT_DELAY_MS: u64 = 650;
+pub(crate) const RECORD_COMMIT_DELAY_MS: u64 = 650;
 
 pub(crate) const TITLE_BAR_HEIGHT: f32 = 40.;
 
@@ -378,7 +378,7 @@ pub struct Tty7App {
     pub(crate) maximized: Option<Entity<TerminalView>>,
     pub(crate) mod_hint_badges: bool,
     pub(crate) mod_hint_gen: u64,
-    record_gen: u64,
+    pub(crate) record_gen: u64,
     pub(crate) home_focus: gpui::FocusHandle,
     pub(crate) shells: ShellInventory,
     pub(crate) shells_host: HostId,
