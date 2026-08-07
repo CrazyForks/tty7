@@ -695,10 +695,13 @@ impl Tty7App {
             // renders the first button as the default and lays the rest out
             // beside it, so Discard was landing directly next to the key that
             // Return presses. Apple separates them for exactly this reason.
+            // Three answers, so the shared helper does not fit: Save keeps
+            // index 0 (rightmost, Return), Cancel takes Escape, and Discard
+            // sits on the far left where nothing lands by reflex.
             &[
-                t(L10nKey::Save),
-                t(L10nKey::Cancel),
-                t(L10nKey::EditorDiscard),
+                gpui::PromptButton::ok(t(L10nKey::Save)),
+                gpui::PromptButton::cancel(t(L10nKey::Cancel)),
+                gpui::PromptButton::ok(t(L10nKey::EditorDiscard)),
             ],
             cx,
         );

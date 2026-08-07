@@ -2584,11 +2584,11 @@ impl Tty7App {
             gpui::PromptLevel::Warning,
             t(L10nKey::SettingsDiscardChangesTitle),
             Some(t(L10nKey::SettingsDiscardChangesBody)),
-            &[t(L10nKey::SettingsKeepEditing), t(L10nKey::EditorDiscard)],
+            &crate::ui::confirm_answers(t(L10nKey::EditorDiscard), t(L10nKey::SettingsKeepEditing)),
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(1) = answer.await else { return };
+            let Ok(0) = answer.await else { return };
             let _ = this.update_in(cx, |this, window, cx| this.close_settings(window, cx));
         })
         .detach();
@@ -2641,11 +2641,11 @@ impl Tty7App {
             gpui::PromptLevel::Warning,
             &t_fmt(L10nKey::FileTreeDeleteTitle, &[("name", &name)]),
             Some(t(L10nKey::SettingsDeleteProfileBody)),
-            &[t(L10nKey::Cancel), t(L10nKey::Delete)],
+            &crate::ui::confirm_answers(t(L10nKey::Delete), t(L10nKey::Cancel)),
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(1) = answer.await else { return };
+            let Ok(0) = answer.await else { return };
             let _ = this.update(cx, |this, cx| this.delete_profile_confirmed(id, cx));
         })
         .detach();

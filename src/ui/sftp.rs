@@ -590,11 +590,11 @@ impl Tty7App {
             gpui::PromptLevel::Warning,
             &t_fmt(L10nKey::FileTreeDeleteTitle, &[("name", &entry.name)]),
             Some(&body),
-            &[t(L10nKey::Cancel), t(L10nKey::Delete)],
+            &crate::ui::confirm_answers(t(L10nKey::Delete), t(L10nKey::Cancel)),
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(1) = answer.await else { return };
+            let Ok(0) = answer.await else { return };
             let _ = this.update(cx, |this, cx| {
                 if this.sftp_panel.open_pane_id != Some(pane_id) {
                     return;
@@ -834,11 +834,11 @@ impl Tty7App {
             gpui::PromptLevel::Warning,
             t(L10nKey::SftpReplaceTitle),
             Some(&body),
-            &[t(L10nKey::Cancel), t(L10nKey::Replace)],
+            &crate::ui::confirm_answers(t(L10nKey::Replace), t(L10nKey::Cancel)),
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(1) = answer.await else { return };
+            let Ok(0) = answer.await else { return };
             let _ = this.update(cx, |this, cx| this.sftp_upload_paths_confirmed(paths, cx));
         })
         .detach();

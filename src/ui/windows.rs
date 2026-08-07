@@ -393,14 +393,14 @@ fn confirm_destructive(
                 gpui::PromptLevel::Warning,
                 &title,
                 Some(&detail),
-                &[t(L10nKey::Cancel), verb_label],
+                &crate::ui::confirm_answers(verb_label, t(L10nKey::Cancel)),
                 cx,
             )
         }) else {
             return;
         };
 
-        if let Ok(1) = answer.await {
+        if let Ok(0) = answer.await {
             let _ = cx.update(|cx| act(cx, workspace));
         }
     })

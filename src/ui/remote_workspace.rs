@@ -444,12 +444,12 @@ impl Tty7App {
             PromptLevel::Warning,
             &title,
             Some(&detail),
-            &[t(L10nKey::Cancel), t(L10nKey::SettingsInstall)],
+            &crate::ui::confirm_answers(t(L10nKey::SettingsInstall), t(L10nKey::Cancel)),
             cx,
         );
         cx.spawn(async move |_, _| {
             let decision = match answer.await {
-                Ok(1) => InstallDecision::Approve,
+                Ok(0) => InstallDecision::Approve,
                 _ => InstallDecision::Decline,
             };
             pending.answer(decision);
@@ -484,7 +484,7 @@ impl Tty7App {
         );
         cx.spawn(async move |this, cx| {
             let answered = answer.await;
-            let restart = matches!(answered, Ok(1));
+            let restart = matches!(answered, Ok(0));
             // The window went away with the question open. Arm the rest again
             // rather than swallowing machines nobody was ever asked about.
             if answered.is_err() {
@@ -529,11 +529,11 @@ impl Tty7App {
             PromptLevel::Warning,
             &t_fmt(L10nKey::RemoteRestartTitle, &[("machine", &label)]),
             Some(&t_fmt(L10nKey::RemoteRestartBody, &[("machine", &label)])),
-            &[t(L10nKey::Cancel), t(L10nKey::RestartServer)],
+            &crate::ui::confirm_answers(t(L10nKey::RestartServer), t(L10nKey::Cancel)),
             cx,
         );
         cx.spawn(async move |this, cx| {
-            if !matches!(answer.await, Ok(1)) {
+            if !matches!(answer.await, Ok(0)) {
                 return;
             }
             let _ = this.update_in(cx, |this, window, cx| {
@@ -597,11 +597,14 @@ impl Tty7App {
             PromptLevel::Warning,
             &t_fmt(L10nKey::RemoteMismatchTitle, &[("machine", &label)]),
             Some(&t_fmt(L10nKey::RemoteReplaceBody, &[("machine", &label)])),
-            &[t(L10nKey::Cancel), t(L10nKey::RemoteMismatchReplaceServer)],
+            &crate::ui::confirm_answers(
+                t(L10nKey::RemoteMismatchReplaceServer),
+                t(L10nKey::Cancel),
+            ),
             cx,
         );
         cx.spawn(async move |this, cx| {
-            if !matches!(answer.await, Ok(1)) {
+            if !matches!(answer.await, Ok(0)) {
                 return;
             }
             let _ = this.update_in(cx, |this, window, cx| {

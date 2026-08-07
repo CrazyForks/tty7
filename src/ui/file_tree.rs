@@ -1150,11 +1150,11 @@ impl Tty7App {
             PromptLevel::Warning,
             &t_fmt(L10nKey::FileTreeDeleteTitle, &[("name", &name)]),
             Some(detail),
-            &[t(L10nKey::Cancel), t(L10nKey::Delete)],
+            &crate::ui::confirm_answers(t(L10nKey::Delete), t(L10nKey::Cancel)),
             cx,
         );
         cx.spawn_in(window, async move |app, cx| {
-            let Ok(1) = answer.await else { return };
+            let Ok(0) = answer.await else { return };
             let _ = app.update_in(cx, |app, window, cx| {
                 let Some(host) = app.active_host(cx) else {
                     return;

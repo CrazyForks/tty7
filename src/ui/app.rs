@@ -569,12 +569,12 @@ impl Tty7App {
                 ],
             ),
         };
-        // Quit first, like every other destructive prompt here. NSAlert and
-        // TaskDialog both give the first button Return, and this one arrives
-        // unasked at launch — the moment a stray Return is most likely — so the
-        // key that lands by reflex has to be the one that destroys nothing.
-        // Restarting is a click or an arrow key away, and it is the same shape
-        // as `restart_daemon` below: safe first, act on the second.
+        // The one prompt here that does not use `confirm_answers`, because
+        // neither answer is "leave it alone" — the app cannot carry on beside a
+        // server it cannot speak to. With nothing safe to give Escape, this
+        // keeps Quit at index 0 where Return lands: it arrives unasked at
+        // launch, the moment a stray Return is most likely, and quitting loses
+        // no sessions while restarting the server ends every one of them.
         let answer = window.prompt(
             PromptLevel::Warning,
             t(L10nKey::AppRestartServerTitle),
@@ -1194,14 +1194,14 @@ impl Tty7App {
             PromptLevel::Warning,
             t(crate::ui::i18n::L10nKey::QuitStopServerTitle),
             Some(t(crate::ui::i18n::L10nKey::QuitStopServerBody)),
-            &[
-                t(crate::ui::i18n::L10nKey::Cancel),
+            &crate::ui::confirm_answers(
                 t(crate::ui::i18n::L10nKey::QuitAndStop),
-            ],
+                t(crate::ui::i18n::L10nKey::Cancel),
+            ),
             cx,
         );
         cx.spawn(async move |_this, cx| {
-            if !matches!(answer.await, Ok(1)) {
+            if !matches!(answer.await, Ok(0)) {
                 return;
             }
             cx.background_spawn(async { crate::daemon::spawn::stop() })
@@ -1233,11 +1233,14 @@ impl Tty7App {
             PromptLevel::Warning,
             t(L10nKey::AppRestartServerTitle),
             Some(t(L10nKey::AppRestartServerBody)),
-            &[t(crate::ui::i18n::L10nKey::Cancel), t(L10nKey::AppRestart)],
+            &crate::ui::confirm_answers(
+                t(L10nKey::AppRestart),
+                t(crate::ui::i18n::L10nKey::Cancel),
+            ),
             cx,
         );
         cx.spawn(async move |this, cx| {
-            if !matches!(answer.await, Ok(1)) {
+            if !matches!(answer.await, Ok(0)) {
                 return;
             }
             let _ = this.update_in(cx, |this, _window, cx| this.restart_daemon_confirmed(cx));
@@ -2912,13 +2915,13 @@ impl Tty7App {
                             level,
                             &title,
                             Some(&detail),
-                            &[t(L10nKey::AppWorktreeKeep), remove_label],
+                            &crate::ui::confirm_answers(remove_label, t(L10nKey::AppWorktreeKeep)),
                             cx,
                         )
                     }) else {
                         return;
                     };
-                    if !matches!(answer.await, Ok(1)) {
+                    if !matches!(answer.await, Ok(0)) {
                         return;
                     }
                     let force = wt.dirty;
@@ -4553,14 +4556,14 @@ impl Tty7App {
             PromptLevel::Warning,
             &title,
             Some(&body),
-            &[
-                t(crate::ui::i18n::L10nKey::Keep),
+            &crate::ui::confirm_answers(
                 t(crate::ui::i18n::L10nKey::Close),
-            ],
+                t(crate::ui::i18n::L10nKey::Keep),
+            ),
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
-            let close = matches!(answer.await, Ok(1));
+            let close = matches!(answer.await, Ok(0));
             let _ = this.update_in(cx, |this, window, cx| match close {
                 true => this.confirm_close(window, cx),
                 // Cancelled, or the window went away with the question open:
@@ -5051,14 +5054,14 @@ impl Tty7App {
             PromptLevel::Warning,
             t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaults),
             Some(t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaultsBody)),
-            &[
-                t(crate::ui::i18n::L10nKey::Cancel),
+            &crate::ui::confirm_answers(
                 t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaults),
-            ],
+                t(crate::ui::i18n::L10nKey::Cancel),
+            ),
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(1) = answer.await else { return };
+            let Ok(0) = answer.await else { return };
             let _ = this.update(cx, |this, cx| {
                 this.restore_default_keybindings_confirmed(cx)
             });
