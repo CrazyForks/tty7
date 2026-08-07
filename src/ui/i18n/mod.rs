@@ -51,8 +51,24 @@ thread_local! {
     static TEST_LOCALE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum L10nKey {
+/// Defines the key enum and, with it, the list of every key that exists.
+///
+/// The parity guard used to walk a hand-maintained copy of this list, so a key
+/// added without being added there was checked by nobody. There is exactly one
+/// list now, and it is the one the compiler reads.
+macro_rules! l10n_keys {
+    ($($key:ident),* $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum L10nKey { $($key),* }
+
+        impl L10nKey {
+            #[cfg(test)]
+            pub(crate) const ALL: &'static [L10nKey] = &[$(L10nKey::$key),*];
+        }
+    };
+}
+
+l10n_keys! {
     SearchTabs,
     SearchFiles,
     SearchThemes,
@@ -1125,241 +1141,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zh_translations_cover_the_initial_keys() {
-        for key in [
-            L10nKey::SearchTabs,
-            L10nKey::SearchFiles,
-            L10nKey::SearchThemes,
-            L10nKey::SearchSettings,
-            L10nKey::FilterHosts,
-            L10nKey::SearchCommandsOrHost,
-            L10nKey::SearchTheme,
-            L10nKey::Search,
-            L10nKey::SearchWorkspacesAndMachines,
-            L10nKey::SearchFonts,
-            L10nKey::SearchFind,
-            L10nKey::SearchMatchCase,
-            L10nKey::SearchUseRegex,
-            L10nKey::NewFolderName,
-            L10nKey::NewFileName,
-            L10nKey::HomeNewTab,
-            L10nKey::HomeReopenClosedTab,
-            L10nKey::HomeSwitchWorkspace,
-            L10nKey::HomeCommandPalette,
-            L10nKey::HomeSplitRight,
-            L10nKey::HomeSplitDown,
-            L10nKey::HomeSettings,
-            L10nKey::TrayQuitStopServer,
-            L10nKey::Reconnect,
-            L10nKey::None,
-            L10nKey::TryAgain,
-            L10nKey::Refreshing,
-            L10nKey::Binary,
-            L10nKey::Delete,
-            L10nKey::NoMatchingCommands,
-            L10nKey::ConnectSshHint,
-            L10nKey::EditHint,
-            L10nKey::OpenFileFromTree,
-            L10nKey::TreeDirLoading,
-            L10nKey::TreeDirEmpty,
-            L10nKey::TreeDirHiddenOnly,
-            L10nKey::TreeDirUnreadable,
-            L10nKey::FileChangedOnDisk,
-            L10nKey::Reload,
-            L10nKey::KeepMine,
-            L10nKey::Dismiss,
-            L10nKey::StoredPasswordRejected,
-            L10nKey::Trust,
-            L10nKey::Abort,
-            L10nKey::HostKeyOverrideMessage,
-            L10nKey::Override,
-            L10nKey::RememberKeychain,
-            L10nKey::Cancel,
-            L10nKey::Close,
-            L10nKey::QuitStopServerTitle,
-            L10nKey::QuitStopServerBody,
-            L10nKey::QuitAndStop,
-            L10nKey::CloseSshConnectionTitle,
-            L10nKey::CloseSshConnectionBody,
-            L10nKey::ClosePaneBusyTitle,
-            L10nKey::CloseTabBusyTitle,
-            L10nKey::CloseBusyCommandBody,
-            L10nKey::CloseBusyAgentBody,
-            L10nKey::Keep,
-            L10nKey::SettingsNavAppearance,
-            L10nKey::SettingsNavTerminal,
-            L10nKey::SettingsNavInput,
+    fn every_key_is_translated_in_every_locale() {
+        // Deliberately the same in every locale. Each of these reads as
+        // English because English is the right answer there, not because
+        // nobody got to it.
+        const KEPT_IN_ENGLISH: &[L10nKey] = &[
+            // Protocol and format names no locale translates.
+            L10nKey::CmdGroupSsh,
             L10nKey::SettingsNavSsh,
-            L10nKey::SettingsNavAgents,
-            L10nKey::SettingsNavWindowTabs,
-            L10nKey::SettingsNavKeybindings,
-            L10nKey::SettingsNavAbout,
-            L10nKey::SettingsHeader,
-            L10nKey::Reset,
-            L10nKey::Save,
-            L10nKey::Connect,
-            L10nKey::Download,
-            L10nKey::Link,
-            L10nKey::SettingsThemeIntroTitle,
-            L10nKey::SettingsThemeIntroDesc,
-            L10nKey::SettingsTypography,
-            L10nKey::SettingsFontSize,
-            L10nKey::SettingsFontSizeDesc,
-            L10nKey::SettingsLineHeight,
-            L10nKey::SettingsLineHeightDesc,
-            L10nKey::SettingsFontFamily,
-            L10nKey::SettingsFontFamilyDesc,
-            L10nKey::SettingsBoldFont,
-            L10nKey::SettingsBoldFontDesc,
-            L10nKey::SettingsItalicFont,
-            L10nKey::SettingsItalicFontDesc,
-            L10nKey::SettingsFontLigatures,
-            L10nKey::SettingsFontLigaturesDesc,
-            L10nKey::SettingsCursor,
-            L10nKey::SettingsCursorShape,
-            L10nKey::SettingsCursorShapeDesc,
-            L10nKey::SettingsCursorBlink,
-            L10nKey::SettingsCursorBlinkDesc,
-            L10nKey::SettingsTransparency,
-            L10nKey::SettingsOpacity,
-            L10nKey::SettingsOpacityDesc,
-            L10nKey::SettingsBlur,
-            L10nKey::SettingsBlurDesc,
-            L10nKey::FollowTheme,
-            L10nKey::SettingsDimInactivePanes,
-            L10nKey::SettingsDimInactivePanesDesc,
-            L10nKey::SettingsOpenThemesFolder,
-            L10nKey::SettingsChangeThemeImage,
-            L10nKey::SettingsChooseThemeImage,
-            L10nKey::SettingsRemoveThemeImage,
-            L10nKey::SettingsImageOpacity,
-            L10nKey::SettingsImageOpacityDesc,
-            L10nKey::SettingsEditTheme,
-            L10nKey::SettingsEditThemeIntro,
-            L10nKey::SettingsBackgroundImage,
-            L10nKey::SettingsBackgroundImageDesc,
-            L10nKey::SettingsAnsiColors,
-            L10nKey::SettingsCustomThemes,
-            L10nKey::SettingsCustomThemesIntro,
-            L10nKey::SettingsDuplicateToEdit,
-            L10nKey::SettingsHosts,
-            L10nKey::SettingsDefaults,
-            L10nKey::SettingsInheritedByEveryHost,
-            L10nKey::SettingsNoSavedHosts,
-            L10nKey::SettingsNothingMatches,
-            L10nKey::SettingsInTty7,
-            L10nKey::SettingsImportFromSshConfig,
-            L10nKey::SettingsExpandAllGroups,
-            L10nKey::SettingsNoHostsYet,
-            L10nKey::SettingsNothingSelected,
-            L10nKey::SettingsTypeAddressToConnect,
-            L10nKey::SettingsMoreInSshConfig,
-            L10nKey::SettingsAliasesLinked,
-            L10nKey::SettingsImportAliases,
-            L10nKey::SettingsImportAliasesDesc,
-            L10nKey::SettingsImportNow,
-            L10nKey::SettingsDefaultsIntro,
-            L10nKey::SettingsCopyAddress,
-            L10nKey::SettingsDuplicate,
-            L10nKey::SettingsForgetPassword,
-            L10nKey::SettingsForgotPasswordFor,
-            L10nKey::SettingsDeleteProfileBody,
-            L10nKey::SettingsCouldntForgetPassword,
-            L10nKey::SettingsSecurity,
-            L10nKey::SettingsSecurityIntro,
-            L10nKey::SettingsVerifyHostKeys,
-            L10nKey::SettingsVerifyHostKeysDesc,
-            L10nKey::WarnBeforeClosing,
-            L10nKey::SettingsWarnBeforeClosingDesc,
-            L10nKey::SettingsNewHost,
-            L10nKey::SettingsDiscardChangesTitle,
-            L10nKey::SettingsDiscardChangesBody,
-            L10nKey::SettingsKeepEditing,
-            L10nKey::SettingsName,
-            L10nKey::SettingsNameDesc,
-            L10nKey::SettingsHost,
-            L10nKey::SettingsHostDesc,
-            L10nKey::SettingsUser,
-            L10nKey::SettingsUserDesc,
-            L10nKey::SettingsAuth,
-            L10nKey::SettingsAuthDesc,
-            L10nKey::SettingsAuthModeAuto,
-            L10nKey::SettingsAuthModePassword,
-            L10nKey::SettingsAuthModeKey,
-            L10nKey::SettingsAuthModeAgent,
+            L10nKey::ForwardSocksLabel,
+            L10nKey::RemoteInstallShaLabel,
             L10nKey::SettingsAuthMode2Fa,
-            L10nKey::SettingsJumpHost,
-            L10nKey::SettingsJumpHostDesc,
-            L10nKey::SettingsNoneSummary,
-            L10nKey::SettingsNoneLower,
-            L10nKey::SettingsPortForwarding,
-            L10nKey::SettingsRulesOpenedWithConnection,
-            L10nKey::SettingsAddRule,
-            L10nKey::SettingsFwdLegendLocal,
-            L10nKey::SettingsFwdLegendRemote,
-            L10nKey::SettingsFwdLegendDynamic,
-            L10nKey::SettingsFwdNeedsBoth,
-            L10nKey::SettingsFwdNeedsListen,
-            L10nKey::SettingsAdvanced,
-            L10nKey::SettingsAdvancedSummary,
-            L10nKey::SettingsIdentityFiles,
-            L10nKey::SettingsIdentityFilesDesc,
-            L10nKey::SettingsAgentForwarding,
-            L10nKey::SettingsAgentForwardingDesc,
             L10nKey::SettingsProxyCommand,
-            L10nKey::SettingsProxyCommandDesc,
-            L10nKey::SettingsSocks5Proxy,
-            L10nKey::SettingsSocks5ProxyDesc,
-            L10nKey::SettingsHttpProxy,
-            L10nKey::SettingsHttpProxyDesc,
-            L10nKey::SettingsKexAlgorithms,
-            L10nKey::SettingsKexAlgorithmsDesc,
-            L10nKey::SettingsCiphers,
-            L10nKey::SettingsCiphersDesc,
-            L10nKey::SettingsMacs,
-            L10nKey::SettingsMacsDesc,
-            L10nKey::SettingsHostKeyAlgorithms,
-            L10nKey::SettingsHostKeyAlgorithmsDesc,
-            L10nKey::SettingsCompression,
-            L10nKey::SettingsJumpHostVia,
-            L10nKey::SettingsConnected,
-            L10nKey::SettingsProfileCopied,
-            L10nKey::SettingsCompressionDesc,
-            L10nKey::SettingsKeepaliveInterval,
-            L10nKey::SettingsKeepaliveIntervalDesc,
-            L10nKey::SettingsKeepaliveCountMax,
-            L10nKey::SettingsKeepaliveCountMaxDesc,
-            L10nKey::SettingsConnectTimeout,
-            L10nKey::SettingsConnectTimeoutDesc,
-            L10nKey::SettingsX11Forwarding,
-            L10nKey::SettingsX11ForwardingDesc,
-            L10nKey::SettingsShellIntegration,
-            L10nKey::SettingsShellIntegrationDesc,
-            L10nKey::SettingsLoginScripts,
-            L10nKey::SettingsLoginScriptsDesc,
-            L10nKey::SettingsSkipBanner,
-            L10nKey::SettingsSkipBannerDesc,
-            L10nKey::SettingsDefaultFollowsDefaults,
-            L10nKey::SettingsValueOn,
-            L10nKey::SettingsValueOff,
-            L10nKey::SettingsDefault,
-            L10nKey::SettingsOn,
-            L10nKey::SettingsOff,
+            L10nKey::SftpContextChmod,
             L10nKey::SettingsShell,
-            L10nKey::SettingsShellIntro,
-            L10nKey::SettingsProgram,
-            L10nKey::SettingsProgramDesc,
-            L10nKey::SettingsArguments,
-            L10nKey::SettingsArgumentsDesc,
-            L10nKey::SettingsStartIn,
-            L10nKey::SettingsStartInDesc,
-            L10nKey::SettingsCustomPath,
-            L10nKey::SettingsCustomPathDesc,
-            L10nKey::SettingsWdInherit,
-            L10nKey::SettingsWdHome,
-            L10nKey::SettingsWdCustom,
-            L10nKey::SettingsShellFooter,
-            L10nKey::SettingsScrolling,
             L10nKey::SettingsScrollback,
             L10nKey::SettingsScrollbackDesc,
             L10nKey::SettingsScrollSpeed,
@@ -1520,9 +1315,16 @@ mod tests {
             L10nKey::SettingsAppHttpProxy,
             L10nKey::SettingsAppHttpProxyDesc,
             L10nKey::SettingsAppHttpProxyInvalid,
+            L10nKey::Ok,
+            // Pure templates: every word in them is a placeholder.
+            L10nKey::AppCmdSshProfileTitle,
+            L10nKey::HostOpsError,
+            L10nKey::SftpTransferProgress,
+            // Product names.
             L10nKey::SettingsAgentClaudeCode,
             L10nKey::SettingsAgentCodex,
             L10nKey::SettingsAgentCopilotCli,
+            L10nKey::SettingsAgentGrokBuild,
             L10nKey::SettingsAgentOpencode,
             L10nKey::SettingsAgentPi,
             L10nKey::SettingsAgentGrokBuild,
@@ -2062,29 +1864,40 @@ mod tests {
             L10nKey::SwitcherStatusNotConnected,
             L10nKey::SettingsLanguage,
             L10nKey::SettingsLanguageDesc,
+            // A language is named in its own language on every locale's list.
             L10nKey::SettingsLanguageEnglish,
             L10nKey::SettingsLanguageChinese,
             L10nKey::SettingsLanguageJapanese,
-            L10nKey::SettingsSearchLanguageKeywords,
-            L10nKey::SettingsFontDefault,
-            L10nKey::ForwardDescriptionPlaceholder,
-            L10nKey::SettingsShellDefaultLoginShell,
-            L10nKey::SftpErrorUnexpectedReply,
-            L10nKey::SftpErrorUnsafeRemoteName,
-            L10nKey::SftpErrorInvalidOctalMode,
-        ] {
-            assert!(
-                translate_zh(key).is_some_and(|text| !text.is_empty()),
-                "missing zh translation for {key:?}"
-            );
-            assert!(
-                translate_ja(key).is_some_and(|text| !text.is_empty()),
-                "missing ja translation for {key:?}"
-            );
-            assert!(
-                !translate_en(key).is_empty(),
-                "missing en translation for {key:?}"
-            );
+            // The pane-type labels are one set — shell / agent / ssh — and
+            // translating only the middle one would break the set.
+            L10nKey::PanelShell,
+            L10nKey::PanelAgent,
+            L10nKey::PanelSsh,
+            // "Agent" is the word the Chinese- and Japanese-speaking developer
+            // audience uses for these; a translation here would be less clear,
+            // not more.
+            L10nKey::CmdGroupAgents,
+            L10nKey::SettingsNavAgents,
+            L10nKey::SettingsAgentsIntro,
+        ];
+
+        for &key in L10nKey::ALL {
+            let en = translate_en(key);
+            assert!(!en.is_empty(), "missing en translation for {key:?}");
+            for (name, text) in [("zh", translate_zh(key)), ("ja", translate_ja(key))] {
+                let text = text.unwrap_or_else(|| panic!("missing {name} translation for {key:?}"));
+                assert!(!text.is_empty(), "empty {name} translation for {key:?}");
+                // A value identical to the English one is usually a key that
+                // was added and never translated. Some are deliberate — see
+                // the list above — and product names carry through.
+                // A value byte-identical to the English one is almost always
+                // a key that was added and never translated. The exceptions
+                // are listed above, with the reason.
+                assert!(
+                    text != en || KEPT_IN_ENGLISH.contains(&key),
+                    "{name} still reads the English for {key:?}: {en:?}"
+                );
+            }
         }
     }
 

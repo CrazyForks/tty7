@@ -514,8 +514,8 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsUpdateChannelDesc => {
             "Stable は正式リリースを、Nightly は最新のコードから毎晩ビルドされる版を追いかけます。新しい代わりに、リリース前のテストは経ていません。"
         }
-        L10nKey::SettingsUpdateChannelStable => "Stable",
-        L10nKey::SettingsUpdateChannelNightly => "Nightly",
+        L10nKey::SettingsUpdateChannelStable => "安定版",
+        L10nKey::SettingsUpdateChannelNightly => "ナイトリー",
         L10nKey::SettingsDaemonStale => "バックグラウンドサービスは {build} のままです。",
         L10nKey::SettingsDaemonStaleDesc => {
             "tty7 はその場で更新されたため、アプリは新しくなりましたが、各ペインは以前のビルドのサービスが処理しています。サービスを再起動すると新しいビルドに切り替わりますが、ペインで動いているプロセス（シェル、エージェント、SSH セッション）はすべて終了します。急ぐ必要はありません。ペインが空いているときに実行してください。"
