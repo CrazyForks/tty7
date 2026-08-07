@@ -82,7 +82,21 @@ impl Tty7App {
                 s.tabs
                     .iter()
                     .map(|&i| (i, self.tab_label(&self.tabs[i], i, Some(window), cx)))
-                    .filter(|(_, label)| query.is_empty() || label.to_lowercase().contains(&query))
+                    // The row shows a truncated title and a branch; the filter
+                    // only ever read the truncated title, so typing the branch
+                    // you can see, or the part of the path the row elided,
+                    // matched nothing.
+                    .filter(|(i, label)| {
+                        query.is_empty()
+                            || label.to_lowercase().contains(&query)
+                            || self.tabs[*i]
+                                .leaf_title(Some(window), cx)
+                                .to_lowercase()
+                                .contains(&query)
+                            || self.tabs[*i]
+                                .git_status(Some(window), cx)
+                                .is_some_and(|g| g.branch.to_lowercase().contains(&query))
+                    })
                     .collect()
             })
             .collect();
