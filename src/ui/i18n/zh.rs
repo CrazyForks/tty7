@@ -1166,6 +1166,9 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsShellDefaultLoginShell => "你的登录 shell",
         L10nKey::SftpErrorUnexpectedReply => "意外回复：{reply}",
         L10nKey::SftpErrorUnsafeRemoteName => "拒绝不安全的远程名称 {name}",
+        L10nKey::SftpReplaceTitle => "覆盖已有的文件？",
+        L10nKey::SftpReplaceBody => "{names} 在这个文件夹里已经存在，上传会覆盖它们。",
+        L10nKey::Replace => "覆盖",
         L10nKey::SftpErrorInvalidOctalMode => "无效的八进制模式",
         L10nKey::PanelMoreChangedFiles => "…还有 {count} 个变更文件——运行 `git diff` 查看。",
         L10nKey::PanelUntracked => "{count} 个未跟踪文件",
@@ -1270,6 +1273,8 @@ pub fn translate_variant_zh(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::SettingsOfflineMachines, "other") => {
             "还有 {count} 台已保存的机器未连接——在其中一台上打开工作区，即可在那台机器上安装 hook。"
         }
+        (L10nKey::SftpReplaceBody, "one") => "{names} 在这个文件夹里已经存在，上传会覆盖它。",
+        (L10nKey::SftpReplaceBody, "other") => "{names} 在这个文件夹里已经存在，上传会覆盖它们。",
         (L10nKey::PanelUntracked, "zero") => "0 个未跟踪文件",
         (L10nKey::PanelUntracked, "one") => "1 个未跟踪文件",
         (L10nKey::PanelUntracked, "other") => "{count} 个未跟踪文件",

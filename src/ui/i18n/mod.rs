@@ -1033,6 +1033,9 @@ l10n_keys! {
     SettingsShellDefaultLoginShell,
     SftpErrorUnexpectedReply,
     SftpErrorUnsafeRemoteName,
+    SftpReplaceTitle,
+    SftpReplaceBody,
+    Replace,
     SftpErrorInvalidOctalMode,
 }
 
@@ -1900,6 +1903,29 @@ mod tests {
                     "{name} still reads the English for {key:?}: {en:?}"
                 );
             }
+            L10nKey::SettingsSearchLanguageKeywords,
+            L10nKey::SettingsFontDefault,
+            L10nKey::ForwardDescriptionPlaceholder,
+            L10nKey::SettingsShellDefaultLoginShell,
+            L10nKey::SftpErrorUnexpectedReply,
+            L10nKey::SftpErrorUnsafeRemoteName,
+            L10nKey::SftpReplaceTitle,
+            L10nKey::SftpReplaceBody,
+            L10nKey::Replace,
+            L10nKey::SftpErrorInvalidOctalMode,
+        ] {
+            assert!(
+                translate_zh(key).is_some_and(|text| !text.is_empty()),
+                "missing zh translation for {key:?}"
+            );
+            assert!(
+                translate_ja(key).is_some_and(|text| !text.is_empty()),
+                "missing ja translation for {key:?}"
+            );
+            assert!(
+                !translate_en(key).is_empty(),
+                "missing en translation for {key:?}"
+            );
         }
     }
 

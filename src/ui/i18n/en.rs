@@ -1230,6 +1230,11 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsShellDefaultLoginShell => "your login shell",
         L10nKey::SftpErrorUnexpectedReply => "unexpected reply: {reply}",
         L10nKey::SftpErrorUnsafeRemoteName => "refusing unsafe remote name {name}",
+        L10nKey::SftpReplaceTitle => "Replace what is already there?",
+        L10nKey::SftpReplaceBody => {
+            "{names} already exist in this folder. Uploading overwrites them."
+        }
+        L10nKey::Replace => "Replace",
         L10nKey::SftpErrorInvalidOctalMode => "invalid octal mode",
         L10nKey::PanelMoreChangedFiles => {
             "… and {count} more changed files — run `git diff` to see them."
@@ -1339,6 +1344,12 @@ pub fn translate_variant_en(key: L10nKey, branch: &'static str) -> Option<&'stat
         }
         (L10nKey::SettingsOfflineMachines, "other") => {
             "{count} more saved machines are not connected — open a workspace on one to install its hooks there."
+        }
+        (L10nKey::SftpReplaceBody, "one") => {
+            "{names} already exists in this folder. Uploading overwrites it."
+        }
+        (L10nKey::SftpReplaceBody, "other") => {
+            "{names} already exist in this folder. Uploading overwrites them."
         }
         (L10nKey::PanelUntracked, "zero") => "0 untracked",
         (L10nKey::PanelUntracked, "one") => "1 untracked",

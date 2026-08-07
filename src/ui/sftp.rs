@@ -265,6 +265,31 @@ fn local_download_dir() -> PathBuf {
     local_home().join("Downloads")
 }
 
+/// `dir/name`, or the first `dir/name (n)` that is not taken. A dotfile keeps
+/// its leading dot and gets the number on the end, the way the OS numbers one.
+fn free_local_path(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let path = Path::new(name);
+    let ext = path.extension().map(|e| e.to_string_lossy().to_string());
+    let stem = path
+        .file_stem()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string());
+    for n in 2..1000u32 {
+        let candidate = match &ext {
+            Some(ext) => dir.join(format!("{stem} ({n}).{ext}")),
+            None => dir.join(format!("{stem} ({n})")),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
 impl Tty7App {
     pub(crate) fn toggle_sftp(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         use crate::core::config::RightPanelTab;
@@ -517,7 +542,10 @@ impl Tty7App {
             return;
         }
         let remote = remote_join(&self.sftp_panel.cwd, &entry.name);
-        let local = local_download_dir().join(&entry.name);
+        // Downloading twice used to write over the first copy without a word.
+        // Browsers answer this by numbering the second one; that keeps the
+        // gesture one click and still cannot lose a file.
+        let local = free_local_path(&local_download_dir(), &entry.name);
         let recursive = matches!(entry.kind, SftpEntryKind::Dir);
         let spec = SftpTransferSpec {
             pane_id,
@@ -755,7 +783,7 @@ impl Tty7App {
         }
     }
 
-    pub(crate) fn sftp_pick_upload(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn sftp_pick_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sftp_panel.open_pane_id.is_none() {
             return;
         }
@@ -765,15 +793,58 @@ impl Tty7App {
             multiple: true,
             prompt: None,
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
-                let _ = this.update(cx, |this, cx| this.sftp_upload_paths(paths, cx));
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.sftp_upload_paths(paths, window, cx)
+                });
             }
         })
         .detach();
     }
 
-    pub(crate) fn sftp_upload_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    pub(crate) fn sftp_upload_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Uploading into the directory on screen used to overwrite whatever was
+        // already there without a word. The listing being shown is the answer —
+        // no extra round trip to the far side to find out.
+        let clashes: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .filter(|name| self.sftp_panel.entries.iter().any(|e| &e.name == name))
+            .collect();
+        if clashes.is_empty() {
+            self.sftp_upload_paths_confirmed(paths, cx);
+            return;
+        }
+        let names = match clashes.len() {
+            1..=3 => clashes.join(", "),
+            _ => format!("{}, …", clashes[..3].join(", ")),
+        };
+        let body = crate::ui::i18n::t_plural(
+            L10nKey::SftpReplaceBody,
+            clashes.len(),
+            &[("names", &names)],
+        );
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            t(L10nKey::SftpReplaceTitle),
+            Some(&body),
+            &[t(L10nKey::Cancel), t(L10nKey::Replace)],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(1) = answer.await else { return };
+            let _ = this.update(cx, |this, cx| this.sftp_upload_paths_confirmed(paths, cx));
+        })
+        .detach();
+    }
+
+    fn sftp_upload_paths_confirmed(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let Some(pane_id) = self.sftp_panel.open_pane_id else {
             return;
         };
@@ -921,8 +992,8 @@ impl Tty7App {
                 list,
                 &self.sftp_panel.scroll,
             ))
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
-                this.sftp_upload_paths(paths.paths().to_vec(), cx);
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.sftp_upload_paths(paths.paths().to_vec(), window, cx);
             }))
             .into_any_element()
     }
@@ -1018,7 +1089,7 @@ impl Tty7App {
         match action {
             SftpMenuAction::NewFolder => self.sftp_begin_new_folder(window, cx),
             SftpMenuAction::NewFile => self.sftp_begin_new_file(window, cx),
-            SftpMenuAction::Upload => self.sftp_pick_upload(cx),
+            SftpMenuAction::Upload => self.sftp_pick_upload(window, cx),
             SftpMenuAction::GotoShellCwd => {
                 if let Some(pane_id) = self.sftp_panel.open_pane_id
                     && let Some(cwd) = self.pane_shell_cwd(pane_id, window, cx)
@@ -1605,6 +1676,46 @@ impl Tty7App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_download_is_numbered_rather_than_written_over_the_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+
+        // Nothing there: the plain name.
+        assert_eq!(free_local_path(d, "notes.txt"), d.join("notes.txt"));
+
+        std::fs::write(d.join("notes.txt"), b"first").expect("write");
+        assert_eq!(free_local_path(d, "notes.txt"), d.join("notes (2).txt"));
+        std::fs::write(d.join("notes (2).txt"), b"second").expect("write");
+        assert_eq!(free_local_path(d, "notes.txt"), d.join("notes (3).txt"));
+
+        // Extensionless and dotfiles keep their shape.
+        std::fs::write(d.join("Makefile"), b"x").expect("write");
+        assert_eq!(free_local_path(d, "Makefile"), d.join("Makefile (2)"));
+        std::fs::write(d.join(".env"), b"x").expect("write");
+        assert_eq!(free_local_path(d, ".env"), d.join(".env (2)"));
+
+        // And the first file is still the first file.
+        assert_eq!(
+            std::fs::read(d.join("notes.txt")).expect("read"),
+            b"first".to_vec()
+        );
+    }
+
+    #[test]
+    fn the_overwrite_question_counts_correctly_in_every_locale() {
+        use crate::ui::i18n::{L10nKey, t_plural};
+        for locale in ["en", "zh-CN", "ja-JP"] {
+            crate::ui::i18n::set_locale(locale);
+            for n in [1usize, 2, 7] {
+                let body = t_plural(L10nKey::SftpReplaceBody, n, &[("names", "a.txt")]);
+                assert!(body.contains("a.txt"), "{locale}/{n}: {body}");
+                assert!(!body.contains("{names}"), "{locale}/{n}: {body}");
+            }
+        }
+        crate::ui::i18n::set_locale("en");
+    }
 
     fn entry(name: &str, kind: SftpEntryKind, target_is_dir: bool) -> SftpEntry {
         SftpEntry {
