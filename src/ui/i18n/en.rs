@@ -543,6 +543,12 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsServerDesc => {
             "Restarts the background server that keeps your shells running. This ends every shell on this computer; your tabs and layout reopen with fresh ones."
         }
+        L10nKey::SettingsHowShellsWorkBody => {
+            "Your shells run in a background server, not inside this window. Quitting tty7 \
+             leaves them running: reopen it and your tabs, layout and working directories \
+             come back with the same shells still in them. Closing a tab ends its shell, and \
+             Restart server and Quit and Stop Server end all of them."
+        }
         L10nKey::SettingsRestartServer => "Restart server…",
         L10nKey::SettingsAppHttpProxy => "Proxy for updates",
         L10nKey::SettingsAppHttpProxyDesc => {

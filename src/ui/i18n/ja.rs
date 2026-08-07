@@ -543,6 +543,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsServerDesc => {
             "シェルを動かし続けているバックグラウンドサーバーを再起動します。このコンピュータ上のすべてのシェルが終了し、タブとレイアウトは新しいシェルで開き直します"
         }
+        L10nKey::SettingsHowShellsWorkBody => {
+            "シェルはこのウィンドウの中ではなく、バックグラウンドのサーバーで動いています。tty7 を終了してもシェルは動き続け、開き直せばタブ・レイアウト・作業ディレクトリが同じシェルのまま戻ります。タブを閉じるとそのシェルは終了し、「サーバーを再起動」と「終了してサーバーを停止」はすべてのシェルを終了します。"
+        }
         L10nKey::SettingsRestartServer => "サーバーを再起動…",
         L10nKey::SettingsAppHttpProxy => "アップデート用プロキシ",
         L10nKey::SettingsAppHttpProxyDesc => {

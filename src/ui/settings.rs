@@ -401,6 +401,29 @@ pub(crate) fn section_match_count(section: SettingsSection, query: &str) -> usiz
         .count()
 }
 
+/// Whether a rendered row is one of the ones the section's `(n)` badge counted.
+/// A row can match on its own label, or through the keyword list the search
+/// index carries for it — "persist" finds "How shells work" and nothing on that
+/// page contains the word.
+fn row_matches_query(section: SettingsSection, label: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    if label.to_lowercase().contains(query) {
+        return true;
+    }
+    settings_search_entries()
+        .iter()
+        .any(|e| e.section == section && t(e.title) == label && entry_matches(e, query))
+}
+
+pub(crate) fn total_match_count(query: &str) -> usize {
+    SettingsSection::ALL
+        .into_iter()
+        .map(|s| section_match_count(s, query))
+        .sum()
+}
+
 pub(crate) fn best_matching_section(query: &str) -> Option<SettingsSection> {
     SettingsSection::ALL
         .into_iter()
@@ -729,6 +752,7 @@ impl Tty7App {
         let theme = cx.theme();
         let (background, foreground, header_muted) =
             (theme.background, theme.foreground, theme.muted_foreground);
+        let note_bg = theme.secondary.opacity(0.5);
 
         let (focus_handle, section, theme_panel_open, search) = match self.active_settings() {
             Some(s) => (
@@ -860,6 +884,24 @@ impl Tty7App {
             SettingsSection::About => self.render_settings_about(cx),
         };
 
+        // A query that matches nothing anywhere leaves the nav badge-less and
+        // `autoselect_settings_search` with nowhere to go, so without this the
+        // page just sits there looking like the search did nothing.
+        let no_match_note = (!query.is_empty() && total_match_count(&query) == 0).then(|| {
+            div()
+                .mb_6()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .bg(note_bg)
+                .text_sm()
+                .text_color(header_muted)
+                .child(t_fmt(
+                    L10nKey::SettingsNothingMatches,
+                    &[("query", query.as_str())],
+                ))
+        });
+
         let content_pane = if section == SettingsSection::Ssh {
             v_flex()
                 .id("settings-content")
@@ -877,10 +919,13 @@ impl Tty7App {
                 .bg(background)
                 .overflow_y_scroll()
                 .child(
-                    div()
-                        .px_10()
-                        .py_8()
-                        .child(div().w_full().max_w(px(640.)).child(content)),
+                    div().px_10().py_8().child(
+                        div()
+                            .w_full()
+                            .max_w(px(640.))
+                            .children(no_match_note)
+                            .child(content),
+                    ),
                 )
         };
 
@@ -987,6 +1032,23 @@ impl Tty7App {
         // Descriptions can contain live status (for example an agent hook target), so they
         // must not participate in the identity that preserves GPUI's hover state.
         let element_id = settings_row_id(&label, &desc);
+        // The nav badge says "Appearance (2)"; this is what makes those two
+        // findable once you are on the page. Only mark rows when the section
+        // actually holds a match — otherwise a query that landed elsewhere
+        // would grey out a page the user is simply reading.
+        let (hit, miss) = match self.active_settings() {
+            Some(s) => {
+                let query = s.search.read(cx).value().trim().to_lowercase();
+                match query.is_empty() || section_match_count(s.section, &query) == 0 {
+                    true => (false, false),
+                    false => {
+                        let hit = row_matches_query(s.section, &label, &query);
+                        (hit, !hit)
+                    }
+                }
+            }
+            None => (false, false),
+        };
         h_flex()
             .id(element_id)
             .items_center()
@@ -996,6 +1058,8 @@ impl Tty7App {
             .px_2p5()
             .mx_neg_2p5()
             .rounded_lg()
+            .when(hit, |row| row.bg(theme.accent.opacity(0.16)))
+            .when(miss, |row| row.opacity(0.45))
             .hover(|h| h.bg(gpui::rgb(cx.global::<presets::Surfaces>().window.hover)))
             .on_hover(cx.listener(|_this, _hovered, _window, cx| cx.notify()))
             .child(
@@ -4790,6 +4854,29 @@ impl Tty7App {
                     .text_color(muted_fg)
                     .child(t(L10nKey::SettingsAboutDesc1)),
             )
+            // The search index has promised a "How shells work" entry on this
+            // page since it was written, and it pointed at nothing — the one
+            // thing that makes tty7 different from any other terminal was
+            // never stated in the app.
+            .child(
+                v_flex()
+                    .mt_6()
+                    .gap_2()
+                    .child(self.section_rule(cx))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(foreground)
+                            .child(t(L10nKey::SettingsSearchHowShellsWorkTitle)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted_fg)
+                            .child(t(L10nKey::SettingsHowShellsWorkBody)),
+                    ),
+            )
             .child(
                 v_flex()
                     .mt_6()
@@ -5092,6 +5179,54 @@ impl Tty7App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_is_marked_by_its_label_or_by_the_keywords_behind_it() {
+        // Straight label hit.
+        assert!(row_matches_query(
+            SettingsSection::Appearance,
+            "Blur",
+            "blur"
+        ));
+        // Keyword hit: nothing on the About page contains "persist", but the
+        // index says the "How shells work" block answers it.
+        assert!(row_matches_query(
+            SettingsSection::About,
+            t(L10nKey::SettingsSearchHowShellsWorkTitle),
+            "persist"
+        ));
+        // A row on some other page is not a hit just because the query matches
+        // an entry elsewhere.
+        assert!(!row_matches_query(
+            SettingsSection::Terminal,
+            "Blur",
+            "persist"
+        ));
+        // An empty query marks nothing at all, so no page ever renders greyed
+        // out just because the field is focused.
+        assert!(!row_matches_query(SettingsSection::Appearance, "Blur", ""));
+    }
+
+    #[test]
+    fn a_query_that_matches_nothing_is_distinguishable_from_one_that_does() {
+        assert_eq!(total_match_count("zzqqxx"), 0);
+        assert!(total_match_count("blur") > 0);
+        assert!(total_match_count("persist") > 0);
+    }
+
+    #[test]
+    fn the_how_shells_work_entry_has_something_to_point_at() {
+        // The index promised this page an explanation of the one thing that
+        // makes tty7 different; for a long time it pointed at nothing.
+        assert!(
+            !t(L10nKey::SettingsHowShellsWorkBody).is_empty(),
+            "the About page has no body copy for its own search entry"
+        );
+        assert_eq!(
+            best_matching_section("persist").map(|s| s.profile_label()),
+            Some(SettingsSection::About.profile_label())
+        );
+    }
 
     #[test]
     fn settings_row_identity_depends_only_on_its_stable_label() {

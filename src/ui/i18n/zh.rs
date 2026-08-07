@@ -480,6 +480,9 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsServerDesc => {
             "重启在后台维持 shell 运行的服务器。这会结束这台计算机上所有正在运行的 shell；你的标签页和布局会以全新的 shell 重新打开。"
         }
+        L10nKey::SettingsHowShellsWorkBody => {
+            "你的 shell 跑在后台服务器里，不在这个窗口里。退出 tty7 后它们照常运行——再打开时标签页、布局和工作目录都会回来，里面还是原来那些 shell。关闭标签页会结束它那个 shell；“重启服务器”和“退出并停止服务器”会结束全部。"
+        }
         L10nKey::SettingsRestartServer => "重启服务器…",
         L10nKey::SettingsAppHttpProxy => "更新代理",
         L10nKey::SettingsAppHttpProxyDesc => {
