@@ -21,7 +21,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::core::config::{
-    BellMode, Config, CursorStyle, NewTabPosition, NotifyMode, TabBarPosition,
+    BellMode, Config, CursorStyle, NewTabPosition, NotifyMode, TabBarPosition, UpdateChannel,
 };
 use crate::core::keychain::CredentialRef;
 use crate::core::ssh_profile::{
@@ -85,58 +85,7 @@ struct SearchEntry {
     keywords: L10nKey,
 }
 
-fn localized_update_phase(phase: &crate::core::update::UpdatePhase) -> Option<String> {
-    use crate::core::update::{UpdateFailure, UpdatePhase};
-
-    match phase {
-        UpdatePhase::Idle => None,
-        UpdatePhase::Checking => Some(t(L10nKey::SettingsUpdateChecking).to_string()),
-        UpdatePhase::UpToDate => Some(t(L10nKey::SettingsUpdateUpToDate).to_string()),
-        UpdatePhase::Downloading => Some(t(L10nKey::SettingsUpdateDownloading).to_string()),
-        UpdatePhase::Installing => Some(t(L10nKey::SettingsUpdateInstalling).to_string()),
-        UpdatePhase::Failed(failure) => {
-            let (key, error) = match failure {
-                UpdateFailure::Check(error) => (L10nKey::SettingsUpdateCheckFailed, error),
-                UpdateFailure::Prepare(error) => (L10nKey::SettingsUpdatePrepareFailed, error),
-                UpdateFailure::Launch(error) => (L10nKey::SettingsUpdateLaunchFailed, error),
-            };
-            Some(t_fmt(key, &[("error", error)]))
-        }
-    }
-}
-
-fn localized_update_install_hint(hint: &crate::core::update::UpdateInstallHint) -> String {
-    use crate::core::update::UpdateInstallHint;
-
-    match hint {
-        #[cfg(target_os = "macos")]
-        UpdateInstallHint::UnsupportedMacos => {
-            t(L10nKey::SettingsUpdateUnsupportedMacos).to_string()
-        }
-        #[cfg(target_os = "linux")]
-        UpdateInstallHint::UnsupportedLinux => {
-            t(L10nKey::SettingsUpdateUnsupportedLinux).to_string()
-        }
-        #[cfg(target_os = "windows")]
-        UpdateInstallHint::UnsupportedWindows => {
-            t(L10nKey::SettingsUpdateUnsupportedWindows).to_string()
-        }
-        #[cfg(target_os = "windows")]
-        UpdateInstallHint::WindowsAllUsersInstall => {
-            t(L10nKey::SettingsUpdateWindowsAllUsers).to_string()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        UpdateInstallHint::UnsupportedPlatform => {
-            t(L10nKey::SettingsUpdateUnsupportedPlatform).to_string()
-        }
-        UpdateInstallHint::MissingPackage(name) => {
-            t_fmt(L10nKey::SettingsUpdateMissingPackage, &[("name", name)])
-        }
-        UpdateInstallHint::MissingChecksums => {
-            t(L10nKey::SettingsUpdateMissingChecksums).to_string()
-        }
-    }
-}
+use crate::core::update::{localized_update_install_hint, localized_update_phase};
 
 fn settings_search_entries() -> &'static [SearchEntry] {
     use L10nKey::*;
@@ -4700,8 +4649,12 @@ impl Tty7App {
     }
 
     fn render_settings_about(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let (foreground, muted_fg) = (theme.foreground, theme.muted_foreground);
+        // Copied out rather than held: `self.segmented` below needs `cx`
+        // mutably, and a live `cx.theme()` borrow would keep it locked.
+        let (foreground, muted_fg, danger) = {
+            let theme = cx.theme();
+            (theme.foreground, theme.muted_foreground, theme.danger)
+        };
 
         let update_status = cx
             .try_global::<crate::core::update::UpdateStatus>()
@@ -4711,11 +4664,56 @@ impl Tty7App {
         let update_busy = matches!(
             update_status.phase,
             crate::core::update::UpdatePhase::Checking
-                | crate::core::update::UpdatePhase::Downloading
+                | crate::core::update::UpdatePhase::Downloading { .. }
+                | crate::core::update::UpdatePhase::Verifying
                 | crate::core::update::UpdatePhase::Installing
         );
-        let phase_text = localized_update_phase(&update_status.phase);
+        let transferring = matches!(
+            update_status.phase,
+            crate::core::update::UpdatePhase::Downloading { .. }
+                | crate::core::update::UpdatePhase::Verifying
+        );
+        // A staged package whose directory has since been swept away is not an
+        // offer worth making.
+        let ready = update_status
+            .ready
+            .clone()
+            .filter(crate::core::update::PendingUpdate::is_usable);
+        // "You're running the latest version" directly above "27.0.0 is ready
+        // to install" is a contradiction, and a reachable one: a release that
+        // gets pulled after someone downloaded it leaves exactly this pair.
+        // The staged package is the more useful of the two claims.
+        let phase_text = localized_update_phase(&update_status.phase).filter(|_| {
+            ready.is_none()
+                || !matches!(
+                    update_status.phase,
+                    crate::core::update::UpdatePhase::UpToDate
+                )
+        });
+        let failure = update_status.failure.clone();
+        let stale_daemon = crate::daemon::spawn::local_daemon_stale_build();
         let check_for_updates = cx.global::<Config>().check_for_updates;
+        let auto_download = cx.global::<Config>().auto_download_updates;
+        let channel_idx = match cx.global::<Config>().update_channel {
+            UpdateChannel::Stable => 0,
+            UpdateChannel::Nightly => 1,
+        };
+        let channel_picker = self.segmented(
+            "wt-update-channel",
+            &[
+                t(L10nKey::SettingsUpdateChannelStable),
+                t(L10nKey::SettingsUpdateChannelNightly),
+            ],
+            channel_idx,
+            cx,
+            |this, ix, _w, cx| {
+                let channel = match ix {
+                    0 => UpdateChannel::Stable,
+                    _ => UpdateChannel::Nightly,
+                };
+                this.set_update_channel(channel, cx);
+            },
+        );
         let http_proxy_input = match self.active_settings() {
             Some(s) => s.http_proxy_input.clone(),
             None => return div().into_any_element(),
@@ -4733,7 +4731,7 @@ impl Tty7App {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(theme.danger)
+                        .text_color(danger)
                         .child(t(L10nKey::SettingsAppHttpProxyInvalid)),
                 )
             })
@@ -4784,7 +4782,10 @@ impl Tty7App {
             .child(
                 v_flex()
                     .mt_6()
-                    .gap_2()
+                    // The section can carry several stacked states at once —
+                    // a failure, a staged package, a skipped version. At gap_2
+                    // they read as one paragraph.
+                    .gap_3()
                     .child(self.section_rule(cx))
                     .child(
                         div()
@@ -4793,19 +4794,120 @@ impl Tty7App {
                             .text_color(foreground)
                             .child(t(L10nKey::SettingsUpdates)),
                     )
-                    .when_some(update, |this, upd| {
-                        let button_label = if upd.installable {
-                            t(L10nKey::SettingsUpdateAndRelaunch).to_string()
-                        } else {
-                            t(L10nKey::SettingsUpdateViewRelease).to_string()
-                        };
+                    // A failure the user can act on. Persisted, so it is still
+                    // here tomorrow — the old in-memory phase died with the
+                    // process and took the only evidence with it.
+                    .when_some(failure, |this, failure| {
+                        this.child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().text_color(danger).child(t_fmt(
+                                    L10nKey::SettingsUpdateFailedTitle,
+                                    &[("version", &failure.version)],
+                                )))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child(failure.detail.clone()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("update-retry")
+                                                .label(t(L10nKey::SettingsUpdateRetry))
+                                                .small()
+                                                .disabled(update_busy)
+                                                .on_click(cx.listener(|_, _, _window, cx| {
+                                                    crate::core::update::dismiss_failure(cx);
+                                                    crate::core::update::install_available(cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("update-manual")
+                                                .label(t(L10nKey::SettingsUpdateDownloadManually))
+                                                .small()
+                                                .on_click(cx.listener(|_, _, _window, _cx| {
+                                                    crate::core::update::open_releases_page()
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("update-dismiss")
+                                                .label(t(L10nKey::SettingsUpdateDismiss))
+                                                .small()
+                                                .on_click(cx.listener(|_, _, _window, cx| {
+                                                    crate::core::update::dismiss_failure(cx)
+                                                })),
+                                        ),
+                                ),
+                        )
+                    })
+                    // Downloaded and verified: the decision left is "may I
+                    // restart", not "will you spend five minutes on this".
+                    .when_some(ready.clone(), |this, pending| {
+                        this.child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().text_color(foreground).child(t_fmt(
+                                    L10nKey::SettingsUpdateReady,
+                                    &[("version", &pending.version)],
+                                )))
+                                .when(pending.apply_on_launch, |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .child(t(L10nKey::SettingsUpdateReadyNextLaunch)),
+                                    )
+                                })
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("install-ready")
+                                                .label(t(L10nKey::SettingsUpdateInstallNow))
+                                                .small()
+                                                .disabled(update_busy)
+                                                .on_click(cx.listener(|_, _, _window, cx| {
+                                                    crate::core::update::install_available(cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("discard-ready")
+                                                .label(t(L10nKey::SettingsUpdateDiscard))
+                                                .small()
+                                                .disabled(update_busy)
+                                                .on_click(cx.listener(|_, _, _window, cx| {
+                                                    crate::core::update::discard_pending(cx)
+                                                })),
+                                        ),
+                                ),
+                        )
+                    })
+                    // One action, not the three that used to crowd this row.
+                    // The update dialog covers the rest, but it is a moment
+                    // rather than a place: after "Later" it does not come back
+                    // for days, and where the package cannot be installed for
+                    // the user — Linux, an unsupported install — the release
+                    // page is the whole update path. That cannot live only in a
+                    // dialog that has already been dismissed.
+                    .when_some(update.filter(|_| ready.is_none()), |this, upd| {
                         let availability = t_fmt(
                             L10nKey::SettingsVersionAvailable,
                             &[("version", &upd.version)],
                         );
+                        // `install_available` opens the release page by itself
+                        // when there is nothing to install, so both labels lead
+                        // to the one call.
+                        let action = if upd.installable {
+                            t(L10nKey::SettingsUpdateAndRelaunch)
+                        } else {
+                            t(L10nKey::SettingsUpdateViewRelease)
+                        };
                         this.child(
                             v_flex()
-                                .gap_1()
+                                .gap_2()
                                 .child(
                                     h_flex()
                                         .gap_3()
@@ -4818,7 +4920,7 @@ impl Tty7App {
                                         )
                                         .child(
                                             Button::new("install-update")
-                                                .label(button_label)
+                                                .label(action)
                                                 .small()
                                                 .disabled(update_busy)
                                                 .on_click(cx.listener(|_, _, _window, cx| {
@@ -4840,25 +4942,46 @@ impl Tty7App {
                         this.child(div().text_sm().text_color(muted_fg).child(text))
                     })
                     .child(
-                        h_flex().child(
-                            Button::new("check-update-now")
-                                .label(
-                                    if matches!(
-                                        update_status.phase,
-                                        crate::core::update::UpdatePhase::Checking
-                                    ) {
-                                        t(L10nKey::SettingsUpdateChecking)
-                                    } else {
-                                        t(L10nKey::SettingsUpdateCheckNow)
-                                    },
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("check-update-now")
+                                    .label(
+                                        if matches!(
+                                            update_status.phase,
+                                            crate::core::update::UpdatePhase::Checking
+                                        ) {
+                                            t(L10nKey::SettingsUpdateChecking)
+                                        } else {
+                                            t(L10nKey::SettingsUpdateCheckNow)
+                                        },
+                                    )
+                                    .small()
+                                    .disabled(update_busy)
+                                    .on_click(cx.listener(|_, _, _window, cx| {
+                                        crate::core::update::spawn_check_forced(cx)
+                                    })),
+                            )
+                            // Thirty megabytes on a slow link is exactly the
+                            // download someone wants to call off; without this
+                            // the only way out was to kill the app.
+                            .when(transferring, |this| {
+                                this.child(
+                                    Button::new("cancel-update-download")
+                                        .label(t(L10nKey::SettingsUpdateCancel))
+                                        .small()
+                                        .on_click(cx.listener(|_, _, _window, cx| {
+                                            crate::core::update::cancel_download(cx)
+                                        })),
                                 )
-                                .small()
-                                .disabled(update_busy)
-                                .on_click(cx.listener(|_, _, _window, cx| {
-                                    crate::core::update::spawn_check_forced(cx)
-                                })),
-                        ),
+                            }),
                     )
+                    .child(self.settings_row(
+                        t(L10nKey::SettingsUpdateChannel),
+                        t(L10nKey::SettingsUpdateChannelDesc),
+                        channel_picker,
+                        cx,
+                    ))
                     .child(
                         self.settings_row(
                             t(L10nKey::SettingsCheckUpdatesOnLaunch),
@@ -4871,7 +4994,50 @@ impl Tty7App {
                                 .into_any_element(),
                             cx,
                         ),
-                    ),
+                    )
+                    .child(
+                        self.settings_row(
+                            t(L10nKey::SettingsAutoDownload),
+                            t(L10nKey::SettingsAutoDownloadDesc),
+                            crate::ui::theme::switch("auto-download-updates", cx)
+                                .checked(auto_download)
+                                .on_click(cx.listener(|this, on: &bool, _w, cx| {
+                                    this.set_auto_download_updates(*on, cx)
+                                }))
+                                .into_any_element(),
+                            cx,
+                        ),
+                    )
+                    // The other half of an in-place update: the app is new, the
+                    // process serving every pane is not. Shown rather than
+                    // prompted — restarting it ends the user's running work,
+                    // which is not a thing to ask for on tty7's initiative.
+                    .when_some(stale_daemon, |this, build| {
+                        this.child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().text_color(foreground).child(t_fmt(
+                                    L10nKey::SettingsDaemonStale,
+                                    &[("build", &build)],
+                                )))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child(t(L10nKey::SettingsDaemonStaleDesc)),
+                                )
+                                .child(
+                                    h_flex().child(
+                                        Button::new("restart-stale-daemon")
+                                            .label(t(L10nKey::SettingsDaemonStaleRestart))
+                                            .small()
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.restart_daemon(window, cx)
+                                            })),
+                                    ),
+                                ),
+                        )
+                    }),
             )
             .child(self.settings_row(
                 t(L10nKey::SettingsAppHttpProxy),

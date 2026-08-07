@@ -162,6 +162,20 @@ pub struct Config {
     #[serde(default, deserialize_with = "de_lenient")]
     pub notify_on_command_finish: NotifyMode,
     pub check_for_updates: bool,
+    /// Which release feed update checks follow. Stable by default, so an
+    /// installation only ever ends up on Nightly by asking for it.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub update_channel: UpdateChannel,
+    /// Whether a found update is fetched and verified before the user asks for
+    /// it. On by default: it turns "spend five minutes downloading" into "press
+    /// restart", which is the whole difference between an update people apply
+    /// and one they postpone forever. Nothing is ever *installed* without an
+    /// explicit choice — the staged package waits in Settings.
+    ///
+    /// Worth turning off on a metered connection: the packages run 25–30 MB and
+    /// a check happens every six hours.
+    #[serde(default = "default_true")]
+    pub auto_download_updates: bool,
     /// Whether the GUI puts the bundled `tty7` CLI on PATH at launch (see
     /// `core::cli_install`). On by default: the CLI is the agent-facing half of
     /// this product and is worth nothing sitting unreachable inside the bundle.
@@ -330,6 +344,22 @@ pub enum NotifyMode {
     Always,
 }
 
+/// Which release feed this installation follows.
+///
+/// The channel is a property of the installation, not something derived from
+/// the version number. Without it the only thing separating a Nightly from a
+/// Stable is how their versions happen to sort, which is how a Nightly ends up
+/// being walked back onto Stable by an update it never asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    /// Follows the rolling `nightly` prerelease, which is rebuilt from `main`
+    /// every night.
+    Nightly,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BellMode {
@@ -422,6 +452,8 @@ impl Default for Config {
             sidebar_diff_preview: true,
             notify_on_command_finish: NotifyMode::Unfocused,
             check_for_updates: true,
+            update_channel: UpdateChannel::default(),
+            auto_download_updates: true,
             install_cli_on_path: true,
             gui_language: default_gui_language(),
             notify_threshold_secs: default_notify_threshold_secs(),
