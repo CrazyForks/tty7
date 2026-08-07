@@ -450,6 +450,13 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
             "プレフィックスが有効な場合、プレフィックスキーを単独で押すと約 1 秒後にシェルに渡され、プレフィックス + 未割り当てのキーはターミナルへそのまま送信されます"
         }
         L10nKey::SettingsRestoreAllDefaults => "すべてのデフォルトを復元",
+        L10nKey::KeybindGoToTab => "タブ {n} へ移動",
+        L10nKey::KeybindGoToWorkspace => "ワークスペース {n} へ移動",
+        L10nKey::KeybindInsertNewline => "改行を挿入",
+        L10nKey::KeybindForkSessionRight => "右にセッションをフォーク",
+        L10nKey::KeybindForkSessionLeft => "左にセッションをフォーク",
+        L10nKey::KeybindForkSessionDown => "下にセッションをフォーク",
+        L10nKey::KeybindForkSessionUp => "上にセッションをフォーク",
         L10nKey::SettingsAboutDesc1 => {
             "ターミナルワークベンチ: 常駐セッション、リモート作業、エージェント"
         }

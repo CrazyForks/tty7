@@ -34,9 +34,7 @@ use crate::ui::palette::{
 };
 use crate::ui::pane::{CloseOutcome, Dir, Pane, PaneSlot};
 use crate::ui::presets::Fill;
-use crate::ui::settings::{
-    Recording, SettingsSection, SettingsState, ThemeEditor, humanize_action,
-};
+use crate::ui::settings::{Recording, SettingsSection, SettingsState, ThemeEditor};
 use crate::ui::theme::{apply_theme, set_menus, window_background};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4859,8 +4857,8 @@ impl Tty7App {
             t_fmt(
                 L10nKey::AppKeybindingDisplacedNote,
                 &[
-                    ("action", &humanize_action(&action)),
-                    ("previous", &humanize_action(other)),
+                    ("action", &crate::ui::keymap::action_entry(&action).1),
+                    ("previous", &crate::ui::keymap::action_entry(other).1),
                 ],
             )
         });

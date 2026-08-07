@@ -4530,9 +4530,47 @@ impl Tty7App {
             )
             .child(h_flex().flex_shrink_0().child(prefix_control));
 
-        let count = effective.len();
+        // Eighty-nine undivided rows, in the order the binding table happens to
+        // be written. Read them in the same seven sections the command palette
+        // uses, so a shortcut is found by where it belongs rather than by
+        // scrolling.
+        let mut grouped: Vec<(
+            crate::ui::palette::CommandGroup,
+            Vec<(String, String, String)>,
+        )> = Vec::new();
+        for (action, key) in effective {
+            let (group, label) = crate::ui::keymap::action_entry(&action);
+            let slot = match grouped.iter_mut().find(|(g, _)| *g == group) {
+                Some(slot) => slot,
+                None => {
+                    grouped.push((group, Vec::new()));
+                    grouped.last_mut().expect("just pushed")
+                }
+            };
+            slot.1.push((action, key, label));
+        }
+        grouped.sort_by_key(|(g, _)| {
+            crate::ui::palette::CommandGroup::ORDER
+                .iter()
+                .position(|o| o == g)
+                .unwrap_or(usize::MAX)
+        });
+        let rows: Vec<(String, String, String)> = grouped
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().cloned())
+            .collect();
+        let heading_at: std::collections::HashMap<usize, &'static str> = {
+            let mut map = std::collections::HashMap::new();
+            let mut at = 0usize;
+            for (group, rows) in &grouped {
+                map.insert(at, group.title());
+                at += rows.len();
+            }
+            map
+        };
+        let count = rows.len();
         let mut list = v_flex().mt_2();
-        for (i, (action, key)) in effective.into_iter().enumerate() {
+        for (i, (action, key, label)) in rows.into_iter().enumerate() {
             let is_recording = recording.as_ref().is_some_and(|(a, _)| a == &action);
             let is_overridden = overridden.contains(&action);
 
@@ -4609,18 +4647,25 @@ impl Tty7App {
                     )
                 });
 
+            if let Some(title) = heading_at.get(&i) {
+                list = list.child(
+                    div()
+                        .pt_5()
+                        .pb_1p5()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(muted)
+                        .child(*title),
+                );
+            }
+            let last_in_group = heading_at.contains_key(&(i + 1)) || i + 1 == count;
             list = list.child(
                 h_flex()
                     .items_center()
                     .justify_between()
                     .py_1p5()
-                    .when(i + 1 < count, |s| s.border_b_1().border_color(border))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(foreground)
-                            .child(humanize_action(&action)),
-                    )
+                    .when(!last_in_group, |s| s.border_b_1().border_color(border))
+                    .child(div().text_sm().text_color(foreground).child(label))
                     .child(right),
             );
         }

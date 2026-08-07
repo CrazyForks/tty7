@@ -452,6 +452,13 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "With a prefix active, a bare prefix key reaches the shell after a ~1s pause, and prefix + an unbound key is sent through to the terminal."
         }
         L10nKey::SettingsRestoreAllDefaults => "Restore all defaults",
+        L10nKey::KeybindGoToTab => "Go to Tab {n}",
+        L10nKey::KeybindGoToWorkspace => "Go to Workspace {n}",
+        L10nKey::KeybindInsertNewline => "Insert Newline",
+        L10nKey::KeybindForkSessionRight => "Fork Session Right",
+        L10nKey::KeybindForkSessionLeft => "Fork Session Left",
+        L10nKey::KeybindForkSessionDown => "Fork Session Down",
+        L10nKey::KeybindForkSessionUp => "Fork Session Up",
         L10nKey::SettingsAboutDesc1 => {
             "A terminal workbench: persistent sessions, remote work, agents."
         }
