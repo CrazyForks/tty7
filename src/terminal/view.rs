@@ -140,7 +140,7 @@ pub struct TerminalView {
     pub font_size: Pixels,
     pub line_height_mul: f32,
     pub cell_width: Pixels,
-    line_height: Pixels,
+    pub(super) line_height: Pixels,
     selecting: bool,
     drag_scroll: Option<DragScroll>,
     drag_scroll_epoch: u64,

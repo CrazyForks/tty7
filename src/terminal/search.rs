@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use alacritty_terminal::event::EventListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::search::{Match, RegexSearch};
@@ -15,6 +15,13 @@ use gpui_component::{
 use super::view::TerminalView;
 
 const MAX_MATCHES: usize = 10_000;
+
+/// The search bar floats over the top of the grid rather than pushing it down,
+/// so these two decide how many rows it hides. Keep them next to the `.top()`
+/// and `.h()` that use them — a match parked under the bar is on screen and
+/// still unreadable, which is the one thing "next match" must never do.
+const BAR_TOP: f32 = 8.;
+const BAR_HEIGHT: f32 = 34.;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum LinkTarget {
@@ -186,10 +193,11 @@ impl TerminalView {
         self.search_regex_error = regex_error;
 
         let current = self.search.as_ref().and_then(|s| s.current().cloned());
+        let hidden = self.rows_behind_the_search_bar();
         let mut term = self.terminal.term.lock();
         term.selection = None;
         if let Some(m) = current {
-            scroll_match_into_view(&mut term, &m);
+            scroll_match_into_view(&mut term, &m, hidden);
         }
         drop(term);
         cx.notify();
@@ -212,8 +220,13 @@ impl TerminalView {
             s.current_index = Some(next);
             s.matches[next].clone()
         };
-        scroll_match_into_view(&mut self.terminal.term.lock(), &current);
+        let hidden = self.rows_behind_the_search_bar();
+        scroll_match_into_view(&mut self.terminal.term.lock(), &current, hidden);
         cx.notify();
+    }
+
+    fn rows_behind_the_search_bar(&self) -> i32 {
+        rows_under_the_bar(self.line_height.as_f32())
     }
 
     fn toggle_search_case(&mut self, cx: &mut Context<Self>) {
@@ -330,14 +343,14 @@ impl TerminalView {
 
         div()
             .absolute()
-            .top_2()
+            .top(px(BAR_TOP))
             .right_4()
             .occlude()
             .flex()
             .items_center()
             .gap_1p5()
             .w(px(400.))
-            .h(px(34.))
+            .h(px(BAR_HEIGHT))
             .pl_3()
             .pr_1()
             .rounded_lg()
@@ -362,14 +375,47 @@ impl TerminalView {
     }
 }
 
-fn scroll_match_into_view<T: EventListener>(term: &mut Term<T>, m: &Match) {
+/// How many grid rows the floating bar covers, at this line height.
+fn rows_under_the_bar(line_height: f32) -> i32 {
+    if line_height <= 0. {
+        return 0;
+    }
+    ((BAR_TOP + BAR_HEIGHT) / line_height).ceil() as i32
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Reveal {
+    /// Already clear of the bar and inside the viewport.
+    Stay,
+    /// Below the viewport — alacritty's own minimal scroll lands it on the
+    /// last row, which nothing covers.
+    ToPoint,
+    /// Above the readable area. `scroll_to_point` would park it on row 0, the
+    /// row most likely to be behind the bar, so walk back this many lines and
+    /// land it just clear instead.
+    Back(i32),
+}
+
+fn reveal(line: i32, display_offset: i32, screen_lines: i32, hidden: i32) -> Reveal {
+    let top = -display_offset + hidden;
+    let bottom = screen_lines - 1 - display_offset;
+    if line > bottom {
+        Reveal::ToPoint
+    } else if line < top {
+        Reveal::Back(top - line)
+    } else {
+        Reveal::Stay
+    }
+}
+
+fn scroll_match_into_view<T: EventListener>(term: &mut Term<T>, m: &Match, hidden: i32) {
     let grid = term.grid();
     let display_offset = grid.display_offset() as i32;
-    let top = -display_offset;
-    let bottom = grid.screen_lines() as i32 - 1 - display_offset;
-    let line = m.start().line.0;
-    if line < top || line > bottom {
-        term.scroll_to_point(*m.start());
+    let screen_lines = grid.screen_lines() as i32;
+    match reveal(m.start().line.0, display_offset, screen_lines, hidden) {
+        Reveal::Stay => {}
+        Reveal::ToPoint => term.scroll_to_point(*m.start()),
+        Reveal::Back(lines) => term.scroll_display(Scroll::Delta(lines)),
     }
 }
 
@@ -732,6 +778,44 @@ pub(super) fn is_url_char(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bar_hides_whole_rows_however_tall_they_are() {
+        // 8px inset + 34px tall, so at the default 17px line height the bar
+        // sits over rows 0, 1 and part of 2 — all three count as hidden.
+        assert_eq!(rows_under_the_bar(17.), 3);
+        assert_eq!(rows_under_the_bar(42.), 1);
+        assert_eq!(rows_under_the_bar(43.), 1);
+        assert_eq!(rows_under_the_bar(10.), 5);
+        assert_eq!(rows_under_the_bar(0.), 0, "a zero height must not divide");
+    }
+
+    #[test]
+    fn a_match_under_the_bar_counts_as_off_screen() {
+        // 24 rows on screen, sitting at the live end, bar over the first 3.
+        let at = |line| reveal(line, 0, 24, 3);
+        assert_eq!(at(0), Reveal::Back(3), "row 0 is fully covered");
+        assert_eq!(at(2), Reveal::Back(1), "row 2 is partly covered");
+        assert_eq!(at(3), Reveal::Stay, "row 3 is the first readable one");
+        assert_eq!(at(23), Reveal::Stay, "the last row is still on screen");
+        assert_eq!(at(24), Reveal::ToPoint, "one past the end is not");
+    }
+
+    #[test]
+    fn scrolled_back_into_history_the_readable_band_moves_with_it() {
+        // 10 lines of history above the viewport: rows now run -10..=13.
+        let at = |line| reveal(line, 10, 24, 3);
+        assert_eq!(at(-10), Reveal::Back(3), "the top row is behind the bar");
+        assert_eq!(at(-7), Reveal::Stay);
+        assert_eq!(at(13), Reveal::Stay);
+        assert_eq!(at(14), Reveal::ToPoint);
+    }
+
+    #[test]
+    fn without_a_bar_nothing_on_screen_is_moved() {
+        assert_eq!(reveal(0, 0, 24, 0), Reveal::Stay);
+        assert_eq!(reveal(-1, 0, 24, 0), Reveal::Back(1));
+    }
 
     #[test]
     fn regex_escape_neutralizes_metacharacters() {
