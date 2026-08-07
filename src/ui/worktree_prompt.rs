@@ -209,6 +209,17 @@ impl Tty7App {
             div()
                 .absolute()
                 .inset_0()
+                // The backdrop already swallowed every click in the window; it
+                // just did not look like it did. A scrim says the app is
+                // waiting, and clicking it backs out — the same gesture the
+                // palette and the switcher already answer to.
+                .bg(crate::ui::presets::scrim_fill(cx))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                        this.cancel_worktree_prompt(window, cx)
+                    }),
+                )
                 .flex()
                 .flex_col()
                 .items_center()
