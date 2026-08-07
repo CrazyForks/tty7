@@ -1455,7 +1455,17 @@ impl Tty7App {
                 crate::ui::presets::load_registry(cx);
                 self.set_preset(&new_id, window, cx);
             }
-            Err(e) => log::warn!("failed to duplicate theme: {e}"),
+            // A button that does nothing is the worst kind of failure: there
+            // is no way to tell it from "I clicked the wrong thing".
+            Err(e) => {
+                log::warn!("failed to duplicate theme: {e}");
+                crate::ui::host_ops::HostOps::notify_err(
+                    window,
+                    cx,
+                    t(L10nKey::ThemeDuplicateFailed),
+                    &e,
+                );
+            }
         }
     }
 
@@ -1472,7 +1482,10 @@ impl Tty7App {
         }
         mutate(&mut theme);
         if let Err(e) = crate::ui::presets::write_theme_file(&theme) {
+            // Every colour edit runs through here. Without this the picker
+            // moves, the theme does not, and nothing says why.
             log::warn!("failed to write theme file: {e}");
+            crate::ui::host_ops::HostOps::notify_err(window, cx, t(L10nKey::ThemeSaveFailed), &e);
             return;
         }
         crate::ui::presets::load_registry(cx);

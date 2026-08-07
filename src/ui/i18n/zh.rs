@@ -130,6 +130,9 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsAnsiColors => "ANSI 颜色",
         L10nKey::SettingsCustomThemes => "自定义主题",
         L10nKey::SettingsThemesRejected => "主题文件夹里这些没能加载",
+        L10nKey::ThemeDuplicateFailed => "无法复制主题",
+        L10nKey::ThemeSaveFailed => "无法保存主题",
+        L10nKey::OpenInFileManagerFailed => "无法打开 {path}",
         L10nKey::SettingsCustomThemesIntro => {
             "复制一个主题后可在此编辑其颜色，或者把自定义主题放入主题文件夹：tty7 YAML 主题或 iTerm2 的 .itermcolors 方案。"
         }
