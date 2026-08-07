@@ -1092,6 +1092,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::CmdQuickConnectSaveProfile => "Save \"{target}\" as profile…",
         L10nKey::CmdRecent => "Recent",
         L10nKey::AppRestartServerTitle => "Restart Server?",
+        L10nKey::AppRestartServerFailed => "Could not restart the background server: {error}",
         L10nKey::AppRestartServerMismatchDetail => {
             "The server holding your shells is build v{build}, protocol {protocol}; this app speaks {ours}. They can't talk, so your tabs are out of reach.\n\nQuit: nothing changes — the server and your shells keep running.\nRestart: tabs come back with fresh shells, and anything running now is killed."
         }

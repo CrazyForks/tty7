@@ -1125,6 +1125,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::CmdQuickConnectSaveProfile => "「{target}」をプロファイルとして保存…",
         L10nKey::CmdRecent => "最近",
         L10nKey::AppRestartServerTitle => "サーバーを再起動しますか？",
+        L10nKey::AppRestartServerFailed => {
+            "バックグラウンドサーバーを再起動できませんでした: {error}"
+        }
         L10nKey::AppRestartServerMismatchDetail => {
             "サーバーは v{build}、プロトコル {protocol}。このアプリは {ours} です。噛み合わないため、タブを取り出せません。\n\n終了：何も変わりません。サーバーもシェルも動き続けます。\n再起動：タブは新しいシェルで戻り、いま実行中のものは終了します"
         }

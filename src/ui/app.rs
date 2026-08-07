@@ -1241,7 +1241,14 @@ impl Tty7App {
                         crate::ui::tree_sync::resync_window_from_tree(cx, this.workspace);
                     }
                     Err(e) => {
+                        // The user asked for this and lands on an empty home
+                        // page; without a reason there it looks like the
+                        // restart worked and took everything with it.
                         log::error!("restart background service failed, staying on home page: {e}");
+                        this.startup_error = Some(gpui::SharedString::from(t_fmt(
+                            L10nKey::AppRestartServerFailed,
+                            &[("error", &e.to_string())],
+                        )));
                     }
                 }
                 this.focus_active(window, cx);

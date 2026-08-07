@@ -1039,6 +1039,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::CmdQuickConnectSaveProfile => "将 \"{target}\" 保存为主机配置…",
         L10nKey::CmdRecent => "最近使用",
         L10nKey::AppRestartServerTitle => "重启服务器？",
+        L10nKey::AppRestartServerFailed => "无法重启后台服务器：{error}",
         L10nKey::AppRestartServerMismatchDetail => {
             "服务器是 v{build}，协议 {protocol}；此应用使用 {ours}。两者无法对话，标签页取不出来。\n\n退出：什么都不变，服务器和 shell 继续运行。\n重启：标签页带全新 shell 回来，现在跑着的东西会被杀掉。"
         }
