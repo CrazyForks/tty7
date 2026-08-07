@@ -1,7 +1,7 @@
 use gpui::{
-    AnyElement, App, Context, Div, Entity, FontWeight, Image, ImageFormat, KeyDownEvent,
-    MouseButton, SharedString, Stateful, Subscription, Window, div, img, prelude::*, px, relative,
-    rgb,
+    Animation, AnimationExt as _, AnyElement, App, Context, Div, Entity, FontWeight, Image,
+    ImageFormat, KeyDownEvent, MouseButton, SharedString, Stateful, Subscription, Window, div, img,
+    prelude::*, px, relative, rgb,
 };
 use gpui_component::InteractiveElementExt as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -4454,6 +4454,7 @@ impl Tty7App {
             .active_settings()
             .and_then(|s| s.recording.as_ref())
             .map(|r| (r.action.clone(), r.chords.clone()));
+        let record_gen = self.record_gen;
         let note = self
             .active_settings()
             .and_then(|s| s.rebinding_note.clone());
@@ -4558,11 +4559,36 @@ impl Tty7App {
                             .child(t(L10nKey::SettingsPressKeys)),
                     )
                 } else {
+                    // The binding commits on a pause, and the pause was
+                    // invisible: the hint asked people to time something they
+                    // could not see. The bar runs the same clock the commit
+                    // does, and restarts with every extra chord.
                     row.child(keycaps(&chords.join(" "))).child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(t(L10nKey::SettingsPauseToSaveEsc)),
+                        v_flex()
+                            .gap(px(3.))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(t(L10nKey::SettingsPauseToSaveEsc)),
+                            )
+                            .child(
+                                div()
+                                    .h(px(2.))
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .rounded_full()
+                                    .bg(border)
+                                    .child(
+                                        div().h_full().rounded_full().bg(accent).with_animation(
+                                            ("kb-record-countdown", record_gen as usize),
+                                            Animation::new(std::time::Duration::from_millis(
+                                                crate::ui::app::RECORD_COMMIT_DELAY_MS,
+                                            )),
+                                            |bar, delta| bar.w(relative(delta)),
+                                        ),
+                                    ),
+                            ),
                     )
                 };
                 row.into_any_element()
