@@ -134,6 +134,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsAnsiColors => "ANSI colors",
         L10nKey::SettingsCustomThemes => "Custom themes",
+        L10nKey::ThemeDuplicateFailed => "Could not duplicate the theme",
+        L10nKey::ThemeSaveFailed => "Could not save the theme",
+        L10nKey::OpenInFileManagerFailed => "Could not open {path}",
         L10nKey::SettingsCustomThemesIntro => {
             "Duplicate a theme to edit its colors here, or drop your own in the themes folder: a tty7 YAML theme or an iTerm2 .itermcolors scheme."
         }
