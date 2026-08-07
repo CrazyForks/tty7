@@ -1185,6 +1185,33 @@ impl TerminalView {
         self.terminal.agent_session()
     }
 
+    /// What this pane is in the middle of, when it can say so. `None` means
+    /// either nothing is running or the shell never told us — and a terminal
+    /// that guessed would raise this question on every single close.
+    pub fn busy(&self) -> Option<PaneBusy> {
+        if let Some(agent) = self.agent()
+            && self
+                .agent_session()
+                .is_some_and(|s| s.status != crate::core::cli_agent::AgentStatus::Idle)
+        {
+            return Some(PaneBusy::Agent(agent.display_name()));
+        }
+        // Without shell integration `at_prompt` is permanently false, so
+        // `running_since` is permanently Some. Only trust it when the shell is
+        // actually reporting.
+        if !self.terminal.shell_active() {
+            return None;
+        }
+        let started = self.running_since?;
+        Some(PaneBusy::Command {
+            what: match self.running_title.trim().is_empty() {
+                true => self.title.clone(),
+                false => self.running_title.clone(),
+            },
+            secs: started.elapsed().as_secs(),
+        })
+    }
+
     pub fn agent_result_unread(&self) -> bool {
         self.agent_result_unread
     }
@@ -4925,6 +4952,13 @@ fn observe_typeahead_for_owner(
     if !sync_typeahead_owner_state(typeahead, last_blocked, blocked) {
         typeahead.observe(input, *last_blocked);
     }
+}
+
+/// Why closing a pane would end work that is still going on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaneBusy {
+    Command { what: String, secs: u64 },
+    Agent(&'static str),
 }
 
 impl Focusable for TerminalView {

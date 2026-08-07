@@ -408,7 +408,7 @@ pub struct Tty7App {
     _file_search_sub: Subscription,
     settings: Option<SettingsState>,
     pub(crate) ssh_prompt: crate::ui::ssh_prompt::SshPromptState,
-    pub(crate) ssh_close_confirm: Option<SshCloseKind>,
+    pub(crate) close_confirm: Option<(CloseTarget, CloseReason)>,
     window_bounds: Bounds<Pixels>,
     pub(crate) workspace: WorkspaceId,
     pub(crate) workspace_rename: Option<WorkspaceRename>,
@@ -425,9 +425,44 @@ pub struct Tty7App {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SshCloseKind {
+pub(crate) enum CloseTarget {
     Tab(usize),
     Pane,
+}
+
+/// Why closing needs a question first. Closing a tab is the highest-frequency
+/// destructive key in any terminal, and the product's headline claim is that
+/// shells outlive the app — so the one action that permanently ends one has to
+/// name what it is about to end.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum CloseReason {
+    LiveSsh,
+    Busy(crate::terminal::view::PaneBusy),
+}
+
+/// The question to put to the user before ending work that is still going on.
+fn close_prompt(ends_the_tab: bool, reason: &CloseReason) -> (String, String) {
+    use crate::terminal::view::PaneBusy;
+    use crate::ui::i18n::L10nKey;
+    match reason {
+        CloseReason::LiveSsh => (
+            t(L10nKey::CloseSshConnectionTitle).to_string(),
+            t(L10nKey::CloseSshConnectionBody).to_string(),
+        ),
+        CloseReason::Busy(busy) => {
+            let title = match ends_the_tab {
+                true => t(L10nKey::CloseTabBusyTitle),
+                false => t(L10nKey::ClosePaneBusyTitle),
+            };
+            let body = match busy {
+                PaneBusy::Command { what, .. } => {
+                    t_fmt(L10nKey::CloseBusyCommandBody, &[("what", what)])
+                }
+                PaneBusy::Agent(name) => t_fmt(L10nKey::CloseBusyAgentBody, &[("agent", name)]),
+            };
+            (title.to_string(), body)
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -765,7 +800,7 @@ impl Tty7App {
             _file_search_sub: file_search_sub,
             settings: None,
             ssh_prompt: crate::ui::ssh_prompt::SshPromptState::new(cx),
-            ssh_close_confirm: None,
+            close_confirm: None,
             window_bounds: window.window_bounds().get_bounds(),
             workspace,
             workspace_rename: None,
@@ -2478,12 +2513,14 @@ impl Tty7App {
     }
 
     fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ssh_close_confirm.is_none() && self.focused_pane_is_warn_ssh(window, cx) {
-            self.ssh_close_confirm = Some(SshCloseKind::Pane);
-            cx.notify();
+        if self.close_confirm.is_none()
+            && let Some(reason) = self.focused_pane_close_reason(window, cx)
+        {
+            self.close_confirm = Some((CloseTarget::Pane, reason));
+            self.ask_before_closing(window, cx);
             return;
         }
-        self.ssh_close_confirm = None;
+        self.close_confirm = None;
         self.maximized = None;
         let focused = self.tabs.get(self.active).and_then(|tab| {
             tab.pane
@@ -2729,13 +2766,14 @@ impl Tty7App {
         if index >= self.tabs.len() {
             return;
         }
-        let already_confirming = self.ssh_close_confirm == Some(SshCloseKind::Tab(index));
-        if !already_confirming && self.tab_has_warn_ssh(index, cx) {
-            self.ssh_close_confirm = Some(SshCloseKind::Tab(index));
-            cx.notify();
+        let already_confirming =
+            matches!(&self.close_confirm, Some((CloseTarget::Tab(i), _)) if *i == index);
+        if !already_confirming && let Some(reason) = self.tab_close_reason(index, cx) {
+            self.close_confirm = Some((CloseTarget::Tab(index), reason));
+            self.ask_before_closing(window, cx);
             return;
         }
-        self.ssh_close_confirm = None;
+        self.close_confirm = None;
         self.maximized = None;
         self.renaming = None;
         let worktree_cwd = self.tab_host_cwd(index, window, cx);
@@ -2857,8 +2895,11 @@ impl Tty7App {
         if index >= self.tabs.len() {
             return;
         }
+        // A bulk close skips anything that would otherwise raise a question,
+        // rather than stacking one dialog per tab. The tab staying open is its
+        // own explanation.
         for i in (0..self.tabs.len()).rev() {
-            if i == index || self.tab_has_warn_ssh(i, cx) {
+            if i == index || self.tab_close_reason(i, cx).is_some() {
                 continue;
             }
             self.close_tab(i, window, cx);
@@ -2872,7 +2913,7 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         for i in ((index + 1)..self.tabs.len()).rev() {
-            if self.tab_has_warn_ssh(i, cx) {
+            if self.tab_close_reason(i, cx).is_some() {
                 continue;
             }
             self.close_tab(i, window, cx);
@@ -4449,17 +4490,80 @@ impl Tty7App {
             .unwrap_or(false)
     }
 
-    pub(crate) fn confirm_ssh_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.ssh_close_confirm {
-            Some(SshCloseKind::Tab(i)) => self.close_tab(i, window, cx),
-            Some(SshCloseKind::Pane) => self.close_pane(window, cx),
+    /// The app asks every other question of this class through the platform's
+    /// own dialog. This one used to be a bespoke in-app card with no scrim, no
+    /// Escape and no click-outside — the two buttons were the only way out.
+    fn ask_before_closing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((target, reason)) = self.close_confirm.clone() else {
+            return;
+        };
+        // ⌘W closes a pane, but when it is the only one in its tab the tab goes
+        // with it — the question has to name what actually disappears.
+        let ends_the_tab = matches!(target, CloseTarget::Tab(_))
+            || self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| tab.pane.leaves().len() <= 1);
+        let (title, body) = close_prompt(ends_the_tab, &reason);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(&body),
+            &[
+                t(crate::ui::i18n::L10nKey::Keep),
+                t(crate::ui::i18n::L10nKey::Close),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let close = matches!(answer.await, Ok(1));
+            let _ = this.update_in(cx, |this, window, cx| match close {
+                true => this.confirm_close(window, cx),
+                // Cancelled, or the window went away with the question open:
+                // either way the work carries on.
+                false => this.cancel_close(cx),
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.close_confirm.as_ref().map(|(t, _)| *t) {
+            Some(CloseTarget::Tab(i)) => self.close_tab(i, window, cx),
+            Some(CloseTarget::Pane) => self.close_pane(window, cx),
             None => {}
         }
     }
 
-    pub(crate) fn cancel_ssh_close(&mut self, cx: &mut Context<Self>) {
-        self.ssh_close_confirm = None;
+    pub(crate) fn cancel_close(&mut self, cx: &mut Context<Self>) {
+        self.close_confirm = None;
         cx.notify();
+    }
+
+    /// The first reason this pane should not simply vanish.
+    fn leaf_close_reason(&self, leaf: &Entity<TerminalView>, cx: &App) -> Option<CloseReason> {
+        if self.leaf_is_warn_ssh(leaf, cx) {
+            return Some(CloseReason::LiveSsh);
+        }
+        leaf.read(cx).busy().map(CloseReason::Busy)
+    }
+
+    fn tab_close_reason(&self, index: usize, cx: &App) -> Option<CloseReason> {
+        self.tabs
+            .get(index)?
+            .pane
+            .terminals()
+            .iter()
+            .find_map(|l| self.leaf_close_reason(l, cx))
+    }
+
+    fn focused_pane_close_reason(&self, window: &Window, cx: &App) -> Option<CloseReason> {
+        let leaf = self
+            .tabs
+            .get(self.active)?
+            .pane
+            .focused_or_first(window, cx)?;
+        self.leaf_close_reason(&leaf, cx)
     }
 
     pub(crate) fn active_ssh_pane(
@@ -5202,9 +5306,6 @@ impl Render for Tty7App {
                 this.child(el)
             })
             .when_some(self.render_remote_input_notice(cx), |this, el| {
-                this.child(el)
-            })
-            .when_some(self.render_ssh_close_confirm_overlay(cx), |this, el| {
                 this.child(el)
             })
             .when_some(self.render_worktree_prompt_overlay(cx), |this, el| {
@@ -6411,9 +6512,41 @@ mod window_drag_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        TabAgentSession, leaf_shares_the_window_daemon, mru_order, pane_attachable,
-        parse_ssh_connect_input, parse_ssh_option_words,
+        CloseReason, TabAgentSession, close_prompt, leaf_shares_the_window_daemon, mru_order,
+        pane_attachable, parse_ssh_connect_input, parse_ssh_option_words,
     };
+
+    #[test]
+    fn the_close_question_names_what_it_is_about_to_end() {
+        use crate::terminal::view::PaneBusy;
+        crate::ui::i18n::set_locale("en");
+
+        let build = CloseReason::Busy(PaneBusy::Command {
+            what: "cargo build".into(),
+            secs: 42,
+        });
+        // The command is in the body, not a generic "are you sure".
+        let (title, body) = close_prompt(true, &build);
+        assert!(body.contains("cargo build"), "{body}");
+        assert!(!body.contains("{what}"), "the placeholder leaked: {body}");
+        assert!(title.contains("tab"), "{title}");
+        // Same reason, but the pane has siblings: the tab survives, so the
+        // question must not claim otherwise.
+        let (pane_title, _) = close_prompt(false, &build);
+        assert!(pane_title.contains("pane"), "{pane_title}");
+        assert_ne!(title, pane_title);
+
+        let agent = CloseReason::Busy(PaneBusy::Agent("Claude Code"));
+        let (_, body) = close_prompt(true, &agent);
+        assert!(body.contains("Claude Code"), "{body}");
+        assert!(!body.contains("{agent}"), "the placeholder leaked: {body}");
+
+        // A live SSH connection keeps its own wording rather than being folded
+        // into the busy copy.
+        let (ssh_title, ssh_body) = close_prompt(true, &CloseReason::LiveSsh);
+        assert_ne!(ssh_title, title);
+        assert!(!ssh_body.is_empty());
+    }
 
     #[test]
     fn mru_puts_the_active_tab_first_and_the_last_one_used_behind_it() {

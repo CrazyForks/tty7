@@ -74,67 +74,6 @@ impl Tty7App {
         )
     }
 
-    pub(crate) fn render_ssh_close_confirm_overlay(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        self.ssh_close_confirm?;
-        let theme = cx.theme();
-        let card = v_flex()
-            .w(px(360.))
-            .gap_3()
-            .p_4()
-            .bg(theme.popover)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_lg()
-            .shadow_lg()
-            .occlude()
-            .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(t(crate::ui::i18n::L10nKey::CloseSshConnectionTitle)),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(t(crate::ui::i18n::L10nKey::CloseSshConnectionBody)),
-            )
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("ssh-close-cancel")
-                            .label(t(crate::ui::i18n::L10nKey::Keep))
-                            .small()
-                            .on_click(
-                                cx.listener(|this, _, _window, cx| this.cancel_ssh_close(cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("ssh-close-confirm")
-                            .label(t(crate::ui::i18n::L10nKey::Close))
-                            .primary()
-                            .small()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.confirm_ssh_close(window, cx)
-                            })),
-                    ),
-            );
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(card)
-                .into_any_element(),
-        )
-    }
-
     pub(crate) fn forwards_section(
         &self,
         pane_id: Option<u64>,

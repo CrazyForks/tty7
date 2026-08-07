@@ -92,12 +92,13 @@ Aider、Amp、OpenCode 等约 17 个）并在其外围加功能 —— 绝不包
 | | |
 |---|---|
 | <kbd>⌘ T</kbd> · <kbd>⌘ W</kbd> · <kbd>⌘ ⇧ T</kbd> | 新建标签页 · 关闭标签页 · 恢复关闭的标签页 |
-| <kbd>⌘ 1</kbd>…<kbd>⌘ 9</kbd> · <kbd>⌃ ⇥</kbd> · <kbd>⌃ ⇧ ⇥</kbd> | 跳到第 1–9 个标签页 · 下一个 · 上一个标签页 |
+| <kbd>⌘ 1</kbd>…<kbd>⌘ 9</kbd> | 跳到第 1–9 个标签页 |
+| <kbd>⌃ ⇥</kbd> · <kbd>⌃ ⇧ ⇥</kbd> | 按住不放在切换面板里向后 · 向前走，松手即切换 |
 | <kbd>⌘ D</kbd> · <kbd>⌘ ⇧ D</kbd> | 向右分屏 · 向下分屏 |
 | <kbd>⌘ ]</kbd> · <kbd>⌘ [</kbd> | 下一个窗格 · 上一个窗格 |
 | <kbd>⌘ ⌥ ←→↑↓</kbd> | 按方向切换焦点窗格 |
-| <kbd>⌘ ⏎</kbd> · <kbd>⌘ ⇧ ⏎</kbd> | 切换全屏 · 最大化 / 还原窗格 |
-| <kbd>⌘ K</kbd> | 清屏并清空 scrollback |
+| <kbd>⌘ ⏎</kbd> · <kbd>⌘ ⇧ ⏎</kbd> | 切换全屏 · 缩放窗格 |
+| <kbd>⌘ K</kbd> | 清除 scrollback |
 | <kbd>⌘ P</kbd> | 命令面板 |
 | <kbd>⌘ F</kbd> | 搜索 scrollback |
 | <kbd>⌃ R</kbd> | 模糊搜索 shell 历史 |
