@@ -44,6 +44,33 @@ pub(crate) struct TreeRow {
     pub depth: usize,
     pub is_root: bool,
     pub expanded: bool,
+    /// Stands in for the children of `entry` when there are none to draw.
+    /// Without it, a directory still being listed, one that is genuinely empty,
+    /// one whose contents are all hidden, and one the OS refused to read all
+    /// render as the same nothing.
+    pub note: Option<TreeNote>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TreeNote {
+    Loading,
+    Empty,
+    HiddenOnly,
+    Unreadable,
+}
+
+/// `landed` is how many entries the listing returned, or `None` when nothing
+/// has come back yet — which is the whole difference between "empty" and
+/// "still working". A non-zero count with no visible rows means the hidden
+/// filter took them all, and calling that "empty" is a lie the user can
+/// disprove with one keystroke.
+fn dir_note(unreadable: bool, landed: Option<usize>) -> TreeNote {
+    match (unreadable, landed) {
+        (true, _) => TreeNote::Unreadable,
+        (false, None) => TreeNote::Loading,
+        (false, Some(0)) => TreeNote::Empty,
+        (false, Some(_)) => TreeNote::HiddenOnly,
+    }
 }
 
 pub(crate) enum TreeEdit {
@@ -120,6 +147,10 @@ impl SearchState {
 pub(crate) struct FileTreeState {
     children: ByHost<PathBuf, Vec<TreeEntry>>,
     loads: InFlight<DirKey>,
+    /// Directories whose last listing came back as a failure rather than as an
+    /// empty result. `read_dir` used to be `unwrap_or_default()`ed, so a
+    /// permission-denied folder was indistinguishable from an empty one.
+    unreadable: HashSet<DirKey>,
     stale: HashSet<DirKey>,
     repo_roots: ByHost<PathBuf, PathBuf>,
     repo_root_loads: InFlight<DirKey>,
@@ -162,6 +193,7 @@ impl FileTreeState {
             watch_host: None,
             children: ByHost::default(),
             loads: InFlight::default(),
+            unreadable: HashSet::new(),
             stale: HashSet::new(),
             repo_roots: ByHost::default(),
             repo_root_loads: InFlight::default(),
@@ -315,8 +347,10 @@ impl FileTreeState {
                 let dir = dir.clone();
                 let root = root.clone();
                 move |h| {
-                    let entries = h.read_dir(&dir, Some(&root)).unwrap_or_default();
-                    entries
+                    let listing = h.read_dir(&dir, Some(&root));
+                    let readable = listing.is_ok();
+                    let entries = listing
+                        .unwrap_or_default()
                         .into_iter()
                         .map(|e| TreeEntry {
                             path: h.join(&dir, &e.name),
@@ -324,10 +358,16 @@ impl FileTreeState {
                             is_dir: e.is_dir,
                             ignored: e.ignored,
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    (readable, entries)
                 }
             },
-            move |app, entries, cx| {
+            move |app, (readable, entries), cx| {
+                if readable {
+                    app.file_tree.unreadable.remove(&key);
+                } else {
+                    app.file_tree.unreadable.insert(key.clone());
+                }
                 let landed = app.file_tree.land_load(&key, id, dir.clone(), entries);
                 if landed.changed {
                     cx.notify();
@@ -420,6 +460,7 @@ impl FileTreeState {
                 depth: 0,
                 is_root: false,
                 expanded: false,
+                note: None,
             })
             .collect()
     }
@@ -446,6 +487,7 @@ impl FileTreeState {
                 depth: 0,
                 is_root: true,
                 expanded: true,
+                note: None,
             });
             self.flatten_dir(host, root, 1, expanded, &mut rows);
         }
@@ -461,22 +503,49 @@ impl FileTreeState {
         out: &mut Vec<TreeRow>,
     ) {
         let Some(entries) = self.children.get(host, &dir.to_path_buf()) else {
+            out.push(self.note_row(host, dir, depth, None));
             return;
         };
+        let mut shown = 0usize;
         for e in entries {
             if !self.show_hidden && e.name.starts_with('.') {
                 continue;
             }
+            shown += 1;
             let is_expanded = e.is_dir && expanded.contains(&e.path);
             out.push(TreeRow {
                 entry: e.clone(),
                 depth,
                 is_root: false,
                 expanded: is_expanded,
+                note: None,
             });
             if is_expanded {
                 self.flatten_dir(host, &e.path, depth + 1, expanded, out);
             }
+        }
+        if shown == 0 {
+            out.push(self.note_row(host, dir, depth, Some(entries.len())));
+        }
+    }
+
+    /// Why an expanded directory drew no children. `landed` is the number of
+    /// entries the listing actually returned, or `None` when nothing has landed
+    /// yet — that is the difference between "empty" and "still working".
+    fn note_row(&self, host: HostId, dir: &Path, depth: usize, landed: Option<usize>) -> TreeRow {
+        let key: DirKey = (host, dir.to_path_buf());
+        let note = dir_note(self.unreadable.contains(&key), landed);
+        TreeRow {
+            entry: TreeEntry {
+                name: String::new(),
+                path: dir.to_path_buf(),
+                is_dir: true,
+                ignored: false,
+            },
+            depth,
+            is_root: false,
+            expanded: false,
+            note: Some(note),
         }
     }
 
@@ -823,9 +892,14 @@ impl Tty7App {
         let Some(code) = self.tab_code() else {
             return;
         };
-        let rows = self
+        // Placeholder rows explain an absence; they are not files, so the
+        // cursor must not be able to land on one.
+        let rows: Vec<TreeRow> = self
             .file_tree
-            .visible_rows(host, &code.roots, &code.expanded);
+            .visible_rows(host, &code.roots, &code.expanded)
+            .into_iter()
+            .filter(|r| r.note.is_none())
+            .collect();
         if rows.is_empty() {
             return;
         }
@@ -1185,6 +1259,21 @@ impl Tty7App {
             }
             self.file_tree.visible_rows(host_id, &roots, &expanded)
         };
+        // A search that found nothing, and a tab with no directory behind it,
+        // both used to render as an empty column that looks identical to a
+        // tree still loading.
+        let blank = rows.is_empty().then(|| {
+            let text = match self.file_tree_searching(cx) {
+                true => t_fmt(L10nKey::SettingsNothingMatches, &[("query", &query)]),
+                false => t(L10nKey::OpenFileFromTree).to_string(),
+            };
+            div()
+                .px_3()
+                .py_4()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(text)
+        });
         let column = v_flex()
             .id("right-panel-tree-rows")
             .flex_1()
@@ -1197,6 +1286,7 @@ impl Tty7App {
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 this.file_tree_key_down(ev, window, cx);
             }))
+            .children(blank)
             .children(
                 rows.iter()
                     .flat_map(|row| self.render_tree_row(row, window, cx)),
@@ -1218,6 +1308,33 @@ impl Tty7App {
         let is_dir = row.entry.is_dir;
         let selected = self.tab_code().and_then(|c| c.selected.as_deref()) == Some(&*path);
         let muted = cx.theme().muted_foreground;
+
+        // A placeholder standing in for children that are not there. Not a
+        // file, so it takes none of the row machinery below — no hover, no
+        // selection, no context menu, no drag.
+        if let Some(note) = row.note {
+            let (key, ink) = match note {
+                TreeNote::Loading => (L10nKey::TreeDirLoading, muted),
+                TreeNote::Empty => (L10nKey::TreeDirEmpty, muted),
+                TreeNote::HiddenOnly => (L10nKey::TreeDirHiddenOnly, muted),
+                TreeNote::Unreadable => (L10nKey::TreeDirUnreadable, cx.theme().danger),
+            };
+            return vec![
+                h_flex()
+                    // Aligned with the label column of a real row at this
+                    // depth: 6 for the row's own inset, INDENT for the depth,
+                    // then the width of the icon and its gap.
+                    .pl(px(6.0 + row.depth as f32 * INDENT + 20.0))
+                    .py_1()
+                    .items_center()
+                    .text_xs()
+                    .italic()
+                    .text_color(ink)
+                    .child(t(key))
+                    .into_any_element(),
+            ];
+        }
+
         let sf = cx.global::<crate::ui::presets::Surfaces>().popover;
         let dirty = self
             .tab_code()
@@ -1567,6 +1684,24 @@ mod tests {
             is_dir,
             ignored: false,
         }
+    }
+
+    #[test]
+    fn an_expanded_directory_says_why_it_has_no_children() {
+        // Still in flight.
+        assert_eq!(dir_note(false, None), TreeNote::Loading);
+        // A listing that came back with nothing in it.
+        assert_eq!(dir_note(false, Some(0)), TreeNote::Empty);
+        // Entries landed, but the hidden filter took every one of them.
+        assert_eq!(dir_note(false, Some(3)), TreeNote::HiddenOnly);
+        // A directory the OS refused. `read_dir` used to be
+        // `unwrap_or_default`ed, so this was byte-identical to Empty.
+        assert_eq!(dir_note(true, Some(0)), TreeNote::Unreadable);
+        assert_eq!(
+            dir_note(true, None),
+            TreeNote::Unreadable,
+            "a known failure outranks a retry still in flight"
+        );
     }
 
     #[test]
@@ -2011,7 +2146,9 @@ mod render_idle_gpui_tests {
             let code = app.tab_code().expect("panel state");
             app.file_tree
                 .visible_rows(HostId::LOCAL, &code.roots, &code.expanded)
-                .len()
+                .iter()
+                .filter(|r| r.note.is_none())
+                .count()
         })
     }
 
