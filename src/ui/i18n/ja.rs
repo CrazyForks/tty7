@@ -147,6 +147,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsBackgroundImageDesc => "背景色の上、テキストの下に表示されます",
         L10nKey::SettingsAnsiColors => "ANSI カラー",
         L10nKey::SettingsCustomThemes => "カスタムテーマ",
+        L10nKey::SettingsThemesRejected => "テーマフォルダから読み込めなかったもの",
         L10nKey::SettingsCustomThemesIntro => {
             "テーマを複製して色を編集するか、テーマフォルダに自作テーマ（tty7 の YAML テーマまたは iTerm2 の .itermcolors スキーム）を置けます"
         }

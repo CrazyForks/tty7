@@ -4523,6 +4523,37 @@ impl Tty7App {
             ),
         );
 
+        // A theme file that fails to parse used to log a warning and then just
+        // not be in the list. This is a folder the user opens and drops files
+        // into; "it isn't there" needs a reason attached to it.
+        let rejected = presets::rejected(cx);
+        let rejected_note = (!rejected.is_empty() && query.is_empty()).then(|| {
+            let mut note = v_flex()
+                .mx_4()
+                .mb_4()
+                .p_3()
+                .gap_1p5()
+                .rounded(rounding::TRACK_RADIUS)
+                .border_1()
+                .border_color(theme.danger.opacity(0.4))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(foreground)
+                        .child(t(L10nKey::SettingsThemesRejected)),
+                );
+            for (name, why) in &rejected {
+                note = note.child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(div().text_xs().text_color(theme.danger).child(name.clone()))
+                        .child(div().text_xs().text_color(muted_fg).child(why.clone())),
+                );
+            }
+            note
+        });
+
         let mut list = v_flex().px_4().pb_4().gap_4();
         for p in presets::all(cx) {
             if !query.is_empty() && !p.name.to_lowercase().contains(&query) {
@@ -4599,6 +4630,7 @@ impl Tty7App {
                     .id("theme-panel-list")
                     .flex_1()
                     .overflow_y_scroll()
+                    .children(rejected_note)
                     .child(list),
             )
             .into_any_element()

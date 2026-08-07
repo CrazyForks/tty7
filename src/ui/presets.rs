@@ -472,14 +472,31 @@ pub struct Themes(pub Vec<Theme>);
 
 impl Global for Themes {}
 
+/// Files in the themes folder that could not be read, and why. A malformed
+/// theme used to log a warning and then simply not be in the list — the folder
+/// is one the user opens and drops files into, so "it isn't there" needs a
+/// reason attached to it.
+#[derive(Default)]
+pub struct RejectedThemes(pub Vec<(String, String)>);
+
+impl Global for RejectedThemes {}
+
 pub fn load_registry(cx: &mut App) {
-    cx.set_global(Themes(load_all()));
+    let (themes, rejected) = load_all();
+    cx.set_global(Themes(themes));
+    cx.set_global(RejectedThemes(rejected));
 }
 
 pub fn all(cx: &App) -> Vec<Theme> {
     cx.try_global::<Themes>()
         .map(|t| t.0.clone())
         .unwrap_or_else(builtins)
+}
+
+pub fn rejected(cx: &App) -> Vec<(String, String)> {
+    cx.try_global::<RejectedThemes>()
+        .map(|r| r.0.clone())
+        .unwrap_or_default()
 }
 
 pub fn by_id(cx: &App, id: &str) -> Theme {
@@ -587,11 +604,12 @@ pub fn write_theme_file(t: &Theme) -> std::io::Result<()> {
     crate::core::config::write_atomic(&path, to_yaml(t).as_bytes())
 }
 
-fn load_all() -> Vec<Theme> {
+fn load_all() -> (Vec<Theme>, Vec<(String, String)>) {
     let mut themes = builtins();
-    themes.extend(load_user_themes());
+    let (user, rejected) = load_user_themes();
+    themes.extend(user);
     dedupe_ids(&mut themes);
-    themes
+    (themes, rejected)
 }
 
 fn dedupe_ids(themes: &mut [Theme]) {
@@ -616,14 +634,15 @@ pub fn themes_dir() -> Option<PathBuf> {
     crate::core::config::config_path("themes")
 }
 
-fn load_user_themes() -> Vec<Theme> {
+fn load_user_themes() -> (Vec<Theme>, Vec<(String, String)>) {
     let Some(dir) = themes_dir() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut out = Vec::new();
+    let mut rejected = Vec::new();
     let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     paths.sort_by_key(|p| p.to_string_lossy().to_lowercase());
     for path in paths {
@@ -638,10 +657,17 @@ fn load_user_themes() -> Vec<Theme> {
         };
         match parsed {
             Ok(theme) => out.push(theme),
-            Err(e) => log::warn!("skipping theme {}: {e}", path.display()),
+            Err(e) => {
+                log::warn!("skipping theme {}: {e}", path.display());
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                rejected.push((name, e));
+            }
         }
     }
-    out
+    (out, rejected)
 }
 
 fn id_and_name(path: &std::path::Path) -> (String, String) {
