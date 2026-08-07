@@ -276,11 +276,17 @@ impl TerminalView {
             } else {
                 0
             };
+            // The scan stops at MAX_MATCHES. Without the mark, a query that hit
+            // the ceiling reads as if the scrollback held exactly that many.
+            let more = match total >= MAX_MATCHES {
+                true => "+",
+                false => "",
+            };
             div()
                 .flex_none()
                 .text_xs()
                 .text_color(muted)
-                .child(format!("{current}/{total}"))
+                .child(format!("{current}/{total}{more}"))
         });
 
         let case_toggle = Button::new("search-case")
@@ -732,6 +738,19 @@ pub(super) fn is_url_char(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capped_match_count_says_it_is_capped() {
+        // Same rule the count uses. Below the ceiling the number is the truth;
+        // at the ceiling it is a floor, and has to read like one.
+        let mark = |total: usize| match total >= MAX_MATCHES {
+            true => "+",
+            false => "",
+        };
+        assert_eq!(mark(0), "");
+        assert_eq!(mark(MAX_MATCHES - 1), "");
+        assert_eq!(mark(MAX_MATCHES), "+");
+    }
 
     #[test]
     fn regex_escape_neutralizes_metacharacters() {
