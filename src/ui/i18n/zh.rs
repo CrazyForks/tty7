@@ -231,7 +231,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsMacsDesc => "逗号分隔（留空 = 默认值）。",
         L10nKey::SettingsHostKeyAlgorithms => "主机密钥算法",
         L10nKey::SettingsHostKeyAlgorithmsDesc => "逗号分隔（留空 = 默认值）。",
-        L10nKey::SettingsCompression => "压缩",
+        L10nKey::SettingsCompression => "压缩算法",
         L10nKey::SettingsJumpHostVia => "经由 {jump_name}",
         L10nKey::SettingsConnected => "已连接",
         L10nKey::SettingsProfileCopied => "{name}（副本）",

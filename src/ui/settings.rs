@@ -3440,7 +3440,9 @@ impl Tty7App {
                 &form.hostkey,
                 cx,
             ))
-            .child(self.subgroup_header(L10nKey::SettingsGroupConnection, cx))
+            // Compression here is the algorithm list russh negotiates, not
+            // ssh_config's yes/no switch, so it belongs with the other three
+            // lists rather than under Connection with the keepalives.
             .child(text_row(
                 self,
                 t(L10nKey::SettingsCompression),
@@ -3448,6 +3450,7 @@ impl Tty7App {
                 &form.compression,
                 cx,
             ))
+            .child(self.subgroup_header(L10nKey::SettingsGroupConnection, cx))
             .child(text_row(
                 self,
                 t(L10nKey::SettingsKeepaliveInterval),

@@ -261,7 +261,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsMacsDesc => "Comma-separated (blank = default).",
         L10nKey::SettingsHostKeyAlgorithms => "Host-key algorithms",
         L10nKey::SettingsHostKeyAlgorithmsDesc => "Comma-separated (blank = default).",
-        L10nKey::SettingsCompression => "Compression",
+        L10nKey::SettingsCompression => "Compression algorithms",
         L10nKey::SettingsJumpHostVia => "via {jump_name}",
         L10nKey::SettingsConnected => "connected",
         L10nKey::SettingsProfileCopied => "{name} (copy)",

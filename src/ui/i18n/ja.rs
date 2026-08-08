@@ -259,7 +259,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsMacsDesc => "カンマ区切り（空欄 = デフォルト）",
         L10nKey::SettingsHostKeyAlgorithms => "ホストキーアルゴリズム",
         L10nKey::SettingsHostKeyAlgorithmsDesc => "カンマ区切り（空欄 = デフォルト）",
-        L10nKey::SettingsCompression => "圧縮",
+        L10nKey::SettingsCompression => "圧縮アルゴリズム",
         L10nKey::SettingsJumpHostVia => "{jump_name} 経由",
         L10nKey::SettingsConnected => "接続済み",
         L10nKey::SettingsProfileCopied => "{name}（コピー）",
