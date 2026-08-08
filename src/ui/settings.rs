@@ -474,6 +474,9 @@ pub(crate) struct SettingsState {
     /// claims. Searching tells you "Appearance (2)"; these are what carry you
     /// to the two, which on a long page start well below the fold.
     pub(crate) content_scroll: gpui::ScrollHandle,
+    pub(crate) ssh_master_scroll: gpui::ScrollHandle,
+    pub(crate) ssh_detail_scroll: gpui::ScrollHandle,
+    pub(crate) theme_list_scroll: gpui::ScrollHandle,
     pub(crate) search_anchor: gpui::ScrollAnchor,
     /// Set when the query or the section changes, and spent by the next render
     /// that has somewhere to go. A `Cell` because that render only holds `&self`.
@@ -961,13 +964,11 @@ impl Tty7App {
                 .h_full()
                 .bg(background)
                 .child(content)
+                .into_any_element()
         } else {
-            v_flex()
+            let body = v_flex()
                 .id("settings-content")
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .bg(background)
+                .size_full()
                 .overflow_y_scroll()
                 .when_some(self.active_settings(), |pane, s| {
                     pane.track_scroll(&s.content_scroll)
@@ -987,7 +988,20 @@ impl Tty7App {
                             .children(no_match_note)
                             .child(content),
                     ),
-                )
+                );
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .bg(background)
+                .when_some(self.active_settings(), |pane, s| {
+                    pane.child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "settings-content-scrollbar",
+                        body,
+                        &s.content_scroll,
+                    ))
+                })
+                .into_any_element()
         };
 
         let root = div()
@@ -1704,43 +1718,58 @@ impl Tty7App {
 
     fn render_settings_ssh(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
+        let Some((master_scroll, detail_scroll)) = self
+            .active_settings()
+            .map(|s| (s.ssh_master_scroll.clone(), s.ssh_detail_scroll.clone()))
+        else {
+            return div().into_any_element();
+        };
+        let master = v_flex()
+            .id("ssh-master")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&master_scroll)
+            .child(self.render_ssh_master(cx));
+        let detail = v_flex()
+            .id("ssh-detail")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&detail_scroll)
+            .child(
+                div()
+                    .pt(px(crate::ui::app::TITLE_BAR_HEIGHT))
+                    .px_8()
+                    .pb_8()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(720.))
+                            .child(self.render_ssh_detail(cx)),
+                    ),
+            );
         h_flex()
             .size_full()
             .items_start()
             .child(
                 v_flex()
-                    .id("ssh-master")
                     .flex_shrink_0()
                     .w(px(280.))
                     .h_full()
                     .border_r_1()
                     .border_color(border)
-                    .overflow_y_scroll()
-                    .child(self.render_ssh_master(cx)),
+                    .child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "ssh-master-scrollbar",
+                        master,
+                        &master_scroll,
+                    )),
             )
-            .child(
-                v_flex()
-                    .id("ssh-detail")
-                    .flex_1()
-                    // Without this the flex default `min-width: auto` keeps the
-                    // column at its content width, so a narrow window pushes the
-                    // form off the right edge instead of squeezing the labels.
-                    .min_w_0()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .pt(px(crate::ui::app::TITLE_BAR_HEIGHT))
-                            .px_8()
-                            .pb_8()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .max_w(px(720.))
-                                    .child(self.render_ssh_detail(cx)),
-                            ),
-                    ),
-            )
+            .child(v_flex().flex_1().min_w_0().h_full().child(
+                crate::ui::scrollbar::with_vertical_scrollbar(
+                    "ssh-detail-scrollbar",
+                    detail,
+                    &detail_scroll,
+                ),
+            ))
             .into_any_element()
     }
 
@@ -4602,6 +4631,7 @@ impl Tty7App {
             ),
             None => return div().into_any_element(),
         };
+        let list_scroll = self.active_settings().map(|s| s.theme_list_scroll.clone());
         let config = cx.global::<Config>();
         let slot = match (config.theme_follow_system, slot) {
             (false, _) => ThemeSlot::Manual,
@@ -4769,14 +4799,19 @@ impl Tty7App {
             .child(header)
             .child(subtitle)
             .child(search_box)
-            .child(
-                v_flex()
-                    .id("theme-panel-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .children(rejected_note)
-                    .child(list),
-            )
+            .when_some(list_scroll, |panel, scroll| {
+                panel.child(crate::ui::scrollbar::with_vertical_scrollbar(
+                    "theme-panel-scrollbar",
+                    v_flex()
+                        .id("theme-panel-list")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&scroll)
+                        .children(rejected_note)
+                        .child(list),
+                    &scroll,
+                ))
+            })
             .into_any_element()
     }
 

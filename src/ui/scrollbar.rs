@@ -11,6 +11,12 @@ pub(crate) fn with_vertical_scrollbar(
         .relative()
         .flex_1()
         .min_h_0()
+        // Stretching would size this the same, but not *definitely*: a `w_full`
+        // inside the scroll area would then have no width to be a percentage
+        // of, and would fall back to its content. That is how the settings
+        // reading column lost its 640px cap on the Chinese page — one wide row
+        // measured wider, and every row followed it.
+        .w_full()
         .child(scroll_area)
         .child(
             div()
