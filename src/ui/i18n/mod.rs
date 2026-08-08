@@ -1297,7 +1297,6 @@ mod tests {
             L10nKey::SettingsProxyCommand,
             L10nKey::SftpContextChmod,
             L10nKey::SettingsShell,
-            L10nKey::SettingsScrollback,
             L10nKey::SettingsScrollbackDesc,
             L10nKey::SettingsScrollSpeed,
             L10nKey::SettingsScrollSpeedDesc,

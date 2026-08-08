@@ -276,7 +276,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
             "仅适用于没有可继承目录的 shell，例如窗口的第一个标签页。新标签页和分屏仍会继承活动窗格的目录，已经打开的 shell 会继续运行。"
         }
         L10nKey::SettingsScrolling => "滚动",
-        L10nKey::SettingsScrollback => "Scrollback",
+        L10nKey::SettingsScrollback => "回滚行数",
         L10nKey::SettingsScrollbackDesc => "每个窗格保留的历史行数。仅适用于新窗格。",
         L10nKey::SettingsScrollSpeed => "滚动速度",
         L10nKey::SettingsScrollSpeedDesc => "应用于鼠标滚轮滚动的倍率。",
