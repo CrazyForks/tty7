@@ -457,7 +457,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsWindow => "Window",
         L10nKey::NotifyModeNever => "Never",
-        L10nKey::NotifyModeUnfocused => "When Unfocused",
+        L10nKey::NotifyModeUnfocused => "When unfocused",
         L10nKey::NotifyModeAlways => "Always",
         L10nKey::SettingsStartupNormal => "Normal",
         L10nKey::SettingsStartupMaximized => "Maximized",
@@ -497,25 +497,25 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsVersion => "Version",
         L10nKey::SettingsUpdates => "Updates",
-        L10nKey::SettingsUpdateAndRelaunch => "Update and Relaunch",
-        L10nKey::SettingsUpdateViewRelease => "View Release",
+        L10nKey::SettingsUpdateAndRelaunch => "Update and relaunch",
+        L10nKey::SettingsUpdateViewRelease => "View release",
         L10nKey::SettingsUpdateChecking => "Checking for updates…",
         L10nKey::SettingsUpdateUpToDate => "You're running the latest version.",
         L10nKey::SettingsUpdateDownloadingPercent => "Downloading the update… {percent}% of {size}",
         L10nKey::SettingsUpdateDownloadingBytes => "Downloading the update… {received}",
         L10nKey::SettingsUpdateVerifying => "Verifying the downloaded update…",
         L10nKey::SettingsUpdateInstalling => "Relaunching with the update…",
-        L10nKey::SettingsUpdateCheckNow => "Check Now",
-        L10nKey::SettingsUpdateCancel => "Cancel Download",
-        L10nKey::SettingsUpdateRetry => "Try Again",
+        L10nKey::SettingsUpdateCheckNow => "Check now",
+        L10nKey::SettingsUpdateCancel => "Cancel download",
+        L10nKey::SettingsUpdateRetry => "Try again",
         L10nKey::SettingsUpdateDismiss => "Dismiss",
-        L10nKey::SettingsUpdateDownloadManually => "Download Manually",
+        L10nKey::SettingsUpdateDownloadManually => "Download manually",
         L10nKey::SettingsUpdateFailedTitle => "Updating to {version} failed.",
         L10nKey::SettingsUpdateReady => "Version {version} is downloaded and ready to install.",
         L10nKey::SettingsUpdateReadyNextLaunch => {
             "It will be installed the next time you start tty7."
         }
-        L10nKey::SettingsUpdateInstallNow => "Install and Relaunch",
+        L10nKey::SettingsUpdateInstallNow => "Install and relaunch",
         L10nKey::SettingsUpdateDiscard => "Discard",
         L10nKey::SettingsAutoDownload => "Download updates in the background",
         L10nKey::SettingsAutoDownloadDesc => {
