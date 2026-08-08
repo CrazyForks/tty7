@@ -5,9 +5,9 @@
 ## Input
 
 - **Ghost suggestions** — your history completes the whole line as you type; <kbd>→</kbd> to accept
-- **Explained tab completion** — every flag and subcommand with its description, for ~100 common commands; when tty7 has nothing to offer the Tab falls through to your shell's own completion, and the whole feature can be turned off (Settings → Terminal → Keyboard, or `tab_completion` in `config.json`)
+- **Explained tab completion** — every flag and subcommand with its description, for ~100 common commands; when tty7 has nothing to offer the Tab falls through to your shell's own completion, and the whole feature can be turned off (Settings → Input → Prompt, or `tab_completion` in `config.json`)
 - **Syntax highlighting** — as you type, nothing to install
-- **Fuzzy history search** — <kbd>⌃ R</kbd> shows what you ran, where, and whether it failed; turn it off (Settings → Terminal → Keyboard, or `history_search` in `config.json`) and <kbd>⌃ R</kbd> goes to your shell instead, so an fzf / percol binding keeps working
+- **Fuzzy history search** — <kbd>⌃ R</kbd> shows what you ran, where, and whether it failed; turn it off (Settings → Input → Prompt, or `history_search` in `config.json`) and <kbd>⌃ R</kbd> goes to your shell instead, so an fzf / percol binding keeps working
 - **History from day one** — your existing shell history works as-is and carries across sessions
 - **Line editing** — click to place the caret, mouse selection, word motion, undo
 - **Multi-line editing** — wrapped and multi-line commands edit in place; the grid shifts to keep the caret visible. <kbd>⇧ ⏎</kbd> · <kbd>⌥ ⏎</kbd> insert a newline instead of submitting (rebindable as `InsertNewline`); a plain <kbd>⏎</kbd> submits the whole buffer
@@ -17,11 +17,11 @@
 - **Tabs & splits** — always open in the current directory
 - **Repo-grouped sidebar** — the left tab sidebar groups rows under a header per git repository, non-repo tabs in a trailing *Scratch* section; branch switches and in-repo `cd`s never move a row (`sidebar_grouping` in `config.json`: `repo` default, `none` for a flat list)
 - **Command palette** <kbd>⌘ P</kbd> · scrollback search <kbd>⌘ F</kbd>
-- **⌘/Ctrl-click links** (⌘ on macOS, Ctrl on Windows/Linux) · desktop notifications · copy on select (opt-in, Settings → Terminal → Clipboard)
-- **Smart double-click selection** — double-click grabs the whole URL, file path, bracket/quote pair, or dictionary-segmented CJK word under the cursor; Shift-click extends a selection (toggle in Settings → Terminal → Mouse; word separators via `word_separators` in `config.json`)
+- **⌘/Ctrl-click links** (⌘ on macOS, Ctrl on Windows/Linux) · desktop notifications · copy on select (opt-in, Settings → Input → Selection & clipboard)
+- **Smart double-click selection** — double-click grabs the whole URL, file path, bracket/quote pair, or dictionary-segmented CJK word under the cursor; Shift-click extends a selection (toggle in Settings → Input → Selection & clipboard; word separators via `word_separators` in `config.json`)
 - **Nine themes, plus your own** — YAML seed themes with solid, gradient, or image backgrounds; iTerm2 `.itermcolors` import; in-app color editor with a background-image picker
 - **Sync with system** — Settings → Appearance; pick separate light and dark themes and tty7 follows the OS appearance live (`theme_follow_system`, `theme_preset_light` / `theme_preset_dark` in `config.json`)
-- **Window opacity & blur** — Settings → Appearance → Window; applies to every theme, *Follow theme* returns to the theme's own `opacity` / `blur`
+- **Window opacity & blur** — Settings → Appearance → Transparency; applies to every theme, *Follow theme* returns to the theme's own `opacity` / `blur`
 - **CJK / IME input**
 - **Windows Explorer menu** — the installer offers *Add “Open in tty7” to the folder context menu* as a setup task, off by default, and the uninstaller always takes it back out. Writing shell verbs is an install-time decision, so there is no runtime setting; a portable-zip install can do it itself with `tty7-app.exe --register-explorer-menu` (or `--unregister-explorer-menu`). Either way the keys land under `HKCU`, so only your own Windows account is affected
 

@@ -5,9 +5,9 @@
 ## 输入
 
 - **影子建议** —— 边打字边用你的历史补全整条命令，<kbd>→</kbd> 接受
-- **带说明的 Tab 补全** —— 每个 flag、每个子命令都带说明，覆盖约 100 个常用命令；tty7 没有候选时 Tab 自动交给 shell 自己的补全，整个功能也可关闭（设置 → 终端 → 键盘，或 `config.json` 里的 `tab_completion`）
+- **带说明的 Tab 补全** —— 每个 flag、每个子命令都带说明，覆盖约 100 个常用命令；tty7 没有候选时 Tab 自动交给 shell 自己的补全，整个功能也可关闭（设置 → 输入 → 提示符，或 `config.json` 里的 `tab_completion`）
 - **语法高亮** —— 边打边亮，什么都不用装
-- **模糊历史搜索** —— <kbd>⌃ R</kbd> 看到每条命令在哪跑的、什么时候、有没有失败；关掉它（设置 → 终端 → 键盘，或 `config.json` 里的 `history_search`）后 <kbd>⌃ R</kbd> 直接交给 shell，你绑的 fzf / percol 照常可用
+- **模糊历史搜索** —— <kbd>⌃ R</kbd> 看到每条命令在哪跑的、什么时候、有没有失败；关掉它（设置 → 输入 → 提示符，或 `config.json` 里的 `history_search`）后 <kbd>⌃ R</kbd> 直接交给 shell，你绑的 fzf / percol 照常可用
 - **历史开箱即用** —— 你已有的 shell 历史直接生效，并跨会话延续
 - **行编辑** —— 点击定位光标、鼠标选区、词级移动、撤销
 - **多行编辑** —— 折行和多行命令原地编辑；网格自动上移，光标始终可见。<kbd>⇧ ⏎</kbd> · <kbd>⌥ ⏎</kbd> 插入换行而不提交（可改绑，动作名 `InsertNewline`），单独按 <kbd>⏎</kbd> 提交整个缓冲区
@@ -15,13 +15,13 @@
 ## 窗口
 
 - **标签页与分屏** —— 永远开在当前目录
-- **侧栏按仓库分组** —— 左侧标签栏按 git 仓库分组、每组一个标题行，不在仓库里的标签归入末尾的 *Scratch* 组；切分支、仓库内 `cd` 都不会挪动行（`config.json` 的 `sidebar_grouping`：默认 `repo`，`none` 恢复扁平列表）
+- **侧栏按仓库分组** —— 左侧标签栏按 git 仓库分组、每组一个标题行，不在仓库里的标签归入末尾的 *草稿* 组；切分支、仓库内 `cd` 都不会挪动行（`config.json` 的 `sidebar_grouping`：默认 `repo`，`none` 恢复扁平列表）
 - **命令面板** <kbd>⌘ P</kbd> · scrollback 搜索 <kbd>⌘ F</kbd>
-- **⌘ 点击打开链接** · 桌面通知 · 划选即复制（可选，设置 → 终端 → 剪贴板）
-- **智能双击选中** —— 双击直接选中整条 URL、文件路径、括号/引号对，中文按词典分词出词；Shift 点击扩展选区（设置 → 终端 → 鼠标可开关；分隔符用 `config.json` 的 `word_separators` 配置）
+- **⌘ 点击打开链接** · 桌面通知 · 划选即复制（可选，设置 → 输入 → 选择与剪贴板）
+- **智能双击选中** —— 双击直接选中整条 URL、文件路径、括号/引号对，中文按词典分词出词；Shift 点击扩展选区（设置 → 输入 → 选择与剪贴板可开关；分隔符用 `config.json` 的 `word_separators` 配置）
 - **9 套主题，也能自定义** — YAML 种子主题，背景支持纯色、渐变或图片；可导入 iTerm2 `.itermcolors`；应用内颜色编辑器带背景图选择
-- **跟随系统外观** — 设置 → Appearance；分别选好浅色和深色主题，tty7 随系统深浅模式实时切换（`config.json` 中的 `theme_follow_system`、`theme_preset_light` / `theme_preset_dark`）
-- **窗口透明与模糊** — 设置 → Appearance → Window；对所有主题生效，*Follow theme* 恢复主题自带的 `opacity` / `blur`
+- **跟随系统外观** — 设置 → 外观；分别选好浅色和深色主题，tty7 随系统深浅模式实时切换（`config.json` 中的 `theme_follow_system`、`theme_preset_light` / `theme_preset_dark`）
+- **窗口透明与模糊** — 设置 → 外观 → 透明度；对所有主题生效，*跟随主题* 恢复主题自带的 `opacity` / `blur`
 - **CJK / 输入法输入**
 - **Windows 资源管理器右键菜单** —— 安装程序提供 *Add “Open in tty7” to the folder context menu* 这个安装任务，默认不勾选，卸载时一律移除。写 shell verb 是安装期的决定，所以没有运行时开关；用 portable zip 的话可以自己执行 `tty7-app.exe --register-explorer-menu`（或 `--unregister-explorer-menu`）。两种方式写入的键都在 `HKCU` 下，只影响你自己的 Windows 账户
 
@@ -56,10 +56,10 @@ Aider、Amp、OpenCode 等约 17 个）并在其外围加功能 —— 绝不包
 - **品牌头像** —— 标签 chip / 侧栏行显示每个 pane 跑的是哪个 agent；自定义包装命令可通过 `config.json` 的 `agent_commands` 映射
 - **状态点** —— 工作中（蓝）/ 等你输入（琥珀）/ 完成（绿），由 agent 自己上报的 OSC 事件驱动；在 设置 → Agents 一键装好对应 hooks（Claude Code、Codex、Copilot CLI、OpenCode、Pi、Grok Build）
 - **通知** —— agent 卡在等你批准的那一刻弹 "needs your permission…"，每轮结束弹 "finished after Ns"，遵循你的通知策略
-- **一眼看分支** —— 侧栏每行显示该 pane 的 git 分支和工作区改动（`+N −M`），`cd` 或命令跑完时自动刷新；点改动数字会打开 diff 浮层，关掉它（设置 → 窗口与标签，或 `config.json` 的 `sidebar_diff_preview: false`）分支和数字照常显示，只是不再可点
+- **一眼看分支** —— 侧栏每行显示该 pane 的 git 分支和工作区改动（`+N −M`），`cd` 或命令跑完时自动刷新；点改动数字会打开 diff 浮层，关掉它（设置 → 窗口与标签页，或 `config.json` 的 `sidebar_diff_preview: false`）分支和数字照常显示，只是不再可点
 - **会话恢复** —— 重启后无法重连的 pane 会自动续上 agent 对话，并带上原始启动 flags（`claude --dangerously-skip-permissions --resume …`；`restore_agent_sessions`，默认开启）
 - **Fork 会话** —— 直接调 agent 自己的 fork 命令（`codex fork <id>`、`claude --resume <id> --fork-session`，OpenCode 和 Grok Build 同样支持），把当前对话分叉成一个独立会话；原会话原封不动，两边各自往下走。在 pane 上右键可选择分屏位置，在标签 / 侧栏行上右键则直接开新标签。需要先装好该 agent 的 hooks（fork 认的是 hooks 上报的 session id）；远程 pane 不能 fork，因为命令会跑在本机的 agent 上；另外 fork 会整份复制对话历史，反复 fork 会在 agent 自己的会话目录里占掉不少磁盘
-- **复制 Session ID** —— 把 agent 的原生 session id 复制到剪贴板，就在 *Copy Working Directory* 旁边，方便粘进 `codex resume`、bug 报告或别的工具
+- **复制会话 ID** —— 把 agent 的原生 session id 复制到剪贴板，就在 *复制工作目录* 旁边，方便粘进 `codex resume`、bug 报告或别的工具
 - **上下文回填** —— 面板命令把当前选区或仓库 `git diff` 打包成 prompt 直接喂给正在跑的 agent
 - **托盘图标** —— 系统托盘 / 菜单栏常驻图标，任何 agent 等你输入时立即切换为提醒态；菜单列出所有 agent pane（品牌头像 + 状态点，点击直达）、可切换通知策略，并在保留会话的普通退出之外提供 *退出并停止服务器…*（`show_tray_icon`，默认开启）
 - **`tty7 wait`** —— CLI 的编排原语：阻塞到某个 pane 的 agent 等待输入或完成一轮（`tty7 wait %3 --until waiting,done --changed --timeout 600`，超时退出码 124），让一个 agent 睡到同伴卡在权限确认的那一刻，而不是抓屏猜——然后 `tty7 capture %3 --plain` 收结果。agent 状态是电平不是边沿，所以 `--changed` 会忽略 wait 开始时 pane 本来就处在的那个状态；不加它的话，JSON 里的 `stale` 标记会告诉你这个答案是不是上一轮留下的
@@ -104,7 +104,7 @@ Aider、Amp、OpenCode 等约 17 个）并在其外围加功能 —— 绝不包
 | <kbd>⌃ R</kbd> | 模糊搜索 shell 历史 |
 | <kbd>⌘ +</kbd> · <kbd>⌘ −</kbd> · <kbd>⌘ 0</kbd> | 字号增大 · 减小 · 重置 |
 
-**Settings → Keybindings**（<kbd>⌘ ,</kbd>）列出全部快捷键。点一行、按下新键即可
+**设置 → 按键绑定**（<kbd>⌘ ,</kbd>）列出全部快捷键。点一行、按下新键即可
 （<kbd>Esc</kbd> 取消，<kbd>Backspace</kbd> 恢复默认），改完立即生效。窗格缩放与
 交换默认不绑定键 —— 在这里绑定，或从命令面板执行。
 
