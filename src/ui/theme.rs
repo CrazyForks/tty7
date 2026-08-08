@@ -305,6 +305,11 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.foreground = rgb(m.foreground).into();
     t.border = rgb(m.border).into();
     t.secondary = rgb(m.secondary).into();
+    // Ink, not fill. gpui-component resolves both of these from its *stock*
+    // foreground, so a button's label and the detail panel's section headings
+    // were the only text in the window not written in the preset's own colour.
+    t.button_foreground = rgb(m.foreground).into();
+    t.secondary_foreground = rgb(m.foreground).into();
     t.muted = rgb(m.muted).into();
     t.muted_foreground = rgb(m.muted_foreground).into();
     t.popover = rgb(m.popover).into();
