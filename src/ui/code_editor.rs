@@ -34,6 +34,11 @@ pub(crate) struct OpenFile {
     pub(crate) conflict: bool,
     pub(crate) preview: bool,
     pub(crate) wrap: bool,
+    /// The rendered-Markdown pane's own scroll. Per file, so switching away
+    /// and back lands where you were reading — and so the pane can carry the
+    /// scrollbar every other scrolling surface in tty7 has. The editor itself
+    /// gets one from `Input`.
+    pub(crate) preview_scroll: gpui::ScrollHandle,
     _sub: Subscription,
     _observe: Subscription,
 }
@@ -500,6 +505,7 @@ impl Tty7App {
                 conflict: false,
                 preview: false,
                 wrap: false,
+                preview_scroll: gpui::ScrollHandle::new(),
                 _sub: sub,
                 _observe: observe,
             },
@@ -894,15 +900,28 @@ impl Tty7App {
             None => self.render_editor_empty(cx).into_any_element(),
             Some(f) if f.preview => {
                 let markdown = f.input.read(cx).text().to_string();
-                div()
-                    .id("editor-md-preview")
+                let scroll = f.preview_scroll.clone();
+                // The bar's wrapper takes its height from `flex_1`, so it needs
+                // a column with a definite height to grow inside — hand it one
+                // rather than dropping it straight into the overlay, or the
+                // pane sizes to its content and there is nothing left to
+                // scroll.
+                v_flex()
                     .size_full()
-                    .overflow_y_scroll()
-                    .px_4()
-                    .py_3()
-                    .child(gpui_component::text::TextView::markdown(
-                        "editor-md-preview-body",
-                        markdown,
+                    .child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "editor-md-preview-scrollbar",
+                        div()
+                            .id("editor-md-preview")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&scroll)
+                            .px_4()
+                            .py_3()
+                            .child(gpui_component::text::TextView::markdown(
+                                "editor-md-preview-body",
+                                markdown,
+                            )),
+                        &scroll,
                     ))
                     .into_any_element()
             }

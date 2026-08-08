@@ -2,6 +2,13 @@ use gpui::{AnyElement, ElementId, ScrollHandle, div, prelude::*};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::v_flex;
 
+/// Overlays the shared vertical scrollbar on a scroll area.
+///
+/// The returned element takes its height from `flex_1`, so it wants a flex
+/// column with a height of its own to grow inside — give it one rather than
+/// dropping it straight into whatever is around it. Without that the wrapper
+/// sizes to its content, the `size_full` scroll area inside grows with it, and
+/// the pane stops scrolling because nothing overflows any more.
 pub(crate) fn with_vertical_scrollbar(
     id: impl Into<ElementId>,
     scroll_area: impl IntoElement,
