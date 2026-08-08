@@ -9,13 +9,20 @@ use gpui_component::button::Button;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
 use crate::terminal::git_diff::{
-    self, AUTO_COLLAPSE_LINES, DiffSnapshot, DiffStats, FileDiff, FileStatus, LineKind,
+    self, AUTO_COLLAPSE_LINES, DiffSnapshot, DiffSource, DiffStats, FileDiff, FileStatus,
     MAX_RENDERED_FILES, Truncation,
 };
 use crate::ui::app::Tty7App;
+use crate::ui::diff_rows::{Side, SplitCell, SplitRow, split_hunk};
 use crate::ui::i18n::{L10nKey, t, t_fmt, t_plural};
 use crate::ui::rounding;
 use crate::ui::rounding::RoundedCorners as _;
+
+/// What the right panel's shared probe still asks git for, and therefore what
+/// an overlay opened from the panel has to ask for too: the seed below is only
+/// sound while the two agree. Both move together when the panel splits into
+/// staged and unstaged groups.
+const PANEL_DIFF_SOURCE: DiffSource = DiffSource::Head;
 
 pub(crate) enum DiffLoad {
     Loading,
@@ -26,11 +33,15 @@ pub(crate) enum DiffLoad {
 pub(crate) struct DiffOverlayState {
     pub(crate) host_id: crate::ui::host_ops::HostId,
     pub(crate) cwd: PathBuf,
+    /// Which patch this overlay is showing. Part of its identity, not a
+    /// setting: two sources over one directory are two different overlays.
+    pub(crate) source: DiffSource,
     pub(crate) focus_handle: FocusHandle,
     pub(crate) load: DiffLoad,
     pub(crate) loading: bool,
     pub(crate) expanded: HashMap<String, bool>,
     pub(crate) focus: Option<String>,
+    pub(crate) scroll: gpui::ScrollHandle,
 }
 
 impl Tty7App {
@@ -52,6 +63,18 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_diff_overlay(host, cwd, PANEL_DIFF_SOURCE, focus, window, cx)
+    }
+
+    pub(crate) fn open_diff_overlay(
+        &mut self,
+        host: crate::ui::host_ops::HostId,
+        cwd: PathBuf,
+        source: DiffSource,
+        focus: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let active = self.active;
         let was_front = self.tabs.get(active).is_some_and(|t| {
             t.overlay_top == crate::ui::app::OverlayTop::Diff || !self.code_panel_visible()
@@ -59,11 +82,14 @@ impl Tty7App {
         if let Some(tab) = self.tabs.get_mut(active) {
             tab.overlay_top = crate::ui::app::OverlayTop::Diff;
         }
+        // The source belongs in this filter: an open worktree overlay reused
+        // for a staged file would only move the focus, and go on showing the
+        // unstaged patch under the staged file's name.
         match self
             .tabs
             .get_mut(active)
             .and_then(|t| t.diff_overlay.as_mut())
-            .filter(|o| o.cwd == cwd && o.host_id == host)
+            .filter(|o| o.cwd == cwd && o.host_id == host && o.source == source)
         {
             Some(o) if o.focus == focus && was_front => {
                 self.close_diff_overlay(window, cx);
@@ -78,8 +104,12 @@ impl Tty7App {
             }
             None => {}
         }
+        // Skipping the "Reading…" flash is only allowed when the panel's
+        // snapshot answers the same question this overlay is asking.
         let seed = match (&self.right_panel.diff_cwd, &self.right_panel.diff) {
-            (Some(panel_key), Some(Some(snap))) if *panel_key == (host, cwd.clone()) => {
+            (Some(panel_key), Some(Some(snap)))
+                if source == PANEL_DIFF_SOURCE && *panel_key == (host, cwd.clone()) =>
+            {
                 DiffLoad::Ready(Arc::clone(snap))
             }
             _ => DiffLoad::Loading,
@@ -92,11 +122,13 @@ impl Tty7App {
         tab.diff_overlay = Some(DiffOverlayState {
             host_id: host,
             cwd,
+            source,
             focus_handle: focus_handle.clone(),
             load: seed,
             loading: false,
             expanded: HashMap::new(),
             focus,
+            scroll: gpui::ScrollHandle::new(),
         });
         window.focus(&focus_handle, cx);
         self.spawn_diff_probe(cx);
@@ -137,12 +169,13 @@ impl Tty7App {
             return;
         }
         let cwd = overlay.cwd.clone();
+        let source = overlay.source.clone();
         let id = overlay.host_id;
         let Some(host) = crate::ui::host_registry::HostRegistry::lookup(cx, id) else {
             return;
         };
         overlay.loading = true;
-        self.spawn_shared_diff_probe(host, cwd, cx);
+        self.spawn_diff_probe_for(host, cwd, source, cx);
     }
 
     pub(crate) fn spawn_shared_diff_probe(
@@ -151,22 +184,40 @@ impl Tty7App {
         cwd: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        let key = (host.id(), cwd.clone());
+        self.spawn_diff_probe_for(host, cwd, PANEL_DIFF_SOURCE, cx)
+    }
+
+    pub(crate) fn spawn_diff_probe_for(
+        &mut self,
+        host: crate::ui::host_ops::SharedHost,
+        cwd: PathBuf,
+        source: DiffSource,
+        cx: &mut Context<Self>,
+    ) {
+        let key = probe_key(host.id(), &cwd, &source);
         if !self.diff_probes_inflight.insert(key.clone()) {
             self.diff_probes_restale.insert(key);
             return;
         }
         let host_for_retry = host.clone();
         let probe_cwd = cwd.clone();
+        let probe_source = source.clone();
         crate::ui::host_ops::HostOps::run(
             host,
             cx,
-            move |h| git_diff::probe(h, &probe_cwd),
+            move |h| {
+                let req = git_diff::DiffRequest {
+                    source: probe_source,
+                    ..Default::default()
+                };
+                git_diff::probe_diff(h, &probe_cwd, &req)
+            },
             move |app, result, cx| {
+                let id = key.0;
                 app.diff_probes_inflight.remove(&key);
-                app.install_diff_snapshot(key.0, &cwd, result.map(Arc::new), cx);
-                if app.diff_probes_restale.remove(&(key.0, cwd.clone())) {
-                    app.spawn_shared_diff_probe(host_for_retry, cwd, cx);
+                app.install_diff_snapshot(id, &cwd, &source, result.map(Arc::new), cx);
+                if app.diff_probes_restale.remove(&key) {
+                    app.spawn_diff_probe_for(host_for_retry, cwd, source, cx);
                 }
             },
         );
@@ -176,6 +227,7 @@ impl Tty7App {
         &mut self,
         host: crate::ui::host_ops::HostId,
         cwd: &Path,
+        source: &DiffSource,
         snap: Option<Arc<DiffSnapshot>>,
         cx: &mut Context<Self>,
     ) {
@@ -184,7 +236,7 @@ impl Tty7App {
             let Some(overlay) = tab
                 .diff_overlay
                 .as_mut()
-                .filter(|o| o.cwd == cwd && o.host_id == host)
+                .filter(|o| o.cwd == cwd && o.host_id == host && o.source == *source)
             else {
                 continue;
             };
@@ -194,6 +246,12 @@ impl Tty7App {
                 None => DiffLoad::NotARepo,
             };
             landed = true;
+        }
+        if *source != PANEL_DIFF_SOURCE {
+            if landed {
+                cx.notify();
+            }
+            return;
         }
         let key = (host, cwd.to_path_buf());
         if self.right_panel.diff_pending.as_ref() == Some(&key) {
@@ -218,6 +276,13 @@ impl Tty7App {
             return;
         };
         if overlay.loading {
+            return;
+        }
+        // The cached counts come from `git diff --numstat HEAD`, so only a
+        // HEAD snapshot is comparable to them. A staged or unstaged snapshot
+        // would differ the moment anything is staged, and re-probe forever; a
+        // commit or a range cannot go stale at all.
+        if overlay.source != DiffSource::Head {
             return;
         }
         let DiffLoad::Ready(snap) = &overlay.load else {
@@ -250,9 +315,13 @@ impl Tty7App {
             DiffLoad::Ready(snap) if empty_snapshot(snap) => {
                 self.diff_message(t(L10nKey::DiffWorkingTreeClean), cx)
             }
-            DiffLoad::Ready(snap) => {
-                self.diff_file_list(snap, &overlay.expanded, focused_file(snap, overlay), cx)
-            }
+            DiffLoad::Ready(snap) => self.diff_file_list(
+                snap,
+                &overlay.expanded,
+                focused_file(snap, overlay),
+                &overlay.scroll,
+                cx,
+            ),
         };
 
         let header = self.diff_header(overlay, window, cx);
@@ -442,6 +511,7 @@ impl Tty7App {
         snap: &DiffSnapshot,
         expanded: &HashMap<String, bool>,
         focused: Option<usize>,
+        scroll: &gpui::ScrollHandle,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let stats = snap.stats();
@@ -480,13 +550,17 @@ impl Tty7App {
         if focused.is_none() && !snap.untracked.is_empty() {
             list = list.child(self.diff_untracked_section(snap, cx));
         }
-        div()
-            .id("diff-overlay-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .child(list)
-            .into_any_element()
+        crate::ui::scrollbar::with_vertical_scrollbar(
+            "diff-overlay-scrollbar",
+            div()
+                .id("diff-overlay-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(scroll)
+                .child(list),
+            scroll,
+        )
     }
 
     fn diff_oversized_notice(
@@ -527,6 +601,9 @@ impl Tty7App {
             FileStatus::Modified => ("M", cx.theme().warning),
             FileStatus::Deleted => ("D", cx.theme().danger),
             FileStatus::Renamed => ("R", cx.theme().muted_foreground),
+            FileStatus::Copied => ("C", cx.theme().muted_foreground),
+            FileStatus::TypeChanged => ("T", cx.theme().warning),
+            FileStatus::Unmerged => ("U", cx.theme().danger),
         };
         let shown_path = match &file.old_path {
             Some(old) => format!("{old} → {}", file.path),
@@ -863,76 +940,19 @@ fn oversized_summary(snap: &DiffSnapshot, stats: &DiffStats) -> String {
     parts.join(", ")
 }
 
-#[derive(Clone, Copy)]
-enum Side {
-    Old,
-    New,
-}
-
-struct SplitCell {
-    no: Option<u32>,
-    text: String,
-    changed: bool,
-}
-
-struct SplitRow {
-    left: Option<SplitCell>,
-    right: Option<SplitCell>,
-}
-
-fn split_hunk(lines: &[git_diff::DiffLine]) -> Vec<SplitRow> {
-    fn clean(text: &str) -> String {
-        text.replace('\t', "    ")
-    }
-    fn flush(
-        rows: &mut Vec<SplitRow>,
-        rem: &mut Vec<&git_diff::DiffLine>,
-        add: &mut Vec<&git_diff::DiffLine>,
-    ) {
-        for i in 0..rem.len().max(add.len()) {
-            rows.push(SplitRow {
-                left: rem.get(i).map(|l| SplitCell {
-                    no: l.old_no,
-                    text: clean(&l.text),
-                    changed: true,
-                }),
-                right: add.get(i).map(|l| SplitCell {
-                    no: l.new_no,
-                    text: clean(&l.text),
-                    changed: true,
-                }),
-            });
-        }
-        rem.clear();
-        add.clear();
-    }
-
-    let mut rows = Vec::new();
-    let mut rem: Vec<&git_diff::DiffLine> = Vec::new();
-    let mut add: Vec<&git_diff::DiffLine> = Vec::new();
-    for line in lines {
-        match line.kind {
-            LineKind::Removed => rem.push(line),
-            LineKind::Added => add.push(line),
-            LineKind::Context => {
-                flush(&mut rows, &mut rem, &mut add);
-                rows.push(SplitRow {
-                    left: Some(SplitCell {
-                        no: line.old_no,
-                        text: clean(&line.text),
-                        changed: false,
-                    }),
-                    right: Some(SplitCell {
-                        no: line.new_no,
-                        text: clean(&line.text),
-                        changed: false,
-                    }),
-                });
-            }
-        }
-    }
-    flush(&mut rows, &mut rem, &mut add);
-    rows
+/// The de-duplication sets on `Tty7App` are keyed by `(HostId, PathBuf)`, so
+/// the source rides along inside the path: two sources over one directory are
+/// two independent probes and must not cancel one another. `Debug` is what
+/// makes the tag unique — it carries the rev of a `Commit` and both ends of a
+/// `Range` — and the separator is a byte no path contains.
+fn probe_key(
+    host: crate::ui::host_ops::HostId,
+    cwd: &Path,
+    source: &DiffSource,
+) -> (crate::ui::host_ops::HostId, PathBuf) {
+    let mut tagged = std::ffi::OsString::from(format!("{source:?}\u{1}"));
+    tagged.push(cwd.as_os_str());
+    (host, PathBuf::from(tagged))
 }
 
 #[cfg(test)]
@@ -951,40 +971,22 @@ mod tests {
     }
 
     #[test]
-    fn pairs_removed_and_added_side_by_side() {
-        let lines = vec![
-            line(LineKind::Context, Some(1), Some(1), "a"),
-            line(LineKind::Removed, Some(2), None, "b"),
-            line(LineKind::Removed, Some(3), None, "c"),
-            line(LineKind::Added, None, Some(2), "B"),
-            line(LineKind::Context, Some(4), Some(3), "d"),
-        ];
-        let rows = split_hunk(&lines);
-        assert_eq!(rows.len(), 4);
-
-        let l = rows[0].left.as_ref().unwrap();
-        let r = rows[0].right.as_ref().unwrap();
-        assert_eq!((l.no, l.text.as_str(), l.changed), (Some(1), "a", false));
-        assert_eq!((r.no, r.text.as_str(), r.changed), (Some(1), "a", false));
-
-        let l = rows[1].left.as_ref().unwrap();
-        let r = rows[1].right.as_ref().unwrap();
-        assert_eq!((l.no, l.text.as_str(), l.changed), (Some(2), "b", true));
-        assert_eq!((r.no, r.text.as_str(), r.changed), (Some(2), "B", true));
-
-        assert_eq!(rows[2].left.as_ref().unwrap().text, "c");
-        assert!(rows[2].right.is_none());
-
-        assert_eq!(rows[3].left.as_ref().unwrap().no, Some(4));
-        assert_eq!(rows[3].right.as_ref().unwrap().no, Some(3));
-    }
-
-    #[test]
-    fn expands_tabs_in_cell_text() {
-        let lines = vec![line(LineKind::Added, None, Some(1), "\tindented")];
-        let rows = split_hunk(&lines);
-        assert_eq!(rows[0].right.as_ref().unwrap().text, "    indented");
-        assert!(rows[0].left.is_none());
+    fn the_probe_key_separates_the_sources_over_one_directory() {
+        let host = crate::ui::host_ops::HostId::LOCAL;
+        let cwd = Path::new("/repo");
+        let worktree = probe_key(host, cwd, &DiffSource::Worktree);
+        assert_ne!(worktree, probe_key(host, cwd, &DiffSource::Staged));
+        assert_ne!(worktree, probe_key(host, cwd, &DiffSource::Head));
+        assert_ne!(
+            probe_key(host, cwd, &DiffSource::Commit { rev: "a".into() }),
+            probe_key(host, cwd, &DiffSource::Commit { rev: "b".into() }),
+            "two commits are two probes"
+        );
+        assert_eq!(worktree, probe_key(host, cwd, &DiffSource::Worktree));
+        assert_ne!(
+            worktree,
+            probe_key(host, Path::new("/other"), &DiffSource::Worktree)
+        );
     }
 
     fn small_file(path: &str, added: u32) -> FileDiff {
@@ -1374,5 +1376,105 @@ mod tests {
                  Arc::clone {shared:?}, per holder on the UI thread"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod overlay_gpui_tests {
+    use super::*;
+    use crate::ui::app::test_window;
+    use crate::ui::host_ops::HostId;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+
+    fn overlay_source_and_load(
+        app: &Entity<Tty7App>,
+        vcx: &mut VisualTestContext,
+    ) -> (DiffSource, bool) {
+        app.update_in(vcx, |app, _, _| {
+            let overlay = app.tabs[app.active]
+                .diff_overlay
+                .as_ref()
+                .expect("an overlay is open");
+            (
+                overlay.source.clone(),
+                matches!(overlay.load, DiffLoad::Loading),
+            )
+        })
+    }
+
+    /// Opening a staged file while a worktree overlay is up must re-probe. The
+    /// filter used to match on `(cwd, host)` alone, so it took the "just move
+    /// the focus" branch and left the unstaged patch on screen under the
+    /// staged file's name.
+    #[gpui::test]
+    fn a_second_source_over_one_directory_is_a_second_overlay(cx: &mut TestAppContext) {
+        let (app, mut vcx, _pane) = test_window::harness_with_tabs(cx, 1);
+        let cwd = std::path::PathBuf::from("/no/such/tty7/repo");
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.open_diff_overlay(
+                HostId::LOCAL,
+                cwd.clone(),
+                DiffSource::Worktree,
+                Some("a.rs".to_string()),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(
+            overlay_source_and_load(&app, &mut vcx),
+            (DiffSource::Worktree, true)
+        );
+
+        // Pretend the worktree probe landed, so a reused overlay would show it.
+        app.update_in(&mut vcx, |app, _, _| {
+            let active = app.active;
+            let overlay = app.tabs[active].diff_overlay.as_mut().unwrap();
+            overlay.loading = false;
+            overlay.load = DiffLoad::Ready(Arc::new(DiffSnapshot {
+                source: DiffSource::Worktree,
+                branch: "main".into(),
+                ..Default::default()
+            }));
+        });
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.open_diff_overlay(
+                HostId::LOCAL,
+                cwd.clone(),
+                DiffSource::Staged,
+                Some("a.rs".to_string()),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(
+            overlay_source_and_load(&app, &mut vcx),
+            (DiffSource::Staged, true),
+            "the same file from a different source is a different question"
+        );
+    }
+
+    /// The same source and the same focus still toggles the overlay shut.
+    #[gpui::test]
+    fn the_same_source_twice_still_closes(cx: &mut TestAppContext) {
+        let (app, mut vcx, _pane) = test_window::harness_with_tabs(cx, 1);
+        let cwd = std::path::PathBuf::from("/no/such/tty7/repo");
+
+        for _ in 0..2 {
+            app.update_in(&mut vcx, |app, window, cx| {
+                app.open_diff_overlay(
+                    HostId::LOCAL,
+                    cwd.clone(),
+                    DiffSource::Worktree,
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        }
+        app.update_in(&mut vcx, |app, _, _| {
+            assert!(app.tabs[app.active].diff_overlay.is_none());
+        });
     }
 }
