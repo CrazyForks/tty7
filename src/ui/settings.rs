@@ -65,6 +65,10 @@ fn settings_row_id(label: &str, _desc: &str) -> SharedString {
     SharedString::from(format!("settings-row-{label}"))
 }
 
+fn settings_header_id(title: &str) -> SharedString {
+    SharedString::from(format!("settings-header-{title}"))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsSection {
     Appearance,
@@ -1115,14 +1119,45 @@ impl Tty7App {
             .child(t(key))
     }
 
-    pub(crate) fn section_header(&self, title: &str, cx: &Context<Self>) -> Div {
-        self.header_text(title, cx).mb_4()
+    /// The scroll anchor for the first thing on the page the query matched,
+    /// whatever kind of element that is. A section header can be the only
+    /// match on its page — "ansi", "how shells work" — and while the dimming
+    /// around it already picks it out, nothing was carrying the page to it:
+    /// search "ansi" from the bottom of Appearance and every row greys out
+    /// with the one answer left above the fold.
+    fn first_hit_anchor(&self, label: &str, cx: &Context<Self>) -> Option<gpui::ScrollAnchor> {
+        let s = self.active_settings()?;
+        let query = s.search.read(cx).value().trim().to_lowercase();
+        if query.is_empty() || section_match_count(s.section, &query) == 0 {
+            return None;
+        }
+        if !row_matches_query(s.section, label, &query) {
+            return None;
+        }
+        match self.settings_hit_anchored.replace(true) {
+            false => Some(s.search_anchor.clone()),
+            true => None,
+        }
     }
 
-    fn section_intro(&self, title: &str, desc: impl Into<String>, cx: &Context<Self>) -> Div {
+    pub(crate) fn section_header(&self, title: &str, cx: &Context<Self>) -> Stateful<Div> {
+        self.header_text(title, cx)
+            .mb_4()
+            .id(settings_header_id(title))
+            .anchor_scroll(self.first_hit_anchor(title, cx))
+    }
+
+    fn section_intro(
+        &self,
+        title: &str,
+        desc: impl Into<String>,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         v_flex()
             .mb_4()
             .gap_1()
+            .id(settings_header_id(title))
+            .anchor_scroll(self.first_hit_anchor(title, cx))
             .child(self.header_text(title, cx))
             .child(
                 div()
@@ -1166,10 +1201,7 @@ impl Tty7App {
             }
             None => (false, false),
         };
-        let first_hit_anchor = match hit && !self.settings_hit_anchored.replace(true) {
-            true => self.active_settings().map(|s| s.search_anchor.clone()),
-            false => None,
-        };
+        let first_hit_anchor = self.first_hit_anchor(&label, cx);
         // The control never shrinks, so on a narrow pane it takes the width and
         // the label column — which must keep `min_w_0` or long descriptions
         // stop wrapping — is squeezed to a letter per line. Below the width
