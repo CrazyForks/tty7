@@ -1318,9 +1318,7 @@ pub fn translate_variant_zh(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::DiffUntrackedHeader, "other") => "未跟踪文件 ({count})",
         (L10nKey::DiffMoreUntracked, "zero") => "…还有 0 个——在终端中运行 git status 查看。",
         (L10nKey::DiffMoreUntracked, "one") => "…还有 1 个——在终端中运行 git status 查看。",
-        (L10nKey::DiffMoreUntracked, "other") => {
-            "…还有 {count} 个——在终端中运行 git status 查看。"
-        }
+        (L10nKey::DiffMoreUntracked, "other") => "…还有 {count} 个——在终端中运行 git status 查看。",
         (L10nKey::DiffUntrackedSummary, "zero") => "0 个未跟踪",
         (L10nKey::DiffUntrackedSummary, "one") => "1 个未跟踪",
         (L10nKey::DiffUntrackedSummary, "other") => "{count} 个未跟踪",

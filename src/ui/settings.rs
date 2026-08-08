@@ -789,8 +789,10 @@ impl Tty7App {
         let query = search.read(cx).value().trim().to_lowercase();
         let show_theme_panel = theme_panel_open && section == SettingsSection::Appearance;
 
-        self.settings_row_width
-            .set(settings_row_width(section, window.viewport_size().width.as_f32()));
+        self.settings_row_width.set(settings_row_width(
+            section,
+            window.viewport_size().width.as_f32(),
+        ));
 
         let prof = crate::ui::perf::enabled()
             .then(|| (std::time::Instant::now(), section.profile_label()));
@@ -3555,36 +3557,36 @@ impl Tty7App {
                 .xsmall(),
         )
         .disabled(shells.is_empty())
-            .tooltip(t(L10nKey::SettingsShellDetected))
-            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _window, _cx| {
-                let mut menu = menu.min_w(px(200.));
-                let pick = |program: String| {
-                    let app = picker_app.clone();
-                    let input = picker_input.clone();
-                    move |_: &_, window: &mut Window, cx: &mut App| {
-                        input.update(cx, |state, cx| state.set_value(program.clone(), window, cx));
-                        if let Some(app) = app.upgrade() {
-                            app.update(cx, |this, cx| this.commit_shell_from_picker(cx));
-                        }
+        .tooltip(t(L10nKey::SettingsShellDetected))
+        .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _window, _cx| {
+            let mut menu = menu.min_w(px(200.));
+            let pick = |program: String| {
+                let app = picker_app.clone();
+                let input = picker_input.clone();
+                move |_: &_, window: &mut Window, cx: &mut App| {
+                    input.update(cx, |state, cx| state.set_value(program.clone(), window, cx));
+                    if let Some(app) = app.upgrade() {
+                        app.update(cx, |this, cx| this.commit_shell_from_picker(cx));
                     }
-                };
+                }
+            };
+            menu = menu.item(
+                PopupMenuItem::new(platform_default_item.clone())
+                    .checked(current_program.is_empty())
+                    .on_click(pick(String::new())),
+            );
+            if !shells.is_empty() {
+                menu = menu.item(PopupMenuItem::separator());
+            }
+            for shell in &shells {
                 menu = menu.item(
-                    PopupMenuItem::new(platform_default_item.clone())
-                        .checked(current_program.is_empty())
-                        .on_click(pick(String::new())),
+                    PopupMenuItem::new(shell.label.clone())
+                        .checked(current_program == shell.program)
+                        .on_click(pick(shell.program.clone())),
                 );
-                if !shells.is_empty() {
-                    menu = menu.item(PopupMenuItem::separator());
-                }
-                for shell in &shells {
-                    menu = menu.item(
-                        PopupMenuItem::new(shell.label.clone())
-                            .checked(current_program == shell.program)
-                            .on_click(pick(shell.program.clone())),
-                    );
-                }
-                menu
-            });
+            }
+            menu
+        });
         let program_control = div()
             .w(px(260.))
             .child(Input::new(&program_input).small().suffix(program_picker))
@@ -4498,9 +4500,9 @@ impl Tty7App {
             .mb_2()
             .w_full()
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.toggle_theme_panel(slot, window, cx)
-            }))
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.toggle_theme_panel(slot, window, cx)),
+            )
             .child(
                 h_flex()
                     .w_full()
@@ -4596,9 +4598,9 @@ impl Tty7App {
                         .icon(IconName::Close)
                         .ghost()
                         .small()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.close_theme_panel(window, cx)
-                        })),
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.close_theme_panel(window, cx)),
+                        ),
                 ),
             );
 

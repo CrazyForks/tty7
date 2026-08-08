@@ -1083,7 +1083,9 @@ impl Tty7App {
         // pointer is unusable — but it still has to fit the window it floats
         // over. Below its natural size it takes what there is.
         let viewport = window.viewport_size();
-        let card_w = CARD_W.min(viewport.width.as_f32() - 2. * CARD_MARGIN).max(320.);
+        let card_w = CARD_W
+            .min(viewport.width.as_f32() - 2. * CARD_MARGIN)
+            .max(320.);
         let body_h = BODY_H
             .min(viewport.height.as_f32() - CARD_TOP - CARD_CHROME_H - CARD_MARGIN)
             .max(120.);
