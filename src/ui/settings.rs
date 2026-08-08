@@ -4526,7 +4526,7 @@ impl Tty7App {
         v_flex()
             .w_full()
             .bg(rgb(p.background_color()))
-            .rounded(px(8.))
+            .rounded(rounding::TRACK_RADIUS)
             .overflow_hidden()
             .px_3()
             .py_3()
@@ -4633,7 +4633,12 @@ impl Tty7App {
                 .rounded(px(3.))
                 .bg(rgb(to_u32(active.ansi16[i])))
         }));
-        let preview = self.theme_preview(&active);
+        // Inset inside the card's border, the way the same preview is inset
+        // inside the same card in the theme panel.
+        let preview = self.theme_preview(&active).rounded(rounding::inner_radius(
+            rounding::TRACK_RADIUS,
+            rounding::HAIRLINE,
+        ));
         let open = self
             .active_settings()
             .is_some_and(|s| s.theme_panel_open && s.theme_panel_slot == slot);
@@ -4653,7 +4658,7 @@ impl Tty7App {
                     .items_center()
                     .gap_4()
                     .p_3()
-                    .rounded_xl()
+                    .rounded(rounding::TRACK_RADIUS)
                     .border_1()
                     .border_color(if open {
                         foreground.opacity(0.35)
