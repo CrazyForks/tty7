@@ -90,6 +90,18 @@ pub struct TermLayout {
     hitbox: Hitbox,
 }
 
+fn pack_rgb(c: Rgb) -> u32 {
+    (c.r as u32) << 16 | (c.g as u32) << 8 | c.b as u32
+}
+
+fn unpack_rgb(n: u32) -> Rgb {
+    Rgb {
+        r: (n >> 16) as u8,
+        g: (n >> 8) as u8,
+        b: n as u8,
+    }
+}
+
 fn to_hsla(c: Rgb) -> Hsla {
     Rgba {
         r: c.r as f32 / 255.,
@@ -242,17 +254,22 @@ impl PaintColors {
             c.a = 0.24;
             c
         };
-        let base_match = to_hsla(active_selection_bg(cx));
-        let match_bg = {
-            let mut c = base_match;
-            c.a = 0.32;
-            c
-        };
-        let current_match_bg = {
-            let mut c = base_match;
-            c.a = 0.85;
-            c
-        };
+        // Opaque, and solved for a fixed contrast against the background
+        // rather than a fixed alpha: the selection tint is only 24% away from
+        // the background to begin with, so a 0.32 alpha landed 7% off it in
+        // every theme — on a white one the matches were all but invisible.
+        let bg_packed = pack_rgb(super::palette::hsla_to_rgb(default_bg));
+        let tint = pack_rgb(active_selection_bg(cx));
+        let match_bg = to_hsla(unpack_rgb(crate::ui::presets::wash(
+            bg_packed,
+            tint,
+            crate::ui::presets::MATCH_WASH,
+        )));
+        let current_match_bg = to_hsla(unpack_rgb(crate::ui::presets::wash(
+            bg_packed,
+            tint,
+            crate::ui::presets::CURRENT_MATCH_WASH,
+        )));
         Self {
             default_fg,
             default_bg,

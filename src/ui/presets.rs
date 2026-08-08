@@ -409,6 +409,40 @@ pub(crate) fn is_lighter(a: u32, b: u32) -> bool {
 
 const ACCENT_FLOOR: f32 = 3.0;
 
+/// How far a search match's wash has to stand off the background it sits on,
+/// and how much further the one you are looking at has to stand off the rest.
+///
+/// These are non-text ratios: enough to spot a block at a glance without
+/// drowning the glyph on top of it.
+pub(crate) const MATCH_WASH: f32 = 1.45;
+pub(crate) const CURRENT_MATCH_WASH: f32 = 2.1;
+
+/// The opacity at which `tint` over `surface` first reaches `target` contrast,
+/// as a blended colour.
+///
+/// A fixed alpha does not survive a theme swap: the terminal's selection tint
+/// is `mix(bg, fg, 0.24)`, so painting it at 0.32 is a 7% shift away from the
+/// background in *every* theme — invisible on a white one, and barely there on
+/// a dark one. Solving for the ratio instead keeps the same wash weight
+/// whatever the two colours happen to be.
+pub(crate) fn wash(surface: u32, tint: u32, target: f32) -> u32 {
+    if contrast(mix(surface, tint, 1.0), surface) < target {
+        // The tint cannot get there on its own — a theme whose selection colour
+        // is nearly its background. Fall back to the ink that reads on it.
+        return legible_ink(surface, tint, target);
+    }
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..16 {
+        let mid = (lo + hi) / 2.0;
+        if contrast(mix(surface, tint, mid), surface) >= target {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    mix(surface, tint, hi)
+}
+
 const TEXT_FLOOR: f32 = 4.5;
 
 /// Hairlines are separators, not control outlines — the surfaces they divide
@@ -1508,6 +1542,41 @@ mod tests {
             .find(|t| t.id == "rose_pine")
             .unwrap();
         assert_eq!(rose.neutrals().accent, rose.accent);
+    }
+
+    #[test]
+    fn a_match_wash_is_visible_on_a_white_theme_and_a_black_one() {
+        // The old fixed alpha: 0.32 of a tint 24% off the background.
+        let faint = |bg: u32, fg: u32| {
+            let tint = mix(bg, fg, 0.24);
+            contrast(mix(bg, tint, 0.32), bg)
+        };
+        for (bg, fg) in [(0xffffff, 0x111111), (0x111111, 0xffffff)] {
+            assert!(
+                faint(bg, fg) < 1.25,
+                "the old wash was {:.2}:1 on {bg:06x} — that is what made it vanish",
+                faint(bg, fg)
+            );
+            let tint = mix(bg, fg, 0.24);
+            let w = wash(bg, tint, MATCH_WASH);
+            assert!(
+                contrast(w, bg) >= MATCH_WASH - 0.02,
+                "{:.2}:1 on {bg:06x}",
+                contrast(w, bg)
+            );
+            let cur = wash(bg, tint, CURRENT_MATCH_WASH);
+            assert!(
+                contrast(cur, bg) > contrast(w, bg),
+                "the current match has to stand out from the rest"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wash_whose_tint_cannot_reach_the_target_still_lands_on_something_legible() {
+        // A theme whose selection colour is its background: no alpha gets there.
+        let w = wash(0xffffff, 0xfefefe, MATCH_WASH);
+        assert!(contrast(w, 0xffffff) >= MATCH_WASH - 0.02, "{w:06x}");
     }
 
     #[test]
