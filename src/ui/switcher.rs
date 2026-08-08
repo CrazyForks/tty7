@@ -1642,6 +1642,7 @@ impl Tty7App {
                             .ghost()
                             .xsmall(),
                         )
+                        .tooltip(t(L10nKey::TabTooltipMore))
                         .dropdown_menu(move |menu, _window, _cx| {
                             group_menu(menu, &menu_ref, app.clone())
                         }),

@@ -226,6 +226,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsPortForwarding => "Port forwarding",
         L10nKey::SettingsRulesOpenedWithConnection => "1 rule, opened with the connection",
         L10nKey::SettingsAddRule => "+ Add rule",
+        L10nKey::SettingsRemoveRule => "Remove rule",
         L10nKey::SettingsFwdLegendLocal => "L — a local port reaches the remote side",
         L10nKey::SettingsFwdLegendRemote => "R — a remote port reaches this machine",
         L10nKey::SettingsFwdLegendDynamic => "D — dynamic SOCKS proxy",
@@ -406,6 +407,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsChangeTheme => "Change theme",
         L10nKey::SettingsThemes => "Themes",
+        L10nKey::SettingsThemesCloseTooltip => "Close Themes (Esc)",
         L10nKey::SettingsThemePanelManual => "Change your current theme.",
         L10nKey::SettingsThemePanelLight => "Choose the theme for light mode.",
         L10nKey::SettingsThemePanelDark => "Choose the theme for dark mode.",

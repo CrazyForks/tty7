@@ -3262,6 +3262,7 @@ impl Tty7App {
                                 .ghost()
                                 .xsmall(),
                         )
+                        .tooltip(t(L10nKey::SettingsRemoveRule))
                         .on_click(
                             cx.listener(move |this, _, _w, cx| this.remove_forward_rule(idx, cx)),
                         ),
@@ -4672,6 +4673,7 @@ impl Tty7App {
                         .icon(IconName::Close)
                         .ghost()
                         .small()
+                        .tooltip(t(L10nKey::SettingsThemesCloseTooltip))
                         .on_click(
                             cx.listener(|this, _, window, cx| this.close_theme_panel(window, cx)),
                         ),

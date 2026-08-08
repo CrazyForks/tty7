@@ -224,6 +224,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsPortForwarding => "ポートフォワーディング",
         L10nKey::SettingsRulesOpenedWithConnection => "接続と同時に開くルール 1 件",
         L10nKey::SettingsAddRule => "+ ルールを追加",
+        L10nKey::SettingsRemoveRule => "ルールを削除",
         L10nKey::SettingsFwdLegendLocal => "L — ローカルポートからリモート側へアクセスできる",
         L10nKey::SettingsFwdLegendRemote => "R — リモートポートからこのマシンへアクセスできる",
         L10nKey::SettingsFwdLegendDynamic => "D — ダイナミック SOCKS プロキシ",
@@ -406,6 +407,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsChangeTheme => "テーマを変更",
         L10nKey::SettingsThemes => "テーマ一覧",
+        L10nKey::SettingsThemesCloseTooltip => "テーマ一覧を閉じる (Esc)",
         L10nKey::SettingsThemePanelManual => "現在のテーマを変更",
         L10nKey::SettingsThemePanelLight => "ライトモード用のテーマを選択",
         L10nKey::SettingsThemePanelDark => "ダークモード用のテーマを選択",
