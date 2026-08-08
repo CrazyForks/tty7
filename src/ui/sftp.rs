@@ -1650,13 +1650,18 @@ impl Tty7App {
                     })
                     .when(running, |this| {
                         this.child(
-                            Button::new(("sftp-cancel-job", job_id as usize))
-                                .label("✕")
-                                .xsmall()
-                                .ghost()
-                                .on_click(cx.listener(move |this, _, _w, cx| {
+                            crate::ui::tab_strip::hit_target(
+                                Button::new(("sftp-cancel-job", job_id as usize))
+                                    .icon(IconName::Close)
+                                    .xsmall()
+                                    .ghost(),
+                            )
+                            .tooltip(t(L10nKey::Cancel))
+                            .on_click(
+                                cx.listener(move |this, _, _w, cx| {
                                     this.sftp_cancel_job(job_id, cx)
-                                })),
+                                }),
+                            ),
                         )
                     }),
             )
