@@ -822,10 +822,10 @@ pub fn probe_status(host: &dyn Host, cwd: &Path) -> Option<WorkingTreeStatus> {
         return None;
     }
     let mut parsed = parse_porcelain_v2(&out.stdout);
-    if parsed.ahead_behind.is_none() {
-        if let Some(upstream) = parsed.upstream.clone() {
-            parsed.ahead_behind = rev_list_ahead_behind(host, cwd, &upstream);
-        }
+    if parsed.ahead_behind.is_none()
+        && let Some(upstream) = parsed.upstream.clone()
+    {
+        parsed.ahead_behind = rev_list_ahead_behind(host, cwd, &upstream);
     }
 
     let listing = host.read_dir(&git_dir, None).unwrap_or_default();
