@@ -11,9 +11,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::core::actions::{
-    OpenSettings, SelectWorkspace1, SelectWorkspace2, SelectWorkspace3, SelectWorkspace4,
-    SelectWorkspace5, SelectWorkspace6, SelectWorkspace7, SelectWorkspace8, SelectWorkspace9,
-    TogglePalette,
+    CloseActiveTab, CloseOtherTabs, CloseTabsToTheRight, CopyAgentSessionId, CopyWorkingDirectory,
+    ForkAgentSession, MarkTabUnread, NewWorktreeTab, OpenSettings, RenameTab, SelectWorkspace1,
+    SelectWorkspace2, SelectWorkspace3, SelectWorkspace4, SelectWorkspace5, SelectWorkspace6,
+    SelectWorkspace7, SelectWorkspace8, SelectWorkspace9, SplitDown, SplitRight, TogglePalette,
 };
 use crate::core::config::RightPanelTab;
 use crate::core::shells::DetectedShell;
@@ -725,12 +726,22 @@ impl Tty7App {
         let has_cwd = cwd.is_some();
         let mut menu = menu.min_w(px(200.));
 
-        menu = menu.item(PopupMenuItem::new(t(L10nKey::AppMenuRenameTab)).on_click({
-            let app = app.clone();
-            move |_, window, cx| {
-                let _ = app.update(cx, |this, cx| this.start_rename(index, window, cx));
-            }
-        }));
+        // Every item here acts on *this* tab, so the work is done by the click
+        // handler and the action is carried only so `PopupMenu` can look its
+        // chord up and print it. The handler wins when both are set. Without
+        // this the tab menu was the one context menu in the app that taught no
+        // shortcuts — right-clicking a pane offered "Split Right ⌘D" while
+        // right-clicking its tab offered a bare "Split Right".
+        menu = menu.item(
+            PopupMenuItem::new(t(L10nKey::AppMenuRenameTab))
+                .action(Box::new(RenameTab))
+                .on_click({
+                    let app = app.clone();
+                    move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| this.start_rename(index, window, cx));
+                    }
+                }),
+        );
 
         let tab = this.tabs.get(index);
         if tab.is_some_and(|t| t.agent(cx).is_some()) {
@@ -738,6 +749,7 @@ impl Tty7App {
                 == Some(crate::core::cli_agent::AgentStatus::Done);
             menu = menu.item(
                 PopupMenuItem::new(t(L10nKey::TabContextMarkUnread))
+                    .action(Box::new(MarkTabUnread))
                     .disabled(!done)
                     .on_click({
                         let app = app.clone();
@@ -751,12 +763,15 @@ impl Tty7App {
         let in_repo = this.tab_is_in_repo(index, window, cx);
         if in_repo {
             menu = menu.separator().item(
-                PopupMenuItem::new(t(L10nKey::AppMenuNewWorktreeTab)).on_click({
-                    let app = app.clone();
-                    move |_, window, cx| {
-                        let _ = app.update(cx, |this, cx| this.new_worktree_tab(index, window, cx));
-                    }
-                }),
+                PopupMenuItem::new(t(L10nKey::AppMenuNewWorktreeTab))
+                    .action(Box::new(NewWorktreeTab))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ =
+                                app.update(cx, |this, cx| this.new_worktree_tab(index, window, cx));
+                        }
+                    }),
             );
         }
 
@@ -768,47 +783,61 @@ impl Tty7App {
                 menu = menu.separator();
             }
             let forkable = session.forkable();
-            menu = menu.item(PopupMenuItem::new(label).disabled(!forkable).on_click({
-                let app = app.clone();
-                let source = source.clone();
-                move |_, window, cx| {
-                    let source = source.clone();
-                    let _ = app.update(cx, |this, cx| {
-                        this.fork_agent_session(
-                            index,
-                            source,
-                            crate::ui::app::ForkPlacement::NewTab,
-                            window,
-                            cx,
-                        )
-                    });
-                }
-            }));
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .action(Box::new(ForkAgentSession))
+                    .disabled(!forkable)
+                    .on_click({
+                        let app = app.clone();
+                        let source = source.clone();
+                        move |_, window, cx| {
+                            let source = source.clone();
+                            let _ = app.update(cx, |this, cx| {
+                                this.fork_agent_session(
+                                    index,
+                                    source,
+                                    crate::ui::app::ForkPlacement::NewTab,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                    }),
+            );
         }
 
         menu = menu
             .separator()
-            .item(PopupMenuItem::new(t(L10nKey::AppMenuSplitRight)).on_click({
-                let app = app.clone();
-                move |_, window, cx| {
-                    let _ = app.update(cx, |this, cx| {
-                        this.activate(index, window, cx);
-                        this.split(Axis::Horizontal, window, cx);
-                    });
-                }
-            }))
-            .item(PopupMenuItem::new(t(L10nKey::AppMenuSplitDown)).on_click({
-                let app = app.clone();
-                move |_, window, cx| {
-                    let _ = app.update(cx, |this, cx| {
-                        this.activate(index, window, cx);
-                        this.split(Axis::Vertical, window, cx);
-                    });
-                }
-            }));
+            .item(
+                PopupMenuItem::new(t(L10nKey::AppMenuSplitRight))
+                    .action(Box::new(SplitRight))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.activate(index, window, cx);
+                                this.split(Axis::Horizontal, window, cx);
+                            });
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(t(L10nKey::AppMenuSplitDown))
+                    .action(Box::new(SplitDown))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.activate(index, window, cx);
+                                this.split(Axis::Vertical, window, cx);
+                            });
+                        }
+                    }),
+            );
 
         menu = menu.separator().item(
             PopupMenuItem::new(t(L10nKey::AppMenuCopyWorkingDirectory))
+                .action(Box::new(CopyWorkingDirectory))
                 .disabled(!has_cwd)
                 .on_click(move |_, _window, cx| {
                     if let Some(cwd) = cwd.as_ref() {
@@ -822,6 +851,7 @@ impl Tty7App {
         if let Some(session_id) = agent_session.map(|(_, s)| s.session_id) {
             menu = menu.item(
                 PopupMenuItem::new(t(L10nKey::AppMenuCopySessionId))
+                    .action(Box::new(CopyAgentSessionId))
                     .disabled(session_id.is_none())
                     .on_click(move |_, _window, cx| {
                         if let Some(id) = session_id.as_ref() {
@@ -833,15 +863,18 @@ impl Tty7App {
 
         menu.separator()
             .item(
-                PopupMenuItem::new(t(L10nKey::TabContextCloseTab)).on_click({
-                    let app = app.clone();
-                    move |_, window, cx| {
-                        let _ = app.update(cx, |this, cx| this.close_tab(index, window, cx));
-                    }
-                }),
+                PopupMenuItem::new(t(L10nKey::TabContextCloseTab))
+                    .action(Box::new(CloseActiveTab))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| this.close_tab(index, window, cx));
+                        }
+                    }),
             )
             .item(
                 PopupMenuItem::new(t(L10nKey::AppMenuCloseOtherTabs))
+                    .action(Box::new(CloseOtherTabs))
                     .disabled(tab_count <= 1)
                     .on_click({
                         let app = app.clone();
@@ -857,6 +890,7 @@ impl Tty7App {
                 } else {
                     t(L10nKey::AppMenuCloseTabsRight)
                 })
+                .action(Box::new(CloseTabsToTheRight))
                 .disabled(index + 1 >= tab_count)
                 .on_click({
                     let app = app.clone();
