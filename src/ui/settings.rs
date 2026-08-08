@@ -4771,12 +4771,19 @@ impl Tty7App {
             },
         );
 
+        // The label column has to be allowed to shrink, or its description sets
+        // the row's width and the control it belongs to is pushed off the page.
+        // `settings_row` does this for every other row in Settings; these two
+        // are hand-rolled and were missing it.
         let preset_row = h_flex()
+            .w_full()
             .items_center()
             .justify_between()
+            .gap_8()
             .py_2()
             .child(
                 v_flex()
+                    .min_w_0()
                     .gap_0p5()
                     .child(
                         div()
@@ -4795,11 +4802,14 @@ impl Tty7App {
             .child(h_flex().flex_shrink_0().child(preset_control));
 
         let prefix_row = h_flex()
+            .w_full()
             .items_center()
             .justify_between()
+            .gap_8()
             .py_2()
             .child(
                 div()
+                    .min_w_0()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(foreground)
