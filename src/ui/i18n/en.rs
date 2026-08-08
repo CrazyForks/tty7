@@ -184,7 +184,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "The password saved for it goes too, unless another connection still uses the same address."
         }
         L10nKey::SettingsCouldntForgetPassword => {
-            "Couldn't forget password for {endpoint}: {error}"
+            "Could not forget the saved password for {endpoint}: {error}"
         }
         L10nKey::SettingsSecurity => "Security",
         L10nKey::SettingsSecurityIntro => {
@@ -818,8 +818,8 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::FileTreeContextShowDotfiles => "Show Dotfiles",
         L10nKey::SshPromptNewKey => "new {fingerprint}",
         L10nKey::SshPromptOldKey => "old {old_fingerprint}",
-        L10nKey::EditorCantOpen => "Can't open {path}: {e}",
-        L10nKey::EditorCantRead => "Can't read {path}: {e}",
+        L10nKey::EditorCantOpen => "Could not open {path}: {e}",
+        L10nKey::EditorCantRead => "Could not read {path}: {e}",
         L10nKey::EditorNotUtf8 => "\"{path}\" is not valid UTF-8",
         L10nKey::EditorSaveFailed => "Could not save {name}",
         L10nKey::EditorUnsavedChanges => "\"{name}\" has unsaved changes",
@@ -879,7 +879,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::DiffReading => "Reading diff…",
         L10nKey::DiffNotARepo => "Not a git repository",
         L10nKey::DiffReadFailed => {
-            "Couldn't read the working-tree diff — retrying on the next refresh."
+            "Could not read the working-tree diff — retrying on the next refresh."
         }
         L10nKey::DiffWorkingTreeClean => "Working tree clean",
         L10nKey::DiffCloseTooltip => "Close Diff (Esc)",
@@ -910,7 +910,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::DiffPerFileCap => "the per-file cap",
         L10nKey::DiffUntrackedSummary => "{count} untracked",
         L10nKey::PendingConnecting => "Connecting to {machine}…",
-        L10nKey::PendingUnreachable => "Couldn't reach {machine}",
+        L10nKey::PendingUnreachable => "Could not reach {machine}",
         L10nKey::WorktreePromptNeedsName => "The worktree needs a name",
         L10nKey::WorktreePromptTitle => "New Worktree Tab",
         L10nKey::WorktreePromptName => "Worktree Name",
@@ -1246,7 +1246,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::AppSshParseInvalidPort => "Invalid port \"{value}\"",
         L10nKey::AppSshParseUnsupportedOption => "Unsupported option \"{option}\"",
         L10nKey::AppSshParseEnterHost => "Enter a host to connect to",
-        L10nKey::AppSshParseBadHost => "Can't parse host \"{host}\"",
+        L10nKey::AppSshParseBadHost => "Invalid host \"{host}\"",
         L10nKey::AppMenuMinimize => "Minimize",
         L10nKey::AppMenuZoom => "Zoom",
         L10nKey::SwitcherStatusRestarting => "restarting…",
