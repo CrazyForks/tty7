@@ -160,7 +160,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsNothingMatches => "Nothing matches {query}.",
         L10nKey::SettingsInTty7 => "In tty7",
         L10nKey::SettingsImportFromSshConfig => "Import from ~/.ssh/config",
-        L10nKey::SettingsExpandAllGroups => "Expand all groups",
+        L10nKey::SettingsExpandAllGroups => "Expand All Groups",
         L10nKey::SettingsNoHostsYet => "No hosts yet",
         L10nKey::SettingsNothingSelected => "Nothing selected",
         L10nKey::SettingsTypeAddressToConnect => {
@@ -176,9 +176,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsDefaultsIntro => {
             "Every host starts from these. Any host can override one under its own Advanced."
         }
-        L10nKey::SettingsCopyAddress => "Copy address",
+        L10nKey::SettingsCopyAddress => "Copy Address",
         L10nKey::SettingsDuplicate => "Duplicate",
-        L10nKey::SettingsForgetPassword => "Forget password",
+        L10nKey::SettingsForgetPassword => "Forget Password",
         L10nKey::SettingsForgotPasswordFor => "Forgot saved password for {endpoint}",
         L10nKey::SettingsDeleteProfileBody => {
             "The password saved for it goes too, unless another connection still uses the same address."
@@ -760,12 +760,12 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SftpPanelTitleFiles => "Files",
         L10nKey::SftpTooltipRefresh => "Refresh",
         L10nKey::SftpTooltipMore => "More",
-        L10nKey::SftpMenuNewFolder => "New folder",
-        L10nKey::SftpMenuNewFile => "New file",
+        L10nKey::SftpMenuNewFolder => "New Folder",
+        L10nKey::SftpMenuNewFile => "New File",
         L10nKey::SftpMenuUpload => "Upload…",
-        L10nKey::SftpMenuGotoShellCwd => "Go to shell directory",
-        L10nKey::SftpMenuHideTransferHistory => "Hide transfer history",
-        L10nKey::SftpMenuTransferHistory => "Transfer history",
+        L10nKey::SftpMenuGotoShellCwd => "Go to Shell Directory",
+        L10nKey::SftpMenuHideTransferHistory => "Hide Transfer History",
+        L10nKey::SftpMenuTransferHistory => "Transfer History",
         L10nKey::SftpEditNewFolder => "New folder",
         L10nKey::SftpEditNewFile => "New file",
         L10nKey::SftpEditRename => "Rename",
@@ -773,7 +773,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SftpLoading => "Loading…",
         L10nKey::SftpEmptyDirectory => "Empty directory.",
         L10nKey::SftpContextOpen => "Open",
-        L10nKey::SftpContextFollowSymlink => "Follow symlink",
+        L10nKey::SftpContextFollowSymlink => "Follow Symlink",
         L10nKey::SftpContextRename => "Rename",
         L10nKey::SftpContextChmod => "chmod…",
         L10nKey::SftpTransferSummaryRunning => "{count} transferring · {pct}%",
