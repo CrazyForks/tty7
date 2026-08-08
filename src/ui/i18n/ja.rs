@@ -1072,7 +1072,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SwitcherRename => "名前を変更…",
         L10nKey::SwitcherPickAWorkspace => "ワークスペースを選ぶとタブが表示されます",
         L10nKey::SwitcherNoTabs => "このワークスペースにタブはありません",
-        L10nKey::SwitcherNoTabMatch => "一致するタブがありません。",
+        L10nKey::SwitcherNoTabMatch => "一致するタブがありません",
         L10nKey::SwitcherTabsAfterOpening => "このワークスペースを開くとタブが表示されます",
         L10nKey::SwitcherTabCount => "{n} 個のタブ",
         L10nKey::SwitcherTabCountOne => "1 個のタブ",
