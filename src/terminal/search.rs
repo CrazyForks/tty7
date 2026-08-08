@@ -13,6 +13,7 @@ use gpui_component::{
 };
 
 use super::view::TerminalView;
+use crate::ui::i18n::{L10nKey, t};
 
 const MAX_MATCHES: usize = 10_000;
 
@@ -55,7 +56,7 @@ impl TerminalView {
                 .unwrap_or_else(|| self.search_last_query.clone());
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("Find")
+                    .placeholder(t(L10nKey::SearchFind))
                     .default_value(seed)
             });
             let subs = vec![cx.subscribe_in(&input, window, Self::on_search_event)];
@@ -288,7 +289,7 @@ impl TerminalView {
             .ghost()
             .small()
             .selected(case_on)
-            .tooltip("Match case")
+            .tooltip(t(L10nKey::SearchMatchCase))
             .on_click(cx.listener(|this, _, _window, cx| {
                 this.toggle_search_case(cx);
             }));
@@ -297,7 +298,7 @@ impl TerminalView {
             .ghost()
             .small()
             .selected(regex_on)
-            .tooltip("Use regular expression")
+            .tooltip(t(L10nKey::SearchUseRegex))
             .on_click(cx.listener(|this, _, _window, cx| {
                 this.toggle_search_regex(cx);
             }));
@@ -308,6 +309,7 @@ impl TerminalView {
             .icon(IconName::ChevronUp)
             .ghost()
             .small()
+            .tooltip(t(L10nKey::AppMenuFindPrevious))
             .disabled(!has_matches)
             .on_click(cx.listener(|this, _, _window, cx| {
                 this.step_match(Direction::Left, cx);
@@ -316,6 +318,7 @@ impl TerminalView {
             .icon(IconName::ChevronDown)
             .ghost()
             .small()
+            .tooltip(t(L10nKey::AppMenuFindNext))
             .disabled(!has_matches)
             .on_click(cx.listener(|this, _, _window, cx| {
                 this.step_match(Direction::Right, cx);
@@ -324,6 +327,7 @@ impl TerminalView {
             .icon(IconName::Close)
             .ghost()
             .small()
+            .tooltip(t(L10nKey::Close))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.close_search(window, cx);
             }));

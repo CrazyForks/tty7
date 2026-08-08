@@ -5062,57 +5062,75 @@ impl Render for TerminalView {
                     .menu_element_with_disabled(
                         Box::new(CopyText),
                         !has_selection,
-                        menu_row_with_hint("Copy", Some("secondary-c")),
+                        menu_row_with_hint(t(L10nKey::AppMenuCopy), Some("secondary-c")),
                     )
                     .menu_element_with_disabled(
                         Box::new(CutText),
                         !has_selection,
-                        menu_row_with_hint("Cut", Some("secondary-x")),
+                        menu_row_with_hint(t(L10nKey::AppMenuCut), Some("secondary-x")),
                     )
                     .menu_element(
                         Box::new(PasteText),
-                        menu_row_with_hint("Paste", Some("secondary-v")),
+                        menu_row_with_hint(t(L10nKey::AppMenuPaste), Some("secondary-v")),
                     )
                     .menu_element(
                         Box::new(SelectAll),
-                        menu_row_with_hint("Select All", mac_only("secondary-a")),
+                        menu_row_with_hint(t(L10nKey::AppMenuSelectAll), mac_only("secondary-a")),
                     )
                     .separator()
-                    .menu("Find…", Box::new(FindInTerminal))
-                    .menu("Clear", Box::new(ClearScrollback));
+                    .menu(t(L10nKey::AppMenuFind), Box::new(FindInTerminal))
+                    .menu(
+                        t(L10nKey::AppMenuClearScrollback),
+                        Box::new(ClearScrollback),
+                    );
 
                 let view = menu_view.read(cx);
-                let fork_label = view.agent().and_then(|a| a.fork_label());
-                let can_fork = fork_label.is_some()
+                // `fork_label` is tty7-core's capability probe, and core has no
+                // locale table — take the answer, not its English wording.
+                let can_fork = view.agent().and_then(|a| a.fork_label()).is_some();
+                let fork_ready = can_fork
                     && view.remote_context().is_none()
                     && view.agent_session().is_some_and(|s| s.session_id.is_some());
 
-                let menu = match fork_label {
-                    Some(label) if can_fork => {
+                let menu = match (can_fork, fork_ready) {
+                    (true, true) => {
                         let focus = menu_focus.clone();
-                        menu.separator()
-                            .submenu(label, window, cx, move |submenu, _window, _cx| {
+                        menu.separator().submenu(
+                            t(L10nKey::AppMenuForkSession),
+                            window,
+                            cx,
+                            move |submenu, _window, _cx| {
                                 submenu
                                     .action_context(focus.clone())
-                                    .menu("Split Right", Box::new(ForkAgentSessionRight))
-                                    .menu("Split Left", Box::new(ForkAgentSessionLeft))
-                                    .menu("Split Down", Box::new(ForkAgentSessionDown))
-                                    .menu("Split Up", Box::new(ForkAgentSessionUp))
-                            })
+                                    .menu(
+                                        t(L10nKey::AppMenuSplitRight),
+                                        Box::new(ForkAgentSessionRight),
+                                    )
+                                    .menu(
+                                        t(L10nKey::AppMenuSplitLeft),
+                                        Box::new(ForkAgentSessionLeft),
+                                    )
+                                    .menu(
+                                        t(L10nKey::AppMenuSplitDown),
+                                        Box::new(ForkAgentSessionDown),
+                                    )
+                                    .menu(t(L10nKey::AppMenuSplitUp), Box::new(ForkAgentSessionUp))
+                            },
+                        )
                     }
-                    Some(label) => menu
+                    (true, false) => menu
                         .separator()
-                        .item(PopupMenuItem::new(label).disabled(true)),
-                    None => menu,
+                        .item(PopupMenuItem::new(t(L10nKey::AppMenuForkSession)).disabled(true)),
+                    (false, _) => menu,
                 };
 
                 menu.separator()
-                    .menu("Split Right", Box::new(SplitRight))
-                    .menu("Split Down", Box::new(SplitDown))
-                    .menu("Maximize Pane", Box::new(ToggleMaximizePane))
+                    .menu(t(L10nKey::AppMenuSplitRight), Box::new(SplitRight))
+                    .menu(t(L10nKey::AppMenuSplitDown), Box::new(SplitDown))
+                    .menu(t(L10nKey::AppMenuZoomPane), Box::new(ToggleMaximizePane))
                     .separator()
-                    .menu("New Tab", Box::new(NewTab))
-                    .menu("Close Pane", Box::new(CloseActiveTab))
+                    .menu(t(L10nKey::AppMenuNewTab), Box::new(NewTab))
+                    .menu(t(L10nKey::AppMenuClosePaneTab), Box::new(CloseActiveTab))
             })
     }
 }
