@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::PaneProcs;
-use crate::terminal::git_diff::{DiffSnapshot, MAX_RENDERED_FILES};
+use crate::terminal::git_diff::DiffSnapshot;
 use crate::ui::app::{
     CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App, tile_trailing_inset,
     tile_trailing_inset_sm,
 };
-use crate::ui::i18n::{L10nKey, t, t_plural};
+use crate::ui::i18n::{L10nKey, t};
 use crate::ui::scrollbar::with_vertical_scrollbar;
 
 pub(crate) const MIN_WIDTH: f32 = 216.;
@@ -84,7 +84,7 @@ impl Tty7App {
 
         let body = match tab {
             RightPanelTab::Info => self.render_panel_info(window, cx),
-            RightPanelTab::Changes => self.render_panel_changes(window, cx),
+            RightPanelTab::Scm => self.render_panel_scm(window, cx),
             RightPanelTab::Files => self.render_panel_files(window, cx),
         };
         let (backing, handle) = self.right_panel_resize(cx);
@@ -316,7 +316,7 @@ impl Tty7App {
             .into_any_element()
     }
 
-    fn panel_scroll(&self, inner: AnyElement, title: AnyElement) -> AnyElement {
+    pub(crate) fn panel_scroll(&self, inner: AnyElement, title: AnyElement) -> AnyElement {
         let body = div()
             .id("right-panel-body")
             .flex_1()
@@ -336,7 +336,12 @@ impl Tty7App {
             .into_any_element()
     }
 
-    fn panel_empty(&self, text: &str, hint: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn panel_empty(
+        &self,
+        text: &str,
+        hint: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         v_flex()
             .px(px(CONTENT_INSET))
@@ -702,207 +707,6 @@ impl Tty7App {
             });
         })
         .detach();
-    }
-
-    fn render_panel_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
-        let target = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.detail_pane(window, cx))
-            .and_then(|leaf| {
-                let v = leaf.read(cx);
-                let cwd = v
-                    .git_status_cwd()
-                    .map(|p| p.to_path_buf())
-                    .or_else(|| v.host_cwd())?;
-                Some((v.host(cx)?, cwd))
-            });
-
-        let Some((host, cwd)) = target else {
-            let title = self.panel_title(t(L10nKey::PanelChangesTitle), None, None, window, cx);
-            return self.panel_scroll(
-                self.panel_empty(
-                    t(L10nKey::PanelNoWorkingDirectory),
-                    Some(t(L10nKey::PanelNoWorkingDirectoryHint)),
-                    cx,
-                ),
-                title,
-            );
-        };
-        let key = (host.id(), cwd.clone());
-        if self.right_panel.diff_cwd.as_ref() != Some(&key) {
-            self.right_panel.diff_cwd = Some(key);
-            self.right_panel.diff = None;
-            self.spawn_right_panel_diff(host.clone(), cwd.clone(), cx);
-        } else if self.right_panel.diff.is_none() && self.right_panel.diff_pending.is_none() {
-            self.spawn_right_panel_diff(host.clone(), cwd.clone(), cx);
-        }
-
-        let count = match &self.right_panel.diff {
-            Some(Some(snap)) => {
-                let n = snap.files.len() + snap.untracked_count();
-                (n > 0).then(|| n.to_string())
-            }
-            _ => None,
-        };
-        let title = self.panel_title(t(L10nKey::PanelChangesTitle), count, None, window, cx);
-        let mono = cx.theme().mono_font_family.clone();
-
-        let inner = match &self.right_panel.diff {
-            None => self.panel_empty(t(L10nKey::PanelLoading), None, cx),
-            Some(None) => self.panel_empty(
-                t(L10nKey::PanelNotAGitRepo),
-                Some(t(L10nKey::PanelNotAGitRepoHint)),
-                cx,
-            ),
-            Some(Some(snap)) if snap.files.is_empty() && snap.untracked.is_empty() => self
-                .panel_empty(
-                    t(L10nKey::PanelNoChanges),
-                    Some(t(L10nKey::PanelNoChangesHint)),
-                    cx,
-                ),
-            Some(Some(snap)) => {
-                let snap = Arc::clone(snap);
-                let untracked = snap.untracked_count();
-                let focused = self.diff_overlay_focus(host.id(), &cwd).map(str::to_string);
-                let shown = snap.files.len().min(MAX_RENDERED_FILES);
-                let mut list = v_flex().px(px(CONTENT_INSET - 4.)).py(px(2.)).gap(px(1.));
-                for file in snap.files.iter().take(shown) {
-                    let path = file.path.clone();
-                    let (added, removed) = (file.added, file.removed);
-                    let selected = focused.as_deref() == Some(path.as_str());
-                    list = list.child(
-                        h_flex()
-                            .id(gpui::SharedString::from(format!("panel-change-{path}")))
-                            .items_center()
-                            .gap(px(8.))
-                            .px(px(4.))
-                            .py(px(3.))
-                            .rounded(px(5.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(gpui::rgb(sf.hover)))
-                            .when(selected, |s| s.bg(gpui::rgb(sf.selected)))
-                            .on_click({
-                                let host_id = host.id();
-                                let cwd = cwd.clone();
-                                let path = path.clone();
-                                cx.listener(move |this, _, window, cx| {
-                                    this.toggle_diff_overlay_at(
-                                        host_id,
-                                        cwd.clone(),
-                                        Some(path.clone()),
-                                        window,
-                                        cx,
-                                    );
-                                })
-                            })
-                            .child(git_badge("M", cx.theme().muted_foreground, &mono))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(12.))
-                                    .font_family(mono.clone())
-                                    .text_color(cx.theme().foreground)
-                                    .child(path),
-                            )
-                            .when(added > 0, |this| {
-                                this.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(11.))
-                                        .font_family(mono.clone())
-                                        .text_color(cx.theme().success)
-                                        .child(format!("+{added}")),
-                                )
-                            })
-                            .when(removed > 0, |this| {
-                                this.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(11.))
-                                        .font_family(mono.clone())
-                                        .text_color(cx.theme().danger)
-                                        .child(format!("−{removed}")),
-                                )
-                            }),
-                    );
-                }
-                if snap.files.len() > shown {
-                    let rest = snap.files.len() - shown;
-                    list = list.child(
-                        div()
-                            .px(px(4.))
-                            .py(px(3.))
-                            .text_size(px(11.5))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t_plural(L10nKey::PanelMoreChangedFiles, rest, &[])),
-                    );
-                }
-                if untracked > 0 {
-                    list = list.child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .px(px(4.))
-                            .py(px(3.))
-                            .child(git_badge(
-                                "U",
-                                cx.theme().muted_foreground.opacity(0.75),
-                                &mono,
-                            ))
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(t_plural(L10nKey::PanelUntracked, untracked, &[])),
-                            ),
-                    );
-                }
-                list.into_any_element()
-            }
-        };
-        self.panel_scroll(inner, title)
-    }
-
-    fn spawn_right_panel_diff(
-        &mut self,
-        host: crate::ui::host_ops::SharedHost,
-        cwd: PathBuf,
-        cx: &mut Context<Self>,
-    ) {
-        if self.right_panel.diff_pending.is_some() {
-            return;
-        }
-        self.right_panel.diff_pending = Some((host.id(), cwd.clone()));
-        self.spawn_shared_diff_probe(host, cwd, cx);
-    }
-
-    pub(crate) fn right_panel_refresh_changes(&mut self, cx: &mut Context<Self>) {
-        if self.right_panel.diff_pending.is_some() {
-            return;
-        }
-        let Some((id, cwd)) = self.right_panel.diff_cwd.clone() else {
-            return;
-        };
-        let Some(host) = crate::ui::host_registry::HostRegistry::get(cx, id) else {
-            return;
-        };
-        let Some(Some(snap)) = &self.right_panel.diff else {
-            return;
-        };
-        let Some(status) = cx
-            .try_global::<crate::terminal::git_status::GitStatusCache>()
-            .and_then(|cache| cache.status_for(id, &cwd))
-        else {
-            return;
-        };
-        let stale = status.branch != snap.branch || (status.added, status.removed) != snap.totals();
-        if stale {
-            self.spawn_right_panel_diff(host, cwd, cx);
-        }
     }
 
     fn render_panel_files(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

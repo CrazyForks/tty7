@@ -404,7 +404,7 @@ impl Tty7App {
                 L10nKey::PanelInfoTitle,
             ),
             (
-                RightPanelTab::Changes,
+                RightPanelTab::Scm,
                 Icon::empty().path("icons/git-branch.svg"),
                 L10nKey::PanelChangesTitle,
             ),
@@ -427,7 +427,7 @@ impl Tty7App {
                     )
                     .rounded_lg()
                     .tooltip(match (tab, changed) {
-                        (RightPanelTab::Changes, Some(n)) => {
+                        (RightPanelTab::Scm, Some(n)) => {
                             SharedString::from(format!("{} · {n}", t(label_key)))
                         }
                         _ => SharedString::from(t(label_key)),
