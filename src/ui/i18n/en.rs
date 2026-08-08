@@ -857,6 +857,21 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::ScmResetToCommit => "Reset to Commit",
         L10nKey::ScmRefresh => "Refresh",
         L10nKey::ScmBackToChanges => "Back",
+        L10nKey::ScmTooManyChanges => "Showing the first {shown} of {total} changes.",
+        L10nKey::ScmOpenChanges => "Open Changes",
+        L10nKey::ScmDiscardAllConfirm => {
+            "Discard every change in this repository? This cannot be undone."
+        }
+        L10nKey::ScmAmendConfirm => {
+            "Amend the last commit? It will be replaced by a new one, so anyone who already has it has to reconcile."
+        }
+        L10nKey::ScmOpMerge => "merging",
+        L10nKey::ScmOpRebase => "rebasing",
+        L10nKey::ScmOpCherryPick => "cherry-picking",
+        L10nKey::ScmOpRevert => "reverting",
+        L10nKey::ScmOpBisect => "bisecting",
+        L10nKey::ScmOpAm => "applying",
+        L10nKey::ScmSwitchRepository => "Switch Repository",
         L10nKey::WindowStop => "Stop",
         L10nKey::WindowDelete => "Delete",
         L10nKey::WindowThisWorkspace => "this workspace",

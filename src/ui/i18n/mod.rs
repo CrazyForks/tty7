@@ -683,6 +683,24 @@ pub enum L10nKey {
     ScmResetToCommit,
     ScmRefresh,
     ScmBackToChanges,
+    /// Shown when the working tree has more changes than the status parser
+    /// keeps. The list is still useful; the count at the top would otherwise
+    /// be a lie.
+    ScmTooManyChanges,
+    ScmOpenChanges,
+    ScmDiscardAllConfirm,
+    ScmAmendConfirm,
+    /// Which sequencer operation is parked in the repository. Deliberately no
+    /// separate wording for an interactive rebase: modern git writes
+    /// `rebase-merge/interactive` for every rebase, so the UI would be
+    /// guessing — and `git status` does not draw the distinction either.
+    ScmOpMerge,
+    ScmOpRebase,
+    ScmOpCherryPick,
+    ScmOpRevert,
+    ScmOpBisect,
+    ScmOpAm,
+    ScmSwitchRepository,
     ScmFilesChanged,
     WindowStop,
     WindowDelete,
@@ -1123,6 +1141,17 @@ const SCM_KEYS_AWAITING_A_CALLER: &[L10nKey] = &[
     L10nKey::ScmResetToCommit,
     L10nKey::ScmRefresh,
     L10nKey::ScmBackToChanges,
+    L10nKey::ScmTooManyChanges,
+    L10nKey::ScmOpenChanges,
+    L10nKey::ScmDiscardAllConfirm,
+    L10nKey::ScmAmendConfirm,
+    L10nKey::ScmOpMerge,
+    L10nKey::ScmOpRebase,
+    L10nKey::ScmOpCherryPick,
+    L10nKey::ScmOpRevert,
+    L10nKey::ScmOpBisect,
+    L10nKey::ScmOpAm,
+    L10nKey::ScmSwitchRepository,
     L10nKey::ScmFilesChanged,
     L10nKey::DiffViewSplit,
     L10nKey::DiffViewUnified,

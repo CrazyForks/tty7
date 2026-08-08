@@ -67,9 +67,27 @@ pub(crate) struct ScmPanelState {
     /// Whether the next commit rewrites HEAD. Armed from the commit dropdown
     /// rather than a checkbox row — 260px does not have a row to spare.
     pub(crate) amend: bool,
-    /// Groups the user folded shut. Absent means open, so a group that has
-    /// never been touched renders expanded.
+    /// Groups the user folded shut, and the ones whose fold state they have
+    /// set at all. Both are needed: a group nobody has touched follows the
+    /// default for its size (a thousand untracked files start folded), and
+    /// opening one by hand has to outlast the next file landing in it.
     pub(crate) collapsed: HashSet<ScmGroup>,
+    pub(crate) toggled: HashSet<ScmGroup>,
+    /// Working directory → the repository root containing it. Cached because
+    /// the root is what every write and every cache lookup is keyed by, and
+    /// only a `git status` can say what it is.
+    pub(crate) roots: HashMap<(HostId, PathBuf), PathBuf>,
+    /// When the panel last asked for a status that it did not get back.
+    pub(crate) probe_attempt: HashMap<(HostId, PathBuf), std::time::Instant>,
+    /// The status the last frame drew, as (cache key, `Arc` identity). The
+    /// watcher compares against it so a global write that changed nothing does
+    /// not ask for another frame.
+    pub(crate) seen: Option<((HostId, PathBuf), usize)>,
+    pub(crate) watch: Option<gpui::Subscription>,
+    /// The cheap per-tab git status the panel last reacted to. A change in it
+    /// means a command touched the repository and the expensive status is due
+    /// another look.
+    pub(crate) last_tab_status: Option<crate::terminal::git_status::GitStatus>,
     pub(crate) graph: GraphState,
     /// When set, the panel body is replaced by a single commit's detail view
     /// instead of the working tree.
@@ -86,6 +104,25 @@ impl ScmPanelState {
 
     pub(crate) fn draft(&self, repo: &RepoKey) -> &str {
         self.drafts.get(repo).map(String::as_str).unwrap_or("")
+    }
+
+    /// Whether a group renders folded. `count` decides it only for a group the
+    /// user has never touched.
+    pub(crate) fn group_collapsed(&self, group: ScmGroup, count: usize) -> bool {
+        if self.toggled.contains(&group) {
+            self.collapsed.contains(&group)
+        } else {
+            crate::ui::scm::panel::starts_collapsed(group, count)
+        }
+    }
+
+    pub(crate) fn set_group_collapsed(&mut self, group: ScmGroup, collapsed: bool) {
+        self.toggled.insert(group);
+        if collapsed {
+            self.collapsed.insert(group);
+        } else {
+            self.collapsed.remove(&group);
+        }
     }
 }
 
