@@ -131,10 +131,9 @@ impl Render for DragTab {
     }
 }
 
-/// Says what the workspace head does, with its shortcut. The name alone was
-/// redundant — it is already the button's label.
-/// What a chrome tile says on hover: the action, then the chord that runs it
-/// when there is one.
+/// What a chrome tile says on hover: what it does, then the chord that does it.
+/// The tile's own name is no use as a tooltip — the workspace head already
+/// wears it as its label.
 fn chord_hint(what: &str, action: &str, cx: &gpui::App) -> SharedString {
     match crate::ui::home::key_hint(action, cx) {
         Some(keys) => SharedString::from(format!("{what}  {keys}")),
@@ -154,7 +153,12 @@ pub(crate) fn chrome_tile_variant_for(selected: bool, cx: &gpui::App) -> ButtonC
         } else {
             cx.theme().sidebar_foreground
         })
-        .hover(cx.theme().sidebar_accent)
+        // `sidebar_accent` is the surface's *selected* step, and it was handed
+        // to hover as well — so a hovered tile wore the fill of a selected one
+        // and, with the right panel open, two tiles read as current at once.
+        // Hover takes the step the palette derives for it. (A selected button
+        // never renders the hover style, so this only reaches the rest.)
+        .hover(gpui::rgb(cx.global::<crate::ui::presets::Surfaces>().sidebar.hover).into())
         .active(cx.theme().sidebar_accent)
 }
 
