@@ -137,12 +137,24 @@ impl Tty7App {
                 .child(Input::new(input).small())
         };
         let name_now = p.name.read(cx).value().trim().to_string();
+        let branch_now = p.branch.read(cx).value().trim().to_string();
+        // Submitting falls back from one field to the other, so either alone
+        // is enough; only both blank has nothing to name a worktree after.
+        // Offering Create there is offering a click that can only fail.
+        let nothing_to_name = name_now.is_empty() && branch_now.is_empty();
+        // Preview what submitting would actually make, which is the same
+        // fallback: with only a branch typed, the worktree takes its name, and
+        // showing "…" there described a path that would never be created.
+        let effective = match name_now.is_empty() {
+            true => branch_now.as_str(),
+            false => name_now.as_str(),
+        };
         let preview = p
             .dir
-            .join(if name_now.is_empty() {
+            .join(if effective.is_empty() {
                 "…"
             } else {
-                &name_now
+                effective
             })
             .display()
             .to_string();
@@ -199,7 +211,7 @@ impl Tty7App {
                             })
                             .small()
                             .primary()
-                            .disabled(p.busy)
+                            .disabled(p.busy || nothing_to_name)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submit_worktree_prompt(window, cx)
                             })),
