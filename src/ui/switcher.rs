@@ -27,6 +27,11 @@ const LEFT_W: f32 = 340.0;
 
 const CARD_TOP: f32 = 120.0;
 
+/// Breathing room the card keeps from the window edge, and the height its own
+/// search row and footer take on top of the body.
+const CARD_MARGIN: f32 = 24.0;
+const CARD_CHROME_H: f32 = 84.0;
+
 const BODY_H: f32 = 420.0;
 
 const ROW_AVATAR: f32 = 20.0;
@@ -1033,7 +1038,11 @@ impl Tty7App {
         self.activate_tree_tab(tab, window, cx);
     }
 
-    pub(crate) fn render_switcher(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_switcher(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let sw = self.switcher.as_ref()?;
         let (sel, column) = (sw.left_sel, sw.column);
         let (left_scroll, right_scroll) = (sw.left_scroll.clone(), sw.right_scroll.clone());
@@ -1070,16 +1079,24 @@ impl Tty7App {
         // Fixed height, not fit-to-content: the tab column changes length every
         // time the left cursor moves, and a card that resizes under the pointer
         // is unusable.
+        // The card is fixed-size by design — a panel that resizes under the
+        // pointer is unusable — but it still has to fit the window it floats
+        // over. Below its natural size it takes what there is.
+        let viewport = window.viewport_size();
+        let card_w = CARD_W.min(viewport.width.as_f32() - 2. * CARD_MARGIN).max(320.);
+        let body_h = BODY_H
+            .min(viewport.height.as_f32() - CARD_TOP - CARD_CHROME_H - CARD_MARGIN)
+            .max(120.);
         let body = div()
             .flex()
             .flex_row()
             .items_stretch()
-            .h(px(BODY_H))
+            .h(px(body_h))
             .child(
                 div()
                     .id("switcher-workspaces")
                     .track_scroll(&left_scroll)
-                    .w(px(LEFT_W))
+                    .w(px(LEFT_W.min(card_w * 0.5)))
                     .flex_shrink_0()
                     .overflow_y_scroll()
                     .border_r_1()
@@ -1099,7 +1116,7 @@ impl Tty7App {
             );
 
         let card = v_flex()
-            .w(px(CARD_W))
+            .w(px(card_w))
             .bg(card_bg)
             .border_1()
             .border_color(border)

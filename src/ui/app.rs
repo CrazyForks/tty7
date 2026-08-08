@@ -5816,7 +5816,7 @@ impl Render for Tty7App {
                 })
                 .child(main_layout)
                 .when_some(settings_overlay, |this, overlay| this.child(overlay))
-                .children(self.render_switcher(cx))
+                .children(self.render_switcher(window, cx))
                 .when_some(self.palette.clone(), |this, palette| this.child(palette))
                 .children(gpui_component::Root::render_notification_layer(window, cx));
 
