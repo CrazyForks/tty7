@@ -747,8 +747,10 @@ mod tests {
     #[test]
     fn an_argument_after_a_pipe_still_completes_as_a_path() {
         // Only the *first* word of the segment is a command position; every word
-        // after it keeps the path fallback it always had.
-        let c = complete("ls | grep et", 12, Some(Path::new("/"))).unwrap();
+        // after it keeps the path fallback it always had. The cwd is a tree we
+        // built rather than `/`, which holds nothing predictable on Windows.
+        let dir = temp_tree("after-pipe", &[("etc", true)]);
+        let c = complete("ls | grep et", 12, Some(&dir)).unwrap();
         assert!(
             c.candidates
                 .iter()
@@ -756,7 +758,8 @@ mod tests {
             "path candidates, not commands: {:?}",
             c.candidates
         );
-        assert!(c.candidates.iter().any(|c| c.text == "etc"));
+        assert!(c.candidates.iter().any(|c| c.text.starts_with("etc")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
