@@ -19,15 +19,172 @@ pub const MAX_RENDERED_FILES: usize = 300;
 
 pub const MAX_UNTRACKED: usize = 500;
 
+/// `-U<n>`. Git's own default, spelled out because the request carries it.
+pub const DEFAULT_CONTEXT: u32 = 3;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Truncation {
     PerFile,
     Budget,
 }
 
+/// Which patch to ask git for.
+///
+/// The three working-tree variants are the same three questions the SCM panel
+/// asks — `Worktree` is what is not staged, `Staged` is what is, and `Head` is
+/// both at once, which is what the overlay has always shown.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub enum DiffSource {
+    /// `git diff` — unstaged changes.
+    Worktree,
+    /// `git diff --cached` — what a commit right now would contain.
+    Staged,
+    /// `git diff HEAD` — staged and unstaged together.
+    #[default]
+    Head,
+    /// One commit against its first parent.
+    Commit { rev: String },
+    /// `base...head`: what `head` added since the two diverged.
+    Range { base: String, head: String },
+}
+
+impl DiffSource {
+    /// The whole argv, minus pathspecs. Every diff tty7 runs is built here so
+    /// there is one place to read, and one place to test, what git is asked.
+    pub fn args(&self, context: u32, ignore_whitespace: bool) -> Vec<String> {
+        // `core.quotePath=false` is not tidiness: with it on, git renders a
+        // non-ASCII path in the `diff --git` header as C octal escapes, and
+        // nothing downstream decodes those — the path would simply be wrong.
+        let mut argv = strings(&["-c", "core.quotePath=false"]);
+        match self {
+            DiffSource::Worktree => argv.push("diff".to_string()),
+            DiffSource::Staged => argv.extend(strings(&["diff", "--cached"])),
+            DiffSource::Head => argv.extend(strings(&["diff", "HEAD"])),
+            // `log -p -1`, not `diff-tree`: `diff-tree` does not honour
+            // `--first-parent` as a *narrowing* of a merge. Measured on git
+            // 2.50.1 against a merge of two branches that each added a file:
+            // `diff-tree -p -m --first-parent` emits both files (one patch per
+            // parent, concatenated), and dropping `-m` emits nothing at all.
+            // `log -p -1 --first-parent` gives the one first-parent patch for a
+            // merge, an ordinary commit and the initial commit alike, so there
+            // is no special case and no need for `--root`. `--format=` empties
+            // the commit header, at the cost of one blank line the parser
+            // ignores.
+            DiffSource::Commit { rev } => {
+                argv.extend(strings(&["log", "-p", "-1", "--format=", "--first-parent"]));
+                argv.push(rev.clone());
+            }
+            // Three dots: measured from the merge base, so unrelated work on
+            // `base` does not show up as if `head` had reverted it.
+            DiffSource::Range { base, head } => {
+                argv.push("diff".to_string());
+                argv.push(format!("{base}...{head}"));
+            }
+        }
+        argv.extend(strings(&[
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-M",
+        ]));
+        argv.push(format!("-U{context}"));
+        if ignore_whitespace {
+            argv.push("-w".to_string());
+        }
+        argv
+    }
+
+    /// Whether untracked files belong in the snapshot. They are a property of
+    /// the working tree, so a commit or a range has none, and a staged diff
+    /// does not either — an untracked file is by definition not in the index.
+    pub fn lists_untracked(&self) -> bool {
+        matches!(self, DiffSource::Worktree | DiffSource::Head)
+    }
+}
+
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| a.to_string()).collect()
+}
+
+/// How much of a patch is worth keeping in memory.
+///
+/// The line counts on [`FileDiff`] stay exact past every one of these; only the
+/// retained text is bounded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DiffBudget {
+    pub max_lines_per_file: usize,
+    pub max_total_lines: usize,
+    pub max_files_with_hunks: usize,
+}
+
+impl DiffBudget {
+    /// A whole tree at once: no single file may crowd out the rest.
+    pub const PANEL: DiffBudget = DiffBudget {
+        max_lines_per_file: MAX_LINES_PER_FILE,
+        max_total_lines: MAX_TOTAL_LINES,
+        max_files_with_hunks: MAX_FILES_WITH_HUNKS,
+    };
+
+    /// One file the user asked for by name. There is nothing to crowd out, so
+    /// the per-file cap rises to where it is a defence against a generated
+    /// file rather than a rationing rule.
+    pub const SINGLE_FILE: DiffBudget = DiffBudget {
+        max_lines_per_file: 50_000,
+        max_total_lines: MAX_TOTAL_LINES,
+        max_files_with_hunks: MAX_FILES_WITH_HUNKS,
+    };
+}
+
+/// The whole point of the second budget. Pinned here so that trimming
+/// [`MAX_LINES_PER_FILE`] one day cannot silently make the two identical.
+const _: () =
+    assert!(DiffBudget::SINGLE_FILE.max_lines_per_file > DiffBudget::PANEL.max_lines_per_file);
+
+impl Default for DiffBudget {
+    fn default() -> DiffBudget {
+        DiffBudget::PANEL
+    }
+}
+
+/// One patch to fetch and parse.
+pub struct DiffRequest<'a> {
+    pub source: DiffSource,
+    /// Empty means the whole tree. Every entry must already be a pathspec —
+    /// `:(literal)…` — because git globs a bare path and a file named `a[b].c`
+    /// would then match nothing.
+    pub paths: &'a [String],
+    pub context: u32,
+    pub budget: DiffBudget,
+    pub ignore_whitespace: bool,
+}
+
+impl Default for DiffRequest<'_> {
+    fn default() -> DiffRequest<'static> {
+        DiffRequest {
+            source: DiffSource::default(),
+            paths: &[],
+            context: DEFAULT_CONTEXT,
+            budget: DiffBudget::PANEL,
+            ignore_whitespace: false,
+        }
+    }
+}
+
+impl DiffRequest<'_> {
+    pub fn args(&self) -> Vec<String> {
+        let mut argv = self.source.args(self.context, self.ignore_whitespace);
+        if !self.paths.is_empty() {
+            argv.push("--".to_string());
+            argv.extend(self.paths.iter().cloned());
+        }
+        argv
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct DiffSnapshot {
     pub root: PathBuf,
+    pub source: DiffSource,
     pub branch: String,
     pub files: Vec<FileDiff>,
     pub untracked: Vec<String>,
@@ -91,6 +248,12 @@ pub enum FileStatus {
     Modified,
     Deleted,
     Renamed,
+    Copied,
+    /// Regular file ↔ symlink ↔ submodule. Not a mode change: `100644` to
+    /// `100755` is still [`FileStatus::Modified`].
+    TypeChanged,
+    /// A path with conflict markers, or one git refused to diff at all.
+    Unmerged,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -126,43 +289,66 @@ pub struct DiffLine {
     pub text: String,
 }
 
+/// The whole working tree against `HEAD`, on the panel's budget.
 pub fn probe(host: &dyn Host, cwd: &Path) -> Option<DiffSnapshot> {
-    let root = git::git(host, cwd, &["rev-parse", "--show-toplevel"])?;
-    let root = PathBuf::from(root.trim_end_matches(['\n', '\r']));
-    let branch = git::branch_name(host, cwd)?;
-    let mut parser = DiffParser::default();
-    let diffed = host.git_lines(
-        cwd,
-        &["diff", "--no-color", "--no-ext-diff", "-M", "HEAD"],
-        &mut |line| parser.push_line(line),
-    );
+    probe_diff(host, cwd, &DiffRequest::default())
+}
+
+pub fn probe_diff(host: &dyn Host, root: &Path, req: &DiffRequest<'_>) -> Option<DiffSnapshot> {
+    let toplevel = git::git(host, root, &["rev-parse", "--show-toplevel"])?;
+    let toplevel = PathBuf::from(toplevel.trim_end_matches(['\n', '\r']));
+    let branch = git::branch_name(host, root)?;
+
+    let argv = req.args();
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut parser = DiffParser::with_budget(req.budget);
+    let diffed = host.git_lines(root, &argv, &mut |line| parser.push_line(line));
     let files = match diffed {
         Ok(Some(0)) => parser.finish(),
         _ => Vec::new(),
     };
+
     let mut untracked: Vec<String> = Vec::new();
     let mut untracked_total = 0usize;
-    let listed = host.git_lines(
-        cwd,
-        &["ls-files", "--others", "--exclude-standard", "--full-name"],
-        &mut |line| {
-            untracked_total += 1;
-            if untracked.len() < MAX_UNTRACKED {
-                untracked.push(line.to_string());
-            }
-        },
-    );
-    if !matches!(listed, Ok(Some(0))) {
+    // A pathspec-limited request is answering "what changed in these files",
+    // so a list of everything else in the tree would be noise.
+    let list_untracked = req.source.lists_untracked() && req.paths.is_empty();
+    let listed = list_untracked.then(|| {
+        host.git_lines(
+            root,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+            ],
+            &mut |line| {
+                untracked_total += 1;
+                if untracked.len() < MAX_UNTRACKED {
+                    untracked.push(line.to_string());
+                }
+            },
+        )
+    });
+    let untracked_ok = match &listed {
+        Some(listed) => matches!(listed, Ok(Some(0))),
+        None => true,
+    };
+    if !untracked_ok {
         untracked.clear();
         untracked_total = 0;
     }
+
     Some(DiffSnapshot {
-        root,
+        root: toplevel,
+        source: req.source.clone(),
         branch,
         files,
         untracked,
         untracked_total,
-        read_failed: !matches!(diffed, Ok(Some(0))) || !matches!(listed, Ok(Some(0))),
+        read_failed: !matches!(diffed, Ok(Some(0))) || !untracked_ok,
     })
 }
 
@@ -177,6 +363,7 @@ pub fn parse_unified(out: &str) -> Vec<FileDiff> {
 
 #[derive(Default)]
 pub struct DiffParser {
+    budget: DiffBudget,
     files: Vec<FileDiff>,
     old_no: u32,
     new_no: u32,
@@ -184,26 +371,44 @@ pub struct DiffParser {
     total_lines: usize,
     files_with_hunks: usize,
     in_hunk: bool,
+    /// How many marker columns the current hunk's body lines carry: one for an
+    /// ordinary patch, one per parent for a combined (`diff --cc`) one.
+    markers: usize,
+    old_mode: String,
 }
 
 impl DiffParser {
+    pub fn with_budget(budget: DiffBudget) -> DiffParser {
+        DiffParser {
+            budget,
+            ..DiffParser::default()
+        }
+    }
+
     pub fn push_line(&mut self, line: &str) {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             let (old_p, new_p) = parse_git_header_paths(rest);
-            self.files.push(FileDiff {
-                path: new_p.clone(),
-                old_path: (old_p != new_p).then_some(old_p),
-                status: FileStatus::Modified,
-                added: 0,
-                removed: 0,
-                binary: false,
-                truncated: None,
-                hunks: Vec::new(),
-            });
-            self.file_lines = 0;
-            self.in_hunk = false;
+            self.start_file(new_p.clone(), (old_p != new_p).then_some(old_p), None);
             return;
         }
+        // A conflicted path comes out as a combined diff against every merge
+        // parent at once, which is git's only way of saying "unmerged" in a
+        // patch — the `diff --git` header has no status field.
+        if let Some(rest) = line
+            .strip_prefix("diff --cc ")
+            .or_else(|| line.strip_prefix("diff --combined "))
+        {
+            let path = parse_combined_header_path(rest);
+            self.start_file(path, None, Some(FileStatus::Unmerged));
+            return;
+        }
+        // `git diff --cached` cannot show a conflicted path at all and says so
+        // on its own line, before any patch.
+        if let Some(rest) = line.strip_prefix("* Unmerged path ") {
+            self.start_file(rest.to_string(), None, Some(FileStatus::Unmerged));
+            return;
+        }
+        let old_mode = std::mem::take(&mut self.old_mode);
         let Some(file) = self.files.last_mut() else {
             return;
         };
@@ -219,6 +424,20 @@ impl DiffParser {
             file.status = FileStatus::Renamed;
             return;
         }
+        if line.starts_with("copy from ") {
+            file.status = FileStatus::Copied;
+            return;
+        }
+        if let Some(mode) = line.strip_prefix("old mode ") {
+            self.old_mode = mode.trim().to_string();
+            return;
+        }
+        if let Some(mode) = line.strip_prefix("new mode ") {
+            if !old_mode.is_empty() && object_type(&old_mode) != object_type(mode.trim()) {
+                file.status = FileStatus::TypeChanged;
+            }
+            return;
+        }
         if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
             file.binary = true;
             return;
@@ -231,12 +450,16 @@ impl DiffParser {
         }
         if line.starts_with("@@") {
             self.in_hunk = true;
+            // `@@` is one marker column, `@@@` two — a combined diff carries
+            // one per merge parent. Set before any early return: the line
+            // counts below stay exact even for a file whose body was dropped.
+            self.markers = line.bytes().take_while(|b| *b == b'@').count().max(2) - 1;
             if file.truncated.is_some() {
                 return;
             }
             let first_hunk = file.hunks.is_empty();
-            if (first_hunk && self.files_with_hunks >= MAX_FILES_WITH_HUNKS)
-                || self.total_lines >= MAX_TOTAL_LINES
+            if (first_hunk && self.files_with_hunks >= self.budget.max_files_with_hunks)
+                || self.total_lines >= self.budget.max_total_lines
             {
                 file.truncated = Some(Truncation::Budget);
                 return;
@@ -256,11 +479,8 @@ impl DiffParser {
         if !self.in_hunk {
             return;
         }
-        let (kind, text) = match line.as_bytes().first() {
-            Some(b'+') => (LineKind::Added, &line[1..]),
-            Some(b'-') => (LineKind::Removed, &line[1..]),
-            Some(b' ') => (LineKind::Context, &line[1..]),
-            _ => return,
+        let Some((kind, text)) = split_body_line(line, self.markers) else {
+            return;
         };
         match kind {
             LineKind::Added => file.added += 1,
@@ -271,11 +491,11 @@ impl DiffParser {
             return;
         }
         self.file_lines += 1;
-        if self.file_lines > MAX_LINES_PER_FILE {
+        if self.file_lines > self.budget.max_lines_per_file {
             file.truncated = Some(Truncation::PerFile);
             return;
         }
-        if self.total_lines >= MAX_TOTAL_LINES {
+        if self.total_lines >= self.budget.max_total_lines {
             file.truncated = Some(Truncation::Budget);
             return;
         }
@@ -310,8 +530,76 @@ impl DiffParser {
     }
 
     pub fn finish(self) -> Vec<FileDiff> {
-        self.files
+        fold_type_changes(self.files)
     }
+
+    fn start_file(&mut self, path: String, old_path: Option<String>, status: Option<FileStatus>) {
+        self.files.push(FileDiff {
+            path,
+            old_path,
+            status: status.unwrap_or(FileStatus::Modified),
+            added: 0,
+            removed: 0,
+            binary: false,
+            truncated: None,
+            hunks: Vec::new(),
+        });
+        self.file_lines = 0;
+        self.in_hunk = false;
+        self.markers = 1;
+        self.old_mode.clear();
+    }
+}
+
+/// A path whose *type* changed is not one patch: git emits the deletion and the
+/// creation back to back, and the header of neither says why. The adjacent pair
+/// over one path is the whole signal — git has no other reason to produce it —
+/// so it is folded back into the single entry the user thinks of.
+fn fold_type_changes(files: Vec<FileDiff>) -> Vec<FileDiff> {
+    let mut folded: Vec<FileDiff> = Vec::with_capacity(files.len());
+    for file in files {
+        let pair = folded.last().is_some_and(|prev| {
+            prev.status == FileStatus::Deleted
+                && file.status == FileStatus::Added
+                && prev.path == file.path
+        });
+        match folded.last_mut().filter(|_| pair) {
+            Some(prev) => {
+                prev.status = FileStatus::TypeChanged;
+                prev.added += file.added;
+                prev.removed += file.removed;
+                prev.binary |= file.binary;
+                prev.truncated = prev.truncated.or(file.truncated);
+                prev.hunks.extend(file.hunks);
+            }
+            None => folded.push(file),
+        }
+    }
+    folded
+}
+
+/// The `100`/`120`/`160` of a git file mode: regular file, symlink, submodule.
+/// Permission bits are deliberately dropped — `100644` to `100755` is a
+/// modification, not a type change.
+fn object_type(mode: &str) -> &str {
+    &mode[..mode.len().min(3)]
+}
+
+/// Splits a hunk body line into its kind and its text, given how many marker
+/// columns the hunk carries. A combined diff marks a line per parent; one `+`
+/// or `-` anywhere in those columns settles what happened to the line.
+fn split_body_line(line: &str, markers: usize) -> Option<(LineKind, &str)> {
+    let head = line.get(..markers)?;
+    let kind = if head.contains('+') {
+        LineKind::Added
+    } else if head.contains('-') {
+        LineKind::Removed
+    } else if head.bytes().all(|b| b == b' ') {
+        LineKind::Context
+    } else {
+        return None;
+    };
+    Some((kind, &line[markers..]))
 }
 
 fn is_hunk_line(line: &str) -> bool {
@@ -366,13 +654,34 @@ fn strip_prefix_ab(p: &str) -> String {
         .to_string()
 }
 
+/// A combined hunk header carries one `-` range per merge parent before the
+/// single `+` range, so the ranges are read positionally rather than by a fixed
+/// shape. The first `-` is the first parent's, which is the side tty7 numbers.
 fn parse_hunk_starts(line: &str) -> Option<(u32, u32)> {
-    let rest = line.strip_prefix("@@ -")?;
-    let (old_part, rest) = rest.split_once(" +")?;
-    let (new_part, _) = rest.split_once(" @@")?;
-    let old = old_part.split(',').next()?.parse().ok()?;
-    let new = new_part.split(',').next()?.parse().ok()?;
-    Some((old, new))
+    let ranges = line.trim_start_matches('@');
+    let ranges = &ranges[..ranges.find(" @@")?];
+    let mut old = None;
+    let mut new = None;
+    for range in ranges.split_whitespace() {
+        let (sign, rest) = range.split_at_checked(1)?;
+        let start: u32 = rest.split(',').next()?.parse().ok()?;
+        match sign {
+            "-" if old.is_none() => old = Some(start),
+            "+" => new = Some(start),
+            _ => {}
+        }
+    }
+    Some((old?, new?))
+}
+
+/// `diff --cc <path>`: one path, repo-relative, with no `a/` or `b/` prefix.
+fn parse_combined_header_path(rest: &str) -> String {
+    match rest.starts_with('"') {
+        true => parse_quoted_pair(rest)
+            .pop()
+            .unwrap_or_else(|| rest.to_string()),
+        false => rest.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +755,176 @@ Binary files a/img.png and b/img.png differ
         assert!(b.hunks.is_empty());
     }
 
+    fn argv(source: DiffSource) -> Vec<String> {
+        source.args(DEFAULT_CONTEXT, false)
+    }
+
+    #[test]
+    fn every_source_spells_out_its_own_argv() {
+        let common = ["--no-color", "--no-ext-diff", "--no-textconv", "-M", "-U3"];
+        let cases: Vec<(DiffSource, Vec<&str>)> = vec![
+            (DiffSource::Worktree, vec!["diff"]),
+            (DiffSource::Staged, vec!["diff", "--cached"]),
+            (DiffSource::Head, vec!["diff", "HEAD"]),
+            (
+                DiffSource::Commit {
+                    rev: "deadbeef".into(),
+                },
+                vec!["log", "-p", "-1", "--format=", "--first-parent", "deadbeef"],
+            ),
+            (
+                DiffSource::Range {
+                    base: "main".into(),
+                    head: "topic".into(),
+                },
+                vec!["diff", "main...topic"],
+            ),
+        ];
+        for (source, middle) in cases {
+            let want: Vec<String> = ["-c", "core.quotePath=false"]
+                .into_iter()
+                .chain(middle)
+                .chain(common)
+                .map(str::to_string)
+                .collect();
+            assert_eq!(argv(source.clone()), want, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn quote_path_is_off_on_every_source() {
+        // Left on, a non-ASCII path arrives as C octal escapes that nothing
+        // downstream decodes — `parse_quoted_pair` would hand back the literal
+        // digits. Verified against git 2.50.1: `diff --git
+        // "a/\344\270\255\346\226\207\345\220\215.txt" …` becomes
+        // `diff --git a/中文名.txt b/中文名.txt` once this is off.
+        for source in [
+            DiffSource::Worktree,
+            DiffSource::Staged,
+            DiffSource::Head,
+            DiffSource::Commit { rev: "HEAD".into() },
+            DiffSource::Range {
+                base: "a".into(),
+                head: "b".into(),
+            },
+        ] {
+            assert_eq!(&argv(source.clone())[..2], ["-c", "core.quotePath=false"]);
+        }
+    }
+
+    #[test]
+    fn octal_escaped_paths_are_what_the_flag_prevents() {
+        let escaped = parse_unified(
+            "diff --git \"a/\\344\\270\\255\\346\\226\\207\\345\\220\\215.txt\" \
+             \"b/\\344\\270\\255\\346\\226\\207\\345\\220\\215.txt\"\n",
+        );
+        assert_ne!(
+            escaped[0].path, "中文名.txt",
+            "the escapes are not decoded here, which is why they must not be produced"
+        );
+
+        let raw = parse_unified("diff --git a/中文名.txt b/中文名.txt\n");
+        assert_eq!(raw[0].path, "中文名.txt");
+    }
+
+    #[test]
+    fn a_request_appends_its_pathspecs_after_a_separator() {
+        let paths = [":(literal)src/a[b].rs".to_string()];
+        let req = DiffRequest {
+            source: DiffSource::Staged,
+            paths: &paths,
+            context: 0,
+            budget: DiffBudget::SINGLE_FILE,
+            ignore_whitespace: true,
+        };
+        assert_eq!(
+            req.args(),
+            [
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--cached",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "-M",
+                "-U0",
+                "-w",
+                "--",
+                ":(literal)src/a[b].rs",
+            ]
+        );
+        assert_eq!(
+            DiffRequest::default()
+                .args()
+                .iter()
+                .filter(|a| *a == "--")
+                .count(),
+            0,
+            "a whole-tree request has nothing to separate"
+        );
+    }
+
+    #[test]
+    fn the_default_request_is_the_panel_probe() {
+        let req = DiffRequest::default();
+        assert_eq!(req.source, DiffSource::Head);
+        assert_eq!(req.budget, DiffBudget::PANEL);
+        assert_eq!(req.args(), argv(DiffSource::Head));
+    }
+
+    #[test]
+    fn a_default_snapshot_still_reads_as_head() {
+        let snap = DiffSnapshot::default();
+        assert_eq!(
+            snap.source,
+            DiffSource::Head,
+            "`..Default::default()` callers keep the source they always had"
+        );
+    }
+
+    #[test]
+    fn the_single_file_budget_only_lifts_the_per_file_cap() {
+        assert_eq!(DiffBudget::PANEL, DiffBudget::default());
+        assert_eq!(
+            DiffBudget::SINGLE_FILE.max_total_lines,
+            DiffBudget::PANEL.max_total_lines
+        );
+        assert_eq!(
+            DiffBudget::SINGLE_FILE.max_files_with_hunks,
+            DiffBudget::PANEL.max_files_with_hunks
+        );
+
+        let mut out = String::from(
+            "diff --git a/big.txt b/big.txt\nindex 1..2 100644\n--- a/big.txt\n+++ b/big.txt\n@@ -0,0 +1,3000 @@\n",
+        );
+        for i in 0..3000 {
+            out.push_str(&format!("+line {i}\n"));
+        }
+        let mut parser = DiffParser::with_budget(DiffBudget::SINGLE_FILE);
+        for line in out.lines() {
+            parser.push_line(line);
+        }
+        let files = parser.finish();
+        assert_eq!(files[0].truncated, None, "3000 lines fit under 50_000");
+        assert_eq!(files[0].hunks[0].lines.len(), 3000);
+    }
+
+    #[test]
+    fn untracked_files_belong_to_the_working_tree_only() {
+        assert!(DiffSource::Worktree.lists_untracked());
+        assert!(DiffSource::Head.lists_untracked());
+        assert!(!DiffSource::Staged.lists_untracked());
+        assert!(!DiffSource::Commit { rev: "x".into() }.lists_untracked());
+        assert!(
+            !DiffSource::Range {
+                base: "a".into(),
+                head: "b".into()
+            }
+            .lists_untracked()
+        );
+    }
+
     #[test]
     fn parses_renames() {
         let out = "\
@@ -460,6 +939,116 @@ rename to new/name.rs
         assert_eq!(files[0].path, "new/name.rs");
         assert_eq!(files[0].old_path.as_deref(), Some("old/name.rs"));
         assert_eq!((files[0].added, files[0].removed), (0, 0));
+    }
+
+    #[test]
+    fn parses_copies() {
+        let out = "\
+diff --git a/tpl.rs b/copy.rs
+similarity index 100%
+copy from tpl.rs
+copy to copy.rs
+";
+        let files = parse_unified(out);
+        assert_eq!(files[0].status, FileStatus::Copied);
+        assert_eq!(files[0].path, "copy.rs");
+        assert_eq!(files[0].old_path.as_deref(), Some("tpl.rs"));
+    }
+
+    #[test]
+    fn a_type_change_is_one_file_not_a_delete_and_an_add() {
+        // git 2.50.1, `git diff` over a regular file replaced by a symlink.
+        let out = "\
+diff --git a/t.txt b/t.txt
+deleted file mode 100644
+index 587be6b..0000000
+--- a/t.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-x
+diff --git a/t.txt b/t.txt
+new file mode 120000
+index 0000000..1de5659
+--- /dev/null
++++ b/t.txt
+@@ -0,0 +1 @@
++target
+\\ No newline at end of file
+";
+        let files = parse_unified(out);
+        assert_eq!(files.len(), 1, "one path, one row");
+        assert_eq!(files[0].status, FileStatus::TypeChanged);
+        assert_eq!((files[0].added, files[0].removed), (1, 1));
+        assert_eq!(files[0].hunks.len(), 2, "both halves stay readable");
+    }
+
+    #[test]
+    fn a_permission_change_is_still_a_modification() {
+        let files = parse_unified("diff --git a/t.sh b/t.sh\nold mode 100644\nnew mode 100755\n");
+        assert_eq!(files[0].status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn a_mode_change_across_object_types_is_a_type_change() {
+        let files = parse_unified("diff --git a/t b/t\nold mode 100644\nnew mode 120000\n");
+        assert_eq!(files[0].status, FileStatus::TypeChanged);
+    }
+
+    #[test]
+    fn a_delete_and_an_add_of_different_paths_stay_two_files() {
+        let files = parse_unified(
+            "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n\
+             diff --git a/new.txt b/new.txt\nnew file mode 100644\n",
+        );
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].status, FileStatus::Deleted);
+        assert_eq!(files[1].status, FileStatus::Added);
+    }
+
+    #[test]
+    fn a_conflicted_file_parses_as_a_combined_diff() {
+        // git 2.50.1, `git diff` during a conflicted merge. Two marker columns,
+        // and a hunk header with one range per parent.
+        let out = "\
+diff --cc f.txt
+index af70335,f794161..0000000
+--- a/f.txt
++++ b/f.txt
+@@@ -1,3 -1,3 +1,7 @@@
+  a
+++<<<<<<< HEAD
+ +MAIN
+++=======
++ SIDE
+++>>>>>>> side
+  c
+";
+        let files = parse_unified(out);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "f.txt");
+        assert_eq!(files[0].status, FileStatus::Unmerged);
+
+        let lines = &files[0].hunks[0].lines;
+        assert_eq!(lines.len(), 7);
+        assert_eq!(lines[0].kind, LineKind::Context);
+        assert_eq!(lines[0].text, "a", "both marker columns come off the text");
+        assert_eq!((lines[0].old_no, lines[0].new_no), (Some(1), Some(1)));
+        assert_eq!(lines[1].kind, LineKind::Added);
+        assert_eq!(lines[1].text, "<<<<<<< HEAD");
+        assert_eq!(lines[4].kind, LineKind::Added);
+        assert_eq!(lines[4].text, "SIDE", "added on one side is still added");
+        assert_eq!(lines[6].text, "c");
+        assert_eq!((files[0].added, files[0].removed), (5, 0));
+    }
+
+    #[test]
+    fn a_staged_diff_reports_the_paths_it_refused_to_show() {
+        let files = parse_unified("* Unmerged path f.txt\ndiff --git a/ok.rs b/ok.rs\n");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "f.txt");
+        assert_eq!(files[0].status, FileStatus::Unmerged);
+        assert!(files[0].hunks.is_empty());
+        assert_eq!(files[1].path, "ok.rs");
     }
 
     #[test]
@@ -653,6 +1242,200 @@ index 1..2 100644
             MAX_UNTRACKED * 3,
             "the count is not"
         );
+    }
+
+    /// A repo with a merge whose two parents each added a file, plus an
+    /// ordinary commit and an initial one. Returns `None` if git is missing.
+    fn merge_repo(name: &str) -> Option<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("tty7-diff-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let run = |args: &[&str]| {
+            git::git_output(&dir, args)
+                .ok()
+                .filter(|out| out.success())
+                .is_some()
+        };
+        if !run(&["init", "-q", "-b", "mainwork", "."]) {
+            return None;
+        }
+        run(&["config", "user.email", "t@tty7.test"]);
+        run(&["config", "user.name", "tty7 test"]);
+        std::fs::write(dir.join("base.txt"), "base\n").ok()?;
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "initial"]);
+        run(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.join("s.txt"), "side\n").ok()?;
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "side"]);
+        run(&["checkout", "-q", "mainwork"]);
+        std::fs::write(dir.join("m.txt"), "main\n").ok()?;
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "main"]);
+        run(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+        Some(dir)
+    }
+
+    fn rev(dir: &Path, spec: &str) -> String {
+        git::git_output(dir, &["rev-parse", spec])
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+
+    fn commit_files(host: &dyn Host, dir: &Path, spec: &str) -> Vec<String> {
+        let req = DiffRequest {
+            source: DiffSource::Commit {
+                rev: rev(dir, spec),
+            },
+            ..Default::default()
+        };
+        probe_diff(host, dir, &req)
+            .expect("the scratch repo answers")
+            .files
+            .into_iter()
+            .map(|f| f.path)
+            .collect()
+    }
+
+    /// The reason `Commit` runs `log -p -1 --first-parent` and not `diff-tree`:
+    /// on git 2.50.1 `diff-tree -p -m --first-parent` emits *both* parents'
+    /// patches concatenated, and without `-m` it emits nothing for a merge at
+    /// all. Either would show a file the merge did not touch on this side.
+    #[test]
+    fn a_merge_commit_yields_only_its_first_parent_patch() {
+        let Some(dir) = merge_repo("merge") else {
+            return;
+        };
+        let host = crate::host::local::LocalHost::new();
+
+        assert_eq!(commit_files(&*host, &dir, "HEAD"), ["s.txt"]);
+        assert_eq!(commit_files(&*host, &dir, "HEAD^"), ["m.txt"]);
+        assert_eq!(
+            commit_files(&*host, &dir, "HEAD^^"),
+            ["base.txt"],
+            "the initial commit diffs against the empty tree, not an error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_three_working_tree_sources_split_staged_from_unstaged() {
+        let Some(dir) = merge_repo("sources") else {
+            return;
+        };
+        let host = crate::host::local::LocalHost::new();
+        std::fs::write(dir.join("base.txt"), "base\nstaged\n").unwrap();
+        let _ = git::git_output(&dir, &["add", "base.txt"]);
+        std::fs::write(dir.join("m.txt"), "main\nunstaged\n").unwrap();
+        std::fs::write(dir.join("fresh.txt"), "new\n").unwrap();
+
+        let files = |source: DiffSource| -> Vec<String> {
+            let req = DiffRequest {
+                source,
+                ..Default::default()
+            };
+            probe_diff(&*host, &dir, &req)
+                .expect("the scratch repo answers")
+                .files
+                .into_iter()
+                .map(|f| f.path)
+                .collect()
+        };
+        assert_eq!(files(DiffSource::Staged), ["base.txt"]);
+        assert_eq!(files(DiffSource::Worktree), ["m.txt"]);
+        assert_eq!(files(DiffSource::Head), ["base.txt", "m.txt"]);
+
+        let staged = probe_diff(
+            &*host,
+            &dir,
+            &DiffRequest {
+                source: DiffSource::Staged,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            staged.untracked.is_empty(),
+            "an untracked file is by definition not staged"
+        );
+        assert_eq!(probe(&*host, &dir).unwrap().untracked, ["fresh.txt"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_ascii_path_survives_the_round_trip() {
+        let Some(dir) = merge_repo("utf8") else {
+            return;
+        };
+        let host = crate::host::local::LocalHost::new();
+        std::fs::write(dir.join("中文名.txt"), "one\n").unwrap();
+        let _ = git::git_output(&dir, &["add", "-A"]);
+
+        let snap = probe_diff(
+            &*host,
+            &dir,
+            &DiffRequest {
+                source: DiffSource::Staged,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            snap.files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["中文名.txt"],
+            "octal escapes would have made this `344\\270\\255…`"
+        );
+
+        std::fs::write(dir.join("未跟踪.txt"), "two\n").unwrap();
+        assert!(
+            probe(&*host, &dir)
+                .unwrap()
+                .untracked
+                .contains(&"未跟踪.txt".to_string()),
+            "ls-files quotes the same way, and is unquoted the same way"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pathspec_narrows_the_patch_and_drops_the_untracked_list() {
+        let Some(dir) = merge_repo("pathspec") else {
+            return;
+        };
+        let host = crate::host::local::LocalHost::new();
+        std::fs::write(dir.join("base.txt"), "base\nedit\n").unwrap();
+        std::fs::write(dir.join("m.txt"), "main\nedit\n").unwrap();
+        std::fs::write(dir.join("fresh.txt"), "new\n").unwrap();
+
+        let paths = [":(literal)m.txt".to_string()];
+        let snap = probe_diff(
+            &*host,
+            &dir,
+            &DiffRequest {
+                source: DiffSource::Worktree,
+                paths: &paths,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            snap.files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["m.txt"]
+        );
+        assert!(snap.untracked.is_empty());
+        assert!(!snap.read_failed);
+        assert_eq!(snap.source, DiffSource::Worktree);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
