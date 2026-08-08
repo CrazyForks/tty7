@@ -768,8 +768,7 @@ impl Tty7App {
 
     fn switcher_rename(&mut self, id: WorkspaceId, window: &mut Window, cx: &mut Context<Self>) {
         let current = crate::ui::machine_mirror::display_name_for(cx, id).unwrap_or_default();
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
-        input.update(cx, |state, cx| state.focus(window, cx));
+        let input = Self::rename_box(current, window, cx);
         let sub = cx.subscribe_in(
             &input,
             window,
