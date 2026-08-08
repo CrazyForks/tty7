@@ -489,6 +489,15 @@ impl Tty7App {
                 self.on_auth_prompt_ready(view, window, cx);
             }
         }
+        if self.ssh_prompt.model.is_none() {
+            // Nothing else is asking, so the sheet stops rendering and the
+            // focus it held goes with it. Every other overlay hands focus back
+            // on the way out; this one left it on an element that was no
+            // longer there, and `submit_ssh_prompt` comes through here too —
+            // so after a successful login, with the pane connected and
+            // waiting, the next keystroke went nowhere until the user clicked.
+            self.focus_active(window, cx);
+        }
         cx.notify();
     }
 
@@ -1013,6 +1022,83 @@ mod tests {
                 accept: true,
                 remember: true
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    use crate::core::config::Config;
+    use crate::core::session::Session;
+    use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+
+    fn harness(cx: &mut TestAppContext) -> (WindowHandle<Tty7App>, VisualTestContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(Config::default());
+        });
+        let window = cx.add_window(|window, cx| {
+            Tty7App::with_session(None, Some(Session::default()), window, cx)
+        });
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.background_executor.run_until_parked();
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        (window, vcx)
+    }
+
+    /// The sheet takes focus into an input it owns, and dismissing it drops
+    /// that input. Every other overlay in the app hands focus back on the way
+    /// out; this one left it on a handle whose element had stopped rendering.
+    /// `submit_ssh_prompt` shares the path, so the same thing happened after a
+    /// *successful* login, where the pane is alive and waiting — and the next
+    /// keystroke went nowhere until the user clicked.
+    #[gpui::test]
+    fn dismissing_the_last_prompt_hands_focus_back(cx: &mut TestAppContext) {
+        let (window, _vcx) = harness(cx);
+
+        let pane_focus = window
+            .update(cx, |app, window, cx| {
+                // The host-key sheet is the one model with no text fields, so
+                // it stands in for a raised sheet without needing an
+                // `InputState` — which this harness cannot build, its window
+                // root being the app rather than gpui-component's `Root`.
+                app.ssh_prompt.model = Some(PromptModel::HostKeyUnknown {
+                    host: "example".into(),
+                    port: 22,
+                    algorithm: "ssh-ed25519".into(),
+                    fingerprint: "SHA256:zzz".into(),
+                });
+                window.focus(&app.ssh_prompt.focus_handle, cx);
+                // A headless harness has no live pane, so `focus_active`
+                // falls through to the home screen's handle. Which target it
+                // picks is not what is under test — that it picks one is.
+                app.home_focus.clone()
+            })
+            .expect("the app window stays open");
+        cx.background_executor.run_until_parked();
+
+        // Sanity: the sheet holds focus while it is up.
+        assert!(
+            !window
+                .update(cx, |_, window, _| pane_focus.is_focused(window))
+                .unwrap(),
+            "the sheet should hold focus while it is up"
+        );
+
+        window
+            .update(cx, |app, window, cx| app.cancel_ssh_prompt(window, cx))
+            .expect("the app window stays open");
+        cx.background_executor.run_until_parked();
+
+        assert!(
+            window
+                .update(cx, |_, window, _| pane_focus.is_focused(window))
+                .unwrap(),
+            "dismissing the last prompt must hand focus back to the app"
         );
     }
 }
