@@ -3123,13 +3123,21 @@ impl Tty7App {
         on_toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
+        let sf = cx.global::<presets::Surfaces>().window;
         let caret = if open { "▾" } else { "▸" };
         h_flex()
             .id(id)
             .items_center()
             .gap_2()
             .py_2()
+            // The other collapsible header on this page lights up under the
+            // pointer; this one only changed the cursor, so the two rows a
+            // reader folds and unfolds answered differently to the same move.
+            .px_2p5()
+            .mx_neg_2p5()
+            .rounded_lg()
             .cursor_pointer()
+            .hover(|s| s.bg(gpui::rgb(sf.hover)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _w, cx| on_toggle(this, cx)),
