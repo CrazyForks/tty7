@@ -560,10 +560,15 @@ impl Tty7App {
                 if data.wipe != wipe || data.generation(id, &root) != sub_gen {
                     return;
                 }
-                match result {
+                let changed = match result {
                     Some((status, index)) => {
+                        let same = data
+                            .status
+                            .get(id, root.as_path())
+                            .is_some_and(|held| **held == *status);
                         data.status.insert(id, root.clone(), status);
                         data.index.insert(id, root.clone(), index);
+                        !same
                     }
                     // Not a repository — a perfectly ordinary answer, and one
                     // that has to be recorded like any other. `read_at` below
@@ -571,15 +576,25 @@ impl Tty7App {
                     // cwd is an ordinary directory would otherwise spawn a
                     // `rev-parse` per frame, forever.
                     None => {
-                        data.status.remove(id, root.as_path());
+                        let held = data.status.remove(id, root.as_path()).is_some();
                         data.index.remove(id, root.as_path());
+                        held
                     }
-                }
+                };
                 data.read_at.insert(id, root.clone(), at);
                 // `run_detached` lands with an `App` and no view, and writing
                 // a global marks nothing dirty, so without this the panel and
                 // the decorations wait for the next unrelated repaint.
-                cx.refresh_windows();
+                //
+                // Only when something actually moved, though. Most probes
+                // confirm what is already on screen — a re-read after a write
+                // that touched another repository, or the "still not a
+                // repository" answer for an ordinary directory — and repainting
+                // for those would put a frame behind every file the tree
+                // notices changing.
+                if changed {
+                    cx.refresh_windows();
+                }
                 if superseded {
                     let _ = this.update(cx, |app, cx| app.scm_refresh(again, root, cx));
                 }
