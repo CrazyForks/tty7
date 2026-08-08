@@ -1178,6 +1178,10 @@ impl Tty7App {
                     code.selected = None;
                 }
                 let target = path.clone();
+                // "Delete failed: Permission denied" leaves out the one thing
+                // you need in a tree of files, the same way "Save failed" used
+                // to in the editor.
+                let failed_name = name.clone();
                 HostOps::run_in(
                     host,
                     window,
@@ -1193,7 +1197,10 @@ impl Tty7App {
                                 HostOps::notify_err(
                                     window,
                                     cx,
-                                    t(L10nKey::FileTreeDeleteFailed),
+                                    &t_fmt(
+                                        L10nKey::FileTreeDeleteFailed,
+                                        &[("name", &failed_name)],
+                                    ),
                                     &e,
                                 );
                             }

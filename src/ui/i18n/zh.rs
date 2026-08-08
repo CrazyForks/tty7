@@ -772,7 +772,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
             "该文件夹及其中所有内容将在 {host} 上被删除。远端没有回收站。"
         }
         L10nKey::SftpDeleteFileBody => "该文件将在 {host} 上被删除。远端没有回收站。",
-        L10nKey::FileTreeDeleteFailed => "删除失败",
+        L10nKey::FileTreeDeleteFailed => "无法删除 {name}",
         L10nKey::FileTreeContextOpen => "打开",
         L10nKey::FileTreeContextCdHere => "cd 到此处",
         L10nKey::FileTreeContextInsertPath => "在终端中插入路径",

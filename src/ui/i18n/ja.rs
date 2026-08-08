@@ -847,7 +847,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SftpDeleteFileBody => {
             "{host} 上でファイルが削除されます。リモート側にゴミ箱はありません。"
         }
-        L10nKey::FileTreeDeleteFailed => "削除に失敗しました",
+        L10nKey::FileTreeDeleteFailed => "{name} を削除できませんでした",
         L10nKey::FileTreeContextOpen => "開く",
         L10nKey::FileTreeContextCdHere => "ここで cd",
         L10nKey::FileTreeContextInsertPath => "ターミナルにパスを挿入",

@@ -806,7 +806,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SftpDeleteFileBody => {
             "The file will be deleted on {host}. There is no trash on the far side."
         }
-        L10nKey::FileTreeDeleteFailed => "Delete failed",
+        L10nKey::FileTreeDeleteFailed => "Could not delete {name}",
         L10nKey::FileTreeContextOpen => "Open",
         L10nKey::FileTreeContextCdHere => "cd Here",
         L10nKey::FileTreeContextInsertPath => "Insert Path in Terminal",
