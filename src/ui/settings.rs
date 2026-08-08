@@ -4804,10 +4804,14 @@ impl Tty7App {
         });
 
         let mut list = v_flex().px_4().pb_4().gap_4();
+        // Filtering every preset out left the panel blank under its own search
+        // box — the one filter in the app that said nothing about it.
+        let mut any_themes = false;
         for p in presets::all(cx) {
             if !query.is_empty() && !p.name.to_lowercase().contains(&query) {
                 continue;
             }
+            any_themes = true;
             let id = p.id.clone();
             let is_active = active_id == id;
             let preview = self.theme_preview(&p).rounded(rounding::inner_radius(
@@ -4862,6 +4866,13 @@ impl Tty7App {
                         ThemeSlot::Dark => this.set_slot_preset(true, &click_id, window, cx),
                     })),
             );
+        }
+
+        if !any_themes {
+            list = list.child(div().py_2().text_sm().text_color(muted_fg).child(t_fmt(
+                L10nKey::SettingsNothingMatches,
+                &[("query", query.as_str())],
+            )));
         }
 
         v_flex()
