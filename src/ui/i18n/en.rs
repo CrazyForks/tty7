@@ -697,6 +697,18 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "restore session previous tabs splits reopen launch startup layout"
         }
         L10nKey::SettingsSearchScrollSpeedKeywords => "mouse wheel multiplier scrolling",
+        L10nKey::SettingsSearchSmoothScrollKeywords => {
+            "smooth animation ease wheel notch trackpad scrolling"
+        }
+        L10nKey::SettingsSearchUpdateChannelKeywords => {
+            "update channel stable nightly release prerelease build"
+        }
+        L10nKey::SettingsSearchCheckUpdatesOnLaunchKeywords => {
+            "update check launch startup automatic release"
+        }
+        L10nKey::SettingsSearchAutoDownloadKeywords => {
+            "update download background install metered connection"
+        }
         L10nKey::SettingsSearchScrollbackKeywords => "history buffer lines scroll",
         L10nKey::SettingsSearchShowTrayIconKeywords => {
             "tray menu bar status item agent attention system icon"

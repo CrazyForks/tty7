@@ -222,6 +222,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Terminal,
+            title: SettingsSmoothScroll,
+            keywords: SettingsSearchSmoothScrollKeywords,
+        },
+        SearchEntry {
+            section: Terminal,
             title: SettingsFocusFollowsMouse,
             keywords: SettingsSearchFocusFollowsMouseKeywords,
         },
@@ -404,6 +409,21 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             section: About,
             title: SettingsSearchHowShellsWorkTitle,
             keywords: SettingsSearchHowShellsWorkKeywords,
+        },
+        SearchEntry {
+            section: About,
+            title: SettingsUpdateChannel,
+            keywords: SettingsSearchUpdateChannelKeywords,
+        },
+        SearchEntry {
+            section: About,
+            title: SettingsCheckUpdatesOnLaunch,
+            keywords: SettingsSearchCheckUpdatesOnLaunchKeywords,
+        },
+        SearchEntry {
+            section: About,
+            title: SettingsAutoDownload,
+            keywords: SettingsSearchAutoDownloadKeywords,
         },
         SearchEntry {
             section: Agents,
@@ -5694,6 +5714,15 @@ mod tests {
             ("known_hosts", Ssh),
             ("claude", Agents),
             ("symlink", Agents),
+            // Rows the index had no entry for at all, so the query counted
+            // nothing, no badge appeared and no row lit up: the whole Updates
+            // group on About, and Smooth scrolling between two rows that were
+            // both findable.
+            ("smooth", Terminal),
+            ("nightly", About),
+            ("channel", About),
+            ("metered", About),
+            ("automatic", About),
         ];
         for (query, expected) in cases {
             assert_eq!(

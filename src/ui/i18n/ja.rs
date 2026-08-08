@@ -732,6 +732,18 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsSearchScrollSpeedKeywords => {
             "マウス ホイール 倍率 スクロール scroll speed mouse wheel multiplier scrolling"
         }
+        L10nKey::SettingsSearchSmoothScrollKeywords => {
+            "スムーズ スクロール アニメーション ホイール トラックパッド smooth animation ease wheel trackpad"
+        }
+        L10nKey::SettingsSearchUpdateChannelKeywords => {
+            "更新 チャンネル 安定版 ナイトリー リリース update channel stable nightly release"
+        }
+        L10nKey::SettingsSearchCheckUpdatesOnLaunchKeywords => {
+            "起動時 更新 確認 自動 update check launch startup automatic"
+        }
+        L10nKey::SettingsSearchAutoDownloadKeywords => {
+            "バックグラウンド ダウンロード 更新 インストール 通信量 update download background install metered"
+        }
         L10nKey::SettingsSearchScrollbackKeywords => {
             "履歴 バッファ 行数 スクロール scrollback history buffer lines scroll"
         }

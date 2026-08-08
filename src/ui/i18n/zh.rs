@@ -661,6 +661,18 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsSearchScrollSpeedKeywords => {
             "滚动速度 鼠标滚轮 滚动倍率 scroll speed mouse wheel multiplier scrolling"
         }
+        L10nKey::SettingsSearchSmoothScrollKeywords => {
+            "平滑滚动 动画 缓动 滚轮 触控板 smooth animation ease wheel trackpad scrolling"
+        }
+        L10nKey::SettingsSearchUpdateChannelKeywords => {
+            "更新通道 稳定版 每夜构建 预发布 版本 update channel stable nightly release"
+        }
+        L10nKey::SettingsSearchCheckUpdatesOnLaunchKeywords => {
+            "启动时检查更新 自动 检查 启动 update check launch startup automatic"
+        }
+        L10nKey::SettingsSearchAutoDownloadKeywords => {
+            "后台下载更新 下载 后台 安装 流量 update download background install metered"
+        }
         L10nKey::SettingsSearchScrollbackKeywords => {
             "scrollback 回看 向上滚动 历史 缓冲区 行数 scrollback history buffer lines"
         }
