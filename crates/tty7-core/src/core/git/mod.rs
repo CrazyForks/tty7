@@ -59,7 +59,7 @@ pub fn probe(host: &dyn Host, cwd: &Path) -> Option<RepoSnapshot> {
     })
 }
 
-fn repo_home(root: &Path, git_dir: Option<&str>, common_dir: Option<&str>) -> PathBuf {
+pub(crate) fn repo_home(root: &Path, git_dir: Option<&str>, common_dir: Option<&str>) -> PathBuf {
     let (Some(git_dir), Some(common)) = (git_dir, common_dir) else {
         return root.to_path_buf();
     };
