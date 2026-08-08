@@ -603,6 +603,8 @@ impl Tty7App {
         f.saving = Some(seq);
         let text = f.input.read(cx).text().to_string();
         let target = f.path.clone();
+        let host_id = host.id();
+        let saved_in = target.parent().map(std::path::Path::to_path_buf);
         HostOps::run_in(
             host,
             window,
@@ -619,15 +621,20 @@ impl Tty7App {
                     f.edit_seq,
                     std::mem::take(&mut f.save_pending),
                 );
+                let wrote = result.is_ok();
                 match result {
-                    Ok(mtime) => {
-                        f.disk_mtime = mtime;
-                    }
+                    Ok(mtime) => f.disk_mtime = mtime,
                     Err(e) => HostOps::notify_err(window, cx, t(L10nKey::EditorSaveFailed), &e),
                 }
                 if landing.clean {
                     f.dirty = false;
                     f.conflict = false;
+                }
+                // A save is a working-tree edit the `.git` watch cannot see,
+                // and the file tree only sees it while it happens to be showing
+                // that directory.
+                if wrote && let Some(dir) = &saved_in {
+                    app.scm_invalidate_cwd(host_id, dir, cx);
                 }
                 if landing.requeue {
                     app.editor_save_file(id, false, window, cx);

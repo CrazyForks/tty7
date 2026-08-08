@@ -690,19 +690,27 @@ impl Tty7App {
     pub(crate) fn scm_sync_watchers(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.scm_forget_lost_hosts(cx);
 
-        let target = self.scm_panel_target(window, cx);
+        let wanted = [
+            (ScmWatcher::Panel, self.scm_panel_target(window, cx)),
+            (ScmWatcher::FileTree, self.scm_tree_target(window, cx)),
+            (ScmWatcher::Editor, self.scm_editor_target(cx)),
+        ];
         // Nothing to watch and nothing being watched, which is every frame of
         // a window whose panel is on another tab. Taking the global mutably
         // here would queue a global-observer effect per frame for no reason.
-        if target.is_none() && cx.try_global::<ScmData>().is_none_or(ScmData::is_quiet) {
+        if wanted.iter().all(|(_, t)| t.is_none())
+            && cx.try_global::<ScmData>().is_none_or(ScmData::is_quiet)
+        {
             return;
         }
-        let dropped = cx
-            .default_global::<ScmData>()
-            .subscriptions()
-            .declare(ScmWatcher::Panel, target);
-        if let Some((host, root)) = dropped {
-            cx.default_global::<ScmData>().drop_watch(host, &root);
+        for (who, target) in wanted {
+            let dropped = cx
+                .default_global::<ScmData>()
+                .subscriptions()
+                .declare(who, target);
+            if let Some((host, root)) = dropped {
+                cx.default_global::<ScmData>().drop_watch(host, &root);
+            }
         }
 
         for (host, root) in cx.default_global::<ScmData>().unwatched() {
@@ -734,6 +742,44 @@ impl Tty7App {
         let root = cx
             .try_global::<crate::terminal::git_status::GitStatusCache>()?
             .repo_root_for(host, view.git_status_cwd()?)?;
+        Some((host, root.to_path_buf()))
+    }
+
+    /// The repository the file tree is decorating, while it is on screen.
+    ///
+    /// The tree can be rooted at several repositories at once but a watcher
+    /// holds one; the active pane's is the one whose decorations the user is
+    /// looking at, and it is the one the panel would pick too — so the two
+    /// subscriptions usually collapse onto the same repository and cost one
+    /// watch between them.
+    fn scm_tree_target(&self, window: &Window, cx: &gpui::App) -> Option<(HostId, PathBuf)> {
+        if !self.file_tree_on_screen(cx) {
+            return None;
+        }
+        let leaf = self.tabs.get(self.active)?.detail_pane(window, cx)?;
+        let view = leaf.read(cx);
+        let host = view.host_id();
+        let root = cx
+            .try_global::<crate::terminal::git_status::GitStatusCache>()?
+            .repo_root_for(host, view.git_status_cwd()?)?;
+        Some((host, root.to_path_buf()))
+    }
+
+    /// The repository the focused editor's file belongs to.
+    ///
+    /// Only the focused one: an editor on a background tab is not showing
+    /// anyone a gutter, and holding a watch per open file would put a `status`
+    /// probe behind every repository the user has visited this session.
+    fn scm_editor_target(&self, cx: &gpui::App) -> Option<(HostId, PathBuf)> {
+        let code = self.tabs.get(self.active)?.code.as_ref()?;
+        if !code.visible {
+            return None;
+        }
+        let open = code.active_file()?;
+        let host = self.spawn_host(cx);
+        let root = cx
+            .try_global::<crate::terminal::git_status::GitStatusCache>()?
+            .repo_root_for(host, open.path.parent()?)?;
         Some((host, root.to_path_buf()))
     }
 

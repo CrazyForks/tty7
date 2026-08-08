@@ -731,6 +731,21 @@ impl Tty7App {
         }) {
             roots_moved = self.file_tree.invalidate_repo_roots();
         }
+        // Working-tree edits the source control cache has no other way to hear
+        // about. Anything under `.git` is skipped: the repository has its own
+        // watch, and routing it through here would only double the events that
+        // land in one debounce window.
+        let mut announced: HashSet<&Path> = HashSet::new();
+        for path in paths {
+            if path.components().any(|c| c.as_os_str() == ".git") {
+                continue;
+            }
+            let Some(dir) = path.parent() else { continue };
+            if announced.insert(dir) {
+                self.scm_invalidate_cwd(host, dir, cx);
+            }
+        }
+
         let gitignore_touched = paths
             .iter()
             .any(|p| p.file_name().is_some_and(|n| n == ".gitignore"));
