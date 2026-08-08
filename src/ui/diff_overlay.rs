@@ -179,7 +179,20 @@ impl Tty7App {
         snap: Option<Arc<DiffSnapshot>>,
         cx: &mut Context<Self>,
     ) {
-        let mut landed = false;
+        // A diff read is a fresher answer to the question the sidebar's
+        // +N −N asks, and it is the one the reader is looking at. Hand the
+        // numbers back before anything renders, or the row can disagree with
+        // the overlay it just opened.
+        let mut landed = if let Some(snap) = snap.as_ref() {
+            let (added, removed) = snap.totals();
+            let root = snap.root.clone();
+            cx.default_global::<crate::terminal::git_status::GitStatusCache>();
+            cx.update_global::<crate::terminal::git_status::GitStatusCache, _>(|cache, _| {
+                cache.note_counts(host, &root, added, removed)
+            })
+        } else {
+            false
+        };
         for tab in self.tabs.iter_mut() {
             let Some(overlay) = tab
                 .diff_overlay
