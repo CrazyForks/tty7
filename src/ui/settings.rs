@@ -3548,11 +3548,13 @@ impl Tty7App {
         // The chevron rides inside the field rather than beside it: hung on the
         // outside it would either push the box narrower than the Arguments box
         // directly below or push past the column every other control ends on.
-        let program_picker = Button::new("shell-program-detected")
-            .icon(IconName::ChevronDown)
-            .ghost()
-            .xsmall()
-            .disabled(shells.is_empty())
+        let program_picker = crate::ui::tab_strip::hit_target(
+            Button::new("shell-program-detected")
+                .icon(IconName::ChevronDown)
+                .ghost()
+                .xsmall(),
+        )
+        .disabled(shells.is_empty())
             .tooltip(t(L10nKey::SettingsShellDetected))
             .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _window, _cx| {
                 let mut menu = menu.min_w(px(200.));
