@@ -59,6 +59,19 @@ pub(crate) struct ScmPanelState {
     /// cleared whenever the active tab changes — an explicit choice should
     /// outlive a pane switch inside one tab, not a jump to somewhere else.
     pub(crate) repo_override: Option<RepoKey>,
+    /// The tab the override was made on, so the jump away can be noticed.
+    pub(crate) override_tab: Option<usize>,
+    /// Local branch names per repository, with the epoch they were read at.
+    /// Anything that could have moved a ref bumps the epoch, so the list in
+    /// the switcher is never older than the last operation.
+    pub(crate) branches: HashMap<RepoKey, (u64, Vec<String>)>,
+    pub(crate) branches_loading: HashSet<RepoKey>,
+    /// A network operation in flight, and the epoch it was dispatched at.
+    /// `run_git_op` bumps the epoch when it finishes, which is the only
+    /// completion signal available from outside it.
+    pub(crate) network: Option<(RepoKey, u64)>,
+    /// The inline "name your branch" input, present only while it is open.
+    pub(crate) new_branch: Option<Entity<InputState>>,
     /// Unsent commit messages, one per working tree.
     pub(crate) drafts: HashMap<RepoKey, String>,
     /// The commit box. `None` until the panel has been rendered once: an
@@ -81,10 +94,12 @@ pub(crate) struct ScmPanelState {
     /// opening one by hand has to outlast the next file landing in it.
     pub(crate) collapsed: HashSet<ScmGroup>,
     pub(crate) toggled: HashSet<ScmGroup>,
-    /// Working directory → the repository root containing it. Cached because
-    /// the root is what every write and every cache lookup is keyed by, and
-    /// only a `git status` can say what it is.
-    pub(crate) roots: HashMap<(HostId, PathBuf), PathBuf>,
+    /// Working directory → the repository root containing it, or `None` when
+    /// there is none, with when the answer was given. The root is what every
+    /// write runs from and what every cache is keyed by, so it is resolved
+    /// once per directory and reused.
+    pub(crate) roots: HashMap<(HostId, PathBuf), (std::time::Instant, Option<PathBuf>)>,
+    pub(crate) root_lookups: HashSet<(HostId, PathBuf)>,
     /// When the panel last asked for a status that it did not get back.
     pub(crate) probe_attempt: HashMap<(HostId, PathBuf), std::time::Instant>,
     /// The status the last frame drew, as (cache key, `Arc` identity). The

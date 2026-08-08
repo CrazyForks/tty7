@@ -21,7 +21,7 @@ use gpui_component::{
 use tty7_core::core::git::diff::MAX_RENDERED_FILES;
 use tty7_core::core::git::ops::GitOp;
 use tty7_core::core::git::status::{
-    ChangeCode, DecoStatus, RepoPath, StatusEntry, WorkingTreeStatus,
+    ChangeCode, DecoStatus, HeadState, RepoOperation, RepoPath, StatusEntry, WorkingTreeStatus,
 };
 
 use crate::terminal::git_data::status_of;
@@ -29,9 +29,9 @@ use crate::terminal::git_diff::DiffSource;
 use crate::ui::app::{CONTENT_INSET, Tty7App};
 use crate::ui::host_ops::{HostId, SharedHost};
 use crate::ui::i18n::{L10nKey, t, t_fmt, t_plural};
-use crate::ui::right_panel::git_badge;
+use crate::ui::right_panel::{git_badge, info_chip};
 use crate::ui::scm::ScmIntent;
-use crate::ui::scm::path::split_display_path;
+use crate::ui::scm::path::{elide_middle, split_display_path};
 use crate::ui::scm::state::{RepoKey, ScmGroup};
 use crate::ui::scm::status::{status_color, status_glyph};
 
@@ -60,6 +60,13 @@ pub(crate) const TILE_GLYPH_XS: f32 = 11.;
 /// context nothing attaches is a binding that never fires.
 pub(crate) const COMMIT_KEY_CONTEXT: &str = "ScmCommit";
 
+/// Past this many, the branch switcher scrolls instead of growing.
+const BRANCHES_IN_MENU: usize = 12;
+
+/// How much of a branch name survives the row. Long names carry their
+/// meaning at both ends (`feature/…/auth-retry`), so the middle is what goes.
+const BRANCH_NAME_CHARS: usize = 24;
+
 /// Untracked files past this many start folded. A fresh clone of a repository
 /// with a stale `.gitignore` can put thousands of them in front of the three
 /// changes the user came to look at.
@@ -73,6 +80,11 @@ const UNTRACKED_AUTO_COLLAPSE: usize = 20;
 /// back empty: a repository we never got a status for stays stale forever, so
 /// without this the panel would start a new `git status` on every frame.
 const PROBE_RETRY: Duration = Duration::from_secs(2);
+
+/// How long "there is no repository here" is believed for. Long enough that
+/// sitting in `/tmp` costs nothing, short enough that `git init` in the pane
+/// below shows up without touching anything.
+const NOT_A_REPO_RETRY: Duration = Duration::from_secs(10);
 
 /// What the panel knows about the directory the active pane is sitting in.
 enum RepoLookup {
@@ -89,6 +101,12 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.scm_watch_status(cx);
+        // An explicit repository pick should outlive a pane switch inside the
+        // tab it was made on, and not a jump to a different tab.
+        if self.scm.override_tab != Some(self.active) {
+            self.scm.repo_override = None;
+            self.scm.override_tab = None;
+        }
 
         let Some((host, cwd)) = self.scm_pane_target(window, cx) else {
             let title = self.panel_title(t(L10nKey::PanelScmTitle), None, None, window, cx);
@@ -118,24 +136,39 @@ impl Tty7App {
             RepoLookup::Root(root) => root,
         };
 
-        self.scm_probe(&host, &root, cx);
-        let Some(status) = self.scm_seen_status(host.id(), &root, cx) else {
+        self.scm.repo = Some(RepoKey {
+            host: host.id(),
+            root,
+        });
+        // An explicit pick from the switcher wins over the pane's own
+        // repository, so everything below reads through `active_repo`.
+        let repo = self
+            .scm
+            .active_repo()
+            .cloned()
+            .expect("the pane's repository was just recorded");
+        let host = match crate::ui::host_registry::HostRegistry::get(cx, repo.host) {
+            Some(host) => host,
+            None => host,
+        };
+        self.scm_probe(&host, &repo.root, cx);
+        let Some(status) = self.scm_seen_status(repo.host, &repo.root, cx) else {
             let title = self.panel_title(t(L10nKey::PanelScmTitle), None, None, window, cx);
             let body = self.panel_empty(t(L10nKey::PanelLoading), None, cx);
             return self.scm_shell(title, body);
         };
 
-        let repo = RepoKey {
-            host: host.id(),
-            root,
-        };
-        self.scm.repo = Some(repo.clone());
-
         let count = (status.total_entries > 0).then(|| status.total_entries.to_string());
         let title = self.panel_title(t(L10nKey::PanelScmTitle), count, None, window, cx);
 
+        let branch = self.scm_branch_row(&repo, &status, cx);
+        let naming = self.scm_new_branch_row(&repo, cx);
         let commit = self.scm_commit_box(&repo, &status, window, cx);
         let buttons = self.scm_commit_buttons(&repo, &status, cx);
+        let mut pinned = vec![branch];
+        pinned.extend(naming);
+        pinned.push(commit);
+        pinned.push(buttons);
         let body = if status.is_clean() {
             self.panel_empty(
                 t(L10nKey::PanelNoChanges),
@@ -145,7 +178,368 @@ impl Tty7App {
         } else {
             self.scm_groups(&repo, &status, cx)
         };
-        self.scm_shell_with(title, vec![commit, buttons], body)
+        self.scm_shell_with(title, pinned, body)
+    }
+
+    /// The repository line: which branch, how far from its upstream, and one
+    /// button to close the gap.
+    ///
+    /// A row of its own rather than the title's trailing slot. Off macOS the
+    /// tab tiles render *after* that slot, and a branch name is the elastic
+    /// element here — it would be the first thing squeezed. `render_sftp_
+    /// breadcrumb` sets the same precedent.
+    fn scm_branch_row(
+        &mut self,
+        repo: &RepoKey,
+        status: &WorkingTreeStatus,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.scm_load_branches(repo, cx);
+        let mono = cx.theme().mono_font_family.clone();
+        let theme = cx.theme();
+        let (accent, warning, muted, fg) = (
+            theme.accent,
+            theme.warning,
+            theme.muted_foreground,
+            theme.foreground,
+        );
+        let detached = matches!(status.head, HeadState::Detached { .. });
+        let busy = self.scm_network_busy(repo, cx);
+        let others = self.scm_other_repos(repo);
+
+        h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .h(px(28.))
+            .pl(px(CONTENT_INSET))
+            .pr(px(crate::ui::app::tile_trailing_inset_sm()))
+            .child(
+                Icon::empty()
+                    .path("icons/git-branch.svg")
+                    .size(px(12.))
+                    .text_color(muted),
+            )
+            // The trigger is a `Button` because that is the one element the
+            // dropdown trait is implemented for. `dropdown_caret` turns its
+            // label row into `justify_between`, which is what puts the name on
+            // the left and the chevron against the chips.
+            .child(
+                Button::new("scm-branch")
+                    .ghost()
+                    .xsmall()
+                    .dropdown_caret(true)
+                    .label(elide_middle(&head_label(&status.head), BRANCH_NAME_CHARS).to_string())
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h(px(20.))
+                    .rounded(px(5.))
+                    .text_color(fg)
+                    .when(detached, |s| s.font_family(mono.clone()))
+                    .dropdown_menu_with_anchor(
+                        gpui::Anchor::TopLeft,
+                        self.scm_branch_menu(repo, status, cx),
+                    ),
+            )
+            .children(others.map(|count| info_chip(&format!("+{count}"), accent, muted, &mono)))
+            .when(detached, |this| {
+                this.child(info_chip(
+                    t(L10nKey::ScmDetached),
+                    warning.opacity(0.16),
+                    warning,
+                    &mono,
+                ))
+            })
+            .children(status.operation.map(|op| {
+                info_chip(
+                    t(operation_label(op)),
+                    warning.opacity(0.16),
+                    warning,
+                    &mono,
+                )
+            }))
+            .when(self.scm.amend, |this| {
+                this.child(info_chip(t(L10nKey::ScmAmendBadge), accent, muted, &mono))
+            })
+            .children(
+                tracking_chip(status.upstream.as_deref(), status.ahead_behind)
+                    .map(|text| info_chip(&text, accent, muted, &mono)),
+            )
+            .child(
+                crate::ui::tab_strip::chrome_tile_sized(
+                    Button::new("scm-sync").icon(if busy {
+                        Icon::new(IconName::LoaderCircle)
+                    } else {
+                        Icon::empty().path("icons/git-sync.svg")
+                    }),
+                    crate::ui::app::TILE_SIZE_SM,
+                    crate::ui::app::TILE_GLYPH_SM,
+                    false,
+                    cx,
+                )
+                .rounded_md()
+                .disabled(busy)
+                .tooltip(if status.upstream.is_some() {
+                    t(L10nKey::ScmSync)
+                } else {
+                    t(L10nKey::ScmPublishBranch)
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.run_scm_action(ScmIntent::Sync, window, cx);
+                })),
+            )
+            .into_any_element()
+    }
+
+    /// Whether a network operation dispatched from here is still running.
+    ///
+    /// There is no completion callback to hang this off, but `run_git_op`
+    /// bumps the repository's epoch when it lands — so an epoch that has not
+    /// moved since the dispatch means the operation has not finished.
+    fn scm_network_busy(&self, repo: &RepoKey, cx: &mut Context<Self>) -> bool {
+        let Some((sent, at)) = &self.scm.network else {
+            return false;
+        };
+        sent == repo
+            && cx
+                .default_global::<crate::terminal::git_data::ScmData>()
+                .epoch(repo.host, &repo.root)
+                == *at
+    }
+
+    /// How many repositories other than this one the panel could switch to.
+    fn scm_other_repos(&self, current: &RepoKey) -> Option<usize> {
+        let choices = self.scm_repo_choices();
+        let count = choices.len().saturating_sub(1);
+        (count > 0 && choices.contains(current)).then_some(count)
+    }
+
+    /// Read the local branch names, at most once per epoch.
+    fn scm_load_branches(&mut self, repo: &RepoKey, cx: &mut Context<Self>) {
+        let epoch = cx
+            .default_global::<crate::terminal::git_data::ScmData>()
+            .epoch(repo.host, &repo.root);
+        if self
+            .scm
+            .branches
+            .get(repo)
+            .is_some_and(|(at, _)| *at == epoch)
+            || self.scm.branches_loading.contains(repo)
+        {
+            return;
+        }
+        let Some(host) = crate::ui::host_registry::HostRegistry::get(cx, repo.host) else {
+            return;
+        };
+        self.scm.branches_loading.insert(repo.clone());
+        let root = repo.root.clone();
+        let key = repo.clone();
+        crate::ui::host_ops::HostOps::run(
+            host,
+            cx,
+            move |h| {
+                // `for-each-ref` rather than `branch`: no porcelain warnings,
+                // no column layout, and one name per line whatever the config.
+                tty7_core::core::git::git(
+                    h,
+                    &root,
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+                )
+            },
+            move |this, out, cx| {
+                this.scm.branches_loading.remove(&key);
+                let names = out
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                this.scm.branches.insert(key, (epoch, names));
+                cx.notify();
+            },
+        );
+    }
+
+    fn scm_branch_menu(
+        &self,
+        repo: &RepoKey,
+        status: &WorkingTreeStatus,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static + use<>
+    {
+        let app = cx.entity().downgrade();
+        let repo = repo.clone();
+        let current = match &status.head {
+            HeadState::Branch { name, .. } | HeadState::Unborn { branch: name } => name.clone(),
+            HeadState::Detached { .. } => String::new(),
+        };
+        let branches = self
+            .scm
+            .branches
+            .get(&repo)
+            .map(|(_, names)| names.clone())
+            .unwrap_or_default();
+        let others = self.scm_repo_choices();
+
+        move |menu, _window, _cx| {
+            let mut menu = menu.min_w(px(200.));
+            // Past a dozen the list stops being scannable, so it scrolls
+            // rather than growing taller than the window.
+            if branches.len() > BRANCHES_IN_MENU {
+                menu = menu.scrollable(true).max_h(px(300.));
+            }
+            for name in &branches {
+                let is_current = *name == current;
+                menu = menu.item(
+                    PopupMenuItem::new(name.clone())
+                        .checked(is_current)
+                        .disabled(is_current)
+                        .on_click({
+                            let app = app.clone();
+                            let repo = repo.clone();
+                            let name = name.clone();
+                            move |_, window, cx| {
+                                let _ = app.update(cx, |this, cx| {
+                                    this.scm_op(
+                                        repo.clone(),
+                                        GitOp::CheckoutBranch { name: name.clone() },
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            }
+                        }),
+                );
+            }
+            menu = menu
+                .separator()
+                .item(PopupMenuItem::new(t(L10nKey::ScmCreateBranch)).on_click({
+                    let app = app.clone();
+                    move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| this.scm_begin_create_branch(window, cx));
+                    }
+                }));
+            for (label, intent) in [
+                (L10nKey::ScmFetch, ScmIntent::Fetch),
+                (L10nKey::ScmPull, ScmIntent::Pull),
+                (L10nKey::ScmPush, ScmIntent::Push),
+            ] {
+                menu = menu.item(PopupMenuItem::new(t(label)).on_click({
+                    let app = app.clone();
+                    move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| this.run_scm_action(intent, window, cx));
+                    }
+                }));
+            }
+            if others.len() > 1 {
+                menu = menu
+                    .separator()
+                    .item(PopupMenuItem::label(t(L10nKey::ScmSwitchRepository)));
+                for other in &others {
+                    let label = other
+                        .root
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| other.root.display().to_string());
+                    menu = menu.item(PopupMenuItem::new(label).checked(*other == repo).on_click({
+                        let app = app.clone();
+                        let other = other.clone();
+                        move |_, _window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.scm.repo_override = Some(other.clone());
+                                this.scm.override_tab = Some(this.active);
+                                cx.notify();
+                            });
+                        }
+                    }));
+                }
+            }
+            menu
+        }
+    }
+
+    /// Every repository the panel has looked at this session.
+    ///
+    /// Built from the roots it resolved rather than from the open tabs,
+    /// because only a resolved root is safe to act on: the cheap per-tab cache
+    /// knows a repository's *home*, which is a different directory inside a
+    /// linked worktree, and running an operation in the wrong tree is worse
+    /// than not offering the switch.
+    fn scm_repo_choices(&self) -> Vec<RepoKey> {
+        let mut out: Vec<RepoKey> = Vec::new();
+        for ((host, _cwd), (_, root)) in &self.scm.roots {
+            let Some(root) = root else { continue };
+            let key = RepoKey {
+                host: *host,
+                root: root.clone(),
+            };
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        out.sort_by(|a, b| a.root.cmp(&b.root));
+        out
+    }
+
+    pub(crate) fn scm_begin_create_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t(L10nKey::ScmCreateBranch)));
+        let handle = input.read(cx).focus_handle(cx);
+        self.scm.new_branch = Some(input);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// The inline "name your branch" row.
+    ///
+    /// A text input rather than a dialog: `window.prompt` can only offer
+    /// buttons, and the project has no modal component to reach for. The file
+    /// tree names new files the same way.
+    fn scm_new_branch_row(&mut self, repo: &RepoKey, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let input = self.scm.new_branch.clone()?;
+        let repo = repo.clone();
+        Some(
+            h_flex()
+                .id("scm-new-branch")
+                .flex_none()
+                .items_center()
+                .h(px(30.))
+                .px(px(CONTENT_INSET))
+                .child(div().flex_1().min_w_0().child(Input::new(&input).xsmall()))
+                .on_key_down(
+                    cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
+                        match ev.keystroke.key.as_str() {
+                            "escape" => {
+                                this.scm.new_branch = None;
+                                cx.notify();
+                            }
+                            "enter" => {
+                                let Some(input) = this.scm.new_branch.take() else {
+                                    return;
+                                };
+                                let name = input.read(cx).value().trim().to_string();
+                                cx.notify();
+                                if name.is_empty() {
+                                    return;
+                                }
+                                this.scm_op(
+                                    repo.clone(),
+                                    GitOp::CreateBranch {
+                                        name,
+                                        start: None,
+                                        checkout: true,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The message box.
@@ -413,9 +807,11 @@ impl Tty7App {
     /// root is also the cache key, which is what lets two panes in two
     /// subdirectories of one repository share a single status.
     ///
-    /// The cheap repository/not-a-repository answer comes from the cache the
-    /// tab badge already fills in, so a directory that is not a repository
-    /// never reaches `git status` from here at all.
+    /// Resolved with its own `rev-parse` rather than borrowed from the cheap
+    /// per-tab cache. That cache holds a repository's *home*, which is a
+    /// different directory inside a linked worktree, and it is only filled in
+    /// for panes whose shell reports a cwd — a pane without shell integration
+    /// would leave the panel loading forever.
     fn scm_repo_root(
         &mut self,
         host: &SharedHost,
@@ -424,27 +820,44 @@ impl Tty7App {
     ) -> RepoLookup {
         let id = host.id();
         let key = (id, cwd.to_path_buf());
-        if let Some(root) = self.scm.roots.get(&key) {
-            return RepoLookup::Root(root.clone());
+        match self.scm.roots.get(&key) {
+            Some((_, Some(root))) => return RepoLookup::Root(root.clone()),
+            // "Not a repository" is re-asked now and then, because `git init`
+            // in the pane below has to start showing up without a restart.
+            Some((at, None)) if at.elapsed() < NOT_A_REPO_RETRY => return RepoLookup::NotARepo,
+            _ => {}
         }
-        match cx
-            .try_global::<crate::terminal::git_status::GitStatusCache>()
-            .and_then(|cache| cache.known_repo_for(id, cwd))
-        {
-            None => RepoLookup::Pending,
-            Some(None) => RepoLookup::NotARepo,
-            Some(Some(_)) => {
-                self.scm_probe(host, cwd, cx);
-                match status_of(cx, id, cwd) {
-                    Some(status) => {
-                        let root = status.root.clone();
-                        self.scm.roots.insert(key, root.clone());
-                        RepoLookup::Root(root)
-                    }
-                    None => RepoLookup::Pending,
-                }
-            }
+        if !self.scm.root_lookups.insert(key.clone()) {
+            return RepoLookup::Pending;
         }
+        let dir = cwd.to_path_buf();
+        crate::ui::host_ops::HostOps::run(
+            host.clone(),
+            cx,
+            move |h| {
+                // Asked separately from the status probe, and asked first: the
+                // answer is what everything else is keyed by, it is the same
+                // for every pane in the tree, and it is a ref lookup rather
+                // than a walk of the working tree.
+                tty7_core::core::git::git(
+                    h,
+                    &dir,
+                    &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+                )
+            },
+            move |this, out, cx| {
+                this.scm.root_lookups.remove(&key);
+                let root = out
+                    .as_deref()
+                    .and_then(|s| s.lines().next())
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(PathBuf::from);
+                this.scm.roots.insert(key, (Instant::now(), root));
+                cx.notify();
+            },
+        );
+        RepoLookup::Pending
     }
 
     /// `scm_refresh` with a floor under how often a fruitless probe repeats.
@@ -1097,6 +1510,53 @@ pub(crate) fn starts_collapsed(group: ScmGroup, count: usize) -> bool {
     group == ScmGroup::Untracked && count > UNTRACKED_AUTO_COLLAPSE
 }
 
+/// What the branch row says where the branch name goes.
+pub(crate) fn head_label(head: &HeadState) -> String {
+    match head {
+        // A detached HEAD has no name, so it wears its sha — shortened to the
+        // seven characters git itself abbreviates to.
+        HeadState::Detached { oid } => oid.chars().take(7).collect(),
+        _ => head.label(),
+    }
+}
+
+/// The `↑2 ↓1` chip, or nothing.
+///
+/// A branch that is level with its upstream says nothing at all: the quiet
+/// state is the common one, and a chip that is always there stops being read.
+/// A branch with no upstream offers to publish instead.
+pub(crate) fn tracking_chip(
+    upstream: Option<&str>,
+    ahead_behind: Option<(u32, u32)>,
+) -> Option<String> {
+    if upstream.is_none() {
+        return Some(t(L10nKey::ScmPublishBranch).to_string());
+    }
+    match ahead_behind? {
+        (0, 0) => None,
+        (ahead, 0) => Some(format!("↑{ahead}")),
+        (0, behind) => Some(format!("↓{behind}")),
+        (ahead, behind) => Some(format!("↑{ahead} ↓{behind}")),
+    }
+}
+
+/// Which sequencer operation is parked in the repository.
+///
+/// `RebaseInteractive` reads as "rebasing" on purpose: modern git writes
+/// `rebase-merge/interactive` for every rebase, so the distinction the variant
+/// name suggests is not one the repository on disk can actually make — and
+/// `git status` does not draw it either.
+pub(crate) fn operation_label(op: RepoOperation) -> L10nKey {
+    match op {
+        RepoOperation::Merge => L10nKey::ScmOpMerge,
+        RepoOperation::Rebase | RepoOperation::RebaseInteractive => L10nKey::ScmOpRebase,
+        RepoOperation::CherryPick => L10nKey::ScmOpCherryPick,
+        RepoOperation::Revert => L10nKey::ScmOpRevert,
+        RepoOperation::Bisect => L10nKey::ScmOpBisect,
+        RepoOperation::Am => L10nKey::ScmOpAm,
+    }
+}
+
 /// What the commit button says, and whether it can be pressed at all.
 pub(crate) struct CommitPlan {
     pub(crate) label: L10nKey,
@@ -1231,7 +1691,7 @@ mod tests {
     use crate::core::config::{CoreConfig, DiffViewMode, RightPanelTab};
     use crate::ui::app::test_window::harness;
     use gpui::TestAppContext;
-    use tty7_core::core::git::status::{ConflictKind, EntryKind, HeadState, RepoPath};
+    use tty7_core::core::git::status::{ConflictKind, EntryKind, RepoPath};
 
     fn entry(path: &str, index: ChangeCode, worktree: ChangeCode, kind: EntryKind) -> StatusEntry {
         StatusEntry {
@@ -1557,6 +2017,70 @@ mod tests {
         assert!(!commit_stages_everything(&unstaged, true));
     }
 
+    #[test]
+    fn a_branch_level_with_its_upstream_says_nothing() {
+        assert_eq!(tracking_chip(Some("origin/main"), Some((0, 0))), None);
+        assert_eq!(
+            tracking_chip(Some("origin/main"), Some((2, 0))).as_deref(),
+            Some("↑2")
+        );
+        assert_eq!(
+            tracking_chip(Some("origin/main"), Some((0, 1))).as_deref(),
+            Some("↓1")
+        );
+        assert_eq!(
+            tracking_chip(Some("origin/main"), Some((2, 1))).as_deref(),
+            Some("↑2 ↓1")
+        );
+        // Nothing to compare against is not the same as being level: the chip
+        // becomes the offer to publish.
+        assert_eq!(
+            tracking_chip(None, None).as_deref(),
+            Some(t(L10nKey::ScmPublishBranch))
+        );
+        // An upstream git could not count against says nothing rather than
+        // claiming zero.
+        assert_eq!(tracking_chip(Some("origin/main"), None), None);
+    }
+
+    #[test]
+    fn a_detached_head_shows_the_sha_git_would_print() {
+        assert_eq!(
+            head_label(&HeadState::Detached {
+                oid: "0123456789abcdef".into()
+            }),
+            "0123456"
+        );
+        assert_eq!(
+            head_label(&HeadState::Branch {
+                name: "main".into(),
+                oid: "0123456".into()
+            }),
+            "main"
+        );
+    }
+
+    #[test]
+    fn every_parked_operation_has_something_to_say() {
+        // Interactive and plain rebase read the same on purpose: git writes
+        // `rebase-merge/interactive` for both, so the distinction is not one
+        // the repository on disk can make.
+        assert_eq!(
+            operation_label(RepoOperation::RebaseInteractive),
+            operation_label(RepoOperation::Rebase)
+        );
+        for op in [
+            RepoOperation::Merge,
+            RepoOperation::Rebase,
+            RepoOperation::CherryPick,
+            RepoOperation::Revert,
+            RepoOperation::Bisect,
+            RepoOperation::Am,
+        ] {
+            assert!(!t(operation_label(op)).is_empty(), "{op:?}");
+        }
+    }
+
     #[gpui::test]
     fn commit_action_is_scoped_to_the_message_box(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
@@ -1761,5 +2285,151 @@ mod tests {
         assert!(!app.read_with(&vcx, |app, _| {
             app.scm.group_collapsed(ScmGroup::Untracked, 500)
         }));
+    }
+}
+
+/// The panel asks git for a lot, from inside `render`. These hold it to
+/// asking once and then going quiet.
+///
+/// The hazard is specific: `scm_refresh` reaches for its cache through
+/// `default_global`, which fires the global observers whether or not anything
+/// changed, and it is called every frame. A watcher that notified on every one
+/// of those would request a frame from inside a frame and never stop.
+#[cfg(all(test, unix))]
+mod render_idle_gpui_tests {
+    use super::*;
+    use crate::daemon::protocol::DaemonMsg;
+    use crate::ui::app::{render_probe, test_window};
+    use crate::ui::host_ops::HostId;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use tty7_core::core::config::RightPanelTab;
+
+    const BUDGET: u64 = 200;
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tty7-scm-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    fn scm_panel_on(
+        cx: &mut TestAppContext,
+        root: &Path,
+        until: impl Fn(&Tty7App, &gpui::App) -> bool,
+    ) -> (
+        Entity<Tty7App>,
+        VisualTestContext,
+        std::os::unix::net::UnixStream,
+    ) {
+        let (app, mut vcx, mut pane) = test_window::harness_with_pane(cx);
+        DaemonMsg::Cwd(root.to_path_buf())
+            .encode(&mut pane)
+            .expect("the pane's socket takes the cwd");
+        app.update_in(&mut vcx, |app, _, cx| {
+            app.right_panel_visible = true;
+            app.right_panel_tab = RightPanelTab::Scm;
+            cx.notify();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            app.update_in(&mut vcx, |_, _, cx| cx.notify());
+            vcx.background_executor.run_until_parked();
+            if app.update_in(&mut vcx, |app, _, cx| until(app, cx)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the panel never settled on the directory"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        vcx.background_executor.run_until_parked();
+        (app, vcx, pane)
+    }
+
+    fn draws_while_idle(vcx: &mut VisualTestContext) -> u64 {
+        render_probe::arm(BUDGET);
+        vcx.background_executor.run_until_parked();
+        vcx.executor()
+            .advance_clock(std::time::Duration::from_secs(3));
+        vcx.background_executor.run_until_parked();
+        render_probe::arm(BUDGET);
+        vcx.executor()
+            .advance_clock(std::time::Duration::from_secs(9));
+        vcx.background_executor.run_until_parked();
+        render_probe::draws()
+    }
+
+    #[gpui::test]
+    fn a_settled_source_control_panel_reaches_render_idle(cx: &mut TestAppContext) {
+        let _serial = serial();
+        let root = scratch("settled");
+        git(&root, &["init", "--quiet"]);
+        std::fs::write(root.join("a.rs"), "fn main() {}\n").unwrap();
+        git(&root, &["add", "a.rs"]);
+        std::fs::write(root.join("b.rs"), "// untracked\n").unwrap();
+
+        let want = root.clone();
+        let (app, mut vcx, _pane) = scm_panel_on(cx, &root, move |app, cx| {
+            app.scm.repo.as_ref().is_some_and(|r| r.root == want)
+                && crate::terminal::git_data::status_of(cx, HostId::LOCAL, &want).is_some()
+        });
+
+        let status = app.update_in(&mut vcx, |app, _, cx| {
+            crate::terminal::git_data::status_of(
+                cx,
+                HostId::LOCAL,
+                &app.scm.repo.clone().unwrap().root,
+            )
+        });
+        let status = status.expect("the panel read a status");
+        assert_eq!(status.staged().count(), 1, "a.rs is in the index");
+        assert_eq!(status.untracked().count(), 1, "b.rs is not");
+
+        assert_eq!(draws_while_idle(&mut vcx), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn a_directory_with_no_repository_reaches_render_idle(cx: &mut TestAppContext) {
+        let _serial = serial();
+        let root = scratch("bare");
+        std::fs::write(root.join("notes.txt"), "").unwrap();
+
+        // Nothing here is a repository, so `git status` must never be reached
+        // — and the panel must not spin looking for one that is not coming.
+        let want = root.clone();
+        let (app, mut vcx, _pane) = scm_panel_on(cx, &root, move |app, _cx| {
+            app.scm.roots.contains_key(&(HostId::LOCAL, want.clone()))
+        });
+        assert!(
+            app.update_in(&mut vcx, |app, _, _| app
+                .scm
+                .roots
+                .values()
+                .all(|(_, r)| r.is_none())),
+            "no root was resolved for a directory that is not a repository"
+        );
+        assert!(
+            app.update_in(&mut vcx, |app, _, _| app.scm.repo.is_none()),
+            "and no status was ever asked for"
+        );
+        assert_eq!(draws_while_idle(&mut vcx), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

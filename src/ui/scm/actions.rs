@@ -80,6 +80,15 @@ impl Tty7App {
         let Some(host) = HostRegistry::get(cx, repo.host) else {
             return;
         };
+        if op.is_network() {
+            // The epoch `run_git_op` bumps when it lands is the only signal
+            // there is that a push has finished, so record the one we started
+            // from and let the branch row spin until it moves.
+            let at = cx
+                .default_global::<crate::terminal::git_data::ScmData>()
+                .epoch(repo.host, &repo.root);
+            self.scm.network = Some((repo.clone(), at));
+        }
         let Some(loss) = op.destructive() else {
             self.run_git_op(host, repo.root, op, window, cx);
             return;
@@ -148,9 +157,10 @@ impl Tty7App {
                 window,
                 cx,
             ),
-            // Both open a picker rather than doing anything, so they are the
-            // panel's business and not this match's.
-            ScmIntent::CheckoutBranch | ScmIntent::CreateBranch => {}
+            ScmIntent::CreateBranch => self.scm_begin_create_branch(window, cx),
+            // Checking out is a pick, not a verb: the switcher hangs off the
+            // branch name, which is where the list of branches already is.
+            ScmIntent::CheckoutBranch => {}
         }
     }
 
