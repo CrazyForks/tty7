@@ -1,3 +1,19 @@
+//! Everything tty7 knows about git, split by question:
+//!
+//! - this file — how a `git` process is *run* (and its output re-assembled)
+//! - [`status`] — what the working tree looks like right now
+//! - [`diff`] — what a particular patch looks like
+//! - [`log`] — what the history looks like, and how to lay it out in lanes
+//! - [`ops`] — how to *change* the repository
+//!
+//! Nothing here depends on gpui: the headless `tty7-server` answers the same
+//! questions for a remote workspace that `LocalHost` answers for this machine,
+//! and the conformance suite holds the two to the same behaviour.
+pub mod diff;
+pub mod log;
+pub mod ops;
+pub mod status;
+
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -94,6 +110,19 @@ pub fn git(host: &dyn Host, cwd: &Path, args: &[&str]) -> Option<String> {
 }
 
 pub fn git_output(cwd: &Path, args: &[&str]) -> io::Result<Output> {
+    git_output_with_env(cwd, args, &[])
+}
+
+/// `git_output` plus extra environment. Network operations (`fetch`/`pull`/
+/// `push`) need to be told they have no terminal to prompt at; read paths must
+/// *not* inherit that, so the two share a body rather than a config.
+///
+/// A `None` value removes the variable instead of setting it.
+pub fn git_output_with_env(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, Option<&str>)],
+) -> io::Result<Output> {
     if !cwd.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -104,12 +133,23 @@ pub fn git_output(cwd: &Path, args: &[&str]) -> io::Result<Output> {
     cmd.arg("-C")
         .arg(cwd)
         .args(args)
+        // Keeps `git status` from refreshing and writing back `.git/index`.
+        // Beyond the obvious (never dirty a repo just by looking at it), this is
+        // what stops the SCM panel's own probes from waking the `.git` watcher
+        // that schedules them — the read path is provably write-free. Do not
+        // drop it.
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in env {
+        match value {
+            Some(v) => cmd.env(key, v),
+            None => cmd.env_remove(key),
+        };
+    }
     let out = crate::core::proc::hide_console(&mut cmd).output()?;
     Ok(Output {
         status: out.status.code(),
@@ -204,6 +244,71 @@ impl LineSplitter {
 
     fn keep(&mut self, bytes: &[u8]) {
         let room = MAX_LINE.saturating_sub(self.tail.len());
+        let take = room.min(bytes.len());
+        self.tail.extend_from_slice(&bytes[..take]);
+        self.dropped += bytes.len() - take;
+    }
+}
+
+/// Splits a byte stream on an arbitrary separator, handing out whole records.
+///
+/// [`LineSplitter`]'s sibling, for the two git formats that are *not* newline
+/// delimited: `--porcelain=v2 -z` (NUL) and `log --pretty` with an ASCII record
+/// separator. Records come out as `&[u8]` rather than `&str` because a path in
+/// a `-z` status is raw bytes and need not be UTF-8 at all — deciding what to
+/// do about that belongs to the parser, not to the splitter.
+pub struct RecordSplitter {
+    sep: u8,
+    tail: Vec<u8>,
+    dropped: usize,
+}
+
+pub const MAX_RECORD: usize = 1024 * 1024;
+
+impl RecordSplitter {
+    pub fn new(sep: u8) -> RecordSplitter {
+        RecordSplitter {
+            sep,
+            tail: Vec::new(),
+            dropped: 0,
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8], mut on_record: impl FnMut(&[u8])) {
+        let mut rest = chunk;
+        while let Some(at) = rest.iter().position(|b| *b == self.sep) {
+            let (record, after) = rest.split_at(at);
+            if self.tail.is_empty() && self.dropped == 0 && record.len() <= MAX_RECORD {
+                on_record(record);
+            } else {
+                self.keep(record);
+                let joined = std::mem::take(&mut self.tail);
+                self.dropped = 0;
+                on_record(&joined);
+            }
+            rest = &after[1..];
+        }
+        self.keep(rest);
+    }
+
+    /// Emits a trailing record only if one was actually started. Unlike lines,
+    /// well-formed `-z` output ends *with* a separator, so the common case here
+    /// is emitting nothing.
+    pub fn finish(mut self, mut on_record: impl FnMut(&[u8])) {
+        if !self.tail.is_empty() {
+            let joined = std::mem::take(&mut self.tail);
+            on_record(&joined);
+        }
+    }
+
+    /// How many bytes were discarded for overrunning [`MAX_RECORD`]. Non-zero
+    /// means the parse is incomplete and the caller should say so.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    fn keep(&mut self, bytes: &[u8]) {
+        let room = MAX_RECORD.saturating_sub(self.tail.len());
         let take = room.min(bytes.len());
         self.tail.extend_from_slice(&bytes[..take]);
         self.dropped += bytes.len() - take;

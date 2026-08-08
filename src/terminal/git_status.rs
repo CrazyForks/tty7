@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub use crate::core::git::{GitStatus, RepoSnapshot, branch_name, git, probe};
+pub use crate::core::git::{GitStatus, RepoSnapshot, probe};
 use crate::ui::host_ops::{ByHost, HostId, InFlight};
 
 #[derive(Default)]
