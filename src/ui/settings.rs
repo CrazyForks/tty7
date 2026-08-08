@@ -919,7 +919,14 @@ impl Tty7App {
                 .bg(background)
                 .overflow_y_scroll()
                 .child(
-                    div().px_10().py_8().child(
+                    // The padding box needs its own width for the reading
+                    // column's `w_full` to resolve against something definite;
+                    // without it the percentage falls back to the content, and
+                    // `max_w` loses to a row that measures wider — which is how
+                    // the theme card came to run the width of the window on the
+                    // Chinese and Japanese pages while every other row stopped
+                    // at the column.
+                    div().w_full().px_10().py_8().child(
                         div()
                             .w_full()
                             .max_w(px(640.))
@@ -4460,6 +4467,7 @@ impl Tty7App {
             }))
             .child(
                 h_flex()
+                    .w_full()
                     .items_center()
                     .gap_4()
                     .p_3()
