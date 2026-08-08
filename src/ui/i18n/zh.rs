@@ -245,7 +245,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsX11Forwarding => "X11 转发",
         L10nKey::SettingsX11ForwardingDesc => "请求 X11 转发（macOS 上需要 XQuartz）。",
         L10nKey::SettingsShellIntegration => "Shell 集成",
-        L10nKey::SettingsShellIntegrationDesc => "让远程 shell 报告提示符、退出码和目录。",
+        L10nKey::SettingsShellIntegrationDesc => "让远程 shell 报告提示符、退出码和工作目录。",
         L10nKey::SettingsLoginScripts => "登录脚本",
         L10nKey::SettingsLoginScriptsDesc => "shell 打开后发送的命令，每行一个。",
         L10nKey::SettingsSkipBanner => "跳过横幅",

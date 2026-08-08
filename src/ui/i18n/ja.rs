@@ -274,7 +274,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsX11ForwardingDesc => "X11 転送を要求（macOS では XQuartz が必要）",
         L10nKey::SettingsShellIntegration => "シェル統合",
         L10nKey::SettingsShellIntegrationDesc => {
-            "リモートシェルにプロンプト・終了コード・ディレクトリを報告させる"
+            "リモートシェルにプロンプト・終了コード・作業ディレクトリを報告させる"
         }
         L10nKey::SettingsLoginScripts => "ログインスクリプト",
         L10nKey::SettingsLoginScriptsDesc => "シェル起動後に送信するコマンド（1 行に 1 つ）",

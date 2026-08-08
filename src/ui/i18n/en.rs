@@ -276,7 +276,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsX11ForwardingDesc => "Request X11 forwarding (needs XQuartz on macOS).",
         L10nKey::SettingsShellIntegration => "Shell integration",
         L10nKey::SettingsShellIntegrationDesc => {
-            "Let the remote shell report prompts, exit codes and directory."
+            "Let the remote shell report prompts, exit codes, and the working directory."
         }
         L10nKey::SettingsLoginScripts => "Login scripts",
         L10nKey::SettingsLoginScriptsDesc => "Commands sent after the shell opens, one per line.",
@@ -529,7 +529,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsUpdateChannelNightly => "Nightly",
         L10nKey::SettingsDaemonStale => "The background server is still running {build}.",
         L10nKey::SettingsDaemonStaleDesc => {
-            "tty7 was updated in place, so the app is new but your panes are still served by the previous build. Restarting the server picks up the new one and ends every process running in your panes — shells, agents and SSH sessions alike. There is no hurry: pick a moment when your panes are idle."
+            "tty7 was updated in place, so the app is new but your panes are still served by the previous build. Restarting the server picks up the new one and ends every process running in your panes — shells, agents, and SSH sessions alike. There is no hurry: pick a moment when your panes are idle."
         }
         L10nKey::UpdateDialogTitle => "Update available",
         L10nKey::UpdateDialogDetail => {
@@ -584,9 +584,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsHowShellsWorkBody => {
             "Your shells run in a background server, not inside this window. Quitting tty7 \
-             leaves them running: reopen it and your tabs, layout and working directories \
-             come back with the same shells still in them. Closing a tab ends its shell, and \
-             Restart server and Quit and Stop Server end all of them."
+             leaves them running: reopen it and your tabs, layout, and working directories \
+             come back with the same shells still in them. Closing a tab ends its shell; \
+             \"Restart server\" and \"Quit and Stop Server\" end all of them."
         }
         L10nKey::SettingsRestartServer => "Restart server…",
         L10nKey::SettingsAppHttpProxy => "Proxy for updates",
