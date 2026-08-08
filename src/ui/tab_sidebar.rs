@@ -611,7 +611,11 @@ impl Tty7App {
                         cx,
                     )
                     .rounded_lg()
-                    .tooltip(t(L10nKey::TabTooltipHideSidebar))
+                    .tooltip(crate::ui::tab_strip::chord_hint(
+                        t(L10nKey::TabTooltipHideSidebar),
+                        "ToggleLeftPanel",
+                        cx,
+                    ))
                     .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
                 ),
             );

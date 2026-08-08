@@ -134,7 +134,7 @@ impl Render for DragTab {
 /// What a chrome tile says on hover: what it does, then the chord that does it.
 /// The tile's own name is no use as a tooltip — the workspace head already
 /// wears it as its label.
-fn chord_hint(what: &str, action: &str, cx: &gpui::App) -> SharedString {
+pub(crate) fn chord_hint(what: &str, action: &str, cx: &gpui::App) -> SharedString {
     match crate::ui::home::key_hint(action, cx) {
         Some(keys) => SharedString::from(format!("{what}  {keys}")),
         None => SharedString::from(what.to_string()),
@@ -428,11 +428,14 @@ impl Tty7App {
                         cx,
                     )
                     .rounded_lg()
-                    .tooltip(if panel_open {
-                        t(L10nKey::TabTooltipHideDetailPanel)
-                    } else {
-                        t(L10nKey::TabTooltipShowDetailPanel)
-                    })
+                    .tooltip(chord_hint(
+                        match panel_open {
+                            true => t(L10nKey::TabTooltipHideDetailPanel),
+                            false => t(L10nKey::TabTooltipShowDetailPanel),
+                        },
+                        "ToggleRightPanel",
+                        cx,
+                    ))
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.toggle_right_panel(cx);
                     })),
@@ -1248,7 +1251,11 @@ impl Tty7App {
                             cx,
                         )
                         .rounded_lg()
-                        .tooltip(t(L10nKey::TabTooltipShowSidebar))
+                        .tooltip(chord_hint(
+                            t(L10nKey::TabTooltipShowSidebar),
+                            "ToggleLeftPanel",
+                            cx,
+                        ))
                         .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
                     ),
                 )
