@@ -1835,6 +1835,7 @@ impl Tty7App {
                                     .icon(Icon::new(IconName::Plus))
                                     .ghost()
                                     .small()
+                                    .tooltip(t(L10nKey::SettingsNewHost))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.add_new_profile(window, cx)
                                     })),
