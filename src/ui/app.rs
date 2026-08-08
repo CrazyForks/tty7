@@ -4041,6 +4041,11 @@ impl Tty7App {
         self.file_search.update(cx, |state, cx| {
             state.set_placeholder(t(L10nKey::SearchFiles), window, cx)
         });
+        // The remote Files panel is built once with the app, so its placeholder
+        // is the one input that would otherwise keep the old language.
+        self.sftp_panel.filter_input.update(cx, |state, cx| {
+            state.set_placeholder(t(L10nKey::SearchFiles), window, cx)
+        });
         if let Some(s) = self.active_settings() {
             let rows = crate::ui::i18n::SUPPORTED_LANGUAGES
                 .iter()
