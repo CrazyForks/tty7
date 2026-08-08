@@ -53,7 +53,7 @@ one that advances 0.5em (Sarasa Mono SC, say) makes two columns exactly 1.0em.
 ## Coding agents
 
 tty7 recognizes third-party coding agents running in a pane (Claude Code,
-Codex, Gemini CLI, Aider, Amp, OpenCode, and ~10 more) and adds around them —
+Codex, Gemini CLI, Aider, Amp, OpenCode, and 11 more) and adds around them —
 it never wraps or replaces the agent.
 
 - **Brand avatars** — the tab chip / sidebar row shows which agent runs where; custom wrappers map in via `agent_commands` in `config.json`
