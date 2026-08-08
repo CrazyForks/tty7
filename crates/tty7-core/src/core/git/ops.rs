@@ -1340,6 +1340,10 @@ mod tests {
         }
     }
 
+    fn kind_of(stderr: &str) -> GitOpErrorKind {
+        classify(stderr, Some(1))
+    }
+
     #[test]
     fn classify_recognizes_every_shape_of_credential_failure() {
         for stderr in [
