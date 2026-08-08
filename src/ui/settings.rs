@@ -977,6 +977,7 @@ impl Tty7App {
                                 .w(px(TILE_SIZE))
                                 .h(px(TILE_SIZE))
                                 .rounded_lg()
+                                .tooltip(t(L10nKey::Close))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.close_settings_checked(window, cx)
                                 })),
@@ -1710,6 +1711,7 @@ impl Tty7App {
                                     .icon(Icon::empty().path("stock/icons/ellipsis.svg"))
                                     .ghost()
                                     .small()
+                                    .tooltip(t(L10nKey::TabTooltipMore))
                                     .dropdown_menu_with_anchor(
                                         gpui::Anchor::TopRight,
                                         move |menu, _window, _cx| {
@@ -2001,6 +2003,7 @@ impl Tty7App {
                         .icon(Icon::empty().path("stock/icons/ellipsis.svg"))
                         .ghost()
                         .small()
+                        .tooltip(t(L10nKey::TabTooltipMore))
                         .dropdown_menu_with_anchor(
                             gpui::Anchor::TopRight,
                             move |menu, _window, cx| {

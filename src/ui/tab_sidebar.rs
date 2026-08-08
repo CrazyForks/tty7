@@ -370,6 +370,7 @@ impl Tty7App {
                                                 .ghost()
                                                 .xsmall(),
                                         )
+                                        .tooltip(t(L10nKey::TabContextCloseTab))
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {
                                                 this.close_tab(i, window, cx);
