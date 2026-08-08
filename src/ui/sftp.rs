@@ -151,6 +151,7 @@ pub(crate) struct SftpPanelState {
     editing_path_sub: Vec<Subscription>,
     pub(crate) poll_gen: u64,
     scroll: gpui::ScrollHandle,
+    transfers_scroll: gpui::ScrollHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -184,6 +185,7 @@ impl SftpPanelState {
             editing_path_sub: Vec::new(),
             poll_gen: 0,
             scroll: gpui::ScrollHandle::new(),
+            transfers_scroll: gpui::ScrollHandle::new(),
             _subs: vec![sub],
         }
     }
@@ -1554,11 +1556,19 @@ impl Tty7App {
                 }
                 list
             };
-            div()
-                .id("sftp-transfers-list")
-                .max_h(px(200.))
-                .overflow_y_scroll()
-                .child(inner)
+            // The list caps at 200px and scrolls past it; it was the last
+            // scroll area in the app with nothing to say so. This wrapper only
+            // overlays the bar, so the box keeps the height it already had.
+            crate::ui::scrollbar::over_vertical_scroll(
+                "sftp-transfers-scrollbar",
+                div()
+                    .id("sftp-transfers-list")
+                    .max_h(px(200.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.sftp_panel.transfers_scroll)
+                    .child(inner),
+                &self.sftp_panel.transfers_scroll,
+            )
         });
 
         Some(
