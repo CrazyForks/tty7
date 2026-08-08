@@ -5063,40 +5063,22 @@ impl Tty7App {
             // page since it was written, and it pointed at nothing — the one
             // thing that makes tty7 different from any other terminal was
             // never stated in the app.
+            .child(self.section_rule(cx))
+            .child(self.section_header(t(L10nKey::SettingsSearchHowShellsWorkTitle), cx))
             .child(
-                v_flex()
-                    .mt_6()
-                    .gap_2()
-                    .child(self.section_rule(cx))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(foreground)
-                            .child(t(L10nKey::SettingsSearchHowShellsWorkTitle)),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(muted_fg)
-                            .child(t(L10nKey::SettingsHowShellsWorkBody)),
-                    ),
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .child(t(L10nKey::SettingsHowShellsWorkBody)),
             )
+            .child(self.section_rule(cx))
+            .child(self.section_header(t(L10nKey::SettingsUpdates), cx))
             .child(
                 v_flex()
-                    .mt_6()
                     // The section can carry several stacked states at once —
                     // a failure, a staged package, a skipped version. At gap_2
                     // they read as one paragraph.
                     .gap_3()
-                    .child(self.section_rule(cx))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(foreground)
-                            .child(t(L10nKey::SettingsUpdates)),
-                    )
                     // A failure the user can act on. Persisted, so it is still
                     // here tomorrow — the old in-memory phase died with the
                     // process and took the only evidence with it.
@@ -5348,18 +5330,11 @@ impl Tty7App {
                 http_proxy_control,
                 cx,
             ))
+            .child(self.section_rule(cx))
+            .child(self.section_header(t(L10nKey::SettingsServer), cx))
             .child(
                 v_flex()
-                    .mt_6()
                     .gap_2()
-                    .child(self.section_rule(cx))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(foreground)
-                            .child(t(L10nKey::SettingsServer)),
-                    )
                     .child(
                         div()
                             .text_sm()
