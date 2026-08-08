@@ -339,6 +339,47 @@ fn compose_notification_title(
     }
 }
 
+/// The longest command line to put in a confirmation. The shell sends up to
+/// 512 bytes; a dialog asking whether to end your work should still read as a
+/// sentence.
+const BUSY_COMMAND_MAX: usize = 60;
+
+/// Undo the escaping the shell integration applies to an OSC 133;C payload so
+/// it cannot break OSC framing: `%` and the four control bytes. Anything else
+/// is left exactly as the user typed it.
+fn unescape_mark_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let (decoded, width) = match tail.get(..3) {
+            Some("%25") => ("%", 3),
+            Some("%1B") | Some("%07") | Some("%0D") => ("", 3),
+            Some("%0A") => (" ", 3),
+            _ => ("%", 1),
+        };
+        out.push_str(decoded);
+        rest = &tail[width..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn clamp_command(cmd: &str) -> String {
+    let cmd = cmd.trim();
+    match cmd.chars().count() > BUSY_COMMAND_MAX {
+        false => cmd.to_string(),
+        true => format!(
+            "{}…",
+            cmd.chars()
+                .take(BUSY_COMMAND_MAX)
+                .collect::<String>()
+                .trim_end()
+        ),
+    }
+}
+
 impl TerminalView {
     fn notify_command_finished(
         &self,
@@ -1203,12 +1244,27 @@ impl TerminalView {
             return None;
         }
         self.running_since?;
-        Some(PaneBusy::Command(
-            match self.running_title.trim().is_empty() {
+        // Prefer what the shell said it was running. `running_title` is only
+        // the window title as it stood when the command began, and a prompt
+        // that titles by directory — a very common setup — made this ask
+        // "tty7 is still running. Closing ends it." about a folder. The
+        // OSC 133;C mark carries the submitted line itself.
+        let named = self
+            .terminal
+            .marks()
+            .list()
+            .into_iter()
+            .rev()
+            .find(|m| !m.done)
+            .map(|m| clamp_command(&unescape_mark_text(&m.text)))
+            .filter(|t| !t.is_empty());
+        Some(PaneBusy::Command(match named {
+            Some(cmd) => cmd,
+            None => match self.running_title.trim().is_empty() {
                 true => self.title.clone(),
                 false => self.running_title.clone(),
             },
-        ))
+        }))
     }
 
     pub fn agent_result_unread(&self) -> bool {
@@ -5689,6 +5745,32 @@ fn drag_scroll_step(overshoot: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_busy_command_name_undoes_the_shell_escaping() {
+        use super::unescape_mark_text;
+        // The integration escapes % and the four bytes that would break OSC
+        // framing; everything else is the line as typed.
+        assert_eq!(unescape_mark_text("printf '100%25'"), "printf '100%'");
+        assert_eq!(unescape_mark_text("a%1Bb%07c%0Dd"), "abcd");
+        assert_eq!(unescape_mark_text("one%0Atwo"), "one two");
+        // A bare % the shell somehow left alone must survive rather than eat
+        // the next two characters.
+        assert_eq!(unescape_mark_text("50% off"), "50% off");
+        assert_eq!(unescape_mark_text("cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn a_busy_command_name_stays_short_enough_to_read() {
+        use super::{BUSY_COMMAND_MAX, clamp_command};
+        assert_eq!(clamp_command("  sleep 300  "), "sleep 300");
+        let long = "cargo ".repeat(40);
+        let out = clamp_command(&long);
+        assert!(out.ends_with('…'), "{out:?}");
+        assert!(out.chars().count() <= BUSY_COMMAND_MAX + 1, "{out:?}");
+        // No dangling space before the ellipsis.
+        assert!(!out.contains(" …"), "{out:?}");
+    }
     use super::{
         LoopbackPlan, RawInput, SelectEndCopy, Typeahead, WheelRoute, clipboard_paste_text,
         compose_notification_title, cwd_is_on_host, display_width, is_typeahead_interrupt,

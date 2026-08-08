@@ -55,9 +55,10 @@ impl Marks {
         }
     }
 
-    /// Only the tests read the store back; the panel that used to has been
-    /// removed, and prompt state reaches the client over the wire instead.
-    #[cfg(test)]
+    /// The recorded commands, oldest first, skipping prompts the user walked
+    /// away from. The close confirmation reads this to name what it is about
+    /// to end: the wire frame carries only whether a command is running, not
+    /// which one, and the shell's own C mark is the only place the text is.
     pub fn list(&self) -> Vec<CommandMark> {
         let Ok(marks) = self.0.lock() else {
             return Vec::new();
