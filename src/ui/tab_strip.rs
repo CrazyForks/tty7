@@ -168,6 +168,26 @@ pub(crate) fn hit_target(button: Button) -> Button {
     button.w(px(MIN_TARGET)).h(px(MIN_TARGET))
 }
 
+/// The narrowest a chip gets: its `min_w`, which flex-shrink cannot go under.
+const CHIP_MIN_W: f32 = 100.;
+
+/// The run of chips to draw when they cannot all fit.
+///
+/// The row clips what overflows, so past a certain tab count the chips at the
+/// end simply were not drawn — including, right after ⌘T, the tab that was
+/// just opened and made active. Slide the run instead: keep it anchored at the
+/// first tab until the active one would fall off the right edge, then move it
+/// by as little as it takes to hold the active chip.
+fn visible_chips(order: &[usize], active: usize, avail: f32) -> Vec<usize> {
+    let fits = ((avail / (CHIP_MIN_W + CHIP_GAP)).floor() as usize).max(1);
+    if order.len() <= fits {
+        return order.to_vec();
+    }
+    let at = order.iter().position(|&i| i == active).unwrap_or(0);
+    let start = at.saturating_sub(fits - 1).min(order.len() - fits);
+    order[start..start + fits].to_vec()
+}
+
 pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> Button {
     chrome_tile_sized(button, TILE_SIZE, TILE_GLYPH, selected, cx)
 }
@@ -831,22 +851,38 @@ impl Tty7App {
     ) -> impl IntoElement + use<> {
         let active = self.active;
         let show_badges = self.mod_hint_badges;
+        // On macOS an open detail panel draws its own chrome in the title bar,
+        // so the strip stops at the panel's edge rather than running the width
+        // of the window. Sizing it to the whole viewport made it overrun that
+        // edge, and what got pushed out past it was the New Tab button.
+        let panel_w = match cfg!(target_os = "macos") && self.right_panel_open(cx) {
+            true => self.right_panel_px(window, cx),
+            false => 0.,
+        };
         let strip_w = if cfg!(target_os = "macos") {
-            (window.viewport_size().width - px(80.)).max(px(160.))
+            (window.viewport_size().width - px(80. + panel_w)).max(px(160.))
         } else {
             (window.viewport_size().width - px(114.)).max(px(140.))
         };
         let chrome_band_w = (!cfg!(target_os = "macos") && self.right_panel_open(cx)).then(|| {
             (self.right_panel_px(window, cx) - crate::ui::app::WINDOW_CONTROLS_W - 1.).max(0.)
         });
-        let corner_w = chrome_band_w.unwrap_or_else(|| {
-            let trailing_pad = if cfg!(target_os = "macos") {
-                tile_trailing_inset()
-            } else {
-                4.
-            };
-            trailing_pad + crate::ui::app::TILE_SIZE + 2. + crate::ui::app::TILE_SIZE
-        });
+        // `corner_w` reserves the trailing window chrome. With the panel open on
+        // macOS that chrome belongs to the panel's own header, which the strip
+        // now stops short of, so reserving for it here would charge the chips
+        // for it twice.
+        let corner_w = if panel_w > 0. {
+            0.
+        } else {
+            chrome_band_w.unwrap_or_else(|| {
+                let trailing_pad = if cfg!(target_os = "macos") {
+                    tile_trailing_inset()
+                } else {
+                    4.
+                };
+                trailing_pad + crate::ui::app::TILE_SIZE + 2. + crate::ui::app::TILE_SIZE
+            })
+        };
         let fixed_w = 3. * CHIP_GAP + crate::ui::app::TILE_SIZE + corner_w;
         let chips_avail = (strip_w - px(fixed_w + GRAB_HANDLE_W)).max(px(80.));
         let mut chips = h_flex()
@@ -871,6 +907,7 @@ impl Tty7App {
             }
             None => (0..self.tabs.len()).collect(),
         };
+        let display = visible_chips(&display, active, f32::from(chips_avail));
 
         for i in display {
             if !show_chips {
@@ -934,7 +971,7 @@ impl Tty7App {
                 .justify_between()
                 .gap_1p5()
                 .h(px(30.))
-                .min_w(px(100.))
+                .min_w(px(CHIP_MIN_W))
                 .flex_shrink(1.)
                 .pl_3()
                 .pr_1p5()
@@ -1244,6 +1281,49 @@ mod tests {
         let out = short_title(&long);
         assert_eq!(out.chars().count(), 41);
         assert!(out.ends_with('…'));
+    }
+
+    /// One chip is 100 wide plus a 6 gap, so this is "room for exactly four".
+    const FOUR_CHIPS: f32 = 4. * (CHIP_MIN_W + CHIP_GAP);
+
+    #[test]
+    fn every_chip_is_drawn_while_they_all_fit() {
+        let order: Vec<usize> = (0..4).collect();
+        assert_eq!(visible_chips(&order, 0, FOUR_CHIPS), order);
+        assert_eq!(visible_chips(&order, 3, FOUR_CHIPS), order);
+        assert_eq!(visible_chips(&[0, 1], 1, FOUR_CHIPS), vec![0, 1]);
+    }
+
+    #[test]
+    fn the_run_stays_put_until_the_active_chip_would_fall_off() {
+        let order: Vec<usize> = (0..9).collect();
+        // Anchored at the first tab for as long as the active one is inside it.
+        assert_eq!(visible_chips(&order, 0, FOUR_CHIPS), vec![0, 1, 2, 3]);
+        assert_eq!(visible_chips(&order, 3, FOUR_CHIPS), vec![0, 1, 2, 3]);
+        // Then it slides by exactly as much as it has to.
+        assert_eq!(visible_chips(&order, 4, FOUR_CHIPS), vec![1, 2, 3, 4]);
+        assert_eq!(visible_chips(&order, 8, FOUR_CHIPS), vec![5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn the_active_chip_is_always_among_the_drawn_ones() {
+        let order: Vec<usize> = (0..40).collect();
+        for active in 0..40 {
+            for avail in [0., 1., 80., FOUR_CHIPS, 4000.] {
+                let shown = visible_chips(&order, active, avail);
+                assert!(
+                    shown.contains(&active),
+                    "active {active} missing at {avail}px: {shown:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reordered_run_is_sliced_in_its_own_order() {
+        // Mid-drag the strip renders `preview.order`, not 0..n.
+        let order = vec![3, 0, 1, 2, 4, 5];
+        assert_eq!(visible_chips(&order, 5, FOUR_CHIPS), vec![1, 2, 4, 5]);
     }
 
     #[test]
