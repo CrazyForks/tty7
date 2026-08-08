@@ -18,14 +18,13 @@ use crate::ui::app::{TITLE_BAR_HEIGHT, Tty7App};
 use crate::ui::hints::tab_badge_label;
 use crate::ui::i18n::{L10nKey, t};
 use crate::ui::reorder::{self, Reorder, Surface};
+use crate::ui::right_panel::RESIZE_HANDLE_WIDTH;
 use crate::ui::tab_strip::{DragTab, REORDER_SLIDE_MS};
 
 const MIN_SIDEBAR_WIDTH: f32 = 180.;
 
 const GRAB_HANDLE_W: f32 = 48.;
 const MAX_SIDEBAR_WIDTH_RATIO: f32 = 0.5;
-
-const RESIZE_HANDLE_WIDTH: f32 = 8.;
 
 const ROW_GAP: f32 = 2.;
 

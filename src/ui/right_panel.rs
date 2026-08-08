@@ -20,7 +20,9 @@ use crate::ui::scrollbar::with_vertical_scrollbar;
 pub(crate) const MIN_WIDTH: f32 = 216.;
 pub(crate) const MAX_WIDTH_RATIO: f32 = 0.5;
 
-const RESIZE_HANDLE_WIDTH: f32 = 8.;
+/// How wide a panel edge is to grab. Both edges a window can drag — the tab
+/// sidebar's and this panel's — are the same target, so they are one number.
+pub(crate) const RESIZE_HANDLE_WIDTH: f32 = 8.;
 
 #[derive(Default)]
 pub(crate) struct RightPanelState {
