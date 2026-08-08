@@ -1418,26 +1418,52 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// Opens or closes the theme picker, and moves the caret with it.
+    ///
+    /// The panel leads with a search box, and it opened unfocused — so the
+    /// first thing typed at a panel whose whole job is picking one of nine
+    /// themes went nowhere. Closing hands the caret back to the settings
+    /// search rather than leaving it on a box that is no longer drawn.
     pub(crate) fn toggle_theme_panel(
         &mut self,
         slot: crate::ui::settings::ThemeSlot,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(s) = self.active_settings_mut() {
-            if s.theme_panel_open && s.theme_panel_slot == slot {
+        let opened = match self.active_settings_mut() {
+            Some(s) if s.theme_panel_open && s.theme_panel_slot == slot => {
                 s.theme_panel_open = false;
-            } else {
+                false
+            }
+            Some(s) => {
                 s.theme_panel_open = true;
                 s.theme_panel_slot = slot;
+                true
             }
-            cx.notify();
-        }
+            None => return,
+        };
+        self.focus_theme_panel(opened, window, cx);
+        cx.notify();
     }
 
-    pub(crate) fn close_theme_panel(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_theme_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_settings_mut().is_none() {
+            return;
+        }
         if let Some(s) = self.active_settings_mut() {
             s.theme_panel_open = false;
-            cx.notify();
+        }
+        self.focus_theme_panel(false, window, cx);
+        cx.notify();
+    }
+
+    fn focus_theme_panel(&mut self, opened: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.settings.as_ref().map(|s| match opened {
+            true => s.theme_search.read(cx).focus_handle(cx),
+            false => s.search.read(cx).focus_handle(cx),
+        });
+        if let Some(handle) = handle {
+            window.focus(&handle, cx);
         }
     }
 

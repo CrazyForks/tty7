@@ -4446,7 +4446,9 @@ impl Tty7App {
             .mb_2()
             .w_full()
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _w, cx| this.toggle_theme_panel(slot, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_theme_panel(slot, window, cx)
+            }))
             .child(
                 h_flex()
                     .items_center()
@@ -4541,7 +4543,9 @@ impl Tty7App {
                         .icon(IconName::Close)
                         .ghost()
                         .small()
-                        .on_click(cx.listener(|this, _, _w, cx| this.close_theme_panel(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_theme_panel(window, cx)
+                        })),
                 ),
             );
 
