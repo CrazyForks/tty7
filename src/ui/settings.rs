@@ -37,6 +37,29 @@ use crate::ui::presets;
 use crate::ui::rounding;
 use crate::ui::rounding::RoundedCorners as _;
 
+/// The settings nav, the SSH host list, and the padding each page sets — the
+/// chrome a row has to share the window with.
+const NAV_W: f32 = 220.;
+const SSH_LIST_W: f32 = 280.;
+const SSH_DETAIL_PAD: f32 = 64.;
+const PAGE_PAD: f32 = 80.;
+
+/// What a row on this page really has to lay out in.
+///
+/// The nav is always in front of it; the SSH page puts its host list there too,
+/// and only the scrolled pages cap the reading column at 640.
+fn settings_row_width(section: SettingsSection, viewport: f32) -> f32 {
+    match section {
+        SettingsSection::Ssh => (viewport - NAV_W - SSH_LIST_W - SSH_DETAIL_PAD).max(0.),
+        _ => (viewport - NAV_W - PAGE_PAD).clamp(0., 640.),
+    }
+}
+
+/// Width a settings row needs before its label and its control fit side by
+/// side: a 260px control, the `gap_8` between them, and enough left for a
+/// description to read as prose rather than as a column of words.
+const STACK_ROW_BELOW: f32 = 500.;
+
 fn settings_row_id(label: &str, _desc: &str) -> SharedString {
     SharedString::from(format!("settings-row-{label}"))
 }
@@ -766,6 +789,9 @@ impl Tty7App {
         let query = search.read(cx).value().trim().to_lowercase();
         let show_theme_panel = theme_panel_open && section == SettingsSection::Appearance;
 
+        self.settings_row_width
+            .set(settings_row_width(section, window.viewport_size().width.as_f32()));
+
         let prof = crate::ui::perf::enabled()
             .then(|| (std::time::Instant::now(), section.profile_label()));
 
@@ -1078,11 +1104,38 @@ impl Tty7App {
             }
             None => (false, false),
         };
-        h_flex()
+        // The control never shrinks, so on a narrow pane it takes the width and
+        // the label column — which must keep `min_w_0` or long descriptions
+        // stop wrapping — is squeezed to a letter per line. Below the width
+        // where both still fit, put the control on its own line instead.
+        // Measured, not `flex_wrap`: wrapping made the label column size to its
+        // description, which then ran out past the row on every wide page.
+        let stacked = self.settings_row_width.get() < STACK_ROW_BELOW;
+        let labels = v_flex()
+            .gap_0p5()
+            .min_w_0()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .when(!desc.is_empty(), |col| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(desc),
+                )
+            });
+        div()
             .id(element_id)
-            .items_center()
-            .justify_between()
-            .gap_8()
+            .flex()
+            .when(stacked, |row| row.flex_col().items_start().gap_2())
+            .when(!stacked, |row| {
+                row.flex_row().items_center().justify_between().gap_8()
+            })
             .py_2()
             .px_2p5()
             .mx_neg_2p5()
@@ -1091,26 +1144,7 @@ impl Tty7App {
             .when(miss, |row| row.opacity(0.45))
             .hover(|h| h.bg(gpui::rgb(cx.global::<presets::Surfaces>().window.hover)))
             .on_hover(cx.listener(|_this, _hovered, _window, cx| cx.notify()))
-            .child(
-                v_flex()
-                    .gap_0p5()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.foreground)
-                            .child(label),
-                    )
-                    .when(!desc.is_empty(), |col| {
-                        col.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(desc),
-                        )
-                    }),
-            )
+            .child(labels)
             .child(h_flex().flex_shrink_0().child(control))
     }
 
@@ -5447,6 +5481,24 @@ impl Tty7App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row keeps its side-by-side shape while both halves fit, and stacks
+    /// once they do not. The SSH page reaches that point first — it spends 500px
+    /// on two lists before the row gets any.
+    #[test]
+    fn a_row_stacks_once_its_label_and_control_stop_fitting() {
+        use SettingsSection::*;
+        assert!(settings_row_width(Terminal, 1440.) >= STACK_ROW_BELOW);
+        assert!(settings_row_width(Terminal, 900.) >= STACK_ROW_BELOW);
+        assert!(settings_row_width(Terminal, 700.) < STACK_ROW_BELOW);
+        // Capped at the reading column, so a wider window never widens the row.
+        assert_eq!(settings_row_width(Terminal, 4000.), 640.);
+        // SSH crosses over while the window is still wide.
+        assert!(settings_row_width(Ssh, 1440.) >= STACK_ROW_BELOW);
+        assert!(settings_row_width(Ssh, 1000.) < STACK_ROW_BELOW);
+        // And never goes negative on a window narrower than its own chrome.
+        assert_eq!(settings_row_width(Ssh, 100.), 0.);
+    }
 
     #[test]
     fn a_row_is_marked_by_its_label_or_by_the_keywords_behind_it() {

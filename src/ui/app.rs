@@ -393,6 +393,11 @@ pub struct Tty7App {
     pub(crate) editor: crate::ui::code_editor::EditorPanelState,
     pub(crate) sidebar_width: Rc<Cell<f32>>,
     pub(crate) sidebar_dragging: Rc<Cell<bool>>,
+    /// How much width a settings row will actually get, measured once per
+    /// render. `settings_row` is called from page builders that never see the
+    /// window, and the answer differs per page — the SSH page spends 500px on
+    /// its two lists first.
+    pub(crate) settings_row_width: Cell<f32>,
     pub(crate) right_panel_width: Rc<Cell<f32>>,
     pub(crate) right_panel_dragging: Rc<Cell<bool>>,
     pub(crate) right_panel_visible: bool,
@@ -806,6 +811,7 @@ impl Tty7App {
             editor,
             sidebar_width: Rc::new(Cell::new(sidebar_width)),
             sidebar_dragging: Rc::new(Cell::new(false)),
+            settings_row_width: Cell::new(f32::MAX),
             right_panel_width: Rc::new(Cell::new(right_panel_width)),
             right_panel_dragging: Rc::new(Cell::new(false)),
             right_panel_visible,
