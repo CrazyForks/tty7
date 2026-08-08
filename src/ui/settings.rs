@@ -1063,15 +1063,9 @@ impl Tty7App {
         };
         h_flex()
             .id(element_id)
-            // A settings pane can end up narrow — the SSH page spends 500px on
-            // its two lists before this row gets any. Wrapping puts the control
-            // on its own line rather than pushing it off the right edge, and the
-            // floor below stops the label shrinking into one word per line.
-            .flex_wrap()
             .items_center()
             .justify_between()
-            .gap_x_8()
-            .gap_y_2()
+            .gap_8()
             .py_2()
             .px_2p5()
             .mx_neg_2p5()
@@ -1083,8 +1077,7 @@ impl Tty7App {
             .child(
                 v_flex()
                     .gap_0p5()
-                    .flex_1()
-                    .min_w(px(200.))
+                    .min_w_0()
                     .child(
                         div()
                             .text_sm()
