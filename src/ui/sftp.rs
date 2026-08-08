@@ -158,7 +158,7 @@ impl SftpPanelState {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Tty7App>) -> Self {
         let filter_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Search))
+                .placeholder(crate::ui::i18n::t(crate::ui::i18n::L10nKey::SearchFiles))
         });
         let sub = cx.subscribe_in(&filter_input, window, |_this, _input, ev, _w, cx| {
             if matches!(ev, gpui_component::input::InputEvent::Change) {

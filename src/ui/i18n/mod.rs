@@ -76,7 +76,6 @@ l10n_keys! {
     FilterHosts,
     SearchCommandsOrHost,
     SearchTheme,
-    Search,
     SearchWorkspacesAndMachines,
     SearchFonts,
     SearchFind,
