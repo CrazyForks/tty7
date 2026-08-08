@@ -76,6 +76,22 @@ pub enum CommandKind {
     ShowSshForwards,
     ToggleCodePanel,
     RestartSshSession,
+    ScmCommit,
+    ScmStageAll,
+    ScmUnstageAll,
+    ScmDiscardAll,
+    ScmPush,
+    ScmPull,
+    ScmFetch,
+    ScmSync,
+    ScmCreateBranch,
+    OpenBranchPicker,
+    /// One branch, filled in by the picker. Dynamic like `OpenSshConnect`, so
+    /// it gets no stable id and no key spec. Nothing emits it until the picker
+    /// can list refs.
+    #[allow(dead_code)]
+    CheckoutBranch(String),
+    ToggleDiffViewMode,
     SendSelectionToAgent,
     SendGitDiffToAgent,
     OpenThemePicker,
@@ -140,7 +156,9 @@ impl CommandKind {
             ToggleLeftPanel => "left-sidebar",
             ToggleRightPanel => "right-panel",
             ShowRightPanel(RightPanelTab::Info) => "right-panel-info",
-            ShowRightPanel(RightPanelTab::Changes) => "right-panel-changes",
+            // Frecency is keyed by this string, so it stays `right-panel-changes`
+            // even though the panel is now called Source Control.
+            ShowRightPanel(RightPanelTab::Scm) => "right-panel-changes",
             ShowRightPanel(RightPanelTab::Files) => "right-panel-files",
             ClearTerminal => "clear-scrollback",
             FindInTerminal => "find",
@@ -164,12 +182,24 @@ impl CommandKind {
             ShowSshForwards => "ssh-port-forwarding",
             ToggleCodePanel => "code-panel",
             RestartSshSession => "ssh-reconnect",
+            ScmCommit => "git-commit",
+            ScmStageAll => "git-stage-all",
+            ScmUnstageAll => "git-unstage-all",
+            ScmDiscardAll => "git-discard-all",
+            ScmPush => "git-push",
+            ScmPull => "git-pull",
+            ScmFetch => "git-fetch",
+            ScmSync => "git-sync",
+            ScmCreateBranch => "git-create-branch",
+            OpenBranchPicker => "git-checkout",
+            ToggleDiffViewMode => "diff-view-mode",
             SendSelectionToAgent => "agent-send-selection",
             SendGitDiffToAgent => "agent-send-diff",
             OpenThemePicker => "change-theme",
             OpenSshConnectInput => "ssh-add-connection",
             OpenSshProfiles => "ssh-manage-profiles",
             OpenSshConnect(_)
+            | CheckoutBranch(_)
             | SetTheme(_)
             | ActivateTab(_)
             | ConnectSavedProfile(_)
@@ -229,7 +259,7 @@ impl CommandKind {
             ToggleRightPanel => "ToggleRightPanel",
             ShowRightPanel(tab) => match tab {
                 RightPanelTab::Info => "ShowRightPanelInfo",
-                RightPanelTab::Changes => "ShowRightPanelChanges",
+                RightPanelTab::Scm => "ShowRightPanelChanges",
                 RightPanelTab::Files => "ShowRightPanelFiles",
             },
             ClearTerminal => "ClearScrollback",
@@ -251,6 +281,17 @@ impl CommandKind {
             ToggleCodePanel => "ToggleCodePanel",
             RestartSshSession => "RestartSshSession",
             OpenSshProfiles => "OpenSshProfiles",
+            ScmCommit => "ScmCommit",
+            ScmStageAll => "ScmStageAll",
+            ScmUnstageAll => "ScmUnstageAll",
+            ScmDiscardAll => "ScmDiscardAll",
+            ScmPush => "ScmPush",
+            ScmPull => "ScmPull",
+            ScmFetch => "ScmFetch",
+            ScmSync => "ScmSync",
+            ScmCreateBranch => "ScmCreateBranch",
+            OpenBranchPicker => "ScmCheckoutBranch",
+            ToggleDiffViewMode => "ToggleDiffViewMode",
             CopyText
             | CutText
             | PasteText
@@ -261,6 +302,7 @@ impl CommandKind {
             | OpenThemePicker
             | OpenSshConnectInput
             | OpenSshConnect(_)
+            | CheckoutBranch(_)
             | SetTheme(_)
             | ActivateTab(_)
             | ConnectSavedProfile(_)
@@ -277,6 +319,7 @@ pub enum CommandGroup {
     TabsPanes,
     Workspaces,
     View,
+    Git,
     Terminal,
     Ssh,
     Agents,
@@ -284,10 +327,11 @@ pub enum CommandGroup {
 }
 
 impl CommandGroup {
-    const ORDER: [CommandGroup; 7] = [
+    const ORDER: [CommandGroup; 8] = [
         CommandGroup::TabsPanes,
         CommandGroup::Workspaces,
         CommandGroup::View,
+        CommandGroup::Git,
         CommandGroup::Terminal,
         CommandGroup::Ssh,
         CommandGroup::Agents,
@@ -299,6 +343,7 @@ impl CommandGroup {
             CommandGroup::TabsPanes => t(L10nKey::CmdGroupTabsPanes),
             CommandGroup::Workspaces => t(L10nKey::CmdGroupWorkspaces),
             CommandGroup::View => t(L10nKey::CmdGroupView),
+            CommandGroup::Git => t(L10nKey::CmdGroupGit),
             CommandGroup::Terminal => t(L10nKey::CmdGroupTerminal),
             CommandGroup::Ssh => t(L10nKey::CmdGroupSsh),
             CommandGroup::Agents => t(L10nKey::CmdGroupAgents),
@@ -424,7 +469,7 @@ impl Command {
             ),
             Command::new(
                 t(L10nKey::CmdRightPanelChanges),
-                ShowRightPanel(RightPanelTab::Changes),
+                ShowRightPanel(RightPanelTab::Scm),
             ),
             Command::new(
                 t(L10nKey::CmdRightPanelFiles),
@@ -433,6 +478,24 @@ impl Command {
             Command::new(t(L10nKey::CmdChangeTheme), OpenThemePicker),
             Command::new(t(L10nKey::CmdResetFontSize), ResetFontSize),
             Command::new(t(L10nKey::CmdEnterFullScreen), ToggleFullscreen),
+            Command::new(t(L10nKey::CmdToggleDiffViewMode), ToggleDiffViewMode),
+        ];
+
+        // Their own group rather than more entries under View: View is a list
+        // of things to show and hide, and ten git verbs in it would drown that.
+        let git = [
+            Command::new(t(L10nKey::CmdGitCommit), ScmCommit),
+            Command::new(t(L10nKey::CmdGitStageAll), ScmStageAll),
+            Command::new(t(L10nKey::CmdGitUnstageAll), ScmUnstageAll),
+            Command::new(t(L10nKey::CmdGitDiscardAll), ScmDiscardAll)
+                .with_subtitle(t(L10nKey::CmdGitDiscardAllSubtitle)),
+            Command::new(t(L10nKey::CmdGitCheckoutTo), OpenBranchPicker),
+            Command::new(t(L10nKey::CmdGitCreateBranch), ScmCreateBranch),
+            Command::new(t(L10nKey::CmdGitSync), ScmSync)
+                .with_subtitle(t(L10nKey::CmdGitSyncSubtitle)),
+            Command::new(t(L10nKey::CmdGitPush), ScmPush),
+            Command::new(t(L10nKey::CmdGitPull), ScmPull),
+            Command::new(t(L10nKey::CmdGitFetch), ScmFetch),
         ];
 
         let terminal = [
@@ -482,6 +545,7 @@ impl Command {
         push(tabs.into(), CommandGroup::TabsPanes);
         push(workspaces.into(), CommandGroup::Workspaces);
         push(view.into(), CommandGroup::View);
+        push(git.into(), CommandGroup::Git);
         push(terminal.into(), CommandGroup::Terminal);
         push(ssh.into(), CommandGroup::Ssh);
         push(agents.into(), CommandGroup::Agents);
@@ -1202,5 +1266,56 @@ mod tests {
         assert!(CommandKind::ActivateTab(2).id().is_none());
         assert!(CommandKind::SetTheme(0).id().is_none());
         assert!(CommandKind::QuickConnect("a@b".into()).id().is_none());
+    }
+}
+
+#[cfg(test)]
+mod gpui_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn every_palette_command_has_a_stable_id(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        cx.update(|cx| {
+            cx.set_global(Config::default());
+            crate::ui::i18n::set_locale("en");
+            let chrome = ChromeState {
+                rail_collapsed: false,
+                right_panel_visible: false,
+            };
+            let mut seen = std::collections::HashSet::new();
+            for cmd in Command::base_commands(cx, chrome) {
+                // Frecency is keyed by this string. A command without one is
+                // never learned, so it never rises in the list no matter how
+                // often it is run.
+                let id = cmd
+                    .kind
+                    .id()
+                    .unwrap_or_else(|| panic!("`{}` has no stable id", cmd.title));
+                assert!(seen.insert(id), "two commands claim the id {id:?}");
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn the_git_group_is_its_own_section(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        cx.update(|cx| {
+            cx.set_global(Config::default());
+            crate::ui::i18n::set_locale("en");
+            let chrome = ChromeState {
+                rail_collapsed: false,
+                right_panel_visible: false,
+            };
+            let cmds = Command::base_commands(cx, chrome);
+            let git = cmds.iter().filter(|c| c.group == CommandGroup::Git).count();
+            assert_eq!(git, 10, "the git section should hold ten verbs");
+            // View stays a list of things to show and hide.
+            assert!(
+                !cmds.iter().any(|c| c.group == CommandGroup::View
+                    && c.kind.id().unwrap_or("").starts_with("git-")),
+            );
+        });
     }
 }
