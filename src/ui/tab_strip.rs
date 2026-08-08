@@ -605,6 +605,31 @@ impl Tty7App {
         }
     }
 
+    /// The full title behind a shortened one, for the row to name on hover.
+    ///
+    /// `tab_label` hands back a path elided to its last three segments and then
+    /// capped, and the chip truncates whatever is left over — so a tab could
+    /// read `…/a/b/c` with no way to find out which `a` that was. `None` when
+    /// nothing was dropped, so tabs that already show their whole name stay
+    /// quiet under the pointer.
+    pub(crate) fn tab_title_tooltip(
+        &self,
+        tab: &Tab,
+        index: usize,
+        window: Option<&Window>,
+        cx: &App,
+    ) -> Option<SharedString> {
+        if tab.name.as_ref().is_some_and(|n| !n.trim().is_empty()) {
+            return None;
+        }
+        let raw = tab.leaf_title(window, cx);
+        let raw = raw.trim();
+        if raw.is_empty() || raw == self.tab_label(tab, index, window, cx) {
+            return None;
+        }
+        Some(SharedString::from(abbreviate_home(raw).into_owned()))
+    }
+
     pub(crate) fn tab_label(
         &self,
         tab: &Tab,
@@ -917,6 +942,7 @@ impl Tty7App {
             let tab = &self.tabs[i];
             let is_active = i == active;
             let label = self.tab_label(tab, i, Some(window), cx);
+            let full_title = self.tab_title_tooltip(tab, i, Some(window), cx);
             let ssh_dot = self.tab_ssh_dot(tab, cx);
             let agent = tab.agent(cx);
             let agent_status = tab.agent_status(cx);
@@ -942,6 +968,11 @@ impl Tty7App {
                     .truncate()
                     .text_sm()
                     .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
+                    .when_some(full_title, |d, title| {
+                        d.tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(title.clone()).build(window, cx)
+                        })
+                    })
                     .child(label)
                     .into_any_element(),
             };

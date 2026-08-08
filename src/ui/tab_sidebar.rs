@@ -236,6 +236,15 @@ impl Tty7App {
                         .flex_1()
                         .min_w_0()
                         .gap(px(2.))
+                        .when_some(
+                            self.tab_title_tooltip(tab, i, Some(window), cx),
+                            |col, title| {
+                                col.tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(title.clone())
+                                        .build(window, cx)
+                                })
+                            },
+                        )
                         .child(
                             div()
                                 .w_full()
