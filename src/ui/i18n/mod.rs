@@ -872,6 +872,8 @@ l10n_keys! {
     SwitcherNoTabs,
     SwitcherNoTabMatch,
     SwitcherTabsAfterOpening,
+    SwitcherOpenToManage,
+    SwitcherConnectToUse,
     SwitcherTabCount,
     SwitcherTabCountOne,
     SwitcherActiveTab,

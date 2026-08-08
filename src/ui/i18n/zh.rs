@@ -994,6 +994,8 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SwitcherNoTabs => "这个工作区没有标签页。",
         L10nKey::SwitcherNoTabMatch => "没有匹配的标签页。",
         L10nKey::SwitcherTabsAfterOpening => "打开这个工作区后才能看到它的标签页。",
+        L10nKey::SwitcherOpenToManage => "打开这个工作区后才能重命名或停止它。",
+        L10nKey::SwitcherConnectToUse => "连接这台机器后才能在上面新建工作区。",
         L10nKey::SwitcherTabCount => "{n} 个标签页",
         L10nKey::SwitcherTabCountOne => "1 个标签页",
         L10nKey::SwitcherActiveTab => "当前",

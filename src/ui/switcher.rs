@@ -2327,6 +2327,21 @@ impl RowRef {
     }
 }
 
+/// Whether a machine's menu would open with every verb greyed out.
+///
+/// New Workspace needs the machine's home directory, which only a link that
+/// has come up once supplies; Disconnect needs a live link; Restart Server is
+/// offered to SSH alone. A WSL or stdio machine that has never connected fails
+/// all three, and the menu opened with every row greyed and nothing to say for
+/// itself. One line about the link beats three dead verbs.
+fn group_menu_is_empty_handed(group: &GroupRef) -> bool {
+    let Some(target) = group.target.as_ref() else {
+        // A local machine can always take a new workspace.
+        return false;
+    };
+    group.home.is_none() && group.link != Link::Connected && !target.is_ssh()
+}
+
 fn group_menu(
     menu: gpui_component::menu::PopupMenu,
     group: &GroupRef,
@@ -2335,6 +2350,9 @@ fn group_menu(
     let (a1, a2, a3) = (app.clone(), app.clone(), app);
     let gref = group.clone();
     let can_create = group.target.is_none() || group.home.is_some();
+    if group_menu_is_empty_handed(group) {
+        return menu.item(PopupMenuItem::label(t(L10nKey::SwitcherConnectToUse)));
+    }
     let menu = menu.item(
         PopupMenuItem::new(t(L10nKey::AppMenuNewWorkspace))
             .disabled(!can_create)
@@ -2375,27 +2393,31 @@ fn row_menu(
     let (a1, a2, a3, a4) = (app.clone(), app.clone(), app.clone(), app);
     let (id, adopt) = (row.id, row.adopt.is_some());
     let stoppable = row.live;
+    // Every verb below addresses a workspace by its local id, and a remote
+    // this client has never adopted has none yet. That greyed all four out at
+    // once: the menu opened with nothing to press and no word about why, which
+    // reads as broken rather than as not-yet. Say what would make them work,
+    // the way the tab pane already says it for the same rows.
+    if adopt {
+        return menu.item(PopupMenuItem::label(t(L10nKey::SwitcherOpenToManage)));
+    }
     menu.item(
-        PopupMenuItem::new(t(L10nKey::SwitcherRename))
-            .disabled(adopt)
-            .on_click(move |_, window, cx| {
-                let _ = a1.update(cx, |this, cx| this.switcher_rename(id, window, cx));
-            }),
+        PopupMenuItem::new(t(L10nKey::SwitcherRename)).on_click(move |_, window, cx| {
+            let _ = a1.update(cx, |this, cx| this.switcher_rename(id, window, cx));
+        }),
     )
     .item(
-        PopupMenuItem::new(t(L10nKey::SwitcherOpenInNewWindow))
-            .disabled(adopt)
-            .on_click(move |_, window, cx| {
-                let _ = a2.update(cx, |this, cx| {
-                    this.close_switcher(window, cx);
-                    crate::ui::windows::open(cx, Some(id));
-                });
-            }),
+        PopupMenuItem::new(t(L10nKey::SwitcherOpenInNewWindow)).on_click(move |_, window, cx| {
+            let _ = a2.update(cx, |this, cx| {
+                this.close_switcher(window, cx);
+                crate::ui::windows::open(cx, Some(id));
+            });
+        }),
     )
     .separator()
     .item(
         PopupMenuItem::new(t(L10nKey::AppMenuStopWorkspace))
-            .disabled(adopt || !stoppable)
+            .disabled(!stoppable)
             .on_click(move |_, window, cx| {
                 let _ = a3.update(cx, |this, cx| {
                     this.close_switcher(window, cx);
@@ -2404,14 +2426,12 @@ fn row_menu(
             }),
     )
     .item(
-        PopupMenuItem::new(t(L10nKey::AppMenuDeleteWorkspace))
-            .disabled(adopt)
-            .on_click(move |_, window, cx| {
-                let _ = a4.update(cx, |this, cx| {
-                    this.close_switcher(window, cx);
-                    this.delete_workspace(id, window, cx);
-                });
-            }),
+        PopupMenuItem::new(t(L10nKey::AppMenuDeleteWorkspace)).on_click(move |_, window, cx| {
+            let _ = a4.update(cx, |this, cx| {
+                this.close_switcher(window, cx);
+                this.delete_workspace(id, window, cx);
+            });
+        }),
     )
 }
 
@@ -2499,6 +2519,66 @@ fn glyph_col(w: f32, child: impl IntoElement) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn group_ref(target: Option<RemoteTarget>, home: Option<&str>, link: Link) -> GroupRef {
+        GroupRef {
+            key: "k".into(),
+            label: "l".into(),
+            target,
+            home: home.map(PathBuf::from),
+            link,
+        }
+    }
+
+    /// A menu that opens with every row greyed and no word about why reads as
+    /// broken rather than as not-yet, so the one state that reaches it has to
+    /// stay pinned as the verbs and their conditions move around.
+    #[test]
+    fn only_an_unconnected_non_ssh_machine_has_nothing_to_offer() {
+        let wsl = || {
+            Some(RemoteTarget::Wsl {
+                distro: "Ubuntu".into(),
+            })
+        };
+        let ssh = || RemoteTarget::direct("me", "host", 22);
+
+        // The case: never connected, so no home, and not SSH, so no restart.
+        assert!(group_menu_is_empty_handed(&group_ref(
+            wsl(),
+            None,
+            Link::Offline
+        )));
+        assert!(group_menu_is_empty_handed(&group_ref(
+            wsl(),
+            None,
+            Link::Failed
+        )));
+
+        // A home from an earlier link still allows a new workspace.
+        assert!(!group_menu_is_empty_handed(&group_ref(
+            wsl(),
+            Some("/home/me"),
+            Link::Offline
+        )));
+        // A live link still allows Disconnect.
+        assert!(!group_menu_is_empty_handed(&group_ref(
+            wsl(),
+            None,
+            Link::Connected
+        )));
+        // SSH always keeps Restart Server.
+        assert!(!group_menu_is_empty_handed(&group_ref(
+            Some(ssh()),
+            None,
+            Link::Offline
+        )));
+        // This machine is never short of verbs.
+        assert!(!group_menu_is_empty_handed(&group_ref(
+            None,
+            None,
+            Link::Local
+        )));
+    }
 
     fn tab(label: &str, path: &str) -> TabRow {
         TabRow {

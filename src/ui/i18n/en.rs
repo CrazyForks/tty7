@@ -1054,6 +1054,8 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SwitcherNoTabs => "No tabs in this workspace.",
         L10nKey::SwitcherNoTabMatch => "No tab matches.",
         L10nKey::SwitcherTabsAfterOpening => "Open this workspace to see its tabs.",
+        L10nKey::SwitcherOpenToManage => "Open this workspace to rename or stop it.",
+        L10nKey::SwitcherConnectToUse => "Connect to this machine to open a workspace on it.",
         L10nKey::SwitcherTabCount => "{n} tabs",
         L10nKey::SwitcherTabCountOne => "1 tab",
         L10nKey::SwitcherActiveTab => "active",
