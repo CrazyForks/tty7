@@ -1904,7 +1904,10 @@ impl Tty7App {
             .w_full()
             .mt_2()
             .py_1()
-            .px_1p5()
+            // 8 + 10 + 4 puts the group name on the same column as a host
+            // title, which sits 8 + 6 + 8 past the list edge — and it hands
+            // the header the same 8px inset the rows hover with.
+            .px_2()
             .rounded_md()
             .cursor_pointer()
             .text_xs()
@@ -2007,16 +2010,20 @@ impl Tty7App {
                 cx.stop_propagation();
                 on_select(ev, window, cx);
             })
-            .when_some(dot, |row, live| {
-                row.child(
-                    div()
-                        .flex_shrink_0()
-                        .size(px(6.))
-                        .rounded_full()
-                        .when(live, |d| d.bg(success))
-                        .when(!live, |d| d.border_1().border_color(border)),
-                )
-            })
+            // The gutter is here on every row, dot or no dot. Only hosts carry
+            // a liveness dot, and skipping the space on the rows that don't —
+            // Defaults, and nothing else — started their title 14px left of
+            // every host title under them.
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .size(px(6.))
+                    .when_some(dot, |d, live| {
+                        d.rounded_full()
+                            .when(live, |d| d.bg(success))
+                            .when(!live, |d| d.border_1().border_color(border))
+                    }),
+            )
             .child(
                 v_flex()
                     .min_w_0()
