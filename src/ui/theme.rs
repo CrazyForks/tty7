@@ -420,11 +420,13 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.tokens.switch = Hsla::from(rgb(surfaces.window.selected)).into();
 
     // A filled slider track means the same thing an on switch does — "this is
-    // the value you set" — so it gets the same colour. Left alone it falls back
-    // to `tokens.primary`, the near-black we give primary buttons, and the two
-    // controls disagree about what a set value looks like sitting side by side
-    // on one settings page.
+    // the value you set" — so it gets the same colour, and its knob is the same
+    // knob. Left alone the bar falls back to `tokens.primary`, the near-black we
+    // give primary buttons, and the thumb to `primary_foreground`, which on a
+    // dark theme is a black disc on a dark page. Side by side on one settings
+    // page the two controls disagreed about what a set value looks like.
     t.tokens.slider_bar = Hsla::from(rgb(m.accent)).into();
+    t.tokens.slider_thumb = Hsla::from(rgb(knob)).into();
 
     t.caret = rgb(m.caret).into();
     t.selection = rgb(m.selection).into();
