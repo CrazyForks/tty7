@@ -117,7 +117,27 @@ pub(crate) fn display_path(path: &std::path::Path) -> String {
         .chars()
         .skip(shortened.chars().count() - PICKER_PATH_MAX)
         .collect();
-    format!("…{tail}")
+    format!("…{}", snap_to_separator(&tail))
+}
+
+/// Drops a leading half-component from a front-elided path.
+///
+/// Cutting at a character count lands mid-name as often as not, and the
+/// remainder reads as a directory that exists: "…eeply/nested/projects" offers
+/// "eeply" with the same weight as "nested". A partial name carries no
+/// information the rest of the path does not, so it goes — unless it is the
+/// longer half, which happens when a single component overruns the whole
+/// budget and there is nothing else left to show.
+fn snap_to_separator(tail: &str) -> &str {
+    let Some(cut) = tail.find('/') else {
+        return tail;
+    };
+    let (dropped, kept) = tail.split_at(cut);
+    if dropped.is_empty() || dropped.chars().count() <= kept.chars().count() {
+        kept
+    } else {
+        tail
+    }
 }
 
 pub(crate) fn key_hint(action: &str, cx: &App) -> Option<String> {
@@ -430,12 +450,35 @@ mod tests {
         ));
         assert!(long.starts_with('…'), "{long} should be front-elided");
         assert!(long.ends_with("thing"), "{long} must keep the tail");
-        assert_eq!(long.chars().count(), PICKER_PATH_MAX + 1);
+        // Snapping to a separator can only shorten what the char budget kept.
+        assert!(long.chars().count() <= PICKER_PATH_MAX + 1);
+
+        // A cut that lands mid-name drops the fragment rather than passing it
+        // off as a directory.
+        let midname = display_path(std::path::Path::new(
+            "/Users/tester/verylongish/deeply/nested/projects/area/thing",
+        ));
+        assert_eq!(midname, "…/deeply/nested/projects/area/thing");
 
         match saved {
             Some(home) => unsafe { std::env::set_var("HOME", home) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    /// The fragment only goes when the rest of the path can stand without it.
+    #[test]
+    fn a_path_that_is_one_huge_name_keeps_what_it_can() {
+        // Nothing to snap to.
+        assert_eq!(snap_to_separator("abcdefghij"), "abcdefghij");
+        // The fragment is the longer half, so dropping it would leave almost
+        // nothing — better a partial name than "…/ui".
+        assert_eq!(
+            snap_to_separator("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ui"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ui"
+        );
+        // Already on a boundary: nothing is dropped.
+        assert_eq!(snap_to_separator("/src/ui/i18n"), "/src/ui/i18n");
     }
 
     #[test]
