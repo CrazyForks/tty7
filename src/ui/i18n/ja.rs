@@ -519,17 +519,17 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsUpdateDiscard => "破棄",
         L10nKey::SettingsAutoDownload => "アップデートをバックグラウンドでダウンロード",
         L10nKey::SettingsAutoDownloadDesc => {
-            "新しいリリースを見つけ次第ダウンロードと検証を済ませておき、インストールは再起動するだけにします。確認なしにインストールすることはありません。従量制の回線ではオフにしてください（パッケージは約 30 MB です）。"
+            "新しいリリースを見つけ次第ダウンロードと検証を済ませておき、インストールは再起動するだけにします。確認なしにインストールすることはありません。従量制の回線ではオフにしてください（パッケージは約 30 MB です）"
         }
         L10nKey::SettingsUpdateChannel => "更新チャンネル",
         L10nKey::SettingsUpdateChannelDesc => {
-            "Stable は正式リリースを、Nightly は最新のコードから毎晩ビルドされる版を追いかけます。新しい代わりに、リリース前のテストは経ていません。"
+            "Stable は正式リリースを、Nightly は最新のコードから毎晩ビルドされる版を追いかけます。新しい代わりに、リリース前のテストは経ていません"
         }
         L10nKey::SettingsUpdateChannelStable => "安定版",
         L10nKey::SettingsUpdateChannelNightly => "ナイトリー",
         L10nKey::SettingsDaemonStale => "バックグラウンドサーバーは {build} のままです。",
         L10nKey::SettingsDaemonStaleDesc => {
-            "tty7 はその場で更新されたため、アプリは新しくなりましたが、各ペインは以前のビルドのサーバーが処理しています。サーバーを再起動すると新しいビルドに切り替わりますが、ペインで動いているプロセス（シェル、エージェント、SSH セッション）はすべて終了します。急ぐ必要はありません。ペインが空いているときに実行してください。"
+            "tty7 はその場で更新されたため、アプリは新しくなりましたが、各ペインは以前のビルドのサーバーが処理しています。サーバーを再起動すると新しいビルドに切り替わりますが、ペインで動いているプロセス（シェル、エージェント、SSH セッション）はすべて終了します。急ぐ必要はありません。ペインが空いているときに実行してください"
         }
         L10nKey::UpdateDialogTitle => "アップデートがあります",
         L10nKey::UpdateDialogDetail => {
