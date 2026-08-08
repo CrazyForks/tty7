@@ -5163,6 +5163,7 @@ impl Render for Tty7App {
         let prof = crate::ui::perf::enabled().then(std::time::Instant::now);
         self.claim_pending_tab(window, cx);
         self.touch_active_tab();
+        self.scm_sync_watchers(window, cx);
         if cx.has_active_drag() {
             crate::ui::reorder::clear_pending(&self.reorder);
         } else if let Some(order) = crate::ui::reorder::take_pending(&self.reorder) {
