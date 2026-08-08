@@ -1340,7 +1340,7 @@ impl Tty7App {
                         .py(px(8.))
                         .rounded(px(6.))
                         .border_1()
-                        .border_color(theme.danger.opacity(0.35))
+                        .border_color(theme.danger.opacity(0.4))
                         .child(
                             div()
                                 .text_xs()
@@ -1523,7 +1523,7 @@ impl Tty7App {
         let (fg, muted, dim) = (
             theme.foreground,
             theme.muted_foreground,
-            theme.muted_foreground.opacity(0.75),
+            theme.muted_foreground.opacity(0.7),
         );
         let hover = hover_fill(cx);
         let gref = GroupRef::of(group);

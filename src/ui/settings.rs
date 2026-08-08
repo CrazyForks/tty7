@@ -3316,7 +3316,11 @@ impl Tty7App {
                     .child(
                         div()
                             .flex_1()
-                            .opacity(if needs_target { 1.0 } else { 0.35 })
+                            .opacity(if needs_target {
+                                1.0
+                            } else {
+                                crate::ui::forwards::NO_TARGET_FADE
+                            })
                             .child(endpoint(&row.target_host, &row.target_port)),
                     )
                     .child(

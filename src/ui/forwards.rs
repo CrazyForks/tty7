@@ -8,6 +8,11 @@ use crate::terminal::view::TerminalView;
 use crate::ui::app::{CONTENT_INSET, Tty7App};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 
+/// How far a forward's target endpoint fades when the rule is Dynamic and has
+/// no target to name. The rules editor in Settings and the live Forwards panel
+/// draw the same row, so they fade it by the same amount.
+pub(crate) const NO_TARGET_FADE: f32 = 0.4;
+
 impl Tty7App {
     pub(crate) fn render_ssh_status_strip(
         &self,
@@ -342,7 +347,7 @@ impl Tty7App {
             ))
             .child(
                 div()
-                    .opacity(if needs_target { 1.0 } else { 0.4 })
+                    .opacity(if needs_target { 1.0 } else { NO_TARGET_FADE })
                     .child(pair(
                         if needs_target {
                             t(L10nKey::ForwardToLabel)
