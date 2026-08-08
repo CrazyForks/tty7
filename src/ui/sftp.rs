@@ -1245,8 +1245,13 @@ impl Tty7App {
         let show_go_up = self.sftp_panel.cwd != "/" && filter.trim().is_empty();
 
         if entries.is_empty() && !show_go_up {
+            // A filter that matched nothing is not an empty directory, and
+            // saying so about a machine you cannot see is worse than saying
+            // nothing. The local file tree already draws this distinction.
             let text: gpui::SharedString = if self.sftp_panel.loading {
                 t(L10nKey::SftpLoading).into()
+            } else if !filter.trim().is_empty() {
+                t_fmt(L10nKey::SettingsNothingMatches, &[("query", filter.trim())]).into()
             } else {
                 t(L10nKey::SftpEmptyDirectory).into()
             };
