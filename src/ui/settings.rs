@@ -1038,6 +1038,38 @@ impl Tty7App {
         control: AnyElement,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
+        self.settings_row_inner(label, desc, control, false, cx)
+    }
+
+    /// A row that drops its control onto a second line rather than letting it
+    /// push past the right edge.
+    ///
+    /// Only the SSH page needs it: it spends 500px on a nav column and a host
+    /// list before the form gets any, so its rows run out of width while every
+    /// other page still has plenty. It is opt-in rather than the default
+    /// because a wrapping flex line is sized by its widest item, and the long
+    /// descriptions elsewhere ("Tab at the prompt opens tty7's completion
+    /// menu…") measure wider than the pane — those rows would stop wrapping
+    /// and overflow, which is what happened when this was switched on for
+    /// everything.
+    pub(crate) fn settings_row_wrapping(
+        &self,
+        label: impl Into<String>,
+        desc: impl Into<String>,
+        control: AnyElement,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        self.settings_row_inner(label, desc, control, true, cx)
+    }
+
+    fn settings_row_inner(
+        &self,
+        label: impl Into<String>,
+        desc: impl Into<String>,
+        control: AnyElement,
+        wrap: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         let theme = cx.theme();
         let label = label.into();
         let desc = desc.into();
@@ -1063,9 +1095,10 @@ impl Tty7App {
         };
         h_flex()
             .id(element_id)
+            .when(wrap, |row| row.flex_wrap().gap_y_2())
             .items_center()
             .justify_between()
-            .gap_8()
+            .gap_x_8()
             .py_2()
             .px_2p5()
             .mx_neg_2p5()
@@ -1077,7 +1110,8 @@ impl Tty7App {
             .child(
                 v_flex()
                     .gap_0p5()
-                    .min_w_0()
+                    .when(wrap, |col| col.flex_1().min_w(px(200.)))
+                    .when(!wrap, |col| col.min_w_0())
                     .child(
                         div()
                             .text_sm()
@@ -2208,7 +2242,7 @@ impl Tty7App {
                 cx,
             ))
             .child(
-                self.settings_row(
+                self.settings_row_wrapping(
                     t(L10nKey::SettingsImportAliases),
                     t(L10nKey::SettingsImportAliasesDesc),
                     Button::new("ssh-defaults-import")
@@ -2320,13 +2354,13 @@ impl Tty7App {
                 t(L10nKey::SettingsSecurityIntro),
                 cx,
             ))
-            .child(self.settings_row(
+            .child(self.settings_row_wrapping(
                 t(L10nKey::SettingsVerifyHostKeys),
                 t(L10nKey::SettingsVerifyHostKeysDesc),
                 verify_switch,
                 cx,
             ))
-            .child(self.settings_row(
+            .child(self.settings_row_wrapping(
                 t(L10nKey::WarnBeforeClosing),
                 t(L10nKey::SettingsWarnBeforeClosingDesc),
                 warn_switch,
@@ -2838,7 +2872,7 @@ impl Tty7App {
         let core = v_flex()
             .gap_3()
             .child(
-                self.settings_row(
+                self.settings_row_wrapping(
                     t(L10nKey::SettingsName),
                     t(L10nKey::SettingsNameDesc),
                     div()
@@ -2849,7 +2883,7 @@ impl Tty7App {
                 ),
             )
             .child(
-                self.settings_row(
+                self.settings_row_wrapping(
                     t(L10nKey::SettingsHost),
                     t(L10nKey::SettingsHostDesc),
                     h_flex()
@@ -2861,7 +2895,7 @@ impl Tty7App {
                 ),
             )
             .child(
-                self.settings_row(
+                self.settings_row_wrapping(
                     t(L10nKey::SettingsUser),
                     t(L10nKey::SettingsUserDesc),
                     div()
@@ -2871,7 +2905,7 @@ impl Tty7App {
                     cx,
                 ),
             )
-            .child(self.settings_row(
+            .child(self.settings_row_wrapping(
                 t(L10nKey::SettingsAuth),
                 t(L10nKey::SettingsAuthDesc),
                 self.segmented(
@@ -2972,7 +3006,7 @@ impl Tty7App {
         ));
         if form.show_jump {
             section = section.child(
-                self.settings_row(
+                self.settings_row_wrapping(
                     t(L10nKey::SettingsJumpHost),
                     t(L10nKey::SettingsJumpHostDesc),
                     div()
@@ -3244,7 +3278,7 @@ impl Tty7App {
                 cx,
             ))
             .child(
-                self.settings_row(
+                self.settings_row_wrapping(
                     t(L10nKey::SettingsAgentForwarding),
                     t(L10nKey::SettingsAgentForwardingDesc),
                     crate::ui::theme::switch("ssh-form-agent", cx)
@@ -3341,7 +3375,7 @@ impl Tty7App {
             ))
             .child(self.subgroup_header(L10nKey::SettingsGroupSession, cx))
             .child(
-                self.settings_row(
+                self.settings_row_wrapping(
                     t(L10nKey::SettingsX11Forwarding),
                     t(L10nKey::SettingsX11ForwardingDesc),
                     crate::ui::theme::switch("ssh-form-x11", cx)
@@ -3357,7 +3391,7 @@ impl Tty7App {
                 ),
             )
             .child(
-                self.settings_row(
+                self.settings_row_wrapping(
                     t(L10nKey::SettingsShellIntegration),
                     t(L10nKey::SettingsShellIntegrationDesc),
                     crate::ui::theme::switch("ssh-form-shell-integration", cx)
@@ -3380,7 +3414,7 @@ impl Tty7App {
                 cx,
             ))
             .child(
-                self.settings_row(
+                self.settings_row_wrapping(
                     t(L10nKey::SettingsSkipBanner),
                     t(L10nKey::SettingsSkipBannerDesc),
                     crate::ui::theme::switch("ssh-form-banner", cx)
@@ -3396,7 +3430,7 @@ impl Tty7App {
                 ),
             )
             .child(self.subgroup_header(L10nKey::SettingsGroupSecurity, cx))
-            .child(self.settings_row(
+            .child(self.settings_row_wrapping(
                 t(L10nKey::SettingsVerifyHostKeys),
                 t_fmt(
                     L10nKey::SettingsDefaultFollowsDefaults,
@@ -3424,7 +3458,7 @@ impl Tty7App {
                 ),
                 cx,
             ))
-            .child(self.settings_row(
+            .child(self.settings_row_wrapping(
                 t(L10nKey::WarnBeforeClosing),
                 t_fmt(
                     L10nKey::SettingsDefaultFollowsDefaults,
