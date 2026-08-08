@@ -546,6 +546,14 @@ impl Tty7App {
         if self.tab_code().is_some_and(|c| c.active_file().is_some()) {
             self.focus_editor(window, cx);
         } else {
+            // With no file to show, the panel says "Open a file from the file
+            // tree" and hands the tree the focus — but nothing was putting the
+            // tree on screen, so ⌘⇧E on a fresh tab opened an empty editor
+            // pointing at a panel the reader could not see or reach from
+            // there. Reveal it, then focus it.
+            if !self.file_tree_on_screen(cx) {
+                self.set_right_panel_tab(crate::core::config::RightPanelTab::Files, cx);
+            }
             self.file_tree.focus_handle.focus(window, cx);
         }
         cx.notify();
