@@ -216,6 +216,30 @@ pub trait Host: Send + Sync + 'static {
 
     fn git(&self, cwd: &Path, args: &[&str]) -> io::Result<Output>;
 
+    /// `git`, but with an explicit ceiling on how long to wait for the far side.
+    ///
+    /// Network verbs (`fetch`/`pull`/`push`) run for as long as the network
+    /// takes, which is minutes, not the seconds an interactive query is allowed.
+    ///
+    /// `LocalHost` deliberately does not override this: `Command::output()`
+    /// blocks until the child exits and has no timeout of its own, so waiting
+    /// "until the deadline" and waiting "until git is done" are the same wait —
+    /// forwarding to `git` is the honest implementation, not a stub. `RemoteHost`
+    /// does override it, because its per-request deadline is sized for
+    /// interactive queries and a push walks straight into it.
+    ///
+    /// The reply is still the plain `Git` request on the wire, so a server that
+    /// predates this method serves it unchanged.
+    fn git_with_deadline(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        deadline: std::time::Duration,
+    ) -> io::Result<Output> {
+        let _ = deadline;
+        self.git(cwd, args)
+    }
+
     fn git_lines(
         &self,
         cwd: &Path,

@@ -277,6 +277,25 @@ impl Host for RemoteHost {
         }
     }
 
+    fn git_with_deadline(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        deadline: Duration,
+    ) -> io::Result<Output> {
+        // Byte-for-byte the same request `git` sends; only the client's own
+        // patience changes. The server never times a job out, so a v5 peer that
+        // knows nothing about long git verbs serves this unchanged.
+        let req = ControlRequest::Git {
+            cwd: wire_path(cwd),
+            args: args.iter().map(|a| a.to_string()).collect(),
+        };
+        match self.client.call_with_deadline(req, &[], deadline)?.reply {
+            ReplyOk::Output(o) => Ok(o),
+            other => Err(wrong_shape("a process result", &other)),
+        }
+    }
+
     fn git_lines(
         &self,
         cwd: &Path,
