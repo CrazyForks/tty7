@@ -177,37 +177,52 @@ impl Theme {
         }
     }
 
+    fn ansi_seed(&self, index: usize) -> u32 {
+        let (r, g, b) = self.ansi16[index];
+        (r as u32) << 16 | (g as u32) << 8 | b as u32
+    }
+
+    /// Clears a seed colour for use as ink on any of tty7's neutral fills.
+    ///
+    /// An error line lands on a popover or a sidebar row as often as on the
+    /// window, and both of those fills sit a step toward the foreground. Clear
+    /// the floor on every surface the ink can be painted on, not just on the
+    /// darkest one.
+    fn clear_ink(&self, seed: u32, floor: f32) -> u32 {
+        let bg = self.background_color();
+        let fg = legible_foreground(bg, self.foreground);
+        [bg, mix(bg, fg, 0.03), mix(bg, fg, 0.05)]
+            .into_iter()
+            .fold(seed, |ink, surface| legible_ink(surface, ink, floor))
+    }
+
+    /// One entry of the theme's own ANSI ramp, legible as chrome text.
+    ///
+    /// The ramp is authored for terminal cells, where a colour only has to
+    /// stand on the background. Chrome draws the same hues on the sidebar and
+    /// popover fills too, so they go through the same floor the semantic inks
+    /// do.
+    pub fn ansi_ink(&self, index: usize) -> u32 {
+        self.clear_ink(self.ansi_seed(index), TEXT_FLOOR)
+    }
+
     pub fn semantics(&self) -> Semantics {
         let bg = self.background_color();
         let fg = legible_foreground(bg, self.foreground);
-        let ansi = |i: usize| -> u32 {
-            let (r, g, b) = self.ansi16[i];
-            (r as u32) << 16 | (g as u32) << 8 | b as u32
-        };
-        // An error line lands on a popover or a sidebar row as often as on the
-        // window, and both of those fills sit a step toward the foreground.
-        // Clear the floor on every surface the ink can be painted on, not just
-        // on the darkest one.
-        let surfaces = [bg, mix(bg, fg, 0.03), mix(bg, fg, 0.05)];
-        let clear = |seed: u32, floor: f32| {
-            surfaces
-                .iter()
-                .fold(seed, |ink, surface| legible_ink(*surface, ink, floor))
-        };
         let build = |seed: u32| {
-            let fill = clear(seed, ACCENT_FLOOR);
+            let fill = self.clear_ink(seed, ACCENT_FLOOR);
             Semantic {
-                ink: clear(seed, TEXT_FLOOR),
+                ink: self.clear_ink(seed, TEXT_FLOOR),
                 fill,
                 on_fill: ink_on(fill, fg, TEXT_FLOOR),
             }
         };
         Semantics {
-            danger: build(ansi(1)),
-            success: build(ansi(2)),
-            warning: build(ansi(3)),
-            info: build(ansi(6)),
-            link: build(ansi(6)),
+            danger: build(self.ansi_seed(1)),
+            success: build(self.ansi_seed(2)),
+            warning: build(self.ansi_seed(3)),
+            info: build(self.ansi_seed(6)),
+            link: build(self.ansi_seed(6)),
         }
     }
 

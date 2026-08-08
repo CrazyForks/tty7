@@ -408,6 +408,18 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.tokens.button_info_active = fill_active.into();
     t.tokens.button_info_foreground = on_fill.into();
 
+    // The command-line highlighter paints commands, flags, paths, strings and
+    // operators with these, and the find bar flags a bad regex with `red`.
+    // Unset they hold gpui-component's stock ramp, one ramp for every dark
+    // preset and one for every light one — so the line you were typing kept a
+    // palette the output right above it had already left behind.
+    t.red = rgb(theme.ansi_ink(1)).into();
+    t.green = rgb(theme.ansi_ink(2)).into();
+    t.yellow = rgb(theme.ansi_ink(3)).into();
+    t.blue = rgb(theme.ansi_ink(4)).into();
+    t.magenta = rgb(theme.ansi_ink(5)).into();
+    t.cyan = rgb(theme.ansi_ink(6)).into();
+
     t.link = rgb(sem.link.ink).into();
     t.link_hover = rgb(presets::mix(sem.link.ink, m.foreground, 0.25)).into();
     t.link_active = rgb(presets::mix(sem.link.ink, m.background, 0.20)).into();
