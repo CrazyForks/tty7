@@ -69,6 +69,19 @@ const ANSI_COLOR_LABELS: [L10nKey; 16] = [
     L10nKey::AppThemeAnsiBrightWhite,
 ];
 
+/// Looked up at render time, never stored: the editor outlives a language
+/// change, and a label cached when it opened would stay in the old language.
+pub(crate) fn theme_edit_label(edit: ThemeEdit) -> &'static str {
+    t(match edit {
+        ThemeEdit::Background => L10nKey::AppThemeColorBackground,
+        ThemeEdit::Foreground => L10nKey::AppThemeColorForeground,
+        ThemeEdit::Accent => L10nKey::AppThemeColorAccent,
+        ThemeEdit::Cursor => L10nKey::AppThemeColorCursor,
+        ThemeEdit::Selection => L10nKey::AppThemeColorSelection,
+        ThemeEdit::Ansi(i) => ANSI_COLOR_LABELS[i.min(15)],
+    })
+}
+
 fn hsla_to_u32(color: gpui::Hsla) -> u32 {
     let rgba: gpui::Rgba = color.into();
     let to = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -1712,32 +1725,12 @@ impl Tty7App {
         }
 
         let neutrals = theme.neutrals();
-        let seed_specs: [(ThemeEdit, &str, u32); 5] = [
-            (
-                ThemeEdit::Background,
-                t(L10nKey::AppThemeColorBackground),
-                theme.background_color(),
-            ),
-            (
-                ThemeEdit::Foreground,
-                t(L10nKey::AppThemeColorForeground),
-                theme.foreground,
-            ),
-            (
-                ThemeEdit::Accent,
-                t(L10nKey::AppThemeColorAccent),
-                theme.accent,
-            ),
-            (
-                ThemeEdit::Cursor,
-                t(L10nKey::AppThemeColorCursor),
-                theme.caret.unwrap_or(theme.accent),
-            ),
-            (
-                ThemeEdit::Selection,
-                t(L10nKey::AppThemeColorSelection),
-                neutrals.selection,
-            ),
+        let seed_specs: [(ThemeEdit, u32); 5] = [
+            (ThemeEdit::Background, theme.background_color()),
+            (ThemeEdit::Foreground, theme.foreground),
+            (ThemeEdit::Accent, theme.accent),
+            (ThemeEdit::Cursor, theme.caret.unwrap_or(theme.accent)),
+            (ThemeEdit::Selection, neutrals.selection),
         ];
 
         let mut subs = Vec::new();
@@ -1760,9 +1753,7 @@ impl Tty7App {
 
         let seed = seed_specs
             .iter()
-            .map(|&(edit, label, value)| {
-                (edit, label.to_string(), make(edit, value, &mut subs, cx))
-            })
+            .map(|&(edit, value)| (edit, make(edit, value, &mut subs, cx)))
             .collect();
         let ansi = (0..16)
             .map(|i| {
@@ -1770,7 +1761,6 @@ impl Tty7App {
                 let value = (r as u32) << 16 | (g as u32) << 8 | b as u32;
                 (
                     ThemeEdit::Ansi(i),
-                    t(ANSI_COLOR_LABELS[i]).to_string(),
                     make(ThemeEdit::Ansi(i), value, &mut subs, cx),
                 )
             })

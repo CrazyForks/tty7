@@ -480,8 +480,8 @@ pub(crate) fn best_matching_section(query: &str) -> Option<SettingsSection> {
 pub(crate) struct ThemeEditor {
     #[allow(dead_code)]
     pub(crate) for_id: String,
-    pub(crate) seed: Vec<(ThemeEdit, String, Entity<ColorPickerState>)>,
-    pub(crate) ansi: Vec<(ThemeEdit, String, Entity<ColorPickerState>)>,
+    pub(crate) seed: Vec<(ThemeEdit, Entity<ColorPickerState>)>,
+    pub(crate) ansi: Vec<(ThemeEdit, Entity<ColorPickerState>)>,
     pub(crate) image_opacity_slider: Option<Entity<SliderState>>,
     pub(crate) _subs: Vec<Subscription>,
 }
@@ -1596,16 +1596,14 @@ impl Tty7App {
             .on_click(cx.listener(|this, _, w, cx| this.open_themes_folder(w, cx)));
 
         if let Some(editor) = editor {
-            let seed: Vec<_> = editor
-                .seed
-                .iter()
-                .map(|(_, label, state)| (label.clone(), state.clone()))
-                .collect();
-            let ansi: Vec<_> = editor
-                .ansi
-                .iter()
-                .map(|(_, label, state)| (label.clone(), state.clone()))
-                .collect();
+            let label_of = |&(edit, ref state): &(ThemeEdit, Entity<ColorPickerState>)| {
+                (
+                    crate::ui::app::theme_edit_label(edit).to_string(),
+                    state.clone(),
+                )
+            };
+            let seed: Vec<_> = editor.seed.iter().map(label_of).collect();
+            let ansi: Vec<_> = editor.ansi.iter().map(label_of).collect();
             let image_opacity_slider = editor.image_opacity_slider.clone();
 
             let theme = presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
