@@ -489,7 +489,7 @@ fn authored_entry(action: &str) -> Option<(CommandGroup, String)> {
         ),
         "ToggleSwitcher" => (
             CommandGroup::Workspaces,
-            t(L10nKey::HomeSwitchWorkspace).to_string(),
+            t(L10nKey::CmdSwitchWorkspace).to_string(),
         ),
         "IncreaseFontSize" => (
             CommandGroup::View,
@@ -997,6 +997,7 @@ mod tests {
         assert_eq!(action_entry("CloseActiveTab").1, "Close Pane / Tab");
         assert_eq!(action_entry("ClearScrollback").1, "Clear Scrollback");
         assert_eq!(action_entry("TogglePalette").1, "Command Palette…");
+        assert_eq!(action_entry("ToggleSwitcher").1, "Switch Workspace…");
         // The numbered families are templated, not nine strings per locale.
         assert_eq!(action_entry("ActivateTab3").1, "Go to Tab 3");
         assert_eq!(action_entry("SelectWorkspace7").1, "Go to Workspace 7");
