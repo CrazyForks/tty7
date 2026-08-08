@@ -21,13 +21,16 @@ const LOGO: [&str; 4] = [
 
 const LOGO_PX: f32 = 20.0;
 
-const HOME_SHORTCUTS: [&str; 7] = [
+/// What a window with no tabs open can actually do. `SplitRight`/`SplitDown`
+/// were listed here too, but both need a pane to split and return without a
+/// word when there is none — the home page was advertising two chords that do
+/// nothing from the only screen that offers them. `ReopenClosedTab` earns its
+/// row only while something is on the closed stack.
+const HOME_SHORTCUTS: [&str; 5] = [
     "NewTab",
     "ReopenClosedTab",
     "ToggleSwitcher",
     "TogglePalette",
-    "SplitRight",
-    "SplitDown",
     "OpenSettings",
 ];
 
@@ -152,8 +155,12 @@ impl Tty7App {
         ));
 
         let closed_hint = self.closed.last().and_then(closed_tab_label);
+        let nothing_to_reopen = self.closed.is_empty();
         let mut list = v_flex().gap_2().w(px(300.)).text_sm().text_color(muted);
         for action in HOME_SHORTCUTS {
+            if action == "ReopenClosedTab" && nothing_to_reopen {
+                continue;
+            }
             let emphasized = closed_hint.is_some() && action == "ReopenClosedTab";
             let label = home_shortcut_label(action, closed_hint.as_deref());
             list = list.child(
@@ -386,6 +393,32 @@ mod tests {
         match saved {
             Some(home) => unsafe { std::env::set_var("HOME", home) },
             None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn every_home_shortcut_ships_with_a_chord_to_show() {
+        let defaults = crate::ui::keymap::default_bindings();
+        for action in HOME_SHORTCUTS {
+            let key = defaults
+                .iter()
+                .find(|(a, _)| *a == action)
+                .unwrap_or_else(|| panic!("{action} is not a bindable action"))
+                .1;
+            assert!(
+                !key.is_empty(),
+                "{action} has no default chord, so its home row would read as a bare label"
+            );
+        }
+    }
+
+    #[test]
+    fn the_home_list_leaves_out_what_an_empty_window_cannot_do() {
+        for action in ["SplitRight", "SplitDown", "CloseActiveTab", "RenameTab"] {
+            assert!(
+                !HOME_SHORTCUTS.contains(&action),
+                "{action} needs a pane, and the home page is what a window shows without one"
+            );
         }
     }
 
