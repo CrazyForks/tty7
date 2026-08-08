@@ -38,6 +38,54 @@ pub(crate) struct RightPanelState {
 
 const PROCS_POLL: std::time::Duration = std::time::Duration::from_millis(2000);
 
+/// Widest of the labels actually on screen, so the values line up without a
+/// fixed width guessing at them.
+///
+/// A hardcoded 46px fitted "cwd" and "shell" and nothing else: English
+/// "changes" wrapped mid-word to "change / s", and in Chinese and Japanese
+/// almost every label wrapped — ja "作業ディレクトリ" is eight glyphs. The
+/// clamp keeps the longest of those from eating the panel; anything past it
+/// runs into the gap rather than folding, which `whitespace_nowrap` on the
+/// label guarantees.
+fn info_label_column(
+    rows: &[(&'static str, String)],
+    window: &mut Window,
+    cx: &gpui::App,
+) -> gpui::Pixels {
+    const MIN: f32 = 46.;
+    const MAX: f32 = 108.;
+    let font = gpui::Font {
+        family: cx.theme().font_family.clone(),
+        features: Default::default(),
+        fallbacks: None,
+        weight: Default::default(),
+        style: Default::default(),
+    };
+    let widest = rows
+        .iter()
+        .map(|(k, _)| {
+            window
+                .text_system()
+                .shape_line(
+                    gpui::SharedString::from(*k),
+                    px(12.),
+                    &[gpui::TextRun {
+                        len: k.len(),
+                        font: font.clone(),
+                        color: gpui::Hsla::default(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                )
+                .width
+                .as_f32()
+        })
+        .fold(MIN, f32::max);
+    px(widest.clamp(MIN, MAX).ceil())
+}
+
 impl Tty7App {
     pub(crate) fn right_panel_open(&self, _cx: &gpui::App) -> bool {
         self.right_panel_visible && !self.tabs.is_empty()
@@ -426,6 +474,7 @@ impl Tty7App {
         self.sync_procs(pane_id, route, cx);
 
         let mono = cx.theme().mono_font_family.clone();
+        let label_w = info_label_column(&rows, window, cx);
         let mut list = v_flex().px(px(CONTENT_INSET)).py(px(2.)).gap(px(3.));
         for (k, v) in rows {
             list = list.child(
@@ -437,7 +486,8 @@ impl Tty7App {
                     .child(
                         div()
                             .flex_none()
-                            .w(px(46.))
+                            .w(label_w)
+                            .whitespace_nowrap()
                             .text_color(cx.theme().muted_foreground)
                             .child(k),
                     )
