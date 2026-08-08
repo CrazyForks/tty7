@@ -13,6 +13,7 @@ use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_f
 use tty7_core::core::machine::TabId;
 use tty7_core::core::session::{RemoteTarget, WorkspaceId};
 
+use crate::core::actions::{SwitcherAcross, SwitcherAcrossBack};
 use crate::core::session::WorkspaceStore;
 use crate::daemon::install::InstallPhase;
 use crate::terminal::pane_liveness::Liveness;
@@ -148,6 +149,13 @@ pub(crate) struct Switcher {
     hold: Option<gpui::Modifiers>,
     left_scroll: gpui::ScrollHandle,
     right_scroll: gpui::ScrollHandle,
+    /// Anchors on the two scrolls, worn by whichever row is selected. Both
+    /// columns hold their rows inside one child element, and `scroll_to_item`
+    /// indexes a scroll's *direct* children — so it could only ever find item
+    /// 0, and walking the list with the arrows quietly left the selection off
+    /// the bottom of the column.
+    left_anchor: gpui::ScrollAnchor,
+    right_anchor: gpui::ScrollAnchor,
     _subs: Vec<Subscription>,
 }
 
@@ -246,6 +254,7 @@ impl Tty7App {
                 }
             },
         )];
+        let (left_scroll, right_scroll) = (gpui::ScrollHandle::new(), gpui::ScrollHandle::new());
         self.switcher = Some(Switcher {
             query,
             collapsed: HashSet::new(),
@@ -256,8 +265,10 @@ impl Tty7App {
             right_sel: 0,
             mru,
             hold,
-            left_scroll: gpui::ScrollHandle::new(),
-            right_scroll: gpui::ScrollHandle::new(),
+            left_scroll: left_scroll.clone(),
+            right_scroll: right_scroll.clone(),
+            left_anchor: gpui::ScrollAnchor::for_handle(left_scroll),
+            right_anchor: gpui::ScrollAnchor::for_handle(right_scroll),
             _subs: subs,
         });
         // Park the left cursor on this window's own workspace so the tab column
@@ -289,7 +300,7 @@ impl Tty7App {
     ) {
         if self.switcher.is_some() {
             let layout = self.switcher_layout(cx);
-            self.switcher_step_right(&layout, forward, cx);
+            self.switcher_step_right(&layout, forward, window, cx);
             return;
         }
         let n = self.tabs.len();
@@ -856,8 +867,8 @@ impl Tty7App {
             Key::Step(forward) => {
                 cx.stop_propagation();
                 match column {
-                    Column::Left => self.switcher_step_left(&layout, forward, cx),
-                    Column::Right => self.switcher_step_right(&layout, forward, cx),
+                    Column::Left => self.switcher_step_left(&layout, forward, window, cx),
+                    Column::Right => self.switcher_step_right(&layout, forward, window, cx),
                 }
             }
             // Once there is a query, left and right belong to the caret in the
@@ -878,13 +889,23 @@ impl Tty7App {
             Key::ToColumn(_) => {}
             Key::Tab(forward) => {
                 cx.stop_propagation();
-                self.switcher_step_right(&layout, forward, cx);
+                self.switcher_step_right(&layout, forward, window, cx);
             }
             Key::Confirm(new_window) => {
                 cx.stop_propagation();
                 self.switcher_confirm(&layout, new_window, window, cx);
             }
         }
+    }
+
+    /// The anchor a row wears while it is the selected one, so stepping the
+    /// cursor with the keyboard carries the column to it.
+    fn switcher_anchor(&self, column: Column, picked: bool) -> Option<gpui::ScrollAnchor> {
+        let sw = self.switcher.as_ref()?;
+        picked.then(|| match column {
+            Column::Left => sw.left_anchor.clone(),
+            Column::Right => sw.right_anchor.clone(),
+        })
     }
 
     /// Moves the left cursor to a clicked row so the tab column follows it.
@@ -919,7 +940,13 @@ impl Tty7App {
         cx.notify();
     }
 
-    fn switcher_step_left(&mut self, layout: &Layout, forward: bool, cx: &mut Context<Self>) {
+    fn switcher_step_left(
+        &mut self,
+        layout: &Layout,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let n = layout.nav.len();
         let Some(sw) = self.switcher.as_mut() else {
             return;
@@ -931,11 +958,18 @@ impl Tty7App {
         sw.left_sel = step(sw.left_sel.min(n - 1), n, forward);
         // A different workspace means a different tab column.
         sw.right_sel = 0;
-        sw.left_scroll.scroll_to_item(sw.left_sel);
+        let anchor = sw.left_anchor.clone();
+        anchor.scroll_to(window, cx);
         cx.notify();
     }
 
-    fn switcher_step_right(&mut self, layout: &Layout, forward: bool, cx: &mut Context<Self>) {
+    fn switcher_step_right(
+        &mut self,
+        layout: &Layout,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let sel = self.switcher.as_ref().map(|sw| sw.left_sel).unwrap_or(0);
         let query = self
             .switcher
@@ -954,7 +988,8 @@ impl Tty7App {
         }
         sw.column = Column::Right;
         sw.right_sel = step(sw.right_sel.min(n - 1), n, forward);
-        sw.right_scroll.scroll_to_item(sw.right_sel);
+        let anchor = sw.right_anchor.clone();
+        anchor.scroll_to(window, cx);
         cx.notify();
     }
 
@@ -1138,6 +1173,15 @@ impl Tty7App {
                 .justify_center()
                 .pt(px(CARD_TOP))
                 .bg(scrim)
+                .key_context("Switcher")
+                .on_action(cx.listener(|this, _: &SwitcherAcross, window, cx| {
+                    let layout = this.switcher_layout(cx);
+                    this.switcher_step_right(&layout, true, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &SwitcherAcrossBack, window, cx| {
+                    let layout = this.switcher_layout(cx);
+                    this.switcher_step_right(&layout, false, window, cx);
+                }))
                 .on_key_down(cx.listener(Self::on_switcher_key))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1537,6 +1581,7 @@ impl Tty7App {
             .overflow_hidden()
             .cursor_pointer()
             .when(picked, |r| r.bg(gpui::rgb(rungs(cx).pressed)))
+            .anchor_scroll(self.switcher_anchor(Column::Left, picked))
             .hover(move |r| r.bg(hover))
             .child(glyph_col(
                 GUTTER,
@@ -1710,6 +1755,7 @@ impl Tty7App {
             .overflow_hidden()
             .cursor_pointer()
             .when(picked, |r| r.bg(gpui::rgb(sf.pressed)))
+            .anchor_scroll(self.switcher_anchor(Column::Left, picked))
             .hover(move |r| r.bg(hover))
             .child(crate::ui::tab_strip::workspace_avatar(
                 &row.name,
@@ -1826,6 +1872,7 @@ impl Tty7App {
                 .rounded(px(6.))
                 .cursor_pointer()
                 .when(at(Nav::OthersHeader), |r| r.bg(picked))
+                .anchor_scroll(self.switcher_anchor(Column::Left, at(Nav::OthersHeader)))
                 .hover(move |r| r.bg(hover))
                 .child(glyph_col(
                     GUTTER,
@@ -1877,6 +1924,7 @@ impl Tty7App {
                         .overflow_hidden()
                         .cursor_pointer()
                         .when(at(Nav::Other(i)), |r| r.bg(picked))
+                        .anchor_scroll(self.switcher_anchor(Column::Left, at(Nav::Other(i))))
                         .hover(move |r| r.bg(hover))
                         .child(glyph_col(
                             ROW_AVATAR,
@@ -2048,6 +2096,7 @@ impl Tty7App {
                     .overflow_hidden()
                     .cursor_pointer()
                     .when(picked, |r| r.bg(picked_bg))
+                    .anchor_scroll(self.switcher_anchor(Column::Right, picked))
                     .hover(move |r| r.bg(hover))
                     .child(self.tab_avatar(
                         ("switcher-avatar", index),

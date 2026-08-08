@@ -21,6 +21,18 @@ pub fn init(cx: &mut App) {
     bindings.push(KeyBinding::new("secondary-+", IncreaseFontSize, None));
     bindings.push(KeyBinding::new("tab", SendTab, Some("Terminal")));
     bindings.push(KeyBinding::new("shift-tab", SendBackTab, Some("Terminal")));
+    // The switcher's footer tells you Tab is the way across to the tab column
+    // once a query is in the box. gpui-component's Root binds `tab` to its
+    // focus walker, actions are dispatched before key listeners, and the panel
+    // was therefore losing every Tab to the ellipsis button in its own header —
+    // ring and all. A binding on the panel's own context is deeper in the
+    // dispatch path, so it wins.
+    bindings.push(KeyBinding::new("tab", SwitcherAcross, Some("Switcher")));
+    bindings.push(KeyBinding::new(
+        "shift-tab",
+        SwitcherAcrossBack,
+        Some("Switcher"),
+    ));
     cx.bind_keys(bindings);
     cx.set_global(BoundKeystrokes(bound_keystrokes(&effective)));
 
