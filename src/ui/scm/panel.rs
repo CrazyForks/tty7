@@ -11,10 +11,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{AnyElement, Context, SharedString, Window, div, prelude::*, px};
-use gpui_component::{ActiveTheme as _, Icon, IconName, h_flex, v_flex};
+use gpui_component::button::Button;
+use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_component::{ActiveTheme as _, Disableable as _, Icon, IconName, h_flex, v_flex};
 
 use tty7_core::core::git::diff::MAX_RENDERED_FILES;
-use tty7_core::core::git::status::{ChangeCode, DecoStatus, StatusEntry, WorkingTreeStatus};
+use tty7_core::core::git::ops::GitOp;
+use tty7_core::core::git::status::{
+    ChangeCode, DecoStatus, RepoPath, StatusEntry, WorkingTreeStatus,
+};
 
 use crate::terminal::git_data::status_of;
 use crate::terminal::git_diff::DiffSource;
@@ -37,6 +42,14 @@ const BADGE_W: f32 = 14.;
 /// Rows are laid out inside this inset and then pad themselves back out, so a
 /// hovered row's background is wider than its text on both sides.
 const ROW_INSET: f32 = 4.;
+
+/// The row-button tile, one step below `TILE_SIZE_SM`.
+///
+/// These belong next to the other tile sizes in `app.rs`; they are here
+/// because that file is being rewritten elsewhere this cycle, and moving them
+/// is a one-line change once it settles.
+pub(crate) const TILE_SIZE_XS: f32 = 18.;
+pub(crate) const TILE_GLYPH_XS: f32 = 11.;
 
 /// Untracked files past this many start folded. A fresh clone of a repository
 /// with a stale `.gitignore` can put thousands of them in front of the three
@@ -103,10 +116,11 @@ impl Tty7App {
             return self.scm_shell(title, body);
         };
 
-        self.scm.repo = Some(RepoKey {
+        let repo = RepoKey {
             host: host.id(),
-            root: root.clone(),
-        });
+            root,
+        };
+        self.scm.repo = Some(repo.clone());
 
         let count = (status.total_entries > 0).then(|| status.total_entries.to_string());
         let title = self.panel_title(t(L10nKey::PanelScmTitle), count, None, window, cx);
@@ -120,7 +134,7 @@ impl Tty7App {
             return self.scm_shell(title, body);
         }
 
-        let body = self.scm_groups(&host, &root, &status, cx);
+        let body = self.scm_groups(&repo, &status, cx);
         self.scm_shell(title, body)
     }
 
@@ -264,8 +278,7 @@ impl Tty7App {
 
     fn scm_groups(
         &mut self,
-        host: &SharedHost,
-        root: &Path,
+        repo: &RepoKey,
         status: &Arc<WorkingTreeStatus>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -280,13 +293,13 @@ impl Tty7App {
                 continue;
             }
             let collapsed = self.scm.group_collapsed(group, entries.len());
-            list = list.child(self.scm_group_header(group, entries.len(), collapsed, cx));
+            list = list.child(self.scm_group_header(repo, group, &entries, collapsed, cx));
             if collapsed {
                 continue;
             }
             let shown = entries.len().min(MAX_RENDERED_FILES);
             for entry in entries.iter().take(shown) {
-                list = list.child(self.scm_file_row(host, root, group, entry, cx));
+                list = list.child(self.scm_file_row(repo, group, entry, cx));
             }
             if entries.len() > shown {
                 list = list.child(self.scm_note(
@@ -322,15 +335,21 @@ impl Tty7App {
 
     fn scm_group_header(
         &self,
+        repo: &RepoKey,
         group: ScmGroup,
-        count: usize,
+        entries: &[&StatusEntry],
         collapsed: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let count = entries.len();
         let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
         let mono = cx.theme().mono_font_family.clone();
+        let id = SharedString::from(format!("scm-group-{group:?}"));
+        let actions = self.scm_group_actions(&id, repo, group, entries, sf.hover, cx);
         h_flex()
-            .id(SharedString::from(format!("scm-group-{group:?}")))
+            .id(id.clone())
+            .group(id)
+            .relative()
             .items_center()
             .gap(px(8.))
             .h(px(ROW_H))
@@ -377,13 +396,13 @@ impl Tty7App {
                     .text_color(cx.theme().muted_foreground.opacity(0.75))
                     .child(count.to_string()),
             )
+            .child(actions)
             .into_any_element()
     }
 
     fn scm_file_row(
         &self,
-        host: &SharedHost,
-        root: &Path,
+        repo: &RepoKey,
         group: ScmGroup,
         entry: &StatusEntry,
         cx: &mut Context<Self>,
@@ -393,11 +412,22 @@ impl Tty7App {
         let path = entry.path.as_str().to_string();
         let (name, dir) = split_display_path(&path);
         let (letter, deco) = row_status(entry, group);
-        let selected = self.diff_overlay_focus(host.id(), root) == Some(path.as_str());
+        let selected = self.diff_overlay_focus(repo.host, &repo.root) == Some(path.as_str());
         let source = group_diff_source(group);
+        let id = SharedString::from(format!("scm-row-{group:?}-{path}"));
+        let actions = self.scm_row_actions(
+            &id,
+            repo,
+            group,
+            entry,
+            if selected { sf.selected } else { sf.hover },
+            cx,
+        );
 
         h_flex()
-            .id(SharedString::from(format!("scm-row-{group:?}-{path}")))
+            .id(id.clone())
+            .group(id)
+            .relative()
             .items_center()
             .gap(px(8.))
             .h(px(ROW_H))
@@ -408,19 +438,26 @@ impl Tty7App {
             .hover(|s| s.bg(gpui::rgb(sf.hover)))
             .when(selected, |s| s.bg(gpui::rgb(sf.selected)))
             .on_click({
-                let host_id = host.id();
-                let root = root.to_path_buf();
+                let repo = repo.clone();
                 let path = path.clone();
                 cx.listener(move |this, _, window, cx| {
                     this.open_diff_overlay(
-                        host_id,
-                        root.clone(),
+                        repo.host,
+                        repo.root.clone(),
                         source.clone(),
                         Some(path.clone()),
                         window,
                         cx,
                     );
                 })
+            })
+            .context_menu({
+                let app = cx.entity().downgrade();
+                let repo = repo.clone();
+                let entry = entry.clone();
+                move |menu, _window, cx| {
+                    Self::scm_row_context_menu(menu, &app, &repo, group, &entry, cx)
+                }
             })
             .child(git_badge(letter, status_color(deco, cx), &mono))
             .child(
@@ -449,7 +486,263 @@ impl Tty7App {
                         .child(dir.to_string()),
                 )
             })
+            .child(actions)
             .into_any_element()
+    }
+
+    /// The buttons that appear over a hovered row.
+    ///
+    /// Absolutely positioned and opaque, so they cover the tail of the
+    /// directory rather than pushing it aside: hovering a row must not move a
+    /// single pixel of it, or the list crawls under the pointer.
+    fn scm_row_actions(
+        &self,
+        row: &SharedString,
+        repo: &RepoKey,
+        group: ScmGroup,
+        entry: &StatusEntry,
+        backing: u32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // A path git cannot be given is a path nothing can be done to. The
+        // row stays readable and the buttons say why they are dead.
+        let writable = entry.path.pathspec().is_some();
+        let path = entry.path.as_str();
+        let mut actions = h_flex()
+            .occlude()
+            .absolute()
+            .right(px(ROW_INSET))
+            .top_0()
+            .bottom_0()
+            .items_center()
+            .gap(px(1.))
+            .bg(gpui::rgb(backing))
+            .invisible()
+            .group_hover(row.clone(), |s| s.visible());
+
+        for &(verb, ref icon) in row_verbs(group) {
+            let id = SharedString::from(format!("scm-{verb:?}-{group:?}-{path}"));
+            let repo = repo.clone();
+            let entry = entry.clone();
+            actions = actions.child(
+                self.scm_tile(id, icon.clone(), verb_tooltip(verb), writable, cx)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.scm_row_verb(verb, &repo, group, &entry, window, cx);
+                    })),
+            );
+        }
+        actions.into_any_element()
+    }
+
+    fn scm_group_actions(
+        &self,
+        row: &SharedString,
+        repo: &RepoKey,
+        group: ScmGroup,
+        entries: &[&StatusEntry],
+        backing: u32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let paths = writable_paths(entries);
+        let mut actions = h_flex()
+            .occlude()
+            .absolute()
+            .right(px(ROW_INSET))
+            .top_0()
+            .bottom_0()
+            .items_center()
+            .gap(px(1.))
+            .bg(gpui::rgb(backing))
+            .invisible()
+            .group_hover(row.clone(), |s| s.visible());
+
+        for &(verb, ref icon) in group_verbs(group) {
+            let id = SharedString::from(format!("scm-all-{verb:?}-{group:?}"));
+            let repo = repo.clone();
+            let paths = paths.clone();
+            actions = actions.child(
+                self.scm_tile(
+                    id,
+                    icon.clone(),
+                    verb_all_tooltip(verb),
+                    !paths.is_empty(),
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    let Some(op) = verb_op(verb, group, paths.clone()) else {
+                        return;
+                    };
+                    this.scm_op(repo.clone(), op, window, cx);
+                })),
+            );
+        }
+        actions.into_any_element()
+    }
+
+    /// An 18px tile. Smaller than `TILE_SIZE_SM`, because three of those on a
+    /// row would eat 72 of the 236px a file name has to live in.
+    fn scm_tile(
+        &self,
+        id: SharedString,
+        icon: IconName,
+        tooltip: &'static str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        crate::ui::tab_strip::chrome_tile_sized(
+            Button::new(id).icon(Icon::new(icon.clone())),
+            TILE_SIZE_XS,
+            TILE_GLYPH_XS,
+            false,
+            cx,
+        )
+        .rounded(px(4.))
+        .disabled(!enabled)
+        .tooltip(if enabled {
+            tooltip
+        } else {
+            t(L10nKey::ScmUnrepresentablePath)
+        })
+    }
+
+    fn scm_row_verb(
+        &mut self,
+        verb: RowVerb,
+        repo: &RepoKey,
+        group: ScmGroup,
+        entry: &StatusEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if verb == RowVerb::OpenConflict {
+            self.open_diff_overlay(
+                repo.host,
+                repo.root.clone(),
+                group_diff_source(group),
+                Some(entry.path.as_str().to_string()),
+                window,
+                cx,
+            );
+            return;
+        }
+        let Some(op) = verb_op(verb, group, vec![entry.path.clone()]) else {
+            return;
+        };
+        self.scm_op(repo.clone(), op, window, cx);
+    }
+
+    fn scm_row_context_menu(
+        menu: PopupMenu,
+        app: &gpui::WeakEntity<Self>,
+        repo: &RepoKey,
+        group: ScmGroup,
+        entry: &StatusEntry,
+        cx: &gpui::App,
+    ) -> PopupMenu {
+        let danger = cx.theme().danger;
+        let rel = entry.path.as_str().to_string();
+        let absolute = repo.root.join(&rel);
+        let source = group_diff_source(group);
+        let staged = group == ScmGroup::Staged;
+
+        let mut menu = menu
+            .min_w(px(200.))
+            .item(
+                PopupMenuItem::new(t(L10nKey::FileTreeContextOpen)).on_click({
+                    let app = app.clone();
+                    let absolute = absolute.clone();
+                    move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| {
+                            this.open_file_in_editor(&absolute, window, cx)
+                        });
+                    }
+                }),
+            )
+            .item(PopupMenuItem::new(t(L10nKey::ScmOpenChanges)).on_click({
+                let app = app.clone();
+                let repo = repo.clone();
+                let rel = rel.clone();
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.open_diff_overlay(
+                            repo.host,
+                            repo.root.clone(),
+                            source.clone(),
+                            Some(rel.clone()),
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            }))
+            .separator()
+            .item(
+                PopupMenuItem::new(if staged {
+                    t(L10nKey::ScmUnstage)
+                } else {
+                    t(L10nKey::ScmStage)
+                })
+                .on_click({
+                    let app = app.clone();
+                    let repo = repo.clone();
+                    let paths = vec![entry.path.clone()];
+                    move |_, window, cx| {
+                        let op = if staged {
+                            GitOp::Unstage {
+                                paths: paths.clone(),
+                            }
+                        } else {
+                            GitOp::Stage {
+                                paths: paths.clone(),
+                            }
+                        };
+                        let _ =
+                            app.update(cx, |this, cx| this.scm_op(repo.clone(), op, window, cx));
+                    }
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(t(L10nKey::FileTreeContextCopyPath)).on_click({
+                    let absolute = absolute.clone();
+                    move |_, _window, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            absolute.display().to_string(),
+                        ));
+                    }
+                }),
+            );
+
+        // Revealing a path only means anything on the machine the window is
+        // running on; a remote repository's paths are not this filesystem's.
+        if repo.host == HostId::LOCAL {
+            menu = menu.item(
+                PopupMenuItem::new(crate::ui::right_panel::reveal_label()).on_click({
+                    let absolute = absolute.clone();
+                    move |_, _window, cx| cx.reveal_path(&absolute)
+                }),
+            );
+        }
+
+        if let Some(op) = verb_op(RowVerb::Discard, group, vec![entry.path.clone()]) {
+            menu = menu.separator().item(
+                PopupMenuItem::element(move |_window, _cx| {
+                    div().text_color(danger).child(t(L10nKey::ScmDiscard))
+                })
+                .on_click({
+                    let app = app.clone();
+                    let repo = repo.clone();
+                    move |_, window, cx| {
+                        let op = op.clone();
+                        let _ =
+                            app.update(cx, |this, cx| this.scm_op(repo.clone(), op, window, cx));
+                    }
+                }),
+            );
+        }
+        menu
     }
 
     /// What `app.rs`'s `GitStatusCache` observer calls when the cheap
@@ -575,6 +868,97 @@ fn group_label(group: ScmGroup) -> L10nKey {
 /// Whether a group nobody has touched starts folded.
 pub(crate) fn starts_collapsed(group: ScmGroup, count: usize) -> bool {
     group == ScmGroup::Untracked && count > UNTRACKED_AUTO_COLLAPSE
+}
+
+/// What a row's buttons do. Named rather than inlined because the same verb
+/// appears on the row, on its group header and in its context menu, and the
+/// three must not drift into meaning different things.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowVerb {
+    Discard,
+    Stage,
+    Unstage,
+    OpenConflict,
+    MarkResolved,
+}
+
+/// Right to left, most-used last: the pointer travels to the right edge, so
+/// the button under it should be the one nine hovers out of ten want.
+pub(crate) fn row_verbs(group: ScmGroup) -> &'static [(RowVerb, IconName)] {
+    match group {
+        ScmGroup::Merge => &[
+            (RowVerb::OpenConflict, IconName::Eye),
+            (RowVerb::MarkResolved, IconName::Check),
+        ],
+        ScmGroup::Staged => &[(RowVerb::Unstage, IconName::Minus)],
+        ScmGroup::Changes | ScmGroup::Untracked => &[
+            (RowVerb::Discard, IconName::Undo2),
+            (RowVerb::Stage, IconName::Plus),
+        ],
+    }
+}
+
+/// The header's buttons are the row's, minus the ones that only make sense
+/// for one file: there is no group-wide "open the conflict".
+pub(crate) fn group_verbs(group: ScmGroup) -> &'static [(RowVerb, IconName)] {
+    match group {
+        ScmGroup::Merge => &[(RowVerb::MarkResolved, IconName::Check)],
+        _ => row_verbs(group),
+    }
+}
+
+/// The operation a verb runs over one or many paths. `None` for the verbs
+/// that change no state.
+pub(crate) fn verb_op(verb: RowVerb, group: ScmGroup, paths: Vec<RepoPath>) -> Option<GitOp> {
+    if paths.is_empty() {
+        return None;
+    }
+    Some(match verb {
+        // Resolving a conflict is `git add`, exactly as it is on the command
+        // line — there is no separate "resolve" verb in git.
+        RowVerb::Stage | RowVerb::MarkResolved => GitOp::Stage { paths },
+        RowVerb::Unstage => GitOp::Unstage { paths },
+        RowVerb::Discard if group == ScmGroup::Untracked => {
+            let directories = paths.iter().any(|p| p.as_str().ends_with('/'));
+            GitOp::DiscardUntracked { paths, directories }
+        }
+        RowVerb::Discard => GitOp::DiscardWorktree { paths },
+        RowVerb::OpenConflict => return None,
+    })
+}
+
+/// The paths in a group git can actually be told about.
+///
+/// A path that is not valid UTF-8 cannot be sent as a pathspec at all, and
+/// `GitOp::validate` rejects the whole operation over one of them — so a group
+/// action has to leave them out rather than fail for everyone. Their own rows
+/// are greyed out and say why.
+pub(crate) fn writable_paths(entries: &[&StatusEntry]) -> Vec<RepoPath> {
+    entries
+        .iter()
+        .filter(|e| e.path.pathspec().is_some())
+        .map(|e| e.path.clone())
+        .collect()
+}
+
+fn verb_tooltip(verb: RowVerb) -> &'static str {
+    t(match verb {
+        RowVerb::Discard => L10nKey::ScmDiscard,
+        RowVerb::Stage => L10nKey::ScmStage,
+        RowVerb::Unstage => L10nKey::ScmUnstage,
+        RowVerb::OpenConflict => L10nKey::ScmOpenConflict,
+        RowVerb::MarkResolved => L10nKey::ScmMarkResolved,
+    })
+}
+
+fn verb_all_tooltip(verb: RowVerb) -> &'static str {
+    t(match verb {
+        RowVerb::Discard => L10nKey::ScmDiscardAll,
+        RowVerb::Stage => L10nKey::ScmStageAll,
+        RowVerb::Unstage => L10nKey::ScmUnstageAll,
+        RowVerb::OpenConflict => L10nKey::ScmOpenConflict,
+        RowVerb::MarkResolved => L10nKey::ScmMarkResolved,
+    })
 }
 
 #[cfg(test)]
@@ -710,6 +1094,102 @@ mod tests {
         ));
         for group in [ScmGroup::Merge, ScmGroup::Staged, ScmGroup::Changes] {
             assert!(!starts_collapsed(group, 1_000));
+        }
+    }
+
+    #[test]
+    fn every_button_a_row_offers_maps_to_the_verb_it_is_named_for() {
+        let file = vec![RepoPath::from_bytes(b"a.rs")];
+        assert!(matches!(
+            verb_op(RowVerb::Stage, ScmGroup::Changes, file.clone()),
+            Some(GitOp::Stage { .. })
+        ));
+        assert!(matches!(
+            verb_op(RowVerb::Unstage, ScmGroup::Staged, file.clone()),
+            Some(GitOp::Unstage { .. })
+        ));
+        // Resolving a conflict is `git add`; git has no other verb for it.
+        assert!(matches!(
+            verb_op(RowVerb::MarkResolved, ScmGroup::Merge, file.clone()),
+            Some(GitOp::Stage { .. })
+        ));
+        assert!(matches!(
+            verb_op(RowVerb::Discard, ScmGroup::Changes, file.clone()),
+            Some(GitOp::DiscardWorktree { .. })
+        ));
+        // `checkout --` cannot restore a file git has never heard of.
+        assert!(matches!(
+            verb_op(RowVerb::Discard, ScmGroup::Untracked, file.clone()),
+            Some(GitOp::DiscardUntracked {
+                directories: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            verb_op(
+                RowVerb::Discard,
+                ScmGroup::Untracked,
+                vec![RepoPath::from_bytes(b"vendor/")]
+            ),
+            Some(GitOp::DiscardUntracked {
+                directories: true,
+                ..
+            })
+        ));
+        assert!(verb_op(RowVerb::OpenConflict, ScmGroup::Merge, file).is_none());
+        assert!(verb_op(RowVerb::Stage, ScmGroup::Changes, Vec::new()).is_none());
+    }
+
+    #[test]
+    fn everything_that_can_lose_work_says_so_before_it_runs() {
+        // The gate in `scm_op` keys off `destructive()`. If one of these ever
+        // stopped reporting, the panel would throw the work away in silence.
+        let paths = vec![RepoPath::from_bytes(b"a.rs")];
+        for group in [ScmGroup::Changes, ScmGroup::Untracked] {
+            let op = verb_op(RowVerb::Discard, group, paths.clone()).expect("discard has an op");
+            assert!(op.destructive().is_some(), "{group:?} discard");
+        }
+        // Staging and unstaging are reversible, so they must not stop to ask.
+        for verb in [RowVerb::Stage, RowVerb::Unstage, RowVerb::MarkResolved] {
+            let op = verb_op(verb, ScmGroup::Changes, paths.clone()).expect("verb has an op");
+            assert!(op.destructive().is_none(), "{verb:?}");
+        }
+    }
+
+    #[test]
+    fn a_group_action_leaves_out_the_paths_git_cannot_be_told_about() {
+        let good = entry(
+            "a.rs",
+            ChangeCode::None,
+            ChangeCode::Modified,
+            EntryKind::Tracked,
+        );
+        let mut bad = good.clone();
+        bad.path = RepoPath::from_bytes(&[0xff, 0xfe, b'.', b'r', b's']);
+        assert!(bad.path.pathspec().is_none(), "the fixture must be lossy");
+
+        let paths = writable_paths(&[&good, &bad]);
+        assert_eq!(paths.len(), 1, "the lossy path is dropped, not carried");
+        // One unrepresentable path would otherwise fail the operation for the
+        // whole group.
+        let op = verb_op(RowVerb::Stage, ScmGroup::Changes, paths).expect("still has work to do");
+        assert!(op.validate().is_ok());
+
+        let all_bad = verb_op(RowVerb::Stage, ScmGroup::Changes, writable_paths(&[&bad]));
+        assert!(all_bad.is_none(), "nothing to do means no operation at all");
+    }
+
+    #[test]
+    fn a_group_header_offers_no_button_that_only_makes_sense_for_one_file() {
+        let verbs: Vec<RowVerb> = group_verbs(ScmGroup::Merge)
+            .iter()
+            .map(|(v, _)| *v)
+            .collect();
+        assert_eq!(verbs, vec![RowVerb::MarkResolved]);
+        for group in [ScmGroup::Staged, ScmGroup::Changes, ScmGroup::Untracked] {
+            for (verb, _) in group_verbs(group) {
+                assert_ne!(*verb, RowVerb::OpenConflict);
+            }
         }
     }
 
