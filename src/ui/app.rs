@@ -4918,6 +4918,28 @@ impl Tty7App {
         self.run_agent_hooks_action(agent, false, cx);
     }
 
+    /// Words a hook install or removal for the note in Settings.
+    ///
+    /// `agent_hooks` returns what it did rather than a sentence, because it
+    /// lives in `tty7-core` and cannot reach `src/ui/i18n` — it used to hand
+    /// back English prose, which a Chinese or Japanese UI then showed as-is.
+    fn agent_hooks_outcome_msg(outcome: &crate::core::agent_hooks::HookOutcome) -> String {
+        use crate::core::agent_hooks::HookOutcome as O;
+        match outcome {
+            O::Installed => t(L10nKey::AppAgentHooksInstalled).to_string(),
+            O::InstalledEnableCodexThere => {
+                t(L10nKey::AppAgentHooksInstalledEnableCodexThere).to_string()
+            }
+            O::InstalledCodexEnableFailed(e) => t_fmt(
+                L10nKey::AppAgentHooksInstalledCodexEnableFailed,
+                &[("error", e)],
+            ),
+            O::Removed => t(L10nKey::AppAgentHooksRemoved).to_string(),
+            O::NothingInstalled => t(L10nKey::AppAgentHooksNothingInstalled).to_string(),
+            O::NoTty7Hooks => t(L10nKey::AppAgentHooksNoTty7Hooks).to_string(),
+        }
+    }
+
     fn run_agent_hooks_action(
         &mut self,
         agent: crate::core::agent_hooks::HookAgent,
@@ -4961,10 +4983,18 @@ impl Tty7App {
                     s.agent_hooks_note = Some((
                         agent,
                         match result {
-                            Ok(summary) => summary,
-                            Err(e) => {
-                                t_fmt(L10nKey::AppAgentHooksOpFailed, &[("error", &e.to_string())])
-                            }
+                            Ok(outcome) => Self::agent_hooks_outcome_msg(&outcome),
+                            // Every sibling error names its action; this one
+                            // said only "Failed:", leaving the note that
+                            // reports it silent about which half of the
+                            // toggle had not happened.
+                            Err(e) => t_fmt(
+                                match install {
+                                    true => L10nKey::AppAgentHooksInstallFailed,
+                                    false => L10nKey::AppAgentHooksRemoveFailed,
+                                },
+                                &[("error", &e.to_string())],
+                            ),
                         },
                     ));
                 }

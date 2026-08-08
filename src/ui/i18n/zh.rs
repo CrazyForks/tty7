@@ -1197,7 +1197,18 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
             "未连接到这台机器，因此无法读取或写入其 agent 配置。请在其上打开一个工作区后再回来。"
         }
         L10nKey::AppAgentHooksHomeDirUnresolved => "无法解析主目录",
-        L10nKey::AppAgentHooksOpFailed => "失败：{error}",
+        L10nKey::AppAgentHooksInstalled => "已安装",
+        L10nKey::AppAgentHooksInstalledEnableCodexThere => {
+            "已安装 —— 需要在那台机器上运行一次 `codex features enable hooks`"
+        }
+        L10nKey::AppAgentHooksInstalledCodexEnableFailed => {
+            "已安装，但无法运行 `codex features enable hooks`（{error}）—— 请手动运行一次"
+        }
+        L10nKey::AppAgentHooksRemoved => "已移除",
+        L10nKey::AppAgentHooksNothingInstalled => "没有安装任何内容，无需移除",
+        L10nKey::AppAgentHooksNoTty7Hooks => "没有找到 tty7 钩子，无需移除",
+        L10nKey::AppAgentHooksInstallFailed => "无法安装钩子：{error}",
+        L10nKey::AppAgentHooksRemoveFailed => "无法移除钩子：{error}",
         L10nKey::AppKeybindingDisplacedNote => {
             "{action} 占用了原属于 {previous} 的快捷键，{previous} 现在没有快捷键了。"
         }

@@ -1303,7 +1303,22 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
             "このマシンに接続されていないため、エージェントの設定を読み書きできません。そのマシンでワークスペースを開いてから戻ってください"
         }
         L10nKey::AppAgentHooksHomeDirUnresolved => "ホームディレクトリを解決できません",
-        L10nKey::AppAgentHooksOpFailed => "失敗: {error}",
+        L10nKey::AppAgentHooksInstalled => "インストール済み",
+        L10nKey::AppAgentHooksInstalledEnableCodexThere => {
+            "インストール済み — そのマシンで `codex features enable hooks` を一度実行してください"
+        }
+        L10nKey::AppAgentHooksInstalledCodexEnableFailed => {
+            "インストール済みですが `codex features enable hooks` を実行できませんでした ({error}) — 手動で一度実行してください"
+        }
+        L10nKey::AppAgentHooksRemoved => "削除済み",
+        L10nKey::AppAgentHooksNothingInstalled => {
+            "インストールされていないため、削除するものはありません"
+        }
+        L10nKey::AppAgentHooksNoTty7Hooks => {
+            "tty7 のフックが見つからないため、削除するものはありません"
+        }
+        L10nKey::AppAgentHooksInstallFailed => "フックをインストールできませんでした: {error}",
+        L10nKey::AppAgentHooksRemoveFailed => "フックを削除できませんでした: {error}",
         L10nKey::AppKeybindingDisplacedNote => {
             "{action} が {previous} からショートカットを奪いました。{previous} は現在未設定です"
         }

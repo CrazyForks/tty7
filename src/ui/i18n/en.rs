@@ -1261,7 +1261,18 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "Not connected to this machine, so its agent config can't be read or written. Open a workspace on it and come back."
         }
         L10nKey::AppAgentHooksHomeDirUnresolved => "cannot resolve home directory",
-        L10nKey::AppAgentHooksOpFailed => "Failed: {error}",
+        L10nKey::AppAgentHooksInstalled => "Installed",
+        L10nKey::AppAgentHooksInstalledEnableCodexThere => {
+            "Installed — run `codex features enable hooks` once on that machine"
+        }
+        L10nKey::AppAgentHooksInstalledCodexEnableFailed => {
+            "Installed, but could not run `codex features enable hooks` ({error}) — run it once manually"
+        }
+        L10nKey::AppAgentHooksRemoved => "Removed",
+        L10nKey::AppAgentHooksNothingInstalled => "Nothing installed; nothing to remove",
+        L10nKey::AppAgentHooksNoTty7Hooks => "No tty7 hooks found; nothing to remove",
+        L10nKey::AppAgentHooksInstallFailed => "Could not install hooks: {error}",
+        L10nKey::AppAgentHooksRemoveFailed => "Could not remove hooks: {error}",
         L10nKey::AppKeybindingDisplacedNote => {
             "{action} took the shortcut from {previous}, which is now unset."
         }
