@@ -67,10 +67,15 @@ impl Tty7App {
         let keys: Rc<Vec<Option<PathBuf>>> = Rc::new(self.sidebar_group_keys(cx));
         let sections = sidebar_sections(&keys);
 
+        // ⌘N runs ActivateTabN, which goes through `activate_visual` — the
+        // Nth row as the sidebar lays it out, not the Nth tab in `self.tabs`.
+        // The badge has to be read off the same order or it names a chord that
+        // opens a different tab, so take it from `visual_tab_order` rather than
+        // flattening `sections` a second time here.
         let badge_pos: Vec<usize> = {
             let mut pos = vec![0usize; self.tabs.len()];
-            for (n, i) in sections.iter().flat_map(|s| s.tabs.iter()).enumerate() {
-                pos[*i] = n;
+            for (n, i) in self.visual_tab_order(cx).into_iter().enumerate() {
+                pos[i] = n;
             }
             pos
         };
@@ -1014,6 +1019,40 @@ mod tests {
         assert_eq!(flat.len(), 1);
         assert_eq!(flat[0].name, None);
         assert_eq!(flat[0].tabs, vec![0, 1]);
+    }
+
+    /// The badge on a row and the tab ⌘N opens are two readings of one order,
+    /// taken in two places. Grouping makes them diverge from `self.tabs`
+    /// order — tab 3 sits in the second row here — so if they are ever read
+    /// off different things, the badge names a chord that opens another tab.
+    #[test]
+    fn a_row_badge_names_the_chord_that_opens_that_row() {
+        let keys = vec![
+            Some(p("/w/beta")),
+            None,
+            Some(p("/w/alpha")),
+            Some(p("/w/beta")),
+        ];
+        // What `visual_tab_order` returns for a left tab bar.
+        let order: Vec<usize> = sidebar_sections(&keys)
+            .into_iter()
+            .flat_map(|s| s.tabs)
+            .collect();
+        assert_eq!(order, vec![0, 3, 2, 1]);
+
+        let mut badge_pos = vec![0usize; keys.len()];
+        for (n, i) in order.iter().copied().enumerate() {
+            badge_pos[i] = n;
+        }
+        for (row, tab) in order.iter().copied().enumerate() {
+            // ActivateTabN → activate_visual(N - 1) → order[N - 1].
+            let chord = tab_badge_label(badge_pos[tab]);
+            let opens = order[badge_pos[tab]];
+            assert_eq!(
+                opens, tab,
+                "row {row} badges ⌘{chord}, which opens tab {opens}"
+            );
+        }
     }
 
     #[test]
