@@ -180,7 +180,16 @@ impl Tty7App {
             .child(field(t(L10nKey::WorktreePromptBase), &p.base))
             .child(
                 h_flex()
+                    .justify_end()
                     .gap_2()
+                    .child(
+                        Button::new("worktree-cancel")
+                            .label(t(L10nKey::Cancel))
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel_worktree_prompt(window, cx)
+                            })),
+                    )
                     .child(
                         Button::new("worktree-create")
                             .label(if p.busy {
@@ -193,14 +202,6 @@ impl Tty7App {
                             .disabled(p.busy)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submit_worktree_prompt(window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("worktree-cancel")
-                            .label(t(L10nKey::Cancel))
-                            .small()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.cancel_worktree_prompt(window, cx)
                             })),
                     ),
             );

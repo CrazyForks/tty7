@@ -725,7 +725,16 @@ impl Tty7App {
                 )
                 .child(
                     h_flex()
+                        .justify_end()
                         .gap_2()
+                        .child(
+                            Button::new("ssh-hk-abort")
+                                .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Abort))
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.cancel_ssh_prompt(window, cx)
+                                })),
+                        )
                         .child(
                             Button::new("ssh-hk-trust")
                                 .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Trust))
@@ -733,14 +742,6 @@ impl Tty7App {
                                 .primary()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.trust_ssh_host_key(window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("ssh-hk-abort")
-                                .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Abort))
-                                .small()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.cancel_ssh_prompt(window, cx)
                                 })),
                         ),
                 ),
@@ -780,7 +781,19 @@ impl Tty7App {
                 .child(self.render_ssh_input(0))
                 .child(
                     h_flex()
+                        .justify_end()
                         .gap_2()
+                        // Abort stays the emphasized one and now also sits
+                        // where the eye lands last: a changed host key is the
+                        // one prompt where the safe answer wants both.
+                        .child(
+                            Button::new("ssh-hkc-override")
+                                .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Override))
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_ssh_prompt(window, cx)
+                                })),
+                        )
                         .child(
                             Button::new("ssh-hkc-abort")
                                 .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Abort))
@@ -788,14 +801,6 @@ impl Tty7App {
                                 .primary()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.cancel_ssh_prompt(window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("ssh-hkc-override")
-                                .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Override))
-                                .small()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.submit_ssh_prompt(window, cx)
                                 })),
                         ),
                 ),
@@ -824,10 +829,23 @@ impl Tty7App {
             .into_any_element()
     }
 
+    /// The action sits on the right, backing out on its left.
+    ///
+    /// `ui::confirm_answers` settled that arrangement for every native alert
+    /// the app raises; a sheet the app draws itself has no reason to mirror it.
     fn render_ssh_actions(&self, submit_label: &str, cx: &mut Context<Self>) -> AnyElement {
         let submit_label = submit_label.to_string();
         h_flex()
+            .justify_end()
             .gap_2()
+            .child(
+                Button::new("ssh-cancel")
+                    .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Cancel))
+                    .small()
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.cancel_ssh_prompt(window, cx)),
+                    ),
+            )
             .child(
                 Button::new("ssh-submit")
                     .label(submit_label)
@@ -835,14 +853,6 @@ impl Tty7App {
                     .primary()
                     .on_click(
                         cx.listener(|this, _, window, cx| this.submit_ssh_prompt(window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("ssh-cancel")
-                    .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Cancel))
-                    .small()
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.cancel_ssh_prompt(window, cx)),
                     ),
             )
             .into_any_element()
