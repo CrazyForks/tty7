@@ -191,13 +191,21 @@ impl Tty7App {
                             .items_center()
                             .gap_1p5()
                             .when_some(git_cwd, |counts, (host, cwd)| {
-                                counts.cursor_pointer().on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_diff_overlay(host, cwd.clone(), window, cx);
-                                    }),
-                                )
+                                // A click target inside a click target: the row
+                                // highlights as a whole, which says nothing
+                                // about the counts being their own button. The
+                                // underline the SFTP breadcrumb uses for
+                                // clickable text says where this one starts.
+                                counts
+                                    .cursor_pointer()
+                                    .hover(|s| s.underline())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_diff_overlay(host, cwd.clone(), window, cx);
+                                        }),
+                                    )
                             });
                         if g.added > 0 {
                             counts = counts.child(
