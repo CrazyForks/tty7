@@ -1137,6 +1137,7 @@ impl Render for PaletteView {
             .justify_center()
             .pt(px(120.))
             .bg(scrim)
+            .key_context("Palette")
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
                 let ks = &ev.keystroke;
                 if is_edit_gesture(ks) {

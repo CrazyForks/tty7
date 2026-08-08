@@ -33,6 +33,11 @@ pub fn init(cx: &mut App) {
         SwitcherAcrossBack,
         Some("Switcher"),
     ));
+    // The palette has nowhere for Tab to go — the arrows walk the list and
+    // Enter runs it — but Root's focus walker still had somewhere to send it:
+    // out of the modal, onto whichever chrome tile is behind it, ring and all.
+    bindings.push(KeyBinding::new("tab", NoAction {}, Some("Palette")));
+    bindings.push(KeyBinding::new("shift-tab", NoAction {}, Some("Palette")));
     cx.bind_keys(bindings);
     cx.set_global(BoundKeystrokes(bound_keystrokes(&effective)));
 
