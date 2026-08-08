@@ -1128,27 +1128,42 @@ impl Tty7App {
             .flex_row()
             .items_stretch()
             .h(px(body_h))
+            // Both columns scroll once the lists outrun the card, and neither
+            // said so. The border moves out to the column so it stays put
+            // while the rows underneath it move.
             .child(
-                div()
-                    .id("switcher-workspaces")
-                    .track_scroll(&left_scroll)
+                v_flex()
                     .w(px(LEFT_W.min(card_w * 0.5)))
                     .flex_shrink_0()
-                    .overflow_y_scroll()
                     .border_r_1()
                     .border_color(border)
-                    .p(px(6.))
-                    .child(list),
+                    .child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "switcher-workspaces-scrollbar",
+                        div()
+                            .id("switcher-workspaces")
+                            .track_scroll(&left_scroll)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .p(px(6.))
+                            .child(list),
+                        &left_scroll,
+                    )),
             )
             .child(
-                div()
-                    .id("switcher-tabs")
-                    .track_scroll(&right_scroll)
+                v_flex()
                     .flex_1()
                     .min_w_0()
-                    .overflow_y_scroll()
-                    .p(px(6.))
-                    .child(self.render_tabs(&layout, sel, column, cx)),
+                    .child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "switcher-tabs-scrollbar",
+                        div()
+                            .id("switcher-tabs")
+                            .track_scroll(&right_scroll)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .p(px(6.))
+                            .child(self.render_tabs(&layout, sel, column, cx)),
+                        &right_scroll,
+                    )),
             );
 
         let card = v_flex()
