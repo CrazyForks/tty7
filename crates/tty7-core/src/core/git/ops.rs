@@ -514,24 +514,6 @@ fn batched(prefix: &[&str], specs: &[String]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// The environment a network operation needs, for whoever spawns it.
-///
-/// Without `GIT_TERMINAL_PROMPT=0` git opens `/dev/tty` directly when stdin is
-/// closed, and in some environments it gets one and hangs on "Username for
-/// ...". A `None` value means the variable is removed.
-///
-/// This lives here next to the operations that need it, but only
-/// `git_output_with_env` can apply it — `Host::git` takes no environment. It is
-/// the host layer's job to reach for this.
-pub fn network_env() -> &'static [(&'static str, Option<&'static str>)] {
-    &[
-        ("GIT_TERMINAL_PROMPT", Some("0")),
-        ("GIT_ASKPASS", None),
-        ("SSH_ASKPASS", None),
-        ("SSH_ASKPASS_REQUIRE", Some("never")),
-    ]
-}
-
 /// What a failure means, from git's own words.
 ///
 /// Substring matching on English output, checked in a fixed order because the
@@ -637,11 +619,16 @@ pub fn run_op(
                 .collect::<Vec<_>>()
         };
 
-        // Network operations still take the plain path: they want
-        // `GIT_NETWORK_DEADLINE` and `network_env`, and neither can be
-        // expressed through `Host::git`. Both arrive with the host layer's
-        // `git_with_deadline`.
-        let out = host.git(root, &borrowed).map_err(|err| GitOpError {
+        // A push over a slow link outlives the deadline a `Git` request gets
+        // by default, which is sized for interactive queries. The no-prompt
+        // environment is not this layer's business: `LocalHost` puts it on
+        // every call, on both sides of the wire.
+        let spawned = if op.is_network() {
+            host.git_with_deadline(root, &borrowed, GIT_NETWORK_DEADLINE)
+        } else {
+            host.git(root, &borrowed)
+        };
+        let out = spawned.map_err(|err| GitOpError {
             op: label,
             kind: GitOpErrorKind::Spawn,
             message: err.to_string(),
@@ -1351,30 +1338,6 @@ mod tests {
             let expected = matches!(op.label(), "fetch" | "pull" | "push");
             assert_eq!(op.is_network(), expected, "{:?}", op.label());
         }
-    }
-
-    #[test]
-    fn the_network_environment_closes_every_prompt() {
-        let env = network_env();
-        assert_eq!(
-            env.iter().find(|(k, _)| *k == "GIT_TERMINAL_PROMPT"),
-            Some(&("GIT_TERMINAL_PROMPT", Some("0"))),
-        );
-        for key in ["GIT_ASKPASS", "SSH_ASKPASS"] {
-            assert_eq!(
-                env.iter().find(|(k, _)| *k == key).map(|(_, v)| *v),
-                Some(None),
-                "{key} has to be removed, not set",
-            );
-        }
-        assert_eq!(
-            env.iter().find(|(k, _)| *k == "SSH_ASKPASS_REQUIRE"),
-            Some(&("SSH_ASKPASS_REQUIRE", Some("never"))),
-        );
-    }
-
-    fn kind_of(stderr: &str) -> GitOpErrorKind {
-        classify(stderr, Some(1))
     }
 
     #[test]

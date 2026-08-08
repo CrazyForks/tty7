@@ -113,9 +113,14 @@ pub fn git_output(cwd: &Path, args: &[&str]) -> io::Result<Output> {
     git_output_with_env(cwd, args, &[])
 }
 
-/// `git_output` plus extra environment. Network operations (`fetch`/`pull`/
-/// `push`) need to be told they have no terminal to prompt at; read paths must
-/// *not* inherit that, so the two share a body rather than a config.
+/// `git_output` plus extra environment.
+///
+/// What `LocalHost` passes is the no-prompt set: git and ssh have to fail
+/// rather than block on a credential prompt nobody is watching. It goes on
+/// every call, not just `fetch`/`pull`/`push` — a read path never prompts, so
+/// carrying it there costs nothing, and a remote workspace only inherits it
+/// because the far side's `LocalHost` applies the same rule to a request that
+/// arrived over the wire with no "this one is a network op" bit on it.
 ///
 /// A `None` value removes the variable instead of setting it.
 pub fn git_output_with_env(
