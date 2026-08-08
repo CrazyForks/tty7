@@ -5107,12 +5107,22 @@ impl Tty7App {
             .chain(crate::ui::keymap::extra_bindings(cx))
             .find(|(a, k)| *k == spec && *a != action)
             .map(|(a, _)| a);
+        // A trailing "…" on an action name marks a command that opens
+        // something; it is not punctuation, and inside a sentence it reads as
+        // the sentence trailing off — "Rename Tab… took the shortcut from".
+        let in_prose = |name: &str| name.trim_end_matches('…').to_string();
         let note = displaced.as_ref().map(|other| {
             t_fmt(
                 L10nKey::AppKeybindingDisplacedNote,
                 &[
-                    ("action", &crate::ui::keymap::action_entry(&action).1),
-                    ("previous", &crate::ui::keymap::action_entry(other).1),
+                    (
+                        "action",
+                        &in_prose(&crate::ui::keymap::action_entry(&action).1),
+                    ),
+                    (
+                        "previous",
+                        &in_prose(&crate::ui::keymap::action_entry(other).1),
+                    ),
                 ],
             )
         });
