@@ -845,11 +845,18 @@ impl Tty7App {
         // anchor lands on the first matching row below, and `scroll_to` reads
         // where it ended up on the frame after this one — by which time this
         // render has been painted and the anchor knows its own origin.
+        //
+        // A query that matched nowhere has to be reachable too: the note
+        // saying so sits at the top of the page, and a reader who searched
+        // from halfway down would otherwise be left with the untouched page
+        // the note exists to explain.
         if let Some(s) = self.active_settings()
             && s.reveal_first_hit.get()
         {
             s.reveal_first_hit.set(false);
-            if !query.is_empty() && section_match_count(section, &query) > 0 {
+            let matched_here = section_match_count(section, &query) > 0;
+            let matched_nowhere = total_match_count(&query) == 0;
+            if !query.is_empty() && (matched_here || matched_nowhere) {
                 s.search_anchor.scroll_to(window, cx);
             }
         }
@@ -977,6 +984,8 @@ impl Tty7App {
         // page just sits there looking like the search did nothing.
         let no_match_note = (!query.is_empty() && total_match_count(&query) == 0).then(|| {
             div()
+                .id("settings-no-match")
+                .anchor_scroll(self.active_settings().map(|s| s.search_anchor.clone()))
                 .mb_6()
                 .px_3()
                 .py_2()
