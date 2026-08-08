@@ -493,6 +493,12 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.tokens.button_secondary_active = button_active.into();
 
     t.ring = rgb(m.accent).into();
+    // Every splitter and panel edge lights up with this while you drag it, and
+    // the drop target for a dragged-in file tints with it. Unset it is a fixed
+    // blue from gpui-component's stock theme — the same blue under all nine
+    // presets. It is an interaction highlight, so it belongs with the focus
+    // ring and the on-switch.
+    t.drag_border = rgb(m.accent).into();
 
     #[cfg(target_os = "macos")]
     if let Some(window) = window.as_deref_mut() {
