@@ -3,25 +3,36 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, FocusHandle, FontWeight, KeyDownEvent, Pixels, Window, div, prelude::*, px,
+    AnyElement, FocusHandle, FontWeight, KeyDownEvent, Pixels, SharedString, Window, div,
+    prelude::*, px,
 };
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
+use crate::core::config::{Config, DiffViewMode};
+use crate::core::git::status::DecoStatus;
 use crate::terminal::git_diff::{
-    self, AUTO_COLLAPSE_LINES, DiffSnapshot, DiffSource, DiffStats, FileDiff, FileStatus,
+    self, AUTO_COLLAPSE_LINES, DiffSnapshot, DiffSource, DiffStats, FileDiff, FileStatus, LineKind,
     MAX_RENDERED_FILES, Truncation,
 };
 use crate::ui::app::Tty7App;
-use crate::ui::diff_rows::{Side, SplitCell, SplitRow, split_hunk};
+use crate::ui::diff_rows::{Side, SplitCell, SplitRow, UnifiedRow, split_hunk, unified_rows};
 use crate::ui::i18n::{L10nKey, t, t_fmt, t_plural};
+use crate::ui::right_panel::info_chip;
 use crate::ui::rounding;
 use crate::ui::rounding::RoundedCorners as _;
+use crate::ui::scm::status::{status_color, status_glyph};
 
-/// What the right panel's shared probe still asks git for, and therefore what
-/// an overlay opened from the panel has to ask for too: the seed below is only
-/// sound while the two agree. Both move together when the panel splits into
-/// staged and unstaged groups.
+/// What the right panel's shared probe asks git for, and so what an overlay
+/// opened from the sidebar shows.
+///
+/// The panel's own contract, not a default the rest of the file leans on: it
+/// is read where the panel's request is issued, where the panel's answer is
+/// filed away, and at the one entry point that has no source of its own to
+/// name. Whether an overlay may reuse the panel's snapshot is settled by that
+/// snapshot's own `source`, and whether an overlay has gone stale by the
+/// overlay's — so when the panel splits into staged and unstaged groups, this
+/// constant is the only thing that has to move.
 const PANEL_DIFF_SOURCE: DiffSource = DiffSource::Head;
 
 pub(crate) enum DiffLoad {
@@ -42,6 +53,33 @@ pub(crate) struct DiffOverlayState {
     pub(crate) expanded: HashMap<String, bool>,
     pub(crate) focus: Option<String>,
     pub(crate) scroll: gpui::ScrollHandle,
+    /// The [`ScmData`](crate::terminal::git_data::ScmData) epoch this patch was
+    /// read at, for the two sources that can go stale.
+    ///
+    /// Recorded when a probe *starts*, so a `git add` that lands while one is
+    /// running is not mistaken for a change the result already reflects.
+    /// `None` until the first snapshot arrives: the epoch is keyed by the
+    /// repository root, and only a snapshot knows where that is.
+    pub(crate) epoch: Option<u64>,
+}
+
+/// One hunk, already turned into whichever kind of row the current view draws.
+enum HunkRows {
+    Split(Vec<SplitRow>),
+    Unified(Vec<UnifiedRow>),
+}
+
+impl HunkRows {
+    fn len(&self) -> usize {
+        match self {
+            HunkRows::Split(rows) => rows.len(),
+            HunkRows::Unified(rows) => rows.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl Tty7App {
@@ -105,14 +143,20 @@ impl Tty7App {
             None => {}
         }
         // Skipping the "Reading…" flash is only allowed when the panel's
-        // snapshot answers the same question this overlay is asking.
+        // snapshot answers the same question this overlay is asking. The
+        // snapshot says which question that was, so this stays right through
+        // whatever the panel decides to probe for next.
         let seed = match (&self.right_panel.diff_cwd, &self.right_panel.diff) {
             (Some(panel_key), Some(Some(snap)))
-                if source == PANEL_DIFF_SOURCE && *panel_key == (host, cwd.clone()) =>
+                if snap.source == source && *panel_key == (host, cwd.clone()) =>
             {
                 DiffLoad::Ready(Arc::clone(snap))
             }
             _ => DiffLoad::Loading,
+        };
+        let epoch = match &seed {
+            DiffLoad::Ready(snap) => Some(scm_epoch(cx, host, &snap.root)),
+            _ => None,
         };
         self.remember_active_pane(window, cx);
         let Some(tab) = self.tabs.get_mut(active) else {
@@ -129,6 +173,7 @@ impl Tty7App {
             expanded: HashMap::new(),
             focus,
             scroll: gpui::ScrollHandle::new(),
+            epoch,
         });
         window.focus(&focus_handle, cx);
         self.spawn_diff_probe(cx);
@@ -158,11 +203,7 @@ impl Tty7App {
 
     fn spawn_diff_probe(&mut self, cx: &mut Context<Self>) {
         let active = self.active;
-        let Some(overlay) = self
-            .tabs
-            .get_mut(active)
-            .and_then(|t| t.diff_overlay.as_mut())
-        else {
+        let Some(overlay) = self.tabs.get(active).and_then(|t| t.diff_overlay.as_ref()) else {
             return;
         };
         if overlay.loading {
@@ -171,10 +212,24 @@ impl Tty7App {
         let cwd = overlay.cwd.clone();
         let source = overlay.source.clone();
         let id = overlay.host_id;
+        // Read before the probe is dispatched, not after it lands: anything
+        // bumped in between belongs to the next read, not this one.
+        let epoch = match &overlay.load {
+            DiffLoad::Ready(snap) => Some(scm_epoch(cx, id, &snap.root)),
+            _ => None,
+        };
         let Some(host) = crate::ui::host_registry::HostRegistry::lookup(cx, id) else {
             return;
         };
+        let Some(overlay) = self
+            .tabs
+            .get_mut(active)
+            .and_then(|t| t.diff_overlay.as_mut())
+        else {
+            return;
+        };
         overlay.loading = true;
+        overlay.epoch = epoch;
         self.spawn_diff_probe_for(host, cwd, source, cx);
     }
 
@@ -231,6 +286,9 @@ impl Tty7App {
         snap: Option<Arc<DiffSnapshot>>,
         cx: &mut Context<Self>,
     ) {
+        // Only wanted by an overlay whose first probe could not know the root,
+        // and so could not read its own epoch before dispatching.
+        let landing_epoch = snap.as_ref().map(|s| scm_epoch(cx, host, &s.root));
         let mut landed = false;
         for tab in self.tabs.iter_mut() {
             let Some(overlay) = tab
@@ -241,6 +299,7 @@ impl Tty7App {
                 continue;
             };
             overlay.loading = false;
+            overlay.epoch = overlay.epoch.or(landing_epoch);
             overlay.load = match &snap {
                 Some(snap) => DiffLoad::Ready(Arc::clone(snap)),
                 None => DiffLoad::NotARepo,
@@ -278,23 +337,37 @@ impl Tty7App {
         if overlay.loading {
             return;
         }
-        // The cached counts come from `git diff --numstat HEAD`, so only a
-        // HEAD snapshot is comparable to them. A staged or unstaged snapshot
-        // would differ the moment anything is staged, and re-probe forever; a
-        // commit or a range cannot go stale at all.
-        if overlay.source != DiffSource::Head {
-            return;
-        }
         let DiffLoad::Ready(snap) = &overlay.load else {
             return;
         };
-        let Some(status) = cx
-            .try_global::<crate::terminal::git_status::GitStatusCache>()
-            .and_then(|cache| cache.status_for(overlay.host_id, &overlay.cwd))
-        else {
-            return;
+        let stale = match overlay.source {
+            // A commit and a range are fixed patches. Nothing can make either
+            // of them out of date, so nothing should reprobe them.
+            DiffSource::Commit { .. } | DiffSource::Range { .. } => return,
+            // The cached counts come from `git diff --numstat HEAD`, so only a
+            // HEAD snapshot is comparable to them.
+            DiffSource::Head => {
+                let Some(status) = cx
+                    .try_global::<crate::terminal::git_status::GitStatusCache>()
+                    .and_then(|cache| cache.status_for(overlay.host_id, &overlay.cwd))
+                else {
+                    return;
+                };
+                status.branch != snap.branch || (status.added, status.removed) != snap.totals()
+            }
+            // Those same counts would differ from a staged or unstaged patch
+            // the moment anything is staged, and the overlay would reprobe
+            // forever. The epoch answers the question that was actually being
+            // asked — "did anything happen to this repository" — without
+            // knowing what either side is counting.
+            DiffSource::Worktree | DiffSource::Staged => {
+                let Some(seen) = overlay.epoch else {
+                    return;
+                };
+                scm_epoch(cx, overlay.host_id, &snap.root) != seen
+            }
         };
-        if status.branch != snap.branch || (status.added, status.removed) != snap.totals() {
+        if stale {
             self.spawn_diff_probe(cx);
         }
     }
@@ -369,6 +442,8 @@ impl Tty7App {
         } else {
             crate::ui::app::TITLE_BAR_LEAD
         };
+        let mono = SharedString::from(self.font_family.clone());
+        let subject = source_subject(&overlay.source, branch);
         let row = crate::ui::app::title_bar_drag(
             h_flex().id("diff-overlay-header"),
             "diff-overlay-header",
@@ -385,17 +460,35 @@ impl Tty7App {
             .border_color(cx.theme().border)
             .child(
                 gpui::svg()
-                    .path("icons/git-branch.svg")
+                    .path(subject.icon)
                     .flex_shrink_0()
                     .size(px(13.))
                     .text_color(cx.theme().muted_foreground),
             )
-            .child(
+            .child(if subject.is_rev {
+                // A revision is an identifier, not a name: it belongs in the
+                // same monospace the patch below it is set in.
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(13.))
+                    .font_family(self.font_family.clone())
+                    .child(subject.text)
+                    .into_any_element()
+            } else {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
-                    .child(branch),
-            )
+                    .child(subject.text)
+                    .into_any_element()
+            })
+            .when_some(subject.chip, |bar, text| {
+                bar.child(info_chip(
+                    text,
+                    cx.theme().accent.opacity(0.16),
+                    cx.theme().foreground,
+                    &mono,
+                ))
+            })
             .when_some(focused_name(overlay), |bar, name| {
                 bar.child(
                     div().occlude().flex_shrink_0().child(
@@ -476,6 +569,25 @@ impl Tty7App {
                 },
             )
             .child(div().flex_1())
+            .child(div().occlude().flex_shrink_0().child({
+                let sf = cx.global::<crate::ui::presets::Surfaces>().window;
+                let selected = usize::from(view_mode(cx) == DiffViewMode::Unified);
+                self.segmented_on(
+                    sf,
+                    "diff-overlay-view",
+                    &[t(L10nKey::DiffViewSplit), t(L10nKey::DiffViewUnified)],
+                    selected,
+                    cx,
+                    |this, index, _window, cx| {
+                        let mode = if index == 0 {
+                            DiffViewMode::Split
+                        } else {
+                            DiffViewMode::Unified
+                        };
+                        this.update_config(cx, |cfg| cfg.diff_view = mode);
+                    },
+                )
+            }))
             .child(
                 div().occlude().flex_shrink_0().child(
                     crate::ui::tab_strip::chrome_tile_sized(
@@ -515,6 +627,7 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let stats = snap.stats();
+        let mode = view_mode(cx);
         let oversized = focused.is_none() && stats.oversized;
         let mut list = v_flex().gap_3().p_4().w_full();
         if oversized {
@@ -533,7 +646,7 @@ impl Tty7App {
             } else {
                 file_expanded(file, expanded, oversized)
             };
-            list = list.child(self.diff_file_card(idx, file, is_expanded, cx));
+            list = list.child(self.diff_file_card(idx, file, is_expanded, mode, cx));
         }
         if focused.is_none() && snap.files.len() > shown {
             let rest = snap.files.len() - shown;
@@ -592,19 +705,13 @@ impl Tty7App {
         idx: usize,
         file: &FileDiff,
         expanded: bool,
+        mode: DiffViewMode,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let expandable =
             !file.binary && (!file.hunks.is_empty() || file.truncated == Some(Truncation::Budget));
-        let (glyph, glyph_color) = match file.status {
-            FileStatus::Added => ("A", cx.theme().success),
-            FileStatus::Modified => ("M", cx.theme().warning),
-            FileStatus::Deleted => ("D", cx.theme().danger),
-            FileStatus::Renamed => ("R", cx.theme().muted_foreground),
-            FileStatus::Copied => ("C", cx.theme().muted_foreground),
-            FileStatus::TypeChanged => ("T", cx.theme().warning),
-            FileStatus::Unmerged => ("U", cx.theme().danger),
-        };
+        let deco = deco_status(file.status);
+        let (glyph, glyph_color) = (status_glyph(deco), status_color(deco, cx));
         let shown_path = match &file.old_path {
             Some(old) => format!("{old} → {}", file.path),
             None => file.path.clone(),
@@ -711,7 +818,13 @@ impl Tty7App {
             let hunks: Vec<_> = file
                 .hunks
                 .iter()
-                .map(|hunk| (hunk, split_hunk(&hunk.lines)))
+                .map(|hunk| {
+                    let rows = match mode {
+                        DiffViewMode::Split => HunkRows::Split(split_hunk(&hunk.lines)),
+                        DiffViewMode::Unified => HunkRows::Unified(unified_rows(&hunk.lines)),
+                    };
+                    (hunk, rows)
+                })
                 .collect();
             let closing_row = if file.truncated.is_some() {
                 None
@@ -734,8 +847,25 @@ impl Tty7App {
                         .truncate()
                         .child(hunk.header.clone()),
                 );
-                for (r, row) in rows.iter().enumerate() {
-                    body = body.child(self.diff_split_row(row, closing_row == Some((h, r)), cx));
+                match rows {
+                    HunkRows::Split(rows) => {
+                        for (r, row) in rows.iter().enumerate() {
+                            body = body.child(self.diff_split_row(
+                                row,
+                                closing_row == Some((h, r)),
+                                cx,
+                            ));
+                        }
+                    }
+                    HunkRows::Unified(rows) => {
+                        for (r, row) in rows.iter().enumerate() {
+                            body = body.child(self.diff_unified_row(
+                                row,
+                                closing_row == Some((h, r)),
+                                cx,
+                            ));
+                        }
+                    }
                 }
             }
             if let Some(reason) = file.truncated {
@@ -819,6 +949,78 @@ impl Tty7App {
             .into_any_element()
     }
 
+    /// One line of the unified view.
+    ///
+    /// Every measurement it shares with [`Self::diff_split_cell`] is shared on
+    /// purpose — the same 19px row, the same `text_xs` in the same family, and
+    /// above all the same `0.12` wash behind an addition and a removal. The two
+    /// views are one diff seen twice; a different green would read as a
+    /// different thing.
+    ///
+    /// What differs is forced by the shape. The line numbers get 34px a side
+    /// rather than 42 (there are two gutters here in front of one column of
+    /// text, not one in front of each), and the `+`/`−` gets a column of its
+    /// own rather than riding in the text: with three kinds of line stacked in
+    /// one column, an inlined marker would leave the context lines' code
+    /// starting two characters left of everything else.
+    fn diff_unified_row(
+        &self,
+        row: &UnifiedRow,
+        closes_card: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let radius = if closes_card {
+            rounding::inner_radius(rounding::CARD_RADIUS, rounding::HAIRLINE)
+        } else {
+            px(0.)
+        };
+        let (marker_color, tint) = match row.kind {
+            LineKind::Added => (cx.theme().success, Some(cx.theme().success.opacity(0.12))),
+            LineKind::Removed => (cx.theme().danger, Some(cx.theme().danger.opacity(0.12))),
+            LineKind::Context => (cx.theme().muted_foreground, None),
+        };
+        let gutter = |no: Option<u32>| {
+            h_flex()
+                .flex_shrink_0()
+                .w(px(34.))
+                .justify_end()
+                .pr_1p5()
+                .text_color(cx.theme().muted_foreground.opacity(0.7))
+                .child(no.map(|n| n.to_string()).unwrap_or_default())
+        };
+        h_flex()
+            .w_full()
+            .h(px(19.))
+            .items_center()
+            .text_xs()
+            .font_family(self.font_family.clone())
+            .rounded_bl(radius)
+            .rounded_br(radius)
+            .when_some(tint, |line, bg| line.bg(bg))
+            .child(gutter(row.old))
+            .child(gutter(row.new))
+            // The split view's centre rule, in the one place it still means the
+            // same thing: everything left of it is a number, everything right
+            // of it is the file.
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(1.))
+                    .h_full()
+                    .bg(cx.theme().border),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(12.))
+                    .text_center()
+                    .text_color(marker_color)
+                    .child(unified_marker(row.kind)),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(row.text.clone()))
+            .into_any_element()
+    }
+
     fn diff_untracked_section(&self, snap: &DiffSnapshot, cx: &Context<Self>) -> AnyElement {
         let total = snap.untracked_count();
         let untracked = &snap.untracked[..snap.untracked.len().min(MAX_RENDERED_FILES)];
@@ -859,8 +1061,8 @@ impl Tty7App {
                         div()
                             .flex_shrink_0()
                             .font_weight(FontWeight::BOLD)
-                            .text_color(cx.theme().success)
-                            .child("A"),
+                            .text_color(status_color(DecoStatus::Untracked, cx))
+                            .child(status_glyph(DecoStatus::Untracked)),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(path.clone())),
             );
@@ -878,6 +1080,98 @@ impl Tty7App {
             );
         }
         section.into_any_element()
+    }
+}
+
+/// Which layout the overlay draws. One setting for the window, not one per
+/// overlay: VS Code's `diffEditor.renderSideBySide` is global for the same
+/// reason — re-picking on every open is a chore, not a choice.
+fn view_mode(cx: &gpui::App) -> DiffViewMode {
+    cx.try_global::<Config>()
+        .map(|cfg| cfg.diff_view)
+        .unwrap_or_default()
+}
+
+/// The change column. `−` is U+2212, matching the split view: the ASCII hyphen
+/// is narrower than `+` and the two columns would not line up.
+fn unified_marker(kind: LineKind) -> &'static str {
+    match kind {
+        LineKind::Added => "+",
+        LineKind::Removed => "−",
+        LineKind::Context => "",
+    }
+}
+
+/// The git status letter and colour every part of the app agrees on.
+///
+/// `Copied` and `TypeChanged` have no decoration of their own — porcelain v2's
+/// index folds them the same way — so they take the nearest one rather than
+/// inventing a `C` and a `T` that appear in the overlay and nowhere else.
+fn deco_status(status: FileStatus) -> DecoStatus {
+    match status {
+        FileStatus::Added => DecoStatus::Added,
+        FileStatus::Modified => DecoStatus::Modified,
+        FileStatus::Deleted => DecoStatus::Deleted,
+        FileStatus::Renamed | FileStatus::Copied => DecoStatus::Renamed,
+        FileStatus::TypeChanged => DecoStatus::Modified,
+        FileStatus::Unmerged => DecoStatus::Conflict,
+    }
+}
+
+/// The current epoch for a repository, or 0 where nothing has ever bumped one.
+/// Zero is the same value a never-touched repository reports, so an overlay
+/// that reads it before the global exists simply never looks stale.
+fn scm_epoch(cx: &gpui::App, host: crate::ui::host_ops::HostId, root: &Path) -> u64 {
+    cx.try_global::<crate::terminal::git_data::ScmData>()
+        .map(|data| data.epoch(host, root))
+        .unwrap_or(0)
+}
+
+/// What the header calls the patch it is showing.
+struct SourceSubject {
+    icon: &'static str,
+    text: String,
+    /// Set only where the branch name alone would be ambiguous.
+    chip: Option<&'static str>,
+    is_rev: bool,
+}
+
+fn source_subject(source: &DiffSource, branch: String) -> SourceSubject {
+    let branch_of = |chip| SourceSubject {
+        icon: "icons/git-branch.svg",
+        text: branch.clone(),
+        chip,
+        is_rev: false,
+    };
+    match source {
+        // Worktree and Head are both "the branch, right now"; the header for
+        // them is what it has always been.
+        DiffSource::Worktree | DiffSource::Head => branch_of(None),
+        // Staged is the branch too, but a patch that does not match the files
+        // on disk — without the chip it is indistinguishable from the above.
+        DiffSource::Staged => branch_of(Some("STAGED")),
+        DiffSource::Commit { rev } => SourceSubject {
+            icon: "icons/git-commit.svg",
+            text: short_rev(rev),
+            chip: None,
+            is_rev: true,
+        },
+        DiffSource::Range { base, head } => SourceSubject {
+            icon: "icons/git-commit.svg",
+            text: format!("{}…{}", short_rev(base), short_rev(head)),
+            chip: None,
+            is_rev: true,
+        },
+    }
+}
+
+/// Object ids get cut to eight characters; anything else is already a name a
+/// person chose, and cutting `origin/main` in half would only hide which it is.
+fn short_rev(rev: &str) -> String {
+    let is_oid = rev.len() >= 40 && rev.chars().all(|c| c.is_ascii_hexdigit());
+    match is_oid {
+        true => rev[..8].to_string(),
+        false => rev.to_string(),
     }
 }
 
@@ -988,6 +1282,98 @@ mod tests {
             probe_key(host, Path::new("/other"), &DiffSource::Worktree)
         );
     }
+
+    #[test]
+    fn every_file_status_lands_on_a_shared_decoration() {
+        use DecoStatus as D;
+        for (status, want) in [
+            (FileStatus::Added, D::Added),
+            (FileStatus::Modified, D::Modified),
+            (FileStatus::Deleted, D::Deleted),
+            (FileStatus::Renamed, D::Renamed),
+            // A copy is a rename that left the original behind: same letter.
+            (FileStatus::Copied, D::Renamed),
+            // A symlink that became a file is a modification, not a category
+            // of its own — the overlay is the only place that ever saw a `T`.
+            (FileStatus::TypeChanged, D::Modified),
+            (FileStatus::Unmerged, D::Conflict),
+        ] {
+            assert_eq!(deco_status(status), want, "{status:?}");
+        }
+        assert_eq!(status_glyph(deco_status(FileStatus::Unmerged)), "U");
+        assert_eq!(status_glyph(deco_status(FileStatus::Copied)), "R");
+    }
+
+    #[test]
+    fn the_change_column_uses_the_typographic_minus() {
+        assert_eq!(unified_marker(LineKind::Added), "+");
+        assert_eq!(unified_marker(LineKind::Removed), "\u{2212}");
+        assert_ne!(
+            unified_marker(LineKind::Removed),
+            "-",
+            "the ASCII hyphen is narrower than `+`, and the column would wobble"
+        );
+        assert_eq!(
+            unified_marker(LineKind::Context),
+            "",
+            "a context line is neither, and a placeholder glyph would be noise"
+        );
+    }
+
+    #[test]
+    fn the_header_shortens_an_object_id_and_nothing_else() {
+        let oid = "3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a";
+        assert_eq!(short_rev(oid), "3f2a1b9c");
+        assert_eq!(short_rev("v26.7.5"), "v26.7.5");
+        assert_eq!(
+            short_rev("origin/main"),
+            "origin/main",
+            "half a ref name says less than the whole of it"
+        );
+        assert_eq!(short_rev("3f2a1b9"), "3f2a1b9", "already short");
+    }
+
+    #[test]
+    fn each_source_names_itself_in_the_header() {
+        let branch = || "main".to_string();
+        let plain = source_subject(&DiffSource::Worktree, branch());
+        assert_eq!((plain.icon, plain.text.as_str()), (BRANCH_ICON, "main"));
+        assert_eq!(plain.chip, None);
+        assert!(!plain.is_rev);
+
+        assert_eq!(source_subject(&DiffSource::Head, branch()).chip, None);
+
+        let staged = source_subject(&DiffSource::Staged, branch());
+        assert_eq!(staged.icon, BRANCH_ICON, "still a branch, still its name");
+        assert_eq!(
+            staged.chip,
+            Some("STAGED"),
+            "without it the staged patch is indistinguishable from the unstaged one"
+        );
+
+        let commit = source_subject(
+            &DiffSource::Commit {
+                rev: "3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a".into(),
+            },
+            branch(),
+        );
+        assert_eq!(commit.icon, COMMIT_ICON);
+        assert_eq!(commit.text, "3f2a1b9c", "the branch is not what is shown");
+        assert!(commit.is_rev);
+
+        let range = source_subject(
+            &DiffSource::Range {
+                base: "main".into(),
+                head: "feature".into(),
+            },
+            branch(),
+        );
+        assert_eq!(range.icon, COMMIT_ICON);
+        assert_eq!(range.text, "main…feature");
+    }
+
+    const BRANCH_ICON: &str = "icons/git-branch.svg";
+    const COMMIT_ICON: &str = "icons/git-commit.svg";
 
     fn small_file(path: &str, added: u32) -> FileDiff {
         FileDiff {
@@ -1453,6 +1839,122 @@ mod overlay_gpui_tests {
             (DiffSource::Staged, true),
             "the same file from a different source is a different question"
         );
+    }
+
+    fn one_file_snapshot(source: DiffSource) -> DiffSnapshot {
+        use crate::terminal::git_diff::{DiffLine, Hunk, LineKind};
+        DiffSnapshot {
+            root: std::path::PathBuf::from("/no/such/tty7/repo"),
+            source,
+            branch: "main".into(),
+            files: vec![FileDiff {
+                path: "a.rs".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                added: 1,
+                removed: 1,
+                binary: false,
+                truncated: None,
+                hunks: vec![Hunk {
+                    header: "@@ -1,2 +1,2 @@".into(),
+                    lines: vec![
+                        DiffLine {
+                            kind: LineKind::Context,
+                            old_no: Some(1),
+                            new_no: Some(1),
+                            text: "keep".into(),
+                        },
+                        DiffLine {
+                            kind: LineKind::Removed,
+                            old_no: Some(2),
+                            new_no: None,
+                            text: "old".into(),
+                        },
+                        DiffLine {
+                            kind: LineKind::Added,
+                            old_no: None,
+                            new_no: Some(2),
+                            text: "new".into(),
+                        },
+                    ],
+                }],
+            }],
+            untracked: vec!["scratch.txt".into()],
+            untracked_total: 1,
+            read_failed: false,
+        }
+    }
+
+    fn show(app: &Entity<Tty7App>, vcx: &mut VisualTestContext, source: DiffSource) {
+        let cwd = std::path::PathBuf::from("/no/such/tty7/repo");
+        app.update_in(vcx, |app, window, cx| {
+            app.open_diff_overlay(HostId::LOCAL, cwd.clone(), source.clone(), None, window, cx);
+            let active = app.active;
+            let overlay = app.tabs[active].diff_overlay.as_mut().unwrap();
+            overlay.loading = false;
+            overlay.load = DiffLoad::Ready(Arc::new(one_file_snapshot(source)));
+            // The card is what carries the rows, so open it.
+            overlay.expanded.insert("a.rs".to_string(), true);
+        });
+    }
+
+    /// Every header branch, every row renderer, once each. A missing icon, an
+    /// unset global or a panicking helper shows up here rather than the first
+    /// time somebody opens a commit.
+    #[gpui::test]
+    fn every_source_renders_in_both_views(cx: &mut TestAppContext) {
+        let (app, mut vcx, _pane) = test_window::harness_with_tabs(cx, 1);
+
+        for mode in [DiffViewMode::Split, DiffViewMode::Unified] {
+            app.update_in(&mut vcx, |app, _, cx| {
+                app.update_config(cx, |cfg| cfg.diff_view = mode);
+            });
+            for source in [
+                DiffSource::Worktree,
+                DiffSource::Staged,
+                DiffSource::Head,
+                DiffSource::Commit {
+                    rev: "3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a".into(),
+                },
+                DiffSource::Range {
+                    base: "main".into(),
+                    head: "feature".into(),
+                },
+            ] {
+                show(&app, &mut vcx, source.clone());
+                // A real frame, so layout and paint run too: `title_bar_drag`
+                // and the segmented track both want a window that is drawing.
+                crate::ui::app::render_probe::arm(10_000);
+                app.update_in(&mut vcx, |_, _, cx| cx.notify());
+                vcx.background_executor.run_until_parked();
+                assert!(
+                    crate::ui::app::render_probe::draws() > 0,
+                    "nothing was drawn, so nothing was proved: {source:?} in {mode:?}"
+                );
+                app.update_in(&mut vcx, |app, window, cx| {
+                    app.close_diff_overlay(window, cx)
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn toggling_the_diff_view_mode_writes_config(cx: &mut TestAppContext) {
+        let (app, mut vcx, _pane) = test_window::harness_with_tabs(cx, 1);
+        let mode =
+            |vcx: &mut VisualTestContext| vcx.update(|_, cx| cx.global::<Config>().diff_view);
+
+        assert_eq!(
+            mode(&mut vcx),
+            DiffViewMode::Split,
+            "side by side is what everyone already sees"
+        );
+
+        app.update_in(&mut vcx, |app, _, cx| app.toggle_diff_view_mode(cx));
+        assert_eq!(mode(&mut vcx), DiffViewMode::Unified);
+
+        app.update_in(&mut vcx, |app, _, cx| app.toggle_diff_view_mode(cx));
+        assert_eq!(mode(&mut vcx), DiffViewMode::Split, "and back again");
     }
 
     /// The same source and the same focus still toggles the overlay shut.

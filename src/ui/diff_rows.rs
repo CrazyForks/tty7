@@ -85,10 +85,6 @@ pub(crate) fn split_hunk(lines: &[DiffLine]) -> Vec<SplitRow> {
     rows
 }
 
-// Read by the unified renderer, which lands with the view toggle. The rows
-// themselves belong here now so that both shapes of the same hunk are built —
-// and tested — in one place rather than growing a second copy later.
-#[allow(dead_code)]
 pub(crate) struct UnifiedRow {
     pub(crate) old: Option<u32>,
     pub(crate) new: Option<u32>,
@@ -100,7 +96,6 @@ pub(crate) struct UnifiedRow {
 /// every addition. That is the opposite of [`split_hunk`], and it is the whole
 /// difference between the two views: unified shows the patch as it was written,
 /// side-by-side re-pairs it into before and after.
-#[allow(dead_code)]
 pub(crate) fn unified_rows(lines: &[DiffLine]) -> Vec<UnifiedRow> {
     lines
         .iter()
