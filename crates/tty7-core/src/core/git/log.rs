@@ -7,7 +7,13 @@
 //! so an O(commits × lanes) pass in a paint closure would be burned every
 //! frame for a result that only changes when the history does.
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use smallvec::SmallVec;
+
+use super::RecordSplitter;
+use crate::host::Host;
 
 /// Full hex object id. Kept as `String` rather than `[u8; 20]` because sha256
 /// repositories exist and the extra allocation is noise next to the subject.
@@ -168,6 +174,1140 @@ pub struct CommitPage {
     pub open_lanes: Vec<Lane>,
 }
 
-// `LaneAlloc` — the append-only lane assigner these rows come out of — is
-// defined below by the graph layout pass. It is append-only by design: a later
-// page extends the graph without reflowing what is already on screen.
+/// The append-only lane assigner the rows come out of.
+///
+/// Fed `(sha, parents)` newest-first, it produces exactly one [`GraphRow`] per
+/// commit and keeps only the state that has to survive a page boundary: which
+/// oid each lane is holding a place for, and which lanes are holding a place
+/// for a given oid.
+///
+/// Append-only is the point. A later page extends the graph without touching a
+/// row already on screen, which is only possible because a row says nothing
+/// about the rows below it — see [`Edge`].
+#[derive(Default)]
+pub struct LaneAlloc {
+    /// Per lane, the oid that lane is currently waiting for. `None` is free.
+    slots: Vec<Option<Oid>>,
+    /// The reverse index. A `SmallVec` because one child is the common case
+    /// and the second entry is the other side of a merge; more than two
+    /// children of one commit is rare enough to spill.
+    pending: HashMap<Oid, SmallVec<[Lane; 2]>>,
+    truncated: bool,
+}
+
+impl LaneAlloc {
+    pub fn new() -> LaneAlloc {
+        LaneAlloc::default()
+    }
+
+    /// Lays out one page of commits, newest first. `--topo-order` is what makes
+    /// a single forward pass enough: it guarantees a parent is listed after
+    /// every one of its children, so by the time a commit is reached, every
+    /// lane that wants it already exists.
+    pub fn push(&mut self, page: &[(Oid, SmallVec<[Oid; 2]>)], out: &mut Vec<GraphRow>) {
+        out.reserve(page.len());
+        for (sha, parents) in page {
+            let row = self.row(sha, parents);
+            out.push(row);
+        }
+    }
+
+    /// Lanes still held open past the last row laid out — the page boundary.
+    /// The renderer draws these as stubs so the bottom of a page does not read
+    /// as a row of root commits.
+    pub fn open_lanes(&self) -> Vec<Lane> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_some())
+            .map(|(lane, _)| lane as Lane)
+            .collect()
+    }
+
+    /// How many columns are live right now, i.e. one past the rightmost lane in
+    /// use. Lanes are never compacted, so this only shrinks when the rightmost
+    /// lane itself dies.
+    pub fn width(&self) -> Lane {
+        self.slots
+            .iter()
+            .rposition(|slot| slot.is_some())
+            .map_or(0, |lane| lane as Lane + 1)
+    }
+
+    /// Whether history was wider than [`MAX_LANES`] at some point, so lines
+    /// were forced to share the last lane. Sticky: once true it stays true.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    fn row(&mut self, sha: &Oid, parents: &[Oid]) -> GraphRow {
+        // Sorted so the lines entering this row are emitted left to right and
+        // the node lands on the leftmost of them — mainline hugs the left.
+        let mut waiting = self.pending.remove(sha).unwrap_or_default();
+        waiting.sort_unstable();
+        waiting.dedup();
+        let node = match waiting.first() {
+            Some(lane) => *lane,
+            // Nothing is waiting: no child of this commit is inside the window,
+            // so it is a tip and starts a lane of its own.
+            None => self.alloc_lane(&[]),
+        };
+
+        let mut edges: SmallVec<[Edge; 4]> = SmallVec::new();
+        for (lane, slot) in self.slots.iter().enumerate() {
+            let lane = lane as Lane;
+            if slot.is_some() && !waiting.contains(&lane) {
+                edges.push(Edge::Pass { lane, color: lane });
+            }
+        }
+        for &lane in &waiting {
+            edges.push(Edge::In {
+                from: lane,
+                color: lane,
+            });
+            // Release the lane so a parent can claim it below — but only if it
+            // really is this commit's. Past MAX_LANES two commits can share the
+            // overflow lane, and clearing it there would strand the other one.
+            if self.slots[lane as usize].as_deref() == Some(sha.as_str()) {
+                self.slots[lane as usize] = None;
+            }
+        }
+
+        // Lanes this row just gave up, plus the node's own. A second parent
+        // that landed on one of them would draw `lane 2 → node → lane 2`, a V
+        // that reads as one line bending rather than two lines meeting.
+        let mut avoid = waiting;
+        if !avoid.contains(&node) {
+            avoid.push(node);
+        }
+
+        let mut claimed: SmallVec<[Lane; 4]> = SmallVec::new();
+        for (k, parent) in parents.iter().enumerate() {
+            let lane = if k == 0 {
+                // The first parent inherits the node's lane in place, never
+                // migrating. That is what keeps a branch on one lane — and so
+                // in one colour — from its tip down to wherever it was merged.
+                node
+            } else if let Some(lane) = self
+                .pending
+                .get(parent)
+                .and_then(|lanes| lanes.iter().copied().min())
+            {
+                // Some other child already reserved a lane for this parent.
+                // Join it instead of opening a second lane to the same commit:
+                // two lanes converging on one dot is what the merge row itself
+                // is for, and lanes are the scarce resource.
+                lane
+            } else {
+                self.alloc_lane(&avoid)
+            };
+            if claimed.contains(&lane) {
+                continue;
+            }
+            claimed.push(lane);
+            if self.slots[lane as usize].as_deref() != Some(parent.as_str()) {
+                self.slots[lane as usize] = Some(parent.clone());
+                self.pending.entry(parent.clone()).or_default().push(lane);
+            }
+            edges.push(Edge::Out {
+                to: lane,
+                color: lane,
+            });
+        }
+        // No parents: a root. `slots[node]` was released above and nothing
+        // claimed it, so the lane simply ends here.
+
+        edges.sort_unstable_by_key(Edge::paint_rank);
+        GraphRow {
+            node,
+            // Colour is the lane number, fixed when the lane is created and
+            // never reassigned. Not a per-branch counter (what the Git Graph
+            // extension does): with a palette of N, branch 0 and branch N come
+            // out the same colour, and in a 3-column panel those two are very
+            // likely adjacent. Keying on the lane makes neighbouring columns
+            // maximally distinct by construction, and the "one branch, one
+            // colour" property falls out of the first parent inheriting in
+            // place.
+            color: node,
+            parents: parents.len().min(u8::MAX as usize) as u8,
+            edges,
+        }
+    }
+
+    /// The lowest free lane, avoiding the given ones if that is possible
+    /// without widening the graph past [`MAX_LANES`].
+    fn alloc_lane(&mut self, avoid: &[Lane]) -> Lane {
+        let free = self
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(lane, slot)| slot.is_none() && !avoid.contains(&(*lane as Lane)))
+            .map(|(lane, _)| lane as Lane);
+        if let Some(lane) = free {
+            return lane;
+        }
+        if self.slots.len() < MAX_LANES as usize {
+            self.slots.push(None);
+            return (self.slots.len() - 1) as Lane;
+        }
+        // At the cap the avoidance is dropped rather than honoured: a lane is
+        // expensive in a 216px panel and a V-shaped kink is only ugly.
+        if let Some(lane) = self.slots.iter().position(Option::is_none) {
+            return lane as Lane;
+        }
+        // Genuinely out of lanes. Everything past here shares the last one,
+        // which the caller reports so the renderer can say the graph is
+        // incomplete rather than quietly drawing a lie.
+        self.truncated = true;
+        MAX_LANES - 1
+    }
+}
+
+fn row_span(row: &GraphRow) -> Lane {
+    let mut span = row.node + 1;
+    for edge in &row.edges {
+        let lane = match *edge {
+            Edge::Pass { lane, .. } => lane,
+            Edge::In { from, .. } => from,
+            Edge::Out { to, .. } => to,
+        };
+        span = span.max(lane + 1);
+    }
+    span
+}
+
+/// The eleven fields, in order: sha, parents, author name/email/date,
+/// committer name/email/date, decorations, subject, body.
+pub const LOG_PRETTY: &str =
+    "--pretty=format:%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%D%x1f%s%x1f%b";
+
+const LOG_FIELDS: usize = 11;
+
+pub const REF_FORMAT: &str = "--format=%(objectname)%x1f%(refname)%x1f%(refname:short)%x1f%(upstream)%x1f%(HEAD)%x1f%(objecttype)%x1f%(*objectname)";
+
+/// Parses the output of the `log` invocation [`LOG_PRETTY`] belongs to.
+///
+/// Records are split on RS and fields on US. Fields are taken with `splitn`, so
+/// the body — the only field that can contain anything at all — absorbs every
+/// separator past the tenth instead of shifting the parse.
+pub fn parse_log(stdout: &[u8]) -> Vec<Commit> {
+    let mut commits = Vec::new();
+    let mut used = 0usize;
+    let mut on_record = |record: &[u8]| {
+        used = used.saturating_add(record.len());
+        if used > MAX_LOG_BYTES {
+            return;
+        }
+        if let Some(commit) = parse_record(record) {
+            commits.push(commit);
+        }
+    };
+    let mut split = RecordSplitter::new(REC_SEP);
+    split.push(stdout, &mut on_record);
+    split.finish(&mut on_record);
+    commits
+}
+
+fn parse_record(record: &[u8]) -> Option<Commit> {
+    let text = String::from_utf8_lossy(record);
+    let mut fields = text.splitn(LOG_FIELDS, FIELD_SEP as char);
+    let oid = fields.next()?;
+    // The stream opens with an empty record (nothing precedes the first RS),
+    // and a format drift would otherwise turn one bad record into a page of
+    // nonsense. Anything that is not a sha is not a commit.
+    if !is_hex_oid(oid) {
+        return None;
+    }
+    let parents = fields
+        .next()?
+        .split_ascii_whitespace()
+        .map(str::to_string)
+        .collect();
+    let author_name = fields.next()?;
+    let author_email = fields.next()?;
+    let author_at = fields.next()?;
+    let committer_name = fields.next()?;
+    let committer_email = fields.next()?;
+    let committer_at = fields.next()?;
+    let deco = fields.next()?;
+    let subject = fields.next()?;
+    // git joins records with a newline, so the last field carries it.
+    let body = fields.next()?.trim_end_matches(['\n', '\r']);
+
+    Some(Commit {
+        oid: oid.to_string(),
+        parents,
+        author: signature(author_name, author_email, author_at),
+        committer: signature(committer_name, committer_email, committer_at),
+        summary: clip(subject, MAX_SUBJECT_BYTES).to_string(),
+        body: clip(body, MAX_BODY_BYTES).to_string(),
+        refs: parse_deco(deco),
+    })
+}
+
+fn signature(name: &str, email: &str, at: &str) -> Signature {
+    Signature {
+        name: name.to_string(),
+        email: email.to_string(),
+        // A commit whose `%aI` will not parse is not worth dropping the commit
+        // over; it loses its timestamp and keeps everything else.
+        at: parse_iso8601(at).unwrap_or(OffsetTs {
+            unix: 0,
+            offset_minutes: 0,
+        }),
+    }
+}
+
+fn is_hex_oid(text: &str) -> bool {
+    (4..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Truncates to at most `max` bytes without splitting a character.
+fn clip(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// `%D` with `--decorate=full`: `HEAD -> refs/heads/main, tag: refs/tags/v1,
+/// refs/remotes/origin/main`.
+fn parse_deco(text: &str) -> Vec<RefDeco> {
+    let mut out = Vec::new();
+    for piece in text.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let (is_head, name) = match piece.strip_prefix("HEAD -> ") {
+            Some(rest) => (true, rest.trim()),
+            None => (false, piece),
+        };
+        // `--decorate=full` spells refnames out in full but still marks tags
+        // with a `tag: ` prefix, so both have to come off.
+        let name = name.strip_prefix("tag: ").unwrap_or(name).trim();
+        if name == "HEAD" {
+            out.push(RefDeco {
+                kind: RefKind::Head,
+                full: "HEAD".to_string(),
+                short: "HEAD".to_string(),
+                is_head: true,
+            });
+            continue;
+        }
+        if let Some(deco) = ref_deco(name, is_head) {
+            out.push(deco);
+        }
+    }
+    out
+}
+
+fn ref_deco(full: &str, is_head: bool) -> Option<RefDeco> {
+    let (kind, short) = if let Some(rest) = full.strip_prefix("refs/heads/") {
+        (RefKind::LocalBranch, rest)
+    } else if let Some(rest) = full.strip_prefix("refs/remotes/") {
+        (RefKind::RemoteBranch, rest)
+    } else if let Some(rest) = full.strip_prefix("refs/tags/") {
+        (RefKind::Tag, rest)
+    } else {
+        (RefKind::Other, full.strip_prefix("refs/").unwrap_or(full))
+    };
+    if short.is_empty() {
+        return None;
+    }
+    Some(RefDeco {
+        kind,
+        full: full.to_string(),
+        short: short.to_string(),
+        is_head,
+    })
+}
+
+/// Parses the output of the `for-each-ref` invocation [`REF_FORMAT`] belongs
+/// to, keyed by the commit each ref ultimately points at.
+pub fn parse_refs(stdout: &[u8]) -> HashMap<Oid, Vec<RefDeco>> {
+    let mut out: HashMap<Oid, Vec<RefDeco>> = HashMap::new();
+    let text = String::from_utf8_lossy(stdout);
+    for line in text.lines().take(MAX_REFS) {
+        let mut fields = line.split(FIELD_SEP as char);
+        let object = fields.next().unwrap_or_default().trim();
+        let full = fields.next().unwrap_or_default().trim();
+        // `%(refname:short)` is skipped in favour of stripping the prefix here,
+        // so a ref named the same way from `%D` and from here reads identically
+        // in the UI. `%(upstream)` and `%(objecttype)` are asked for because
+        // the branch switcher will want them off the same call; neither has a
+        // home on `RefDeco` yet.
+        let _short = fields.next();
+        let _upstream = fields.next();
+        let head = fields.next().unwrap_or_default().trim();
+        let _kind = fields.next();
+        let peeled = fields.next().unwrap_or_default().trim();
+        // `%(*objectname)` is empty unless this is an annotated tag. When it is
+        // not, the chip belongs on the commit rather than on the tag object,
+        // which is the only reason the field is in the format.
+        let target = if peeled.is_empty() { object } else { peeled };
+        if full.is_empty() || !is_hex_oid(target) {
+            continue;
+        }
+        if let Some(deco) = ref_deco(full, head == "*") {
+            out.entry(target.to_string()).or_default().push(deco);
+        }
+    }
+    out
+}
+
+pub fn for_each_ref(host: &dyn Host, root: &Path) -> HashMap<Oid, Vec<RefDeco>> {
+    let count = format!("--count={MAX_REFS}");
+    let args = [
+        "for-each-ref",
+        "--sort=-committerdate",
+        &count,
+        REF_FORMAT,
+        "refs/heads",
+        "refs/remotes",
+        "refs/tags",
+    ];
+    match host.git(root, &args) {
+        Ok(out) if out.success() => parse_refs(&out.stdout),
+        _ => HashMap::new(),
+    }
+}
+
+/// Loads the newest `count` commits of `scope` and lays them out.
+///
+/// Paging is a bigger `-n`, never `--skip`. `--skip=M` walks and discards M
+/// commits every time, and any ref that moves between two pages shifts the
+/// window so page two no longer continues page one. Re-walking is O(n) either
+/// way, the layout is deterministic, so a larger page reproduces the previous
+/// one as its prefix and nothing on screen moves.
+pub fn load_page(
+    host: &dyn Host,
+    root: &Path,
+    scope: &GraphScope,
+    count: usize,
+) -> Option<CommitPage> {
+    let count = count.clamp(1, MAX_GRAPH_COMMITS);
+    let revs = scope_revs(host, root, scope);
+    if revs.is_empty() {
+        // An unborn HEAD. Not a failure: there is simply no history yet.
+        return Some(CommitPage {
+            commits: Vec::new(),
+            rows: Vec::new(),
+            max_lanes: 0,
+            scope: scope.clone(),
+            requested: count,
+            complete: true,
+            truncated_lanes: false,
+            open_lanes: Vec::new(),
+        });
+    }
+
+    let n = count.to_string();
+    let mut args = vec![
+        "-c",
+        // Verifying signatures on every commit costs more than everything else
+        // in this command put together, and the graph never shows the result.
+        "log.showSignature=false",
+        "log",
+        // Not `--date-order`: the layout needs every parent to come after all
+        // of its children, and dates do not guarantee that. A rebase or a
+        // cherry-pick across timezones is enough to invert a pair.
+        "--topo-order",
+        "--parents",
+        "--decorate=full",
+        "--no-color",
+        LOG_PRETTY,
+        "-n",
+        &n,
+    ];
+    args.extend(revs.iter().map(String::as_str));
+
+    // Buffered rather than streamed on purpose. `Host::git_lines` splits on
+    // newlines, which would chop these RS-delimited records apart and leave the
+    // caller to glue them back together, and `Host::git` is byte-exact over the
+    // control protocol's base64. 5000 commits is a few MB, which that carries
+    // fine. If it ever stops being fine the fix is a raw byte stream on `Host`,
+    // and that one does need a control protocol bump.
+    let out = host.git(root, &args).ok()?;
+    if !out.success() {
+        return None;
+    }
+    let mut commits = parse_log(&out.stdout);
+    let complete = commits.len() < count;
+
+    let page: Vec<(Oid, SmallVec<[Oid; 2]>)> = commits
+        .iter()
+        .map(|c| (c.oid.clone(), c.parents.clone()))
+        .collect();
+    let mut alloc = LaneAlloc::new();
+    let mut rows = Vec::with_capacity(page.len());
+    alloc.push(&page, &mut rows);
+    let max_lanes = rows.iter().map(row_span).max().unwrap_or(0);
+
+    let mut by_oid = for_each_ref(host, root);
+    for commit in &mut commits {
+        if let Some(extra) = by_oid.remove(&commit.oid) {
+            for deco in extra {
+                if !commit.refs.iter().any(|r| r.full == deco.full) {
+                    commit.refs.push(deco);
+                }
+            }
+        }
+        // Highest priority first, so a row that has space for one chip can take
+        // the first and count the rest.
+        commit.refs.sort_by(|a, b| {
+            b.is_head
+                .cmp(&a.is_head)
+                .then_with(|| b.kind.cmp(&a.kind))
+                .then_with(|| a.short.cmp(&b.short))
+        });
+    }
+
+    Some(CommitPage {
+        commits,
+        rows,
+        max_lanes,
+        scope: scope.clone(),
+        requested: count,
+        complete,
+        truncated_lanes: alloc.truncated(),
+        open_lanes: alloc.open_lanes(),
+    })
+}
+
+/// The revs to walk for a scope.
+///
+/// `HeadAndUpstream` resolves to shas first. Paging re-runs the walk with a
+/// larger `-n`, and a symbolic `HEAD` would let a commit pushed between the two
+/// runs change where page two starts — the second page would no longer be a
+/// superset of the first, which is the one thing paging here relies on.
+fn scope_revs(host: &dyn Host, root: &Path, scope: &GraphScope) -> Vec<String> {
+    match scope {
+        GraphScope::Head => vec!["HEAD".to_string()],
+        GraphScope::All => vec!["--all".to_string()],
+        GraphScope::Refs(refs) => {
+            let mut revs: Vec<String> = refs
+                .iter()
+                // A refname cannot begin with `-`, so anything that does is
+                // either a mistake or an option smuggled in through a scope.
+                .filter(|r| !r.is_empty() && !r.starts_with('-'))
+                .cloned()
+                .collect();
+            if revs.is_empty() {
+                revs.push("HEAD".to_string());
+            }
+            revs
+        }
+        GraphScope::HeadAndUpstream => {
+            let mut revs = Vec::new();
+            if let Some(head) = rev(host, root, "HEAD^{commit}") {
+                revs.push(head);
+            }
+            if let Some(upstream) = rev(host, root, "@{upstream}^{commit}")
+                && !revs.contains(&upstream)
+            {
+                revs.push(upstream);
+            }
+            revs
+        }
+    }
+}
+
+fn rev(host: &dyn Host, root: &Path, spec: &str) -> Option<String> {
+    let out = super::git(host, root, &["rev-parse", "--verify", "--quiet", spec])?;
+    let sha = out.trim();
+    is_hex_oid(sha).then(|| sha.to_string())
+}
+
+/// `%aI` is strict ISO 8601: `2026-08-09T14:03:11+08:00`, or `Z` for UTC.
+///
+/// Hand-rolled because the workspace carries neither `chrono` nor `time`, and
+/// thirty lines of arithmetic is a poor reason to add a dependency tree to a
+/// crate the headless server also builds.
+fn parse_iso8601(text: &str) -> Option<OffsetTs> {
+    let b = text.as_bytes();
+    if !text.is_ascii() || b.len() < 19 {
+        return None;
+    }
+    if b[4] != b'-' || b[7] != b'-' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    if b[10] != b'T' && b[10] != b't' && b[10] != b' ' {
+        return None;
+    }
+    let year: i64 = text[0..4].parse().ok()?;
+    let month: u32 = text[5..7].parse().ok()?;
+    let day: u32 = text[8..10].parse().ok()?;
+    let hour: i64 = text[11..13].parse().ok()?;
+    let minute: i64 = text[14..16].parse().ok()?;
+    // 60 is a leap second, which git will never emit but which is legal.
+    let second: i64 = text[17..19].parse().ok()?;
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let offset_minutes = parse_offset(&text[19..])?;
+    let unix = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
+        - i64::from(offset_minutes) * 60;
+    Some(OffsetTs {
+        unix,
+        offset_minutes,
+    })
+}
+
+fn parse_offset(text: &str) -> Option<i32> {
+    if text.is_empty() || text == "Z" || text == "z" {
+        return Some(0);
+    }
+    let (sign, rest) = match text.as_bytes()[0] {
+        b'+' => (1, &text[1..]),
+        b'-' => (-1, &text[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = match rest.len() {
+        5 if rest.as_bytes()[2] == b':' => (&rest[0..2], &rest[3..5]),
+        4 => (&rest[0..2], &rest[2..4]),
+        2 => (rest, "0"),
+        _ => return None,
+    };
+    let hours: i32 = hours.parse().ok()?;
+    let minutes: i32 = minutes.parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Days since 1970-01-01, by Hinnant's era algorithm. Shifting the year to
+/// start in March is what keeps the leap rules out of the code: a 400-year era
+/// is exactly 146097 days, so every correction collapses into a division.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted = i64::from((month + 9) % 12);
+    let day_of_year = (153 * shifted + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn commit(sha: &str, parents: &[&str]) -> (Oid, SmallVec<[Oid; 2]>) {
+        (
+            sha.to_string(),
+            parents.iter().map(|p| p.to_string()).collect(),
+        )
+    }
+
+    fn lay_out(page: &[(Oid, SmallVec<[Oid; 2]>)]) -> Vec<GraphRow> {
+        let mut rows = Vec::new();
+        LaneAlloc::new().push(page, &mut rows);
+        rows
+    }
+
+    fn pass_at(lane: Lane) -> Edge {
+        Edge::Pass { lane, color: lane }
+    }
+
+    fn in_at(lane: Lane) -> Edge {
+        Edge::In {
+            from: lane,
+            color: lane,
+        }
+    }
+
+    fn out_at(lane: Lane) -> Edge {
+        Edge::Out {
+            to: lane,
+            color: lane,
+        }
+    }
+
+    /// Lanes crossing the row's top edge, sorted.
+    fn top(row: &GraphRow) -> Vec<Lane> {
+        let mut lanes: Vec<Lane> = row
+            .edges
+            .iter()
+            .filter_map(|e| match *e {
+                Edge::Pass { lane, .. } => Some(lane),
+                Edge::In { from, .. } => Some(from),
+                Edge::Out { .. } => None,
+            })
+            .collect();
+        lanes.sort_unstable();
+        lanes
+    }
+
+    /// Lanes crossing the row's bottom edge, sorted.
+    fn bottom(row: &GraphRow) -> Vec<Lane> {
+        let mut lanes: Vec<Lane> = row
+            .edges
+            .iter()
+            .filter_map(|e| match *e {
+                Edge::Pass { lane, .. } => Some(lane),
+                Edge::Out { to, .. } => Some(to),
+                Edge::In { .. } => None,
+            })
+            .collect();
+        lanes.sort_unstable();
+        lanes
+    }
+
+    /// The property the whole layout rests on: at any horizontal cut through
+    /// the graph a lane carries at most one line, and what leaves a row's
+    /// bottom is exactly what enters the next row's top. Together those two
+    /// mean colour-by-lane can never put two visible lines in one colour.
+    fn assert_lanes_line_up(rows: &[GraphRow]) {
+        for (i, row) in rows.iter().enumerate() {
+            for edges in [top(row), bottom(row)] {
+                let mut once = edges.clone();
+                once.dedup();
+                assert_eq!(once, edges, "row {i} has two lines on one lane: {row:?}");
+            }
+        }
+        for (i, pair) in rows.windows(2).enumerate() {
+            assert_eq!(
+                bottom(&pair[0]),
+                top(&pair[1]),
+                "row {i} does not hand its lanes to row {}",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn a_linear_chain_stays_in_one_lane() {
+        let page = [commit("a", &["b"]), commit("b", &["c"]), commit("c", &[])];
+        let rows = lay_out(&page);
+
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.node == 0 && r.color == 0));
+        assert_eq!(rows[0].edges.as_slice(), [out_at(0)]);
+        assert_eq!(rows[1].edges.as_slice(), [in_at(0), out_at(0)]);
+        assert_eq!(rows[2].edges.as_slice(), [in_at(0)]);
+        assert_eq!(rows[2].parents, 0, "the last one is a root");
+        assert_lanes_line_up(&rows);
+    }
+
+    #[test]
+    fn a_fork_and_a_merge_open_and_close_one_lane() {
+        let page = [
+            commit("m", &["a", "b"]),
+            commit("a", &["base"]),
+            commit("b", &["base"]),
+            commit("base", &[]),
+        ];
+        let rows = lay_out(&page);
+
+        assert_eq!(rows[0].node, 0);
+        assert_eq!(rows[0].parents, 2);
+        assert_eq!(
+            rows[0].edges.as_slice(),
+            [out_at(0), out_at(1)],
+            "the merge leaves on its own lane and on a fresh one"
+        );
+        assert_eq!(rows[1].edges.as_slice(), [pass_at(1), in_at(0), out_at(0)]);
+        assert_eq!(rows[2].node, 1, "the second parent kept the lane it opened");
+        assert_eq!(rows[3].node, 0);
+        assert_eq!(
+            rows[3].edges.as_slice(),
+            [in_at(0), in_at(1)],
+            "both sides come back together at the base"
+        );
+        assert_eq!(rows[3].parents, 0);
+        assert_lanes_line_up(&rows);
+    }
+
+    #[test]
+    fn an_octopus_merge_leaves_on_one_lane_per_parent() {
+        let page = [
+            commit("m", &["p1", "p2", "p3"]),
+            commit("p1", &[]),
+            commit("p2", &[]),
+            commit("p3", &[]),
+        ];
+        let rows = lay_out(&page);
+
+        assert_eq!(rows[0].parents, 3);
+        assert_eq!(rows[0].edges.as_slice(), [out_at(0), out_at(1), out_at(2)]);
+        assert_eq!(
+            rows.iter().map(|r| r.node).collect::<Vec<_>>(),
+            [0, 0, 1, 2]
+        );
+        assert_lanes_line_up(&rows);
+    }
+
+    #[test]
+    fn a_parent_outside_the_window_leaves_its_lane_open() {
+        let page = [commit("a", &["b"])];
+        let mut alloc = LaneAlloc::new();
+        let mut rows = Vec::new();
+        alloc.push(&page, &mut rows);
+
+        assert_eq!(alloc.open_lanes(), [0], "b is below the page boundary");
+        assert_eq!(alloc.width(), 1);
+        assert!(!alloc.truncated());
+    }
+
+    #[test]
+    fn two_independent_roots_end_their_own_lanes() {
+        let page = [
+            commit("a", &["a1"]),
+            commit("b", &["b1"]),
+            commit("a1", &[]),
+            commit("b1", &[]),
+        ];
+        let mut alloc = LaneAlloc::new();
+        let mut rows = Vec::new();
+        alloc.push(&page, &mut rows);
+
+        assert_eq!(
+            rows.iter().map(|r| r.node).collect::<Vec<_>>(),
+            [0, 1, 0, 1],
+            "the two histories never share a lane"
+        );
+        assert_eq!(rows[2].parents, 0);
+        assert_eq!(rows[3].parents, 0);
+        assert!(
+            alloc.open_lanes().is_empty(),
+            "both lanes died at their root"
+        );
+        assert_lanes_line_up(&rows);
+    }
+
+    #[test]
+    fn a_dead_lane_is_reused_without_two_live_lines_sharing_it() {
+        let page = [
+            commit("a", &["a1"]),
+            commit("b", &["b1"]),
+            commit("b1", &[]),
+            commit("c", &["c1"]),
+        ];
+        let rows = lay_out(&page);
+
+        assert_eq!(rows[1].node, 1);
+        assert_eq!(rows[3].node, 1, "the freed lane was handed to the new tip");
+        assert!(
+            !bottom(&rows[2]).contains(&1),
+            "the old line is gone from the band before the new one starts"
+        );
+        assert!(!top(&rows[3]).contains(&1), "the new tip has nothing above");
+        assert_lanes_line_up(&rows);
+    }
+
+    #[test]
+    fn splitting_a_page_in_two_lays_out_identically() {
+        let page = [
+            commit("m", &["a", "b"]),
+            commit("a", &["base"]),
+            commit("b", &["base"]),
+            commit("t", &["q"]),
+            commit("base", &["p"]),
+            commit("p", &["q"]),
+            commit("q", &[]),
+        ];
+
+        let whole = lay_out(&page);
+
+        let mut alloc = LaneAlloc::new();
+        let mut paged = Vec::new();
+        alloc.push(&page[..3], &mut paged);
+        let first_page = paged.clone();
+        alloc.push(&page[3..], &mut paged);
+
+        assert_eq!(first_page, whole[..3], "the first page is a prefix");
+        assert_eq!(paged, whole, "and loading more never re-flows it");
+        assert_lanes_line_up(&whole);
+    }
+
+    #[test]
+    fn a_second_parent_avoids_the_lane_this_row_just_freed() {
+        let page = [
+            commit("t0", &["c"]),
+            commit("t1", &["x"]),
+            commit("t2", &["c"]),
+            commit("c", &["p0", "p1"]),
+        ];
+        let rows = lay_out(&page);
+
+        let merge = &rows[3];
+        assert_eq!(merge.node, 0);
+        assert_eq!(top(merge), [0, 1, 2], "two lines land here, one passes by");
+        assert!(
+            !merge.edges.contains(&out_at(2)),
+            "lane 2 just ended here; leaving on it would draw a V: {merge:?}"
+        );
+        assert!(merge.edges.contains(&out_at(3)));
+        assert_lanes_line_up(&rows);
+    }
+
+    #[test]
+    fn more_parents_than_lanes_truncates_instead_of_panicking() {
+        let parents: Vec<String> = (0..40).map(|i| format!("p{i}")).collect();
+        let refs: Vec<&str> = parents.iter().map(String::as_str).collect();
+        let mut page = vec![commit("m", &refs)];
+        page.extend(parents.iter().map(|p| commit(p, &[])));
+
+        let mut alloc = LaneAlloc::new();
+        let mut rows = Vec::new();
+        alloc.push(&page, &mut rows);
+
+        assert!(alloc.truncated());
+        assert_eq!(rows[0].parents, 40);
+        assert!(
+            rows.iter().all(|r| r.node < MAX_LANES),
+            "every row stayed inside the lane budget"
+        );
+        assert!(rows.iter().flat_map(bottom).all(|lane| lane < MAX_LANES));
+    }
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    fn record(fields: &[&str]) -> String {
+        format!("\x1e{}", fields.join("\x1f"))
+    }
+
+    fn one(oid: &str, parents: &str, deco: &str, subject: &str, body: &str) -> String {
+        record(&[
+            oid,
+            parents,
+            "Ada",
+            "ada@example.com",
+            "2026-08-09T14:03:11+08:00",
+            "Grace",
+            "grace@example.com",
+            "2026-08-09T15:00:00+08:00",
+            deco,
+            subject,
+            body,
+        ])
+    }
+
+    #[test]
+    fn a_multi_line_body_survives_the_record_split() {
+        let stream = [
+            one(
+                SHA_A,
+                SHA_B,
+                "",
+                "first",
+                "line one\nline two\n\nline four\n",
+            ),
+            one(SHA_B, "", "", "second", ""),
+        ]
+        .join("\n");
+        let commits = parse_log(stream.as_bytes());
+
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].summary, "first");
+        assert_eq!(commits[0].body, "line one\nline two\n\nline four");
+        assert_eq!(commits[0].author.name, "Ada");
+        assert_eq!(commits[0].committer.email, "grace@example.com");
+        assert_eq!(commits[1].body, "");
+        assert_eq!(commits[1].parents.len(), 0);
+        assert!(!commits[0].is_merge());
+    }
+
+    #[test]
+    fn a_merge_records_both_parents() {
+        let stream = one(SHA_A, &format!("{SHA_B} {SHA_C}"), "", "merge", "");
+        let commits = parse_log(stream.as_bytes());
+
+        assert_eq!(commits[0].parents.as_slice(), [SHA_B, SHA_C]);
+        assert!(commits[0].is_merge());
+        assert_eq!(commits[0].short(), "aaaaaaa");
+    }
+
+    #[test]
+    fn decorations_map_to_their_ref_kinds() {
+        let deco = "HEAD -> refs/heads/main, refs/remotes/origin/main, tag: refs/tags/v1.0";
+        let stream = one(SHA_A, "", deco, "subject", "");
+        let refs = parse_log(stream.as_bytes()).remove(0).refs;
+
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].kind, RefKind::LocalBranch);
+        assert_eq!(refs[0].short, "main");
+        assert_eq!(refs[0].full, "refs/heads/main");
+        assert!(refs[0].is_head);
+        assert_eq!(refs[1].kind, RefKind::RemoteBranch);
+        assert_eq!(refs[1].short, "origin/main");
+        assert!(!refs[1].is_head);
+        assert_eq!(refs[2].kind, RefKind::Tag);
+        assert_eq!(refs[2].short, "v1.0");
+
+        let detached = one(SHA_A, "", "HEAD, refs/tags/v2", "subject", "");
+        let refs = parse_log(detached.as_bytes()).remove(0).refs;
+        assert_eq!(refs[0].kind, RefKind::Head);
+        assert!(refs[0].is_head);
+    }
+
+    #[test]
+    fn a_unit_separator_inside_a_body_does_not_shift_fields() {
+        let body = "before\x1fafter\x1fand\x1fmore";
+        let stream = one(SHA_A, "", "", "subject", body);
+        let commits = parse_log(stream.as_bytes());
+
+        assert_eq!(
+            commits[0].summary, "subject",
+            "the subject is still field 10"
+        );
+        assert_eq!(commits[0].body, body, "the body swallowed the extra ones");
+    }
+
+    #[test]
+    fn a_record_that_does_not_start_with_a_sha_is_dropped() {
+        let stream = [
+            record(&["not a sha", "", "who", "", "", "", "", "", "", "junk", ""]),
+            one(SHA_A, "", "", "real", ""),
+            record(&[SHA_B, "only two fields"]),
+        ]
+        .join("\n");
+        let commits = parse_log(stream.as_bytes());
+
+        assert_eq!(commits.len(), 1, "{commits:?}");
+        assert_eq!(commits[0].summary, "real");
+    }
+
+    #[test]
+    fn iso_8601_offsets_and_leap_days_parse() {
+        assert_eq!(
+            parse_iso8601("1970-01-01T00:00:00Z"),
+            Some(OffsetTs {
+                unix: 0,
+                offset_minutes: 0
+            })
+        );
+        assert_eq!(
+            parse_iso8601("1970-01-01T00:00:00+00:00"),
+            Some(OffsetTs {
+                unix: 0,
+                offset_minutes: 0
+            })
+        );
+        // Same instant, written from two sides of the planet.
+        assert_eq!(
+            parse_iso8601("2026-08-09T14:03:11+08:00"),
+            Some(OffsetTs {
+                unix: 1_786_255_391,
+                offset_minutes: 480
+            })
+        );
+        assert_eq!(
+            parse_iso8601("2026-08-09T02:03:11-04:00"),
+            Some(OffsetTs {
+                unix: 1_786_255_391,
+                offset_minutes: -240
+            })
+        );
+        assert_eq!(
+            parse_iso8601("2026-08-09T11:33:11+05:30").map(|t| t.unix),
+            Some(1_786_255_391)
+        );
+        assert_eq!(
+            parse_iso8601("2024-02-29T00:00:00Z").map(|t| t.unix),
+            Some(1_709_164_800),
+            "2024 is a leap year"
+        );
+        assert_eq!(
+            parse_iso8601("2000-02-29T00:00:00Z").map(|t| t.unix),
+            Some(951_782_400),
+            "and so is 2000, the four-hundred-year exception"
+        );
+        assert_eq!(parse_iso8601("2023-02-29T00:00:00Z"), None);
+        assert_eq!(parse_iso8601("1900-02-29T00:00:00Z"), None);
+        assert_eq!(parse_iso8601("2026-13-01T00:00:00Z"), None);
+        assert_eq!(parse_iso8601("2026-08-09T24:00:00Z"), None);
+        assert_eq!(parse_iso8601("nope"), None);
+        assert_eq!(parse_iso8601("2026-08-09T14:03:11 08:00"), None);
+    }
+
+    #[test]
+    fn an_oversized_subject_and_body_are_cut_on_a_char_boundary() {
+        let subject = "提".repeat(400);
+        let body = "交".repeat(4000);
+        let stream = one(SHA_A, "", "", &subject, &body);
+        let commit = parse_log(stream.as_bytes()).remove(0);
+
+        assert_eq!(
+            commit.summary.len(),
+            MAX_SUBJECT_BYTES - MAX_SUBJECT_BYTES % 3,
+            "cut back to the last whole character"
+        );
+        assert!(commit.summary.chars().all(|c| c == '提'));
+        assert_eq!(commit.body.len(), MAX_BODY_BYTES - MAX_BODY_BYTES % 3);
+        assert!(commit.body.chars().all(|c| c == '交'));
+    }
+
+    #[test]
+    fn an_annotated_tag_lands_on_the_commit_not_the_tag_object() {
+        let tag_object = "1111111111111111111111111111111111111111";
+        let lines = [
+            format!(
+                "{SHA_A}\x1frefs/heads/main\x1fmain\x1frefs/remotes/origin/main\x1f*\x1fcommit\x1f"
+            ),
+            format!("{tag_object}\x1frefs/tags/v9\x1fv9\x1f\x1f \x1ftag\x1f{SHA_B}"),
+            format!("{SHA_C}\x1frefs/remotes/origin/dev\x1forigin/dev\x1f\x1f \x1fcommit\x1f"),
+        ];
+        let by_oid = parse_refs(lines.join("\n").as_bytes());
+
+        assert_eq!(by_oid[SHA_A][0].kind, RefKind::LocalBranch);
+        assert!(by_oid[SHA_A][0].is_head, "the `*` column marks HEAD");
+        assert!(
+            !by_oid.contains_key(tag_object),
+            "the tag object itself is never a graph row"
+        );
+        assert_eq!(by_oid[SHA_B][0].kind, RefKind::Tag);
+        assert_eq!(by_oid[SHA_B][0].short, "v9");
+        assert_eq!(by_oid[SHA_C][0].short, "origin/dev");
+    }
+
+    #[test]
+    fn this_repo_lays_out_one_row_per_commit() {
+        let host = crate::host::local::LocalHost::new();
+        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Graceful about not being in a repository at all: a source tarball is
+        // a legitimate place to run the tests from.
+        let Some(page) = load_page(&*host, here, &GraphScope::Head, 30) else {
+            return;
+        };
+
+        assert_eq!(page.rows.len(), page.commits.len());
+        assert!(!page.commits.is_empty(), "this repo has commits");
+        assert!(page.max_lanes >= 1);
+        assert!(!page.truncated_lanes);
+        assert!(page.rows.iter().all(|r| r.node < page.max_lanes));
+        assert!(page.commits.iter().all(|c| is_hex_oid(&c.oid)));
+        assert!(
+            page.commits
+                .iter()
+                .all(|c| c.author.at.unix > 1_600_000_000),
+            "every commit got a real timestamp"
+        );
+        assert_lanes_line_up(&page.rows);
+
+        let page = load_page(&*host, here, &GraphScope::HeadAndUpstream, 5).unwrap();
+        assert_eq!(page.commits.len(), 5);
+        assert!(!page.complete, "five commits is not the whole history");
+    }
+}
