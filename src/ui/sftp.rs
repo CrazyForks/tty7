@@ -515,13 +515,12 @@ impl Tty7App {
         cx.notify();
     }
 
-    pub(crate) fn sftp_enter_dir(&mut self, entry: SftpEntry, cx: &mut Context<Self>) {
-        if is_dir_like(&entry) {
-            let target = remote_join(&self.sftp_panel.cwd, &entry.name);
-            self.sftp_navigate(target, cx);
-        }
-    }
-
+    /// The double-click gesture and the row menu's first item both land here.
+    /// They used to differ: double-click ran a directory-only handler, so
+    /// double-clicking a file — the gesture every file browser answers by
+    /// opening it — did nothing at all, with no cursor change or message to
+    /// say why. A download is visible in the transfers tray and cancellable
+    /// from it, so the worst case is a click you can take back.
     pub(crate) fn sftp_open_entry(&mut self, entry: SftpEntry, cx: &mut Context<Self>) {
         let target = remote_join(&self.sftp_panel.cwd, &entry.name);
         if is_dir_like(&entry) {
@@ -1333,7 +1332,7 @@ impl Tty7App {
             .cursor_pointer()
             .hover(|s| s.bg(list_hover))
             .on_double_click(
-                cx.listener(move |this, _, _w, cx| this.sftp_enter_dir(open_entry.clone(), cx)),
+                cx.listener(move |this, _, _w, cx| this.sftp_open_entry(open_entry.clone(), cx)),
             )
             .child(
                 Icon::new(icon)
