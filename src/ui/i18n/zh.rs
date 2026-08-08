@@ -399,7 +399,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsNotifyOnCommandFinish => "命令完成时通知",
         L10nKey::SettingsNotifyOnCommandFinishDesc => "较长的前台命令完成后发出桌面提醒。",
         L10nKey::SettingsNotifyThreshold => "通知阈值",
-        L10nKey::SettingsNotifyThresholdDesc => "命令需运行多久才能算作\"较长\"。",
+        L10nKey::SettingsNotifyThresholdDesc => "命令需运行多久才能算作“较长”。",
         L10nKey::SettingsWindow => "窗口",
         L10nKey::NotifyModeNever => "从不",
         L10nKey::NotifyModeUnfocused => "窗口未聚焦时",
@@ -752,7 +752,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::FileTreePlaceholderFileName => "文件名",
         L10nKey::FileTreePlaceholderFolderName => "文件夹名",
         L10nKey::FileTreePlaceholderNewName => "新名称",
-        L10nKey::FileTreeDeleteTitle => "删除\"{name}\"？",
+        L10nKey::FileTreeDeleteTitle => "删除“{name}”？",
         L10nKey::FileTreeDeleteFolderBody => "该文件夹及其中的所有内容都将被删除。",
         L10nKey::FileTreeDeleteFileBody => "该文件将被删除。",
         L10nKey::SftpDeleteFolderBody => {
@@ -774,9 +774,9 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SshPromptOldKey => "旧 {old_fingerprint}",
         L10nKey::EditorCantOpen => "无法打开 {path}：{e}",
         L10nKey::EditorCantRead => "无法读取 {path}：{e}",
-        L10nKey::EditorNotUtf8 => "\"{path}\" 不是有效的 UTF-8",
+        L10nKey::EditorNotUtf8 => "“{path}”不是有效的 UTF-8",
         L10nKey::EditorSaveFailed => "保存 {name} 失败",
-        L10nKey::EditorUnsavedChanges => "\"{name}\" 有未保存的更改",
+        L10nKey::EditorUnsavedChanges => "“{name}”有未保存的更改",
         L10nKey::EditorDiscard => "放弃",
         L10nKey::EditorNoFileOpen => "没有打开的文件",
         L10nKey::EditorBackToTerminal => "返回终端 (Esc)",
@@ -785,8 +785,8 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::EditorPreview => "预览",
         L10nKey::EditorWrapOn => "自动换行：开",
         L10nKey::EditorWrapOff => "自动换行：关",
-        L10nKey::EditorFileTooLarge => "\"{path}\" 太大，无法在编辑器中打开（{size} MB）",
-        L10nKey::EditorBinaryFile => "\"{path}\" 看起来是二进制文件",
+        L10nKey::EditorFileTooLarge => "“{path}”太大，无法在编辑器中打开（{size} MB）",
+        L10nKey::EditorBinaryFile => "“{path}”看起来是二进制文件",
         L10nKey::PanelInfoTitle => "信息",
         L10nKey::PanelChangesTitle => "变更",
         L10nKey::PanelFilesTitle => "文件",
@@ -817,7 +817,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::WindowStop => "停止",
         L10nKey::WindowDelete => "删除",
         L10nKey::WindowThisWorkspace => "此工作区",
-        L10nKey::WindowConfirmTitle => "{verb}工作区\"{name}\"？",
+        L10nKey::WindowConfirmTitle => "{verb}工作区“{name}”？",
         L10nKey::WindowStopUnreachable => "无法连接到其所在机器。仍在运行的 shell 将会被终止。",
         L10nKey::WindowDeleteUnreachable => {
             "无法连接到其所在机器。仍在运行的 shell 将会被终止，布局也将被清除。"
@@ -866,7 +866,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::HomeTimeYesterday => "昨天",
         L10nKey::HomeTimeDaysAgo => "{count} 天前",
         L10nKey::HomeTimeOverWeekAgo => "一周多前",
-        L10nKey::HomeReopenNamed => "重新打开\"{name}\"",
+        L10nKey::HomeReopenNamed => "重新打开“{name}”",
         L10nKey::RemoteStripDisconnected => "未连接到 {machine}",
         L10nKey::RemoteStripConnecting => "正在连接 {machine}…",
         L10nKey::RemoteStripReconnecting => "正在重新连接 {machine}…",
@@ -884,7 +884,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
              请检查其 SSH 主机配置或 ~/.ssh/config 条目是否仍然存在。"
         }
         L10nKey::RemoteThisComputer => "本机",
-        L10nKey::RemoteRestartTitle => "重启 \"{machine}\" 上的 tty7 服务器？",
+        L10nKey::RemoteRestartTitle => "重启“{machine}”上的 tty7 服务器？",
         L10nKey::RemoteRestartBody => {
             "这将停止 {machine} 上的所有 shell——其中仍在运行的任何内容都会被终止，\
              包括此窗口未显示的 shell。工作区和布局会被保留，并以全新的 shell 恢复。"
@@ -894,14 +894,14 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
              \n\
              {machine} 上运行的所有会话都会结束，包括此窗口未连接的会话。"
         }
-        L10nKey::RemoteRestartFailedTitle => "\"{machine}\" 上的 tty7 服务器未被重启",
+        L10nKey::RemoteRestartFailedTitle => "“{machine}”上的 tty7 服务器未被重启",
         L10nKey::RemoteRestartFailedBody => {
             "{error}\n\
              \n\
              那里仍在运行的会话用的还是旧版本。如果它们已经结束，重新连接就会启动此版本的服务器。"
         }
         L10nKey::RemoteHostUnreachable => "无法连接到 {machine}：{error}",
-        L10nKey::RemoteInstallTitle => "在 \"{machine}\" 上安装 tty7 服务器？",
+        L10nKey::RemoteInstallTitle => "在“{machine}”上安装 tty7 服务器？",
         L10nKey::RemoteInstallDetail => {
             "tty7 会将其服务器二进制文件写入 {machine}，以便本机可以在那里托管\
              工作区。{machine} 上的其他内容不会被修改，也不会使用 sudo。\n\
@@ -921,7 +921,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::RemoteInstallShaLabel => "SHA-256",
         L10nKey::RemoteInstallSilentUpgrades => "此后在该机器上的升级将静默安装。",
         L10nKey::RemoteInstallBytes => "字节",
-        L10nKey::RemoteMismatchTitle => "更新 \"{machine}\" 上的 tty7 服务器端？",
+        L10nKey::RemoteMismatchTitle => "更新“{machine}”上的 tty7 服务器端？",
         L10nKey::RemoteMismatchDetail => {
             "{machine} 正在使用 {running} 提供 tty7 会话，该版本使用的协议无法被\
              此客户端（{wanted}）识别。tty7 已在那里安装了匹配的服务器端，\
@@ -1085,8 +1085,8 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::CmdRestartServerSubtitle => "结束所有运行中的 shell；保留布局",
         L10nKey::CmdQuitTty7 => "退出 tty7",
         L10nKey::CmdQuitTty7Subtitle => "shell 保持运行",
-        L10nKey::CmdQuickConnect => "连接到 \"{target}\"",
-        L10nKey::CmdQuickConnectSaveProfile => "将 \"{target}\" 保存为主机配置…",
+        L10nKey::CmdQuickConnect => "连接到“{target}”",
+        L10nKey::CmdQuickConnectSaveProfile => "将“{target}”保存为主机配置…",
         L10nKey::CmdRecent => "最近使用",
         L10nKey::AppRestartServerTitle => "重启服务器？",
         L10nKey::AppRestartServerFailed => "无法重启后台服务器：{error}",
@@ -1113,7 +1113,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
             "位于 {path} 的已关闭标签页的 worktree 有未提交的变更。"
         }
         L10nKey::AppWorktreeRemoveDetailClean => "位于 {path} 的已关闭标签页的 worktree 是干净的。",
-        L10nKey::AppWorktreeRemoveTitle => "删除 worktree\"{branch}\"？",
+        L10nKey::AppWorktreeRemoveTitle => "删除 worktree“{branch}”？",
         L10nKey::AppWorktreeDiscardAndRemove => "放弃变更并删除",
         L10nKey::AppWorktreeRemove => "删除 worktree",
         L10nKey::AppWorktreeKeep => "保留",
@@ -1123,7 +1123,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::AppSshConnectionFailed => "SSH 连接失败：{error}",
         L10nKey::AppSshReconnectFailed => "SSH 重新连接失败：{error}",
         L10nKey::AppSplitPaneFailed => "无法拆分窗格：{error}",
-        L10nKey::AppWorktreeRemoved => "已删除 worktree\"{branch}\"",
+        L10nKey::AppWorktreeRemoved => "已删除 worktree“{branch}”",
         L10nKey::AppWorktreeRemoveFailed => "删除 worktree 失败：{error}",
         L10nKey::AppForkStillConnecting => "无法 fork：窗格仍在连接中",
         L10nKey::AppPaneNoCodingAgent => "此窗格未运行编码 agent",
@@ -1167,10 +1167,10 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::AppSshParseUnbalancedQuotes => "SSH 命令中的引号不匹配",
         L10nKey::AppSshParseNoRemoteCommands => "此处不支持远程命令",
         L10nKey::AppSshParseFlagNeedsValue => "-{flag} 需要一个值",
-        L10nKey::AppSshParseInvalidPort => "无效端口 \"{value}\"",
-        L10nKey::AppSshParseUnsupportedOption => "不支持的选项 \"{option}\"",
+        L10nKey::AppSshParseInvalidPort => "无效端口“{value}”",
+        L10nKey::AppSshParseUnsupportedOption => "不支持的选项“{option}”",
         L10nKey::AppSshParseEnterHost => "输入要连接的主机",
-        L10nKey::AppSshParseBadHost => "无法解析主机 \"{host}\"",
+        L10nKey::AppSshParseBadHost => "无法解析主机“{host}”",
         L10nKey::AppMenuMinimize => "最小化",
         L10nKey::AppMenuZoom => "缩放",
         L10nKey::SwitcherStatusRestarting => "正在重启…",
