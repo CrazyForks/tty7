@@ -608,6 +608,12 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsSearchAnsiColorsKeywords => {
             "パレット 16 ANSI カラー ターミナル テーマ ansi colors palette terminal theme colours"
         }
+        L10nKey::SettingsSearchBackgroundImageKeywords => {
+            "背景画像 壁紙 画像 写真 テーマ background image wallpaper picture theme"
+        }
+        L10nKey::SettingsSearchImageOpacityKeywords => {
+            "背景画像 不透明度 透明度 強さ 壁紙 background image opacity strength fade"
+        }
         L10nKey::SettingsSearchArgumentsKeywords => {
             "シェル フラグ ログイン 引数 arguments shell flags login args"
         }
@@ -639,7 +645,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
             "カーソル 形状 ブロック バー アンダーライン ビーム cursor shape caret block bar underline beam"
         }
         L10nKey::SettingsSearchCustomThemesKeywords => {
-            "テーマ 複製 編集 色 フォルダ yaml インポート custom themes duplicate edit colors folder import"
+            "テーマ 複製 編集 色 フォルダ 背景画像 壁紙 yaml インポート custom themes duplicate edit colors folder import background image wallpaper"
         }
         L10nKey::SettingsSearchDetectUrlsKeywords => {
             "リンク ハイパーリンク クリック可能 開く detect urls links hyperlink clickable open"

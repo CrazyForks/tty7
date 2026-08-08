@@ -509,6 +509,8 @@ l10n_keys! {
     SettingsSearchCheckUpdatesOnLaunchKeywords,
     SettingsSearchUpdateChannelKeywords,
     SettingsSearchAnsiColorsKeywords,
+    SettingsSearchBackgroundImageKeywords,
+    SettingsSearchImageOpacityKeywords,
     SettingsSearchArgumentsKeywords,
     SettingsSearchBlurKeywords,
     SettingsSearchBoldFontKeywords,

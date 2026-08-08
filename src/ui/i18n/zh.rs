@@ -539,6 +539,12 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsSearchAnsiColorsKeywords => {
             "ANSI颜色 调色板 终端颜色 主题 ansi colors palette terminal theme"
         }
+        L10nKey::SettingsSearchBackgroundImageKeywords => {
+            "背景图片 背景图 壁纸 图片 照片 主题 background image wallpaper picture theme"
+        }
+        L10nKey::SettingsSearchImageOpacityKeywords => {
+            "背景图片 不透明度 透明度 强度 壁纸 background image opacity strength fade"
+        }
         L10nKey::SettingsSearchArgumentsKeywords => {
             "参数 shell 启动参数 登录参数 arguments shell flags login args"
         }
@@ -568,7 +574,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
             "光标形状 光标 块 竖线 下划线 cursor shape caret block bar underline beam"
         }
         L10nKey::SettingsSearchCustomThemesKeywords => {
-            "自定义主题 复制 编辑 颜色 文件夹 yaml 导入 theme custom edit duplicate colors import"
+            "自定义主题 复制 编辑 颜色 文件夹 背景图片 壁纸 yaml 导入 theme custom edit duplicate colors import background image wallpaper"
         }
         L10nKey::SettingsSearchDetectUrlsKeywords => {
             "检测URL 链接 超链接 可点击 打开 detect urls links hyperlink open"

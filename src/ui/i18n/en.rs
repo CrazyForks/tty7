@@ -607,6 +607,12 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "proxy http https socks socks5 clash v2ray network download update"
         }
         L10nKey::SettingsSearchAnsiColorsKeywords => "palette 16 terminal colours theme",
+        L10nKey::SettingsSearchBackgroundImageKeywords => {
+            "background image wallpaper picture photo backdrop theme"
+        }
+        L10nKey::SettingsSearchImageOpacityKeywords => {
+            "background image opacity strength fade wallpaper"
+        }
         L10nKey::SettingsSearchArgumentsKeywords => "shell flags login args",
         L10nKey::SettingsSearchBlurKeywords => {
             "transparency translucent frosted vibrancy window background"
@@ -626,7 +632,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsSearchCursorBlinkKeywords => "caret blinking flash",
         L10nKey::SettingsSearchCursorShapeKeywords => "caret block bar underline beam",
         L10nKey::SettingsSearchCustomThemesKeywords => {
-            "theme duplicate edit colors folder yaml import"
+            "theme duplicate edit colors folder yaml import background image wallpaper"
         }
         L10nKey::SettingsSearchDetectUrlsKeywords => "links hyperlink clickable open",
         L10nKey::SettingsSearchDiffPreviewFromCountsKeywords => {

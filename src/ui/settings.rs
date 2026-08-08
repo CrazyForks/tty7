@@ -200,6 +200,16 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             keywords: SettingsSearchAnsiColorsKeywords,
         },
         SearchEntry {
+            section: Appearance,
+            title: SettingsBackgroundImage,
+            keywords: SettingsSearchBackgroundImageKeywords,
+        },
+        SearchEntry {
+            section: Appearance,
+            title: SettingsImageOpacity,
+            keywords: SettingsSearchImageOpacityKeywords,
+        },
+        SearchEntry {
             section: Terminal,
             title: SettingsProgram,
             keywords: SettingsSearchProgramKeywords,
@@ -5754,6 +5764,13 @@ mod tests {
             ("channel", About),
             ("metered", About),
             ("automatic", About),
+            // A headline feature the index had never heard of: "background
+            // image" matched nothing, and typing it walked the page to About
+            // because "background" alone hits Download updates in the
+            // background.
+            ("background image", Appearance),
+            ("wallpaper", Appearance),
+            ("image opacity", Appearance),
         ];
         for (query, expected) in cases {
             assert_eq!(
