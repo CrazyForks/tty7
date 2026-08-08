@@ -98,7 +98,14 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuFocusNextPane), FocusNextPane),
             MenuItem::action(t(L10nKey::AppMenuFocusPreviousPane), FocusPrevPane),
-            MenuItem::action(t(L10nKey::AppMenuZoomPane), ToggleMaximizePane),
+            // No "Zoom Pane" here. It is bound to ⇧⌘↵, and gpui's macOS menu
+            // builder has no key equivalent for `enter`: it hands AppKit the
+            // literal string "enter", which takes the "e" — so the item drew
+            // itself as ⇧⌘E, which is Code Panel's chord, and pressing it
+            // opened the code panel. A menu item that teaches the wrong key and
+            // points at another command is worse than no menu item. Zoom Pane
+            // keeps its place in ⌘P, in a pane's own menu (drawn by us, with
+            // the right chord), and on the Keybindings page.
             MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuClearScrollback), ClearScrollback),
             // No "Enter Full Screen" here: AppKit puts its own at the bottom of
