@@ -819,7 +819,7 @@ impl ListDelegate for PaletteDelegate {
         Some(
             h_flex()
                 .h(px(PALETTE_ROW_H))
-                .px(px(11.))
+                .px(px(PALETTE_LABEL_INSET))
                 .items_center()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
@@ -910,7 +910,7 @@ impl ListDelegate for PaletteDelegate {
             ListItem::new(("palette-row", ix.section * 1000 + ix.row))
                 .selected(Some(ix) == self.selected)
                 .h(px(PALETTE_ROW_H))
-                .mx(px(5.))
+                .mx(px(PALETTE_ROW_MX))
                 .rounded(px(6.))
                 .text_sm()
                 .child(row),
@@ -1073,6 +1073,13 @@ impl PaletteView {
 impl EventEmitter<PaletteEvent> for PaletteView {}
 
 const PALETTE_ROW_H: f32 = 30.;
+
+/// Left inset of a row's *label*, so a section header can start on the same
+/// pixel column as the rows it introduces. A row is a `ListItem` inset by
+/// `PALETTE_ROW_MX` whose own padding is `px_3`; a header has neither, so it
+/// has to carry the sum itself.
+const PALETTE_ROW_MX: f32 = 5.;
+const PALETTE_LABEL_INSET: f32 = PALETTE_ROW_MX + 12.;
 
 /// The chord that opens the selected row for editing instead of running it.
 ///
