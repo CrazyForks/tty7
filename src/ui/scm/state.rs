@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use gpui::Entity;
 use gpui_component::input::InputState;
+use tty7_core::core::git::status::HeadState;
 
 use crate::ui::host_ops::HostId;
 
@@ -64,6 +65,13 @@ pub(crate) struct ScmPanelState {
     /// `InputState` needs a real window to be created in, and this struct is
     /// built by `Default` alongside the rest of `Tty7App`.
     pub(crate) commit_input: Option<Entity<InputState>>,
+    /// Which repository's draft the box is currently holding. A change here
+    /// is what moves one draft out and the next one in.
+    pub(crate) commit_repo: Option<RepoKey>,
+    /// A commit that has been dispatched: the repository, what HEAD was
+    /// before it, and the message it carried. Held until HEAD moves, so a
+    /// commit a hook rejects leaves the message in the box.
+    pub(crate) committing: Option<(RepoKey, HeadState, String)>,
     /// Whether the next commit rewrites HEAD. Armed from the commit dropdown
     /// rather than a checkbox row — 260px does not have a row to spare.
     pub(crate) amend: bool,

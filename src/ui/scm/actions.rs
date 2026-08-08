@@ -24,6 +24,10 @@ use crate::ui::scm::state::RepoKey;
 pub(crate) enum ScmIntent {
     Commit,
     CommitAmend,
+    /// Commit, then send it on. Two operations rather than one, so the commit
+    /// still stands if the network half fails.
+    CommitAndPush,
+    CommitAndSync,
     StageAll,
     UnstageAll,
     DiscardAll,
@@ -110,8 +114,21 @@ impl Tty7App {
             ScmIntent::StageAll => self.scm_op(repo, GitOp::StageAll, window, cx),
             ScmIntent::UnstageAll => self.scm_op(repo, GitOp::UnstageAll, window, cx),
             ScmIntent::DiscardAll => self.scm_discard_all(repo, window, cx),
-            // Committing needs the message box, which lands with it.
-            ScmIntent::Commit | ScmIntent::CommitAmend => {}
+            ScmIntent::Commit => {
+                let amend = self.scm.amend;
+                self.scm_commit(repo, amend, window, cx);
+            }
+            ScmIntent::CommitAmend => self.scm_commit(repo, true, window, cx),
+            ScmIntent::CommitAndPush => {
+                let amend = self.scm.amend;
+                self.scm_commit(repo.clone(), amend, window, cx);
+                self.scm_push(repo, false, window, cx);
+            }
+            ScmIntent::CommitAndSync => {
+                let amend = self.scm.amend;
+                self.scm_commit(repo.clone(), amend, window, cx);
+                self.scm_sync(repo, window, cx);
+            }
             ScmIntent::Sync => self.scm_sync(repo, window, cx),
             ScmIntent::Push => self.scm_push(repo, false, window, cx),
             ScmIntent::Pull => self.scm_op(
@@ -135,6 +152,84 @@ impl Tty7App {
             // panel's business and not this match's.
             ScmIntent::CheckoutBranch | ScmIntent::CreateBranch => {}
         }
+    }
+
+    /// Commit whatever the message box holds.
+    ///
+    /// The message comes from the box when it is the one on screen and from
+    /// the saved draft otherwise, so the key binding and the palette entry
+    /// commit the same text the user can see.
+    pub(crate) fn scm_commit(
+        &mut self,
+        repo: RepoKey,
+        amend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(status) = crate::terminal::git_data::status_of(cx, repo.host, &repo.root) else {
+            return;
+        };
+        let message = self.scm_message(&repo, cx);
+        let plan = crate::ui::scm::panel::commit_plan(&status, amend, &message);
+        if !plan.enabled {
+            gpui_component::WindowExt::push_notification(
+                window,
+                t(L10nKey::ScmNothingToCommit).to_string(),
+                cx,
+            );
+            return;
+        }
+        let all = crate::ui::scm::panel::commit_stages_everything(&status, amend);
+        // Remembered so the box can be cleared once HEAD actually moves —
+        // see `scm_commit_landed`.
+        self.scm.committing = Some((repo.clone(), status.head.clone(), message.clone()));
+        self.scm.amend = false;
+        self.scm_op(
+            repo,
+            GitOp::Commit {
+                message,
+                amend,
+                signoff: false,
+                no_verify: false,
+                all,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// What the commit box holds for a repository, whether or not it is the
+    /// one currently on screen.
+    fn scm_message(&self, repo: &RepoKey, cx: &gpui::App) -> String {
+        match (&self.scm.commit_input, &self.scm.commit_repo) {
+            (Some(input), Some(showing)) if showing == repo => input.read(cx).value().to_string(),
+            _ => self.scm.draft(repo).to_string(),
+        }
+    }
+
+    /// Park everything, including the files git does not track yet.
+    ///
+    /// `-u`, because a stash that silently leaves new files behind is a stash
+    /// that did not do what "stash all" says.
+    pub(crate) fn scm_stash_all(
+        &mut self,
+        repo: RepoKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let message = match self.scm_message(&repo, cx) {
+            m if m.trim().is_empty() => None,
+            m => Some(m),
+        };
+        self.scm_op(
+            repo,
+            GitOp::Stash {
+                message,
+                include_untracked: true,
+            },
+            window,
+            cx,
+        );
     }
 
     /// Throw away everything: tracked edits and untracked files alike.
