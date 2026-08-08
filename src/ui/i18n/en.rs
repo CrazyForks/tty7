@@ -527,14 +527,13 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsUpdateChannelStable => "Stable",
         L10nKey::SettingsUpdateChannelNightly => "Nightly",
-        L10nKey::SettingsDaemonStale => "The background service is still running {build}.",
+        L10nKey::SettingsDaemonStale => "The background server is still running {build}.",
         L10nKey::SettingsDaemonStaleDesc => {
-            "tty7 was updated in place, so the app is new but your panes are still served by the previous build. Restarting the service picks up the new one and ends every process running in your panes — shells, agents and SSH sessions alike. There is no hurry: pick a moment when your panes are idle."
+            "tty7 was updated in place, so the app is new but your panes are still served by the previous build. Restarting the server picks up the new one and ends every process running in your panes — shells, agents and SSH sessions alike. There is no hurry: pick a moment when your panes are idle."
         }
-        L10nKey::SettingsDaemonStaleRestart => "Restart Service",
         L10nKey::UpdateDialogTitle => "Update available",
         L10nKey::UpdateDialogDetail => {
-            "tty7 {version} is available — you're on {current}. Installing restarts the app; the background service keeps running, so whatever is open in your panes survives."
+            "tty7 {version} is available — you're on {current}. Installing restarts the app; the background server keeps running, so whatever is open in your panes survives."
         }
         L10nKey::UpdateDialogDetailManual => {
             "tty7 {version} is available — you're on {current}. {hint}"

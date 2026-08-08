@@ -527,14 +527,13 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsUpdateChannelStable => "安定版",
         L10nKey::SettingsUpdateChannelNightly => "ナイトリー",
-        L10nKey::SettingsDaemonStale => "バックグラウンドサービスは {build} のままです。",
+        L10nKey::SettingsDaemonStale => "バックグラウンドサーバーは {build} のままです。",
         L10nKey::SettingsDaemonStaleDesc => {
-            "tty7 はその場で更新されたため、アプリは新しくなりましたが、各ペインは以前のビルドのサービスが処理しています。サービスを再起動すると新しいビルドに切り替わりますが、ペインで動いているプロセス（シェル、エージェント、SSH セッション）はすべて終了します。急ぐ必要はありません。ペインが空いているときに実行してください。"
+            "tty7 はその場で更新されたため、アプリは新しくなりましたが、各ペインは以前のビルドのサーバーが処理しています。サーバーを再起動すると新しいビルドに切り替わりますが、ペインで動いているプロセス（シェル、エージェント、SSH セッション）はすべて終了します。急ぐ必要はありません。ペインが空いているときに実行してください。"
         }
-        L10nKey::SettingsDaemonStaleRestart => "サービスを再起動",
         L10nKey::UpdateDialogTitle => "アップデートがあります",
         L10nKey::UpdateDialogDetail => {
-            "tty7 {version} が利用できます（現在 {current}）。インストールするとアプリが再起動します。バックグラウンドサービスは動いたままなので、ペインで開いているものはそのまま残ります。"
+            "tty7 {version} が利用できます（現在 {current}）。インストールするとアプリが再起動します。バックグラウンドサーバーは動いたままなので、ペインで開いているものはそのまま残ります。"
         }
         L10nKey::UpdateDialogDetailManual => {
             "tty7 {version} が利用できます（現在 {current}）。{hint}"

@@ -5314,7 +5314,7 @@ impl Tty7App {
                                 .child(
                                     h_flex().child(
                                         Button::new("restart-stale-daemon")
-                                            .label(t(L10nKey::SettingsDaemonStaleRestart))
+                                            .label(t(L10nKey::SettingsRestartServer))
                                             .small()
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.restart_daemon(window, cx)

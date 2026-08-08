@@ -466,14 +466,13 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsUpdateChannelStable => "稳定版",
         L10nKey::SettingsUpdateChannelNightly => "每夜构建",
-        L10nKey::SettingsDaemonStale => "后台服务仍运行在 {build}。",
+        L10nKey::SettingsDaemonStale => "后台服务器仍运行在 {build}。",
         L10nKey::SettingsDaemonStaleDesc => {
-            "tty7 是原地升级的，界面已经是新版本，但各个 pane 仍由旧版本的后台服务托管。重启服务才能用上新版本，代价是 pane 里正在跑的进程全部结束——shell、agent、SSH 会话都算。不急，挑个 pane 空闲的时候再重启。"
+            "tty7 是原地升级的，界面已经是新版本，但各个 pane 仍由旧版本的后台服务器托管。重启服务器才能用上新版本，代价是 pane 里正在跑的进程全部结束——shell、agent、SSH 会话都算。不急，挑个 pane 空闲的时候再重启。"
         }
-        L10nKey::SettingsDaemonStaleRestart => "重启服务",
         L10nKey::UpdateDialogTitle => "有可用更新",
         L10nKey::UpdateDialogDetail => {
-            "tty7 {version} 已发布，你现在是 {current}。安装会重启应用；后台服务不动，pane 里开着的东西都还在。"
+            "tty7 {version} 已发布，你现在是 {current}。安装会重启应用；后台服务器不动，pane 里开着的东西都还在。"
         }
         L10nKey::UpdateDialogDetailManual => "tty7 {version} 已发布，你现在是 {current}。{hint}",
         L10nKey::UpdateDialogCannotSelfUpdate => "这份安装无法自行更新。",
