@@ -31,6 +31,7 @@ pub(crate) struct DiffOverlayState {
     pub(crate) loading: bool,
     pub(crate) expanded: HashMap<String, bool>,
     pub(crate) focus: Option<String>,
+    pub(crate) scroll: gpui::ScrollHandle,
 }
 
 impl Tty7App {
@@ -97,6 +98,7 @@ impl Tty7App {
             loading: false,
             expanded: HashMap::new(),
             focus,
+            scroll: gpui::ScrollHandle::new(),
         });
         window.focus(&focus_handle, cx);
         self.spawn_diff_probe(cx);
@@ -263,9 +265,13 @@ impl Tty7App {
             DiffLoad::Ready(snap) if empty_snapshot(snap) => {
                 self.diff_message(t(L10nKey::DiffWorkingTreeClean), cx)
             }
-            DiffLoad::Ready(snap) => {
-                self.diff_file_list(snap, &overlay.expanded, focused_file(snap, overlay), cx)
-            }
+            DiffLoad::Ready(snap) => self.diff_file_list(
+                snap,
+                &overlay.expanded,
+                focused_file(snap, overlay),
+                &overlay.scroll,
+                cx,
+            ),
         };
 
         let header = self.diff_header(overlay, window, cx);
@@ -455,6 +461,7 @@ impl Tty7App {
         snap: &DiffSnapshot,
         expanded: &HashMap<String, bool>,
         focused: Option<usize>,
+        scroll: &gpui::ScrollHandle,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let stats = snap.stats();
@@ -493,13 +500,19 @@ impl Tty7App {
         if focused.is_none() && !snap.untracked.is_empty() {
             list = list.child(self.diff_untracked_section(snap, cx));
         }
-        div()
-            .id("diff-overlay-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .child(list)
-            .into_any_element()
+        // A whole working tree can scroll past here with nothing to say how
+        // far it runs or where in it you are — the one long document in the
+        // app without the bar every other scroll area has.
+        crate::ui::scrollbar::with_vertical_scrollbar(
+            "diff-overlay-scrollbar",
+            div()
+                .id("diff-overlay-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(scroll)
+                .child(list),
+            scroll,
+        )
     }
 
     fn diff_oversized_notice(
