@@ -1752,6 +1752,10 @@ impl Tty7App {
             list = list.child(
                 div()
                     .py_4()
+                    // px_2 is what `render_ssh_row` insets its title by: a note
+                    // standing in for the rows starts on their column, not on
+                    // the list's own edge.
+                    .px_2()
                     .text_sm()
                     .text_color(muted)
                     .child(t(L10nKey::SettingsNoSavedHosts)),
@@ -1760,6 +1764,7 @@ impl Tty7App {
             list = list.child(
                 div()
                     .py_4()
+                    .px_2()
                     .text_sm()
                     .text_color(muted)
                     .child(t_fmt(L10nKey::SettingsNothingMatches, &[("query", &query)])),
