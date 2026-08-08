@@ -575,9 +575,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsCheckUpdatesOnLaunch => "Check for updates on launch",
         L10nKey::SettingsCommandLine => "Command line",
         L10nKey::SettingsCommandLineDesc => {
-            "Put the bundled `tty7` command on your PATH at launch, so scripts and coding agents can drive tty7 from any terminal. Inside a tty7 pane it works either way. Turn this off if you keep your own `tty7` — one you built or installed yourself — and do not want it shadowed. Takes effect at next launch."
+            "Put the bundled tty7 command on your PATH at launch, so scripts and coding agents can drive tty7 from any terminal. Inside a tty7 pane it works either way. Turn this off if you keep your own tty7 — one you built or installed yourself — and do not want it shadowed. Takes effect at next launch."
         }
-        L10nKey::SettingsInstallCliOnPath => "Install the `tty7` command on PATH",
+        L10nKey::SettingsInstallCliOnPath => "Install the tty7 command on PATH",
         L10nKey::SettingsServer => "Server",
         L10nKey::SettingsServerDesc => {
             "Restarts the background server that keeps your shells running. This ends every shell on this computer; your tabs and layout reopen with fresh ones."
@@ -874,20 +874,20 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::DiffChangedFiles => "{count} changed files",
         L10nKey::DiffUntrackedCount => " · {count} untracked",
         L10nKey::DiffMoreFiles => {
-            "… and {count} more changed files — run `git diff` in the terminal to see them."
+            "… and {count} more changed files — run git diff in the terminal to see them."
         }
         L10nKey::DiffOversizedNotice => {
-            "This working tree is too large to render efficiently ({summary}). Every file is collapsed — expand individual files, or run `git diff` in the terminal."
+            "This working tree is too large to render efficiently ({summary}). Every file is collapsed — expand individual files, or run git diff in the terminal."
         }
         L10nKey::DiffTruncatedPerFile => {
-            "Diff truncated at {limit} lines — run `git diff` in the terminal for the rest."
+            "Diff truncated at {limit} lines — run git diff in the terminal for the rest."
         }
         L10nKey::DiffTruncatedBudget => {
-            "Body not loaded — this working tree is past tty7's diff budget. Run `git diff` in the terminal for this file."
+            "Body not loaded — this working tree is past tty7's diff budget. Run git diff in the terminal for this file."
         }
         L10nKey::DiffUntrackedHeader => "Untracked files ({count})",
         L10nKey::DiffMoreUntracked => {
-            "… and {count} more — run `git status` in the terminal to see them."
+            "… and {count} more — run git status in the terminal to see them."
         }
         L10nKey::DiffLines => "{count} diff lines",
         L10nKey::DiffChangedLines => {
@@ -1000,7 +1000,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
              {machine}. Quit tty7 (which stops the daemon) and open it again, then retry."
         }
         L10nKey::RemoteProfileMissing => "that saved SSH profile no longer exists",
-        L10nKey::RemoteAliasMissing => "`{alias}` is no longer in ~/.ssh/config",
+        L10nKey::RemoteAliasMissing => "\"{alias}\" is no longer in ~/.ssh/config",
         L10nKey::RemoteWslNoSsh => "a WSL workspace has no SSH connection",
         L10nKey::RemoteLocalStdioNoSsh => "a local --stdio workspace has no SSH connection",
         L10nKey::RemoteHostNotTty7 => "{machine} answered, but not as a tty7 server: {error}",
@@ -1255,7 +1255,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::Replace => "Replace",
         L10nKey::SftpErrorInvalidOctalMode => "invalid octal mode",
         L10nKey::PanelMoreChangedFiles => {
-            "… and {count} more changed files — run `git diff` to see them."
+            "… and {count} more changed files — run git diff to see them."
         }
         L10nKey::PanelUntracked => "{count} untracked",
         L10nKey::AppMenuAbout => "About tty7",
@@ -1376,13 +1376,13 @@ pub fn translate_variant_en(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::PanelUntracked, "one") => "1 untracked",
         (L10nKey::PanelUntracked, "other") => "{count} untracked",
         (L10nKey::PanelMoreChangedFiles, "zero") => {
-            "… and 0 more changed files — run `git diff` to see them."
+            "… and 0 more changed files — run git diff to see them."
         }
         (L10nKey::PanelMoreChangedFiles, "one") => {
-            "… and 1 more changed file — run `git diff` to see it."
+            "… and 1 more changed file — run git diff to see it."
         }
         (L10nKey::PanelMoreChangedFiles, "other") => {
-            "… and {count} more changed files — run `git diff` to see them."
+            "… and {count} more changed files — run git diff to see them."
         }
         (L10nKey::DiffChangedFiles, "zero") => "0 changed files",
         (L10nKey::DiffChangedFiles, "one") => "1 changed file",
@@ -1391,25 +1391,25 @@ pub fn translate_variant_en(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::DiffUntrackedCount, "one") => " · 1 untracked",
         (L10nKey::DiffUntrackedCount, "other") => " · {count} untracked",
         (L10nKey::DiffMoreFiles, "zero") => {
-            "… and 0 more changed files — run `git diff` in the terminal to see them."
+            "… and 0 more changed files — run git diff in the terminal to see them."
         }
         (L10nKey::DiffMoreFiles, "one") => {
-            "… and 1 more changed file — run `git diff` in the terminal to see it."
+            "… and 1 more changed file — run git diff in the terminal to see it."
         }
         (L10nKey::DiffMoreFiles, "other") => {
-            "… and {count} more changed files — run `git diff` in the terminal to see them."
+            "… and {count} more changed files — run git diff in the terminal to see them."
         }
         (L10nKey::DiffUntrackedHeader, "zero") => "Untracked files (0)",
         (L10nKey::DiffUntrackedHeader, "one") => "Untracked files (1)",
         (L10nKey::DiffUntrackedHeader, "other") => "Untracked files ({count})",
         (L10nKey::DiffMoreUntracked, "zero") => {
-            "… and 0 more — run `git status` in the terminal to see them."
+            "… and 0 more — run git status in the terminal to see them."
         }
         (L10nKey::DiffMoreUntracked, "one") => {
-            "… and 1 more — run `git status` in the terminal to see it."
+            "… and 1 more — run git status in the terminal to see it."
         }
         (L10nKey::DiffMoreUntracked, "other") => {
-            "… and {count} more — run `git status` in the terminal to see them."
+            "… and {count} more — run git status in the terminal to see them."
         }
         (L10nKey::DiffUntrackedSummary, "zero") => "0 untracked",
         (L10nKey::DiffUntrackedSummary, "one") => "1 untracked",

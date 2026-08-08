@@ -5647,7 +5647,7 @@ mod tests {
             "History search",
             "Dim inactive panes",
             "Option (⌥) acts as Meta",
-            "Install the `tty7` command on PATH",
+            "Install the tty7 command on PATH",
         ] {
             assert!(
                 settings_search_entries()

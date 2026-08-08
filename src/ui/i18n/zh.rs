@@ -508,9 +508,9 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsCheckUpdatesOnLaunch => "启动时检查更新",
         L10nKey::SettingsCommandLine => "命令行",
         L10nKey::SettingsCommandLineDesc => {
-            "启动时将自带的 `tty7` 命令加入 PATH，让脚本和编码 agent 可在任意终端驱动 tty7。在 tty7 窗格内两种情况都可用。如果你自己构建或安装了 `tty7` 且不希望被遮蔽，请关闭此选项。下次启动时生效。"
+            "启动时将自带的 tty7 命令加入 PATH，让脚本和编码 agent 可在任意终端驱动 tty7。在 tty7 窗格内两种情况都可用。如果你自己构建或安装了 tty7 且不希望被遮蔽，请关闭此选项。下次启动时生效。"
         }
-        L10nKey::SettingsInstallCliOnPath => "将 `tty7` 命令安装到 PATH",
+        L10nKey::SettingsInstallCliOnPath => "将 tty7 命令安装到 PATH",
         L10nKey::SettingsServer => "服务器",
         L10nKey::SettingsServerDesc => {
             "重启在后台维持 shell 运行的服务器。这会结束这台计算机上所有正在运行的 shell；你的标签页和布局会以全新的 shell 重新打开。"
@@ -831,18 +831,18 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::DiffCloseTooltip => "关闭 diff (Esc)",
         L10nKey::DiffChangedFiles => "{count} 个变更文件",
         L10nKey::DiffUntrackedCount => " · {count} 个未跟踪文件",
-        L10nKey::DiffMoreFiles => "…还有 {count} 个变更文件——在终端中运行 `git diff` 查看。",
+        L10nKey::DiffMoreFiles => "…还有 {count} 个变更文件——在终端中运行 git diff 查看。",
         L10nKey::DiffOversizedNotice => {
-            "此 worktree 太大，无法高效渲染（{summary}）。每个文件都已折叠——可展开单个文件，或在终端中运行 `git diff`。"
+            "此 worktree 太大，无法高效渲染（{summary}）。每个文件都已折叠——可展开单个文件，或在终端中运行 git diff。"
         }
         L10nKey::DiffTruncatedPerFile => {
-            "diff 在 {limit} 行处截断——在终端中运行 `git diff` 查看其余部分。"
+            "diff 在 {limit} 行处截断——在终端中运行 git diff 查看其余部分。"
         }
         L10nKey::DiffTruncatedBudget => {
-            "内容未加载——此 worktree 已超出 tty7 的 diff 预算。在终端中运行 `git diff` 查看此文件。"
+            "内容未加载——此 worktree 已超出 tty7 的 diff 预算。在终端中运行 git diff 查看此文件。"
         }
         L10nKey::DiffUntrackedHeader => "未跟踪文件 ({count})",
-        L10nKey::DiffMoreUntracked => "…还有 {count} 个——在终端中运行 `git status` 查看。",
+        L10nKey::DiffMoreUntracked => "…还有 {count} 个——在终端中运行 git status 查看。",
         L10nKey::DiffLines => "{count} 行 diff",
         L10nKey::DiffChangedLines => "{total} 行变更，在 {cap} 截断前已加载 {loaded} 行 diff",
         L10nKey::DiffBudgetAndCap => "tty7 的预算和单文件上限",
@@ -948,7 +948,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
              请退出 tty7（这会停止守护进程）并重新打开，然后重试。"
         }
         L10nKey::RemoteProfileMissing => "该已保存的 SSH 主机配置已不存在",
-        L10nKey::RemoteAliasMissing => "`{alias}` 已不再位于 ~/.ssh/config 中",
+        L10nKey::RemoteAliasMissing => "“{alias}”已不再位于 ~/.ssh/config 中",
         L10nKey::RemoteWslNoSsh => "WSL 工作区没有 SSH 连接",
         L10nKey::RemoteLocalStdioNoSsh => "本地 --stdio 工作区没有 SSH 连接",
         L10nKey::RemoteHostNotTty7 => "{machine} 已响应，但并非作为 tty7 服务器：{error}",
@@ -1188,7 +1188,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SftpReplaceBody => "{names} 在这个文件夹里已经存在，上传会覆盖它们。",
         L10nKey::Replace => "覆盖",
         L10nKey::SftpErrorInvalidOctalMode => "无效的八进制模式",
-        L10nKey::PanelMoreChangedFiles => "…还有 {count} 个变更文件——运行 `git diff` 查看。",
+        L10nKey::PanelMoreChangedFiles => "…还有 {count} 个变更文件——运行 git diff 查看。",
         L10nKey::PanelUntracked => "{count} 个未跟踪文件",
         L10nKey::AppMenuAbout => "关于 tty7",
         L10nKey::AppMenuCheckForUpdates => "检查更新…",
@@ -1297,10 +1297,10 @@ pub fn translate_variant_zh(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::PanelUntracked, "zero") => "0 个未跟踪文件",
         (L10nKey::PanelUntracked, "one") => "1 个未跟踪文件",
         (L10nKey::PanelUntracked, "other") => "{count} 个未跟踪文件",
-        (L10nKey::PanelMoreChangedFiles, "zero") => "…还有 0 个变更文件——运行 `git diff` 查看。",
-        (L10nKey::PanelMoreChangedFiles, "one") => "…还有 1 个变更文件——运行 `git diff` 查看。",
+        (L10nKey::PanelMoreChangedFiles, "zero") => "…还有 0 个变更文件——运行 git diff 查看。",
+        (L10nKey::PanelMoreChangedFiles, "one") => "…还有 1 个变更文件——运行 git diff 查看。",
         (L10nKey::PanelMoreChangedFiles, "other") => {
-            "…还有 {count} 个变更文件——运行 `git diff` 查看。"
+            "…还有 {count} 个变更文件——运行 git diff 查看。"
         }
         (L10nKey::DiffChangedFiles, "zero") => "0 个变更文件",
         (L10nKey::DiffChangedFiles, "one") => "1 个变更文件",
@@ -1308,18 +1308,18 @@ pub fn translate_variant_zh(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::DiffUntrackedCount, "zero") => " · 0 个未跟踪文件",
         (L10nKey::DiffUntrackedCount, "one") => " · 1 个未跟踪文件",
         (L10nKey::DiffUntrackedCount, "other") => " · {count} 个未跟踪文件",
-        (L10nKey::DiffMoreFiles, "zero") => "…还有 0 个变更文件——在终端中运行 `git diff` 查看。",
-        (L10nKey::DiffMoreFiles, "one") => "…还有 1 个变更文件——在终端中运行 `git diff` 查看。",
+        (L10nKey::DiffMoreFiles, "zero") => "…还有 0 个变更文件——在终端中运行 git diff 查看。",
+        (L10nKey::DiffMoreFiles, "one") => "…还有 1 个变更文件——在终端中运行 git diff 查看。",
         (L10nKey::DiffMoreFiles, "other") => {
-            "…还有 {count} 个变更文件——在终端中运行 `git diff` 查看。"
+            "…还有 {count} 个变更文件——在终端中运行 git diff 查看。"
         }
         (L10nKey::DiffUntrackedHeader, "zero") => "未跟踪文件 (0)",
         (L10nKey::DiffUntrackedHeader, "one") => "未跟踪文件 (1)",
         (L10nKey::DiffUntrackedHeader, "other") => "未跟踪文件 ({count})",
-        (L10nKey::DiffMoreUntracked, "zero") => "…还有 0 个——在终端中运行 `git status` 查看。",
-        (L10nKey::DiffMoreUntracked, "one") => "…还有 1 个——在终端中运行 `git status` 查看。",
+        (L10nKey::DiffMoreUntracked, "zero") => "…还有 0 个——在终端中运行 git status 查看。",
+        (L10nKey::DiffMoreUntracked, "one") => "…还有 1 个——在终端中运行 git status 查看。",
         (L10nKey::DiffMoreUntracked, "other") => {
-            "…还有 {count} 个——在终端中运行 `git status` 查看。"
+            "…还有 {count} 个——在终端中运行 git status 查看。"
         }
         (L10nKey::DiffUntrackedSummary, "zero") => "0 个未跟踪",
         (L10nKey::DiffUntrackedSummary, "one") => "1 个未跟踪",
