@@ -223,7 +223,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "Name of another profile to tunnel through (blank = direct)."
         }
         L10nKey::SettingsNoneSummary => "(none)",
-        L10nKey::SettingsNoneLower => "none",
         L10nKey::SettingsPortForwarding => "Port forwarding",
         L10nKey::SettingsRulesOpenedWithConnection => "1 rule, opened with the connection",
         L10nKey::SettingsAddRule => "+ Add rule",

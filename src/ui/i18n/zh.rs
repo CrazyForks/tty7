@@ -197,7 +197,6 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsJumpHost => "跳板主机",
         L10nKey::SettingsJumpHostDesc => "用于中转的另一个主机配置的名称（留空 = 直连）。",
         L10nKey::SettingsNoneSummary => "（无）",
-        L10nKey::SettingsNoneLower => "无",
         L10nKey::SettingsPortForwarding => "端口转发",
         L10nKey::SettingsRulesOpenedWithConnection => "1 条规则，随连接打开",
         L10nKey::SettingsAddRule => "+ 添加规则",

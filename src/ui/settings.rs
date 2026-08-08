@@ -3128,7 +3128,7 @@ impl Tty7App {
             .filter(|r| r.collect(cx).is_some())
             .count();
         let summary = match count {
-            0 => t(L10nKey::SettingsNoneLower).to_string(),
+            0 => t(L10nKey::SettingsNoneSummary).to_string(),
             _ => t_plural(L10nKey::SettingsRulesOpenedWithConnection, count, &[]),
         };
         let mut section = v_flex().child(self.disclosure_header(

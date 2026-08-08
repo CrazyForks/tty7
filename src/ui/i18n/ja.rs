@@ -221,7 +221,6 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
             "トンネリングに使用する別のプロファイル名 (空欄 = 直接接続)"
         }
         L10nKey::SettingsNoneSummary => "(なし)",
-        L10nKey::SettingsNoneLower => "なし",
         L10nKey::SettingsPortForwarding => "ポートフォワーディング",
         L10nKey::SettingsRulesOpenedWithConnection => "接続と同時に開くルール 1 件",
         L10nKey::SettingsAddRule => "+ ルールを追加",
