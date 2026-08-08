@@ -47,6 +47,28 @@ pub(crate) enum ThemeEdit {
     Ansi(usize),
 }
 
+/// The 16 ANSI slots in the order a terminal numbers them: 0-7, then their
+/// bright twins. A theme author needs to know that slot 9 is what `\e[91m`
+/// paints — "Color 9" does not say that, and "Bright red" does.
+const ANSI_COLOR_LABELS: [L10nKey; 16] = [
+    L10nKey::AppThemeAnsiBlack,
+    L10nKey::AppThemeAnsiRed,
+    L10nKey::AppThemeAnsiGreen,
+    L10nKey::AppThemeAnsiYellow,
+    L10nKey::AppThemeAnsiBlue,
+    L10nKey::AppThemeAnsiMagenta,
+    L10nKey::AppThemeAnsiCyan,
+    L10nKey::AppThemeAnsiWhite,
+    L10nKey::AppThemeAnsiBrightBlack,
+    L10nKey::AppThemeAnsiBrightRed,
+    L10nKey::AppThemeAnsiBrightGreen,
+    L10nKey::AppThemeAnsiBrightYellow,
+    L10nKey::AppThemeAnsiBrightBlue,
+    L10nKey::AppThemeAnsiBrightMagenta,
+    L10nKey::AppThemeAnsiBrightCyan,
+    L10nKey::AppThemeAnsiBrightWhite,
+];
+
 fn hsla_to_u32(color: gpui::Hsla) -> u32 {
     let rgba: gpui::Rgba = color.into();
     let to = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -1748,7 +1770,7 @@ impl Tty7App {
                 let value = (r as u32) << 16 | (g as u32) << 8 | b as u32;
                 (
                     ThemeEdit::Ansi(i),
-                    format!("Color {i}"),
+                    t(ANSI_COLOR_LABELS[i]).to_string(),
                     make(ThemeEdit::Ansi(i), value, &mut subs, cx),
                 )
             })
