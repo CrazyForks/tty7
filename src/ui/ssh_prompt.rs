@@ -507,7 +507,13 @@ impl Tty7App {
                 }
             }
             KeychainWrite::DeletePassword { user, host, port } => {
-                let _ = store.delete_password(&user, &host, port);
+                // The other three arms say when the keychain refuses them. A
+                // delete that keeps failing leaves the rejected password in
+                // place, so the same wrong secret is offered next connect and
+                // nothing anywhere records why.
+                if let Err(e) = store.delete_password(&user, &host, port) {
+                    log::warn!("could not forget password in keychain: {e}");
+                }
             }
             KeychainWrite::SetKeyPassphrase { key_path, secret } => {
                 let path = crate::core::ssh_profile::expand_tilde(&key_path);
