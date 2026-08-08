@@ -907,6 +907,23 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::ScmResetToCommit => "このコミットにリセット",
         L10nKey::ScmRefresh => "更新",
         L10nKey::ScmBackToChanges => "戻る",
+        L10nKey::ScmTooManyChanges => {
+            "変更が多いため、{total} 件のうち先頭 {shown} 件のみ表示しています。"
+        }
+        L10nKey::ScmOpenChanges => "変更を開く",
+        L10nKey::ScmDiscardAllConfirm => {
+            "このリポジトリのすべての変更を破棄しますか？元に戻せません。"
+        }
+        L10nKey::ScmAmendConfirm => {
+            "直前のコミットを修正しますか？新しいコミットに置き換わるため、すでに取得した人は対応が必要になります。"
+        }
+        L10nKey::ScmOpMerge => "マージ中",
+        L10nKey::ScmOpRebase => "リベース中",
+        L10nKey::ScmOpCherryPick => "チェリーピック中",
+        L10nKey::ScmOpRevert => "リバート中",
+        L10nKey::ScmOpBisect => "二分探索中",
+        L10nKey::ScmOpAm => "パッチ適用中",
+        L10nKey::ScmSwitchRepository => "リポジトリを切り替え",
         L10nKey::WindowStop => "停止",
         L10nKey::WindowDelete => "削除",
         L10nKey::WindowThisWorkspace => "このワークスペース",

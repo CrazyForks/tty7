@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use gpui::Entity;
 use gpui_component::input::InputState;
+use tty7_core::core::git::status::HeadState;
 
 use crate::ui::host_ops::HostId;
 
@@ -58,18 +59,58 @@ pub(crate) struct ScmPanelState {
     /// cleared whenever the active tab changes — an explicit choice should
     /// outlive a pane switch inside one tab, not a jump to somewhere else.
     pub(crate) repo_override: Option<RepoKey>,
+    /// The tab the override was made on, so the jump away can be noticed.
+    pub(crate) override_tab: Option<usize>,
+    /// Local branch names per repository, with the epoch they were read at.
+    /// Anything that could have moved a ref bumps the epoch, so the list in
+    /// the switcher is never older than the last operation.
+    pub(crate) branches: HashMap<RepoKey, (u64, Vec<String>)>,
+    pub(crate) branches_loading: HashSet<RepoKey>,
+    /// A network operation in flight, and the epoch it was dispatched at.
+    /// `run_git_op` bumps the epoch when it finishes, which is the only
+    /// completion signal available from outside it.
+    pub(crate) network: Option<(RepoKey, u64)>,
+    /// The inline "name your branch" input, present only while it is open.
+    pub(crate) new_branch: Option<Entity<InputState>>,
     /// Unsent commit messages, one per working tree.
     pub(crate) drafts: HashMap<RepoKey, String>,
     /// The commit box. `None` until the panel has been rendered once: an
     /// `InputState` needs a real window to be created in, and this struct is
     /// built by `Default` alongside the rest of `Tty7App`.
     pub(crate) commit_input: Option<Entity<InputState>>,
+    /// Which repository's draft the box is currently holding. A change here
+    /// is what moves one draft out and the next one in.
+    pub(crate) commit_repo: Option<RepoKey>,
+    /// A commit that has been dispatched: the repository, what HEAD was
+    /// before it, and the message it carried. Held until HEAD moves, so a
+    /// commit a hook rejects leaves the message in the box.
+    pub(crate) committing: Option<(RepoKey, HeadState, String)>,
     /// Whether the next commit rewrites HEAD. Armed from the commit dropdown
     /// rather than a checkbox row — 260px does not have a row to spare.
     pub(crate) amend: bool,
-    /// Groups the user folded shut. Absent means open, so a group that has
-    /// never been touched renders expanded.
+    /// Groups the user folded shut, and the ones whose fold state they have
+    /// set at all. Both are needed: a group nobody has touched follows the
+    /// default for its size (a thousand untracked files start folded), and
+    /// opening one by hand has to outlast the next file landing in it.
     pub(crate) collapsed: HashSet<ScmGroup>,
+    pub(crate) toggled: HashSet<ScmGroup>,
+    /// Working directory → the repository root containing it, or `None` when
+    /// there is none, with when the answer was given. The root is what every
+    /// write runs from and what every cache is keyed by, so it is resolved
+    /// once per directory and reused.
+    pub(crate) roots: HashMap<(HostId, PathBuf), (std::time::Instant, Option<PathBuf>)>,
+    pub(crate) root_lookups: HashSet<(HostId, PathBuf)>,
+    /// When the panel last asked for a status that it did not get back.
+    pub(crate) probe_attempt: HashMap<(HostId, PathBuf), std::time::Instant>,
+    /// The status the last frame drew, as (cache key, `Arc` identity). The
+    /// watcher compares against it so a global write that changed nothing does
+    /// not ask for another frame.
+    pub(crate) seen: Option<((HostId, PathBuf), usize)>,
+    pub(crate) watch: Option<gpui::Subscription>,
+    /// The cheap per-tab git status the panel last reacted to. A change in it
+    /// means a command touched the repository and the expensive status is due
+    /// another look.
+    pub(crate) last_tab_status: Option<crate::terminal::git_status::GitStatus>,
     pub(crate) graph: GraphState,
     /// When set, the panel body is replaced by a single commit's detail view
     /// instead of the working tree.
@@ -86,6 +127,25 @@ impl ScmPanelState {
 
     pub(crate) fn draft(&self, repo: &RepoKey) -> &str {
         self.drafts.get(repo).map(String::as_str).unwrap_or("")
+    }
+
+    /// Whether a group renders folded. `count` decides it only for a group the
+    /// user has never touched.
+    pub(crate) fn group_collapsed(&self, group: ScmGroup, count: usize) -> bool {
+        if self.toggled.contains(&group) {
+            self.collapsed.contains(&group)
+        } else {
+            crate::ui::scm::panel::starts_collapsed(group, count)
+        }
+    }
+
+    pub(crate) fn set_group_collapsed(&mut self, group: ScmGroup, collapsed: bool) {
+        self.toggled.insert(group);
+        if collapsed {
+            self.collapsed.insert(group);
+        } else {
+            self.collapsed.remove(&group);
+        }
     }
 }
 

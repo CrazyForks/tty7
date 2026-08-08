@@ -4,12 +4,10 @@
 //! `file_tree.rs` use. The directory only keeps the surface from piling into
 //! `right_panel.rs`.
 
-// The scaffolding lands one step ahead of the code that consumes it: the panel
-// still renders the old flat list, so the status helpers, the path helpers and
-// most of `ScmPanelState` have no caller yet. Each `allow` comes off as its
-// module gets wired up rather than being left as a blanket at the top.
+// What is left unused is what the graph and the commit detail view will call:
+// `relative_time` has no row to date yet, and `status_rank` is the file tree's
+// to use. Both allows come off with the step that wires them up.
 pub(crate) mod actions;
-#[allow(dead_code)]
 pub(crate) mod panel;
 #[allow(dead_code)]
 pub(crate) mod path;
