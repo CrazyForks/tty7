@@ -131,18 +131,32 @@ impl Theme {
     pub fn neutrals(&self) -> Neutrals {
         let bg = self.background_color();
         let fg = legible_foreground(bg, self.foreground);
+        let sidebar = mix(bg, fg, 0.03);
+        let popover = mix(bg, fg, 0.05);
+        // One hairline value divides all three neutral fills — it is handed to
+        // `sidebar_border` too, and popover chrome draws with it. Floor it on
+        // each of them, not only on the window.
+        let border = [bg, sidebar, popover]
+            .into_iter()
+            .fold(mix(bg, fg, 0.16), |hairline, surface| {
+                at_least(hairline, fg, surface, BORDER_FLOOR)
+            });
         Neutrals {
             background: bg,
             foreground: fg,
-            border: mix(bg, fg, 0.16),
+            border,
             secondary: mix(bg, fg, 0.09),
             muted: mix(bg, fg, 0.06),
             muted_foreground: dim(fg, bg, state::TEXT_RESTING),
-            popover: mix(bg, fg, 0.05),
-            caret: self.caret.unwrap_or(self.accent),
+            popover,
+            caret: legible_ink(bg, self.caret.unwrap_or(self.accent), ACCENT_FLOOR),
             selection: self.selection.unwrap_or_else(|| mix(bg, fg, 0.20)),
-            sidebar: mix(bg, fg, 0.03),
-            sidebar_fg: mix(fg, bg, 0.28),
+            sidebar,
+            // Blended, not bisected, so a palette's own softness carries into
+            // the sidebar — but floored on the fill it is actually painted on
+            // (`sidebar`, not `background`), because four of the nine builtins
+            // land this under 4.5:1 and it is the tab title, not a caption.
+            sidebar_fg: at_least(mix(fg, bg, 0.28), fg, sidebar, TEXT_FLOOR),
             accent: legible_accent(bg, self.accent),
         }
     }
@@ -170,10 +184,20 @@ impl Theme {
             let (r, g, b) = self.ansi16[i];
             (r as u32) << 16 | (g as u32) << 8 | b as u32
         };
+        // An error line lands on a popover or a sidebar row as often as on the
+        // window, and both of those fills sit a step toward the foreground.
+        // Clear the floor on every surface the ink can be painted on, not just
+        // on the darkest one.
+        let surfaces = [bg, mix(bg, fg, 0.03), mix(bg, fg, 0.05)];
+        let clear = |seed: u32, floor: f32| {
+            surfaces
+                .iter()
+                .fold(seed, |ink, surface| legible_ink(*surface, ink, floor))
+        };
         let build = |seed: u32| {
-            let fill = legible_ink(bg, seed, ACCENT_FLOOR);
+            let fill = clear(seed, ACCENT_FLOOR);
             Semantic {
-                ink: legible_ink(bg, seed, TEXT_FLOOR),
+                ink: clear(seed, TEXT_FLOOR),
                 fill,
                 on_fill: ink_on(fill, fg, TEXT_FLOOR),
             }
@@ -360,6 +384,26 @@ pub(crate) fn is_lighter(a: u32, b: u32) -> bool {
 const ACCENT_FLOOR: f32 = 3.0;
 
 const TEXT_FLOOR: f32 = 4.5;
+
+/// Hairlines are separators, not control outlines — the surfaces they divide
+/// carry their own fills, so WCAG 1.4.11's 3:1 does not apply and painting them
+/// that hard would read as a wireframe. This floor only rescues the palettes
+/// where the flat blend disappears entirely, so a divider is worth the same
+/// amount in every theme.
+const BORDER_FLOOR: f32 = 1.5;
+
+/// Keep an authored blend when it already clears `target` on the surface it is
+/// painted on, and walk it back toward `toward` only when it does not.
+fn at_least(ink: u32, toward: u32, surface: u32, target: f32) -> u32 {
+    if contrast(ink, surface) >= target {
+        return ink;
+    }
+    let lifted = bisect_contrast(ink, toward, surface, target);
+    if contrast(lifted, surface) >= target {
+        return lifted;
+    }
+    legible_ink(surface, lifted, target)
+}
 
 fn legible_ink(bg: u32, seed: u32, floor: f32) -> u32 {
     if contrast(seed, bg) >= floor {
@@ -1259,6 +1303,7 @@ mod tests {
     fn semantic_colors_clear_their_floors() {
         for t in builtins() {
             let bg = t.background_color();
+            let m = t.neutrals();
             let s = t.semantics();
             for (name, c) in [
                 ("danger", s.danger),
@@ -1267,20 +1312,28 @@ mod tests {
                 ("info", s.info),
                 ("link", s.link),
             ] {
-                assert!(
-                    contrast(c.ink, bg) >= TEXT_FLOOR - 0.01,
-                    "{}/{name}: ink {:#08x} only {:.2}:1 on the background",
-                    t.id,
-                    c.ink,
-                    contrast(c.ink, bg)
-                );
-                assert!(
-                    contrast(c.fill, bg) >= ACCENT_FLOOR - 0.01,
-                    "{}/{name}: fill {:#08x} only {:.2}:1 on the background",
-                    t.id,
-                    c.fill,
-                    contrast(c.fill, bg)
-                );
+                // Every neutral fill the ink can land on, not just the window:
+                // a failure notice is usually read inside a popover.
+                for (surface, fill) in [
+                    ("background", bg),
+                    ("sidebar", m.sidebar),
+                    ("popover", m.popover),
+                ] {
+                    assert!(
+                        contrast(c.ink, fill) >= TEXT_FLOOR - 0.01,
+                        "{}/{name}: ink {:#08x} only {:.2}:1 on the {surface}",
+                        t.id,
+                        c.ink,
+                        contrast(c.ink, fill)
+                    );
+                    assert!(
+                        contrast(c.fill, fill) >= ACCENT_FLOOR - 0.01,
+                        "{}/{name}: fill {:#08x} only {:.2}:1 on the {surface}",
+                        t.id,
+                        c.fill,
+                        contrast(c.fill, fill)
+                    );
+                }
                 assert!(
                     contrast(c.on_fill, c.fill) >= TEXT_FLOOR - 0.01,
                     "{}/{name}: text on its own fill is only {:.2}:1",
@@ -1310,7 +1363,80 @@ mod tests {
             (r as u32) << 16 | (g as u32) << 8 | b as u32
         };
         assert_eq!(ansi_red, 0xff5555, "Dracula's ANSI red moved");
-        assert_eq!(dracula.semantics().danger.ink, ansi_red);
+        // Conditioning may lift the seed to clear its floor on a popover, but
+        // the result has to stay recognisably the palette's own red rather than
+        // some house error colour.
+        let ink = dracula.semantics().danger.ink;
+        assert!(
+            channel_distance(ink, ansi_red) <= 32,
+            "danger ink {ink:#08x} drifted off Dracula's ANSI red {ansi_red:#08x}"
+        );
+        let (r, g, b) = (ink >> 16 & 0xff, ink >> 8 & 0xff, ink & 0xff);
+        assert!(
+            r > g && r > b,
+            "danger ink {ink:#08x} is no longer red-dominant"
+        );
+    }
+
+    #[test]
+    fn sidebar_text_reads_on_the_fill_it_is_painted_on() {
+        for t in builtins() {
+            let m = t.neutrals();
+            let ratio = contrast(m.sidebar_fg, m.sidebar);
+            assert!(
+                ratio >= TEXT_FLOOR - 0.01,
+                "{}: sidebar text {:#08x} is only {ratio:.2}:1 on the sidebar fill {:#08x}",
+                t.id,
+                m.sidebar_fg,
+                m.sidebar
+            );
+        }
+    }
+
+    #[test]
+    fn carets_stay_visible_on_the_background() {
+        for t in builtins() {
+            let m = t.neutrals();
+            let ratio = contrast(m.caret, m.background);
+            assert!(
+                ratio >= ACCENT_FLOOR - 0.01,
+                "{}: caret {:#08x} is only {ratio:.2}:1 on the background",
+                t.id,
+                m.caret
+            );
+        }
+        // The default theme is the one that used to fail: an orange caret on
+        // pure white read at 2.07:1.
+        let light = builtins().into_iter().find(|t| t.id == DEFAULT_ID).unwrap();
+        assert_ne!(light.neutrals().caret, light.caret.unwrap());
+    }
+
+    #[test]
+    fn hairlines_are_worth_the_same_in_every_theme() {
+        for t in builtins() {
+            let m = t.neutrals();
+            for (name, surface) in [
+                ("background", m.background),
+                ("sidebar", m.sidebar),
+                ("popover", m.popover),
+            ] {
+                let ratio = contrast(m.border, surface);
+                assert!(
+                    ratio >= BORDER_FLOOR - 0.01,
+                    "{}: border {:#08x} is only {ratio:.2}:1 on the {name}",
+                    t.id,
+                    m.border
+                );
+                // A floor, not a target — a hairline that shouts is worse than
+                // one that whispers.
+                assert!(
+                    ratio <= 2.2,
+                    "{}: border {:#08x} is {ratio:.2}:1 on the {name} and reads as a frame",
+                    t.id,
+                    m.border
+                );
+            }
+        }
     }
 
     #[test]
