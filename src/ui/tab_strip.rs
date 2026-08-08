@@ -133,11 +133,12 @@ impl Render for DragTab {
 
 /// Says what the workspace head does, with its shortcut. The name alone was
 /// redundant — it is already the button's label.
-fn switcher_hint(cx: &gpui::App) -> String {
-    let what = t(L10nKey::HomeSwitchWorkspace);
-    match crate::ui::home::key_hint("ToggleSwitcher", cx) {
-        Some(keys) => format!("{what}  {keys}"),
-        None => what.to_string(),
+/// What a chrome tile says on hover: the action, then the chord that runs it
+/// when there is one.
+fn chord_hint(what: &str, action: &str, cx: &gpui::App) -> SharedString {
+    match crate::ui::home::key_hint(action, cx) {
+        Some(keys) => SharedString::from(format!("{what}  {keys}")),
+        None => SharedString::from(what.to_string()),
     }
 }
 
@@ -359,7 +360,11 @@ impl Tty7App {
                     .w_full()
                     .h(px(30.))
                     .rounded_md()
-                    .tooltip(SharedString::from(switcher_hint(cx)))
+                    .tooltip(chord_hint(
+                        t(L10nKey::HomeSwitchWorkspace),
+                        "ToggleSwitcher",
+                        cx,
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_switcher(window, cx);
                     })),
@@ -664,6 +669,10 @@ impl Tty7App {
         let shells = self.shells.shells.clone();
         let default_name = self.default_shell_label(cx);
         let app = cx.entity().downgrade();
+        // Every other tile in this row names itself on hover — Switch
+        // Workspace, More, Hide Sidebar. The three New Tab buttons that come
+        // through here were the ones left silent.
+        let button = button.tooltip(chord_hint(t(L10nKey::AppMenuNewTab), "NewTab", cx));
         button.dropdown_menu(move |menu, _window, _cx| {
             let mut menu = menu.min_w(px(220.));
             for shell in &shells {
