@@ -294,11 +294,11 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsProgram => "Program",
         L10nKey::SettingsProgramDesc => {
-            "Executable name on PATH or an absolute path. e.g. zsh, fish, pwsh."
+            "Executable name on PATH or an absolute path (e.g. zsh, fish, pwsh)."
         }
         L10nKey::SettingsArguments => "Arguments",
         L10nKey::SettingsArgumentsDesc => {
-            "Space-separated launch flags. e.g. -l for a login shell."
+            "Space-separated launch flags (e.g. -l for a login shell)."
         }
         L10nKey::SettingsStartIn => "Start in",
         L10nKey::SettingsStartInDesc => {
