@@ -24,7 +24,11 @@ use crate::ui::hints::tab_badge_label;
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::reorder::{self, Reorder, Surface};
 
-pub(crate) const REORDER_SLIDE_MS: u64 = 140;
+/// One duration and one curve for every transition the app runs, so a fade and
+/// a slide read as the same hand. Long enough to be seen as movement, short
+/// enough that nobody waits on it.
+pub(crate) const TRANSITION_MS: u64 = 140;
+pub(crate) const REORDER_SLIDE_MS: u64 = TRANSITION_MS;
 const CHIP_GAP: f32 = 6.;
 
 pub(crate) const GRAB_HANDLE_W: f32 = 80.;

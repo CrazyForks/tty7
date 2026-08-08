@@ -208,7 +208,8 @@ impl Tty7App {
             .child(list)
             .with_animation(
                 "home-fade-in",
-                Animation::new(Duration::from_millis(150)),
+                Animation::new(Duration::from_millis(crate::ui::tab_strip::TRANSITION_MS))
+                    .with_easing(gpui::ease_out_quint()),
                 |page, delta| page.opacity(delta),
             )
     }
