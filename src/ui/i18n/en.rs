@@ -618,9 +618,8 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsSearchCodexKeywords => "agent integration hooks install openai codex",
         L10nKey::SettingsSearchCommandLineToolKeywords => {
-            "cli tty7 path shell command install symlink terminal iterm agent script"
+            "command line tool cli tty7 path shell command install symlink terminal iterm agent script"
         }
-        L10nKey::SettingsSearchCommandLineToolTitle => "Command line tool",
         L10nKey::SettingsSearchCopilotCliKeywords => {
             "agent integration hooks install github copilot"
         }

@@ -383,7 +383,7 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Agents,
-            title: SettingsSearchCommandLineToolTitle,
+            title: SettingsInstallCliOnPath,
             keywords: SettingsSearchCommandLineToolKeywords,
         },
     ]
@@ -3967,44 +3967,24 @@ impl Tty7App {
         }
 
         let install_cli_on_path = cx.global::<Config>().install_cli_on_path;
-        page.child(
-            v_flex()
-                .mt_6()
-                .gap_2()
-                .child(self.section_rule(cx))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(foreground)
-                        .child(t(L10nKey::SettingsCommandLine)),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(muted_fg)
-                        .child(t(L10nKey::SettingsCommandLineDesc)),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            crate::ui::theme::switch("install-cli-on-path", cx)
-                                .checked(install_cli_on_path)
-                                .on_click(cx.listener(|this, on: &bool, _w, cx| {
-                                    this.set_install_cli_on_path(*on, cx)
-                                })),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(foreground)
-                                .child(t(L10nKey::SettingsInstallCliOnPath)),
-                        ),
-                ),
-        )
-        .into_any_element()
+        let cli_switch = crate::ui::theme::switch("install-cli-on-path", cx)
+            .checked(install_cli_on_path)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_install_cli_on_path(*on, cx)));
+        // Built from the same pieces as every other setting in the app: a
+        // section header, then a row whose label and description sit left of
+        // its control. Hand-rolled, this was the one switch that stood to the
+        // left of its own label — and the one row the settings search could
+        // neither highlight nor dim, so a query that counted it in the nav
+        // badge left nothing on the page looking like the match.
+        page.child(self.section_rule(cx))
+            .child(self.section_header(t(L10nKey::SettingsCommandLine), cx))
+            .child(self.settings_row(
+                t(L10nKey::SettingsInstallCliOnPath),
+                t(L10nKey::SettingsCommandLineDesc),
+                cli_switch.into_any_element(),
+                cx,
+            ))
+            .into_any_element()
     }
 
     fn agent_hooks_machine_picker(&self, selected: HostId, cx: &mut Context<Self>) -> Option<Div> {
@@ -5531,7 +5511,7 @@ mod tests {
     fn command_line_tool_is_searchable_under_agents() {
         let entry = settings_search_entries()
             .iter()
-            .find(|entry| entry.title == L10nKey::SettingsSearchCommandLineToolTitle)
+            .find(|entry| entry.title == L10nKey::SettingsInstallCliOnPath)
             .expect("the CLI setting should be searchable");
 
         assert_eq!(entry.section.profile_label(), "settings:agents");
@@ -5550,6 +5530,7 @@ mod tests {
             "History search",
             "Dim inactive panes",
             "Option (⌥) acts as Meta",
+            "Install the `tty7` command on PATH",
         ] {
             assert!(
                 settings_search_entries()

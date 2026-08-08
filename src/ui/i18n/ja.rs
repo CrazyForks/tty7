@@ -627,7 +627,6 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsSearchCommandLineToolKeywords => {
             "cli tty7 パス シェル コマンド インストール シンボリックリンク ターミナル iterm エージェント スクリプト command line tool"
         }
-        L10nKey::SettingsSearchCommandLineToolTitle => "コマンドラインツール",
         L10nKey::SettingsSearchCopilotCliKeywords => {
             "エージェント 統合 フック インストール github copilot agent integration hooks install"
         }

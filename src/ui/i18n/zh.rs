@@ -556,7 +556,6 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsSearchCommandLineToolKeywords => {
             "命令行工具 cli tty7 路径 shell 命令 安装 符号链接 terminal command line tool"
         }
-        L10nKey::SettingsSearchCommandLineToolTitle => "命令行工具",
         L10nKey::SettingsSearchCopilotCliKeywords => {
             "Copilot CLI agent 集成 hook 安装 GitHub copilot agent integration hooks install"
         }
