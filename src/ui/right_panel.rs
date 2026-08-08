@@ -476,6 +476,7 @@ impl Tty7App {
         self.sync_procs(pane_id, route, cx);
 
         let mono = cx.theme().mono_font_family.clone();
+        let cwd_label = t(L10nKey::PanelCwd);
         let label_w = info_label_column(&rows, window, cx);
         let mut list = v_flex().px(px(CONTENT_INSET)).py(px(2.)).gap(px(3.));
         for (k, v) in rows {
@@ -493,15 +494,32 @@ impl Tty7App {
                             .text_color(cx.theme().muted_foreground)
                             .child(k),
                     )
-                    .child(
-                        div()
+                    .child(match k == cwd_label {
+                        // A path identifies a pane by its last segment, and
+                        // plain truncation eats exactly that: a deep checkout
+                        // read "/private/tmp/claude-501…" and told you
+                        // nothing. Let the head absorb the shrinking so the
+                        // leaf survives, the way a file manager shows a path.
+                        true => {
+                            let (head, leaf) = split_path_leaf(&v);
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .font_family(mono.clone())
+                                .text_color(cx.theme().foreground)
+                                .child(div().min_w_0().flex_shrink(999.).truncate().child(head))
+                                .child(div().min_w_0().flex_shrink(1.).truncate().child(leaf))
+                                .into_any_element()
+                        }
+                        false => div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .font_family(mono.clone())
                             .text_color(cx.theme().foreground)
-                            .child(v),
-                    ),
+                            .child(v)
+                            .into_any_element(),
+                    }),
             );
         }
 
@@ -1058,10 +1076,51 @@ fn agent_status_label(status: crate::core::cli_agent::AgentStatus) -> &'static s
     }
 }
 
+/// Splits a path into everything-but-the-last-segment and the last segment,
+/// so a row can shrink the first and keep the second.
+fn split_path_leaf(s: &str) -> (String, String) {
+    match s.rfind('/') {
+        // Keep the separator with the head: "~/a/b/" + "c" rejoins exactly.
+        Some(i) if i + 1 < s.len() => (s[..=i].to_string(), s[i + 1..].to_string()),
+        _ => (String::new(), s.to_string()),
+    }
+}
+
 fn compact_path(path: &std::path::Path) -> String {
     let s = path.to_string_lossy().to_string();
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && s.starts_with(&home) => s.replacen(&home, "~", 1),
         _ => s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_path_leaf;
+
+    #[test]
+    fn the_head_and_leaf_rejoin_into_the_path_they_came_from() {
+        for p in [
+            "~/repo/tty7",
+            "/private/tmp/claude-501/a-very-long-directory/and-another-level",
+            "/",
+            "relative",
+            "",
+        ] {
+            let (head, leaf) = split_path_leaf(p);
+            assert_eq!(format!("{head}{leaf}"), p, "rejoining {p:?}");
+        }
+    }
+
+    #[test]
+    fn the_leaf_is_the_segment_that_names_the_directory() {
+        let (head, leaf) = split_path_leaf("/a/b/c");
+        assert_eq!((head.as_str(), leaf.as_str()), ("/a/b/", "c"));
+        // A trailing slash has no leaf to keep, so the whole thing is head.
+        let (head, leaf) = split_path_leaf("/a/b/");
+        assert_eq!((head.as_str(), leaf.as_str()), ("", "/a/b/"));
+        // Root is one segment with nothing before it.
+        let (head, leaf) = split_path_leaf("/");
+        assert_eq!((head.as_str(), leaf.as_str()), ("", "/"));
     }
 }
