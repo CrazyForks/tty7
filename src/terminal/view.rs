@@ -4734,7 +4734,10 @@ impl TerminalView {
                 .rounded(px(6.))
                 .font_family(self.font.family.clone())
                 .text_size(self.font_size)
-                .text_color(theme.popover_foreground)
+                // Resting rows sit back so the selected row, which paints
+                // itself in the full foreground, is the brightest line in
+                // the menu — matching what the row icons already do.
+                .text_color(theme.muted_foreground)
                 .children(footer(hidden_above, format!("↑ {hidden_above} more")))
                 .children(rows)
                 .children(footer(hidden_below, format!("↓ {hidden_below} more"))),
@@ -4772,7 +4775,7 @@ impl TerminalView {
             let base = if selected {
                 theme.foreground
             } else {
-                theme.popover_foreground
+                theme.muted_foreground
             };
 
             let mut spans: Vec<gpui::AnyElement> = Vec::new();
@@ -4878,7 +4881,7 @@ impl TerminalView {
                 .rounded(px(6.))
                 .font_family(self.font.family.clone())
                 .text_size(self.font_size)
-                .text_color(theme.popover_foreground)
+                .text_color(theme.muted_foreground)
                 .children(footer(hidden_above, format!("↑ {hidden_above} more")))
                 .children(rows)
                 .children(footer(hidden_below, format!("↓ {hidden_below} more"))),

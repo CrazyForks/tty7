@@ -310,6 +310,11 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.popover = rgb(m.popover).into();
     t.tokens.popover = Hsla::from(rgb(m.popover)).into();
     t.tokens.popover_foreground = Hsla::from(rgb(m.foreground)).into();
+    // The field beside the token, not a duplicate of it: gpui-component reads
+    // this one for every tooltip, dropdown menu and date picker it draws. Left
+    // unset it keeps the stock near-white, so menus and tooltips ignored the
+    // preset and came out brighter than the window they float over.
+    t.popover_foreground = rgb(m.foreground).into();
 
     let accent_fill = rgb(surfaces.popover.cursor);
     let accent_text: Hsla = rgb(m.foreground).into();
