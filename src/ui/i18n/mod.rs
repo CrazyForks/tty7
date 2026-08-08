@@ -724,7 +724,9 @@ l10n_keys! {
     HomeTimeHoursAgo,
     HomeTimeYesterday,
     HomeTimeDaysAgo,
-    HomeTimeOverWeekAgo,
+    HomeTimeWeeksAgo,
+    HomeTimeMonthsAgo,
+    HomeTimeOverYearAgo,
     HomeReopenNamed,
     AppMenuAbout,
     AppMenuCheckForUpdates,
@@ -1276,6 +1278,8 @@ mod tests {
             L10nKey::HomeTimeMinutesAgo,
             L10nKey::HomeTimeHoursAgo,
             L10nKey::HomeTimeDaysAgo,
+            L10nKey::HomeTimeWeeksAgo,
+            L10nKey::HomeTimeMonthsAgo,
         ];
         for key in plural_keys {
             for branch in ["zero", "one", "other"] {

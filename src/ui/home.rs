@@ -72,6 +72,14 @@ pub(crate) fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+const DAY: u64 = 86_400;
+const WEEK: u64 = 7 * DAY;
+/// A twelfth of a year, not 30 days. Dividing by 30 would report "0 months
+/// ago" for the five days between the last whole week and the first whole
+/// 30-day month; a twelfth tiles the year with no such seam.
+const MONTH: u64 = 31_536_000 / 12;
+const YEAR: u64 = 365 * DAY;
+
 pub(crate) fn relative_time(now: u64, then: u64) -> String {
     if then == 0 || then >= now {
         return t(L10nKey::HomeTimeJustNow).to_string();
@@ -81,10 +89,16 @@ pub(crate) fn relative_time(now: u64, then: u64) -> String {
         s if s < 60 => t(L10nKey::HomeTimeJustNow).to_string(),
         s if s < 3_600 => t_plural(L10nKey::HomeTimeMinutesAgo, (s / 60) as usize, &[]),
         s if s < 7_200 => t(L10nKey::HomeTimeHourAgo).to_string(),
-        s if s < 86_400 => t_plural(L10nKey::HomeTimeHoursAgo, (s / 3_600) as usize, &[]),
-        s if s < 172_800 => t(L10nKey::HomeTimeYesterday).to_string(),
-        s if s < 604_800 => t_plural(L10nKey::HomeTimeDaysAgo, (s / 86_400) as usize, &[]),
-        _ => t(L10nKey::HomeTimeOverWeekAgo).to_string(),
+        s if s < DAY => t_plural(L10nKey::HomeTimeHoursAgo, (s / 3_600) as usize, &[]),
+        s if s < 2 * DAY => t(L10nKey::HomeTimeYesterday).to_string(),
+        s if s < WEEK => t_plural(L10nKey::HomeTimeDaysAgo, (s / DAY) as usize, &[]),
+        // The ladder used to stop here, so a workspace last opened a year ago
+        // and one opened eight days ago both read "over a week ago". In the
+        // switcher, where recency is the whole reason the line is there, that
+        // collapsed the interesting half of the range into one label.
+        s if s < MONTH => t_plural(L10nKey::HomeTimeWeeksAgo, (s / WEEK) as usize, &[]),
+        s if s < YEAR => t_plural(L10nKey::HomeTimeMonthsAgo, (s / MONTH) as usize, &[]),
+        _ => t(L10nKey::HomeTimeOverYearAgo).to_string(),
     }
 }
 
@@ -356,13 +370,40 @@ mod tests {
         assert_eq!(relative_time(now, now - 4 * 3600), "4 hours ago");
         assert_eq!(relative_time(now, now - 90_000), "yesterday");
         assert_eq!(relative_time(now, now - 3 * 86_400), "3 days ago");
-        assert_eq!(relative_time(now, now - 30 * 86_400), "over a week ago");
+        assert_eq!(relative_time(now, now - 10 * 86_400), "1 week ago");
+        assert_eq!(relative_time(now, now - 31 * 86_400), "1 month ago");
 
         set_locale("zh-CN");
         assert_eq!(relative_time(now, now - 30), "刚刚");
         assert_eq!(relative_time(now, now - 120), "2 分钟前");
         assert_eq!(relative_time(now, now - 3600), "1 小时前");
         assert_eq!(relative_time(now, now - 90_000), "昨天");
+    }
+
+    /// Every step of the ladder has to hand off to the next one without
+    /// leaving a gap that rounds down to zero — "0 months ago" is the kind of
+    /// label a coarser boundary produces and nobody notices until it ships.
+    #[test]
+    fn relative_time_never_counts_down_to_zero_between_ranges() {
+        set_locale("en");
+        // Far enough from the epoch that subtracting years stays positive.
+        let now = 400_000_000u64;
+        for days in 7..=400u64 {
+            let label = relative_time(now, now - days * 86_400);
+            assert!(
+                !label.starts_with('0'),
+                "{days} days ago rendered as {label:?}"
+            );
+        }
+        // The handoffs themselves, spelled out.
+        assert_eq!(relative_time(now, now - 6 * 86_400), "6 days ago");
+        assert_eq!(relative_time(now, now - 7 * 86_400), "1 week ago");
+        // Weeks run to a twelfth of a year, so day 30 is still four weeks.
+        assert_eq!(relative_time(now, now - 30 * 86_400), "4 weeks ago");
+        assert_eq!(relative_time(now, now - 31 * 86_400), "1 month ago");
+        assert_eq!(relative_time(now, now - 364 * 86_400), "11 months ago");
+        assert_eq!(relative_time(now, now - 365 * 86_400), "over a year ago");
+        assert_eq!(relative_time(now, now - 3_000 * 86_400), "over a year ago");
     }
 
     #[test]

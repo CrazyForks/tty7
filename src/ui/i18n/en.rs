@@ -931,7 +931,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::HomeTimeHoursAgo => "{count} hours ago",
         L10nKey::HomeTimeYesterday => "yesterday",
         L10nKey::HomeTimeDaysAgo => "{count} days ago",
-        L10nKey::HomeTimeOverWeekAgo => "over a week ago",
+        L10nKey::HomeTimeWeeksAgo => "{count} weeks ago",
+        L10nKey::HomeTimeMonthsAgo => "{count} months ago",
+        L10nKey::HomeTimeOverYearAgo => "over a year ago",
         L10nKey::HomeReopenNamed => "Reopen \"{name}\"",
         L10nKey::RemoteStripDisconnected => "Not connected to {machine}",
         L10nKey::RemoteStripConnecting => "Connecting to {machine}…",
@@ -1454,6 +1456,10 @@ pub fn translate_variant_en(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::HomeTimeHoursAgo, "other") => "{count} hours ago",
         (L10nKey::HomeTimeDaysAgo, "one") => "1 day ago",
         (L10nKey::HomeTimeDaysAgo, "other") => "{count} days ago",
+        (L10nKey::HomeTimeWeeksAgo, "one") => "1 week ago",
+        (L10nKey::HomeTimeWeeksAgo, "other") => "{count} weeks ago",
+        (L10nKey::HomeTimeMonthsAgo, "one") => "1 month ago",
+        (L10nKey::HomeTimeMonthsAgo, "other") => "{count} months ago",
         (L10nKey::WindowStopShells, "zero") => {
             "Its layout and working directories will be forgotten."
         }
