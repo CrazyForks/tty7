@@ -1181,6 +1181,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsFontDefault => "默认（匹配主字体）",
         L10nKey::ForwardDescriptionPlaceholder => "用途说明",
         L10nKey::SettingsShellDefaultLoginShell => "你的登录 shell",
+        L10nKey::SettingsShellDetected => "tty7 检测到的 shell",
         L10nKey::SftpErrorUnexpectedReply => "意外回复：{reply}",
         L10nKey::SftpErrorUnsafeRemoteName => "拒绝不安全的远程名称 {name}",
         L10nKey::SftpReplaceTitle => "覆盖已有的文件？",

@@ -1287,6 +1287,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsFontDefault => "デフォルト（メインに合わせる）",
         L10nKey::ForwardDescriptionPlaceholder => "用途",
         L10nKey::SettingsShellDefaultLoginShell => "あなたのログインシェル",
+        L10nKey::SettingsShellDetected => "tty7 が見つけたシェル",
         L10nKey::SftpErrorUnexpectedReply => "予期しない応答: {reply}",
         L10nKey::SftpErrorUnsafeRemoteName => "安全でないリモート名 {name} を拒否しました",
         L10nKey::SftpReplaceTitle => "既にあるファイルを置き換えますか？",

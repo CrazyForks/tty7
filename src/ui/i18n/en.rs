@@ -1245,6 +1245,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsFontDefault => "Default (match primary)",
         L10nKey::ForwardDescriptionPlaceholder => "what it's for",
         L10nKey::SettingsShellDefaultLoginShell => "your login shell",
+        L10nKey::SettingsShellDetected => "Shells tty7 found",
         L10nKey::SftpErrorUnexpectedReply => "unexpected reply: {reply}",
         L10nKey::SftpErrorUnsafeRemoteName => "refusing unsafe remote name {name}",
         L10nKey::SftpReplaceTitle => "Replace what is already there?",

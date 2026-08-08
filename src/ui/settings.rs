@@ -3481,9 +3481,61 @@ impl Tty7App {
             t(L10nKey::SettingsShellDefaultLoginShell)
         };
 
+        // tty7 already knows which shells are installed — it lists them on the
+        // new-tab button. Settings asked you to type one from memory instead,
+        // so the same choice was a menu in one place and a blind text field in
+        // the other. The field stays: a shell tty7 did not find still has to be
+        // reachable by path.
+        let shells = self.shells.shells.clone();
+        let current_program = program_input.read(cx).value().trim().to_string();
+        let platform_default_item: SharedString = if cfg!(windows) {
+            "PowerShell".into()
+        } else {
+            t(L10nKey::AppPlaceholderLoginShell).into()
+        };
+        let picker_app = cx.entity().downgrade();
+        let picker_input = program_input.clone();
+        // The chevron rides inside the field rather than beside it: hung on the
+        // outside it would either push the box narrower than the Arguments box
+        // directly below or push past the column every other control ends on.
+        let program_picker = Button::new("shell-program-detected")
+            .icon(IconName::ChevronDown)
+            .ghost()
+            .xsmall()
+            .disabled(shells.is_empty())
+            .tooltip(t(L10nKey::SettingsShellDetected))
+            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _window, _cx| {
+                let mut menu = menu.min_w(px(200.));
+                let pick = |program: String| {
+                    let app = picker_app.clone();
+                    let input = picker_input.clone();
+                    move |_: &_, window: &mut Window, cx: &mut App| {
+                        input.update(cx, |state, cx| state.set_value(program.clone(), window, cx));
+                        if let Some(app) = app.upgrade() {
+                            app.update(cx, |this, cx| this.commit_shell_from_picker(cx));
+                        }
+                    }
+                };
+                menu = menu.item(
+                    PopupMenuItem::new(platform_default_item.clone())
+                        .checked(current_program.is_empty())
+                        .on_click(pick(String::new())),
+                );
+                if !shells.is_empty() {
+                    menu = menu.item(PopupMenuItem::separator());
+                }
+                for shell in &shells {
+                    menu = menu.item(
+                        PopupMenuItem::new(shell.label.clone())
+                            .checked(current_program == shell.program)
+                            .on_click(pick(shell.program.clone())),
+                    );
+                }
+                menu
+            });
         let program_control = div()
             .w(px(260.))
-            .child(Input::new(&program_input).small())
+            .child(Input::new(&program_input).small().suffix(program_picker))
             .into_any_element();
         let args_control = div()
             .w(px(260.))

@@ -1047,6 +1047,7 @@ l10n_keys! {
     SettingsFontDefault,
     ForwardDescriptionPlaceholder,
     SettingsShellDefaultLoginShell,
+    SettingsShellDetected,
     SftpErrorUnexpectedReply,
     SftpErrorUnsafeRemoteName,
     SftpReplaceTitle,

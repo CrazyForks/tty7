@@ -4422,6 +4422,16 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// Saves the shell after the detected-shell menu wrote into the field.
+    ///
+    /// The field itself only commits on Enter or blur, and picking from a menu
+    /// is neither — without this the choice would sit in the box unsaved until
+    /// the user happened to click into it and out again.
+    pub(crate) fn commit_shell_from_picker(&mut self, cx: &mut Context<Self>) {
+        self.commit_shell(cx);
+        cx.notify();
+    }
+
     fn commit_shell(&mut self, cx: &mut Context<Self>) {
         let Some(settings) = self.active_settings() else {
             return;
