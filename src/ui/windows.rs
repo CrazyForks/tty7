@@ -14,6 +14,15 @@ const CASCADE_STEP: f32 = 28.0;
 
 const DEFAULT_SIZE: (f32, f32) = (1440.0, 900.0);
 
+/// The smallest window tty7 still holds its shape in.
+///
+/// Below this the chrome stops being chrome: the sidebar is at its 180px floor
+/// with barely forty columns beside it, and the overlays the app drops on top —
+/// the palette at 560 wide, the switcher wider still — have nowhere to land.
+/// Every one of those could be made to shrink further, but a terminal this
+/// small is not a window anyone is working in, and a floor is the honest fix.
+const MIN_SIZE: (f32, f32) = (720.0, 520.0);
+
 struct WindowEntry {
     workspace: WorkspaceId,
     handle: AnyWindowHandle,
@@ -557,6 +566,7 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
             ..TitleBar::title_bar_options()
         }),
         window_background: crate::ui::theme::background_appearance(cx),
+        window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
         ..Default::default()
     }
 }
