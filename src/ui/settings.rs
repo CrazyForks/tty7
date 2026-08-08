@@ -16,6 +16,7 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex,
     v_flex,
 };
+use std::cell::Cell;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -469,6 +470,14 @@ pub(crate) struct SettingsState {
     pub(crate) focus_handle: gpui::FocusHandle,
     pub(crate) section: SettingsSection,
     pub(crate) search: Entity<InputState>,
+    /// The page's own scroll, and an anchor on it that the first matching row
+    /// claims. Searching tells you "Appearance (2)"; these are what carry you
+    /// to the two, which on a long page start well below the fold.
+    pub(crate) content_scroll: gpui::ScrollHandle,
+    pub(crate) search_anchor: gpui::ScrollAnchor,
+    /// Set when the query or the section changes, and spent by the next render
+    /// that has somewhere to go. A `Cell` because that render only holds `&self`.
+    pub(crate) reveal_first_hit: Cell<bool>,
     pub(crate) font_select: Entity<SelectState<SearchableVec<String>>>,
     pub(crate) font_bold_select: Entity<SelectState<SearchableVec<String>>>,
     pub(crate) font_italic_select: Entity<SelectState<SearchableVec<String>>>,
@@ -793,6 +802,20 @@ impl Tty7App {
             section,
             window.viewport_size().width.as_f32(),
         ));
+        self.settings_hit_anchored.set(false);
+
+        // A query that matched here has to be reachable, not just counted. The
+        // anchor lands on the first matching row below, and `scroll_to` reads
+        // where it ended up on the frame after this one — by which time this
+        // render has been painted and the anchor knows its own origin.
+        if let Some(s) = self.active_settings()
+            && s.reveal_first_hit.get()
+        {
+            s.reveal_first_hit.set(false);
+            if !query.is_empty() && section_match_count(section, &query) > 0 {
+                s.search_anchor.scroll_to(window, cx);
+            }
+        }
 
         let prof = crate::ui::perf::enabled()
             .then(|| (std::time::Instant::now(), section.profile_label()));
@@ -946,6 +969,9 @@ impl Tty7App {
                 .h_full()
                 .bg(background)
                 .overflow_y_scroll()
+                .when_some(self.active_settings(), |pane, s| {
+                    pane.track_scroll(&s.content_scroll)
+                })
                 .child(
                     // The padding box needs its own width for the reading
                     // column's `w_full` to resolve against something definite;
@@ -1106,6 +1132,10 @@ impl Tty7App {
             }
             None => (false, false),
         };
+        let first_hit_anchor = match hit && !self.settings_hit_anchored.replace(true) {
+            true => self.active_settings().map(|s| s.search_anchor.clone()),
+            false => None,
+        };
         // The control never shrinks, so on a narrow pane it takes the width and
         // the label column — which must keep `min_w_0` or long descriptions
         // stop wrapping — is squeezed to a letter per line. Below the width
@@ -1143,6 +1173,10 @@ impl Tty7App {
             .mx_neg_2p5()
             .rounded_lg()
             .when(hit, |row| row.bg(theme.accent.opacity(0.16)))
+            // Only the first hit on the page carries the anchor: it is the one
+            // the page scrolls to, and a later row claiming it would drag the
+            // view past the matches above.
+            .anchor_scroll(first_hit_anchor)
             .when(miss, |row| row.opacity(0.45))
             .hover(|h| h.bg(gpui::rgb(cx.global::<presets::Surfaces>().window.hover)))
             .on_hover(cx.listener(|_this, _hovered, _window, cx| cx.notify()))

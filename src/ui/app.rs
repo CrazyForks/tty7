@@ -398,6 +398,10 @@ pub struct Tty7App {
     /// window, and the answer differs per page — the SSH page spends 500px on
     /// its two lists first.
     pub(crate) settings_row_width: Cell<f32>,
+    /// Cleared at the top of every settings render, then set by the first row
+    /// the live search matched, so exactly one row per page carries the anchor
+    /// the page scrolls to.
+    pub(crate) settings_hit_anchored: Cell<bool>,
     pub(crate) right_panel_width: Rc<Cell<f32>>,
     pub(crate) right_panel_dragging: Rc<Cell<bool>>,
     pub(crate) right_panel_visible: bool,
@@ -812,6 +816,7 @@ impl Tty7App {
             sidebar_width: Rc::new(Cell::new(sidebar_width)),
             sidebar_dragging: Rc::new(Cell::new(false)),
             settings_row_width: Cell::new(f32::MAX),
+            settings_hit_anchored: Cell::new(false),
             right_panel_width: Rc::new(Cell::new(right_panel_width)),
             right_panel_dragging: Rc::new(Cell::new(false)),
             right_panel_visible,
@@ -3773,6 +3778,9 @@ impl Tty7App {
             cx.subscribe_in(&settings_search, window, |this, _i, ev, _w, cx| {
                 if matches!(ev, InputEvent::Change) {
                     this.autoselect_settings_search(cx);
+                    if let Some(s) = this.active_settings_mut() {
+                        s.reveal_first_hit.set(true);
+                    }
                     cx.notify();
                 }
             }),
@@ -3800,10 +3808,16 @@ impl Tty7App {
             }),
         );
 
+        let content_scroll = gpui::ScrollHandle::new();
+        let search_anchor = gpui::ScrollAnchor::for_handle(content_scroll.clone());
+
         self.settings = Some(SettingsState {
             focus_handle: focus_handle.clone(),
             section: SettingsSection::Appearance,
             search: settings_search,
+            content_scroll,
+            search_anchor,
+            reveal_first_hit: Cell::new(false),
             font_select,
             font_bold_select,
             font_italic_select,
@@ -4694,8 +4708,14 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         if let Some(s) = self.settings.as_mut() {
+            let moved = s.section != target;
             s.section = target;
             s.recording = None;
+            // Arriving on a page with a query live means arriving to look for
+            // what the nav badge counted, so take the page to it.
+            if moved {
+                s.reveal_first_hit.set(true);
+            }
             if target == SettingsSection::Agents {
                 s.agent_hooks_states = crate::ui::settings::AgentHooksView::Loading;
             }
