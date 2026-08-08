@@ -23,18 +23,6 @@ use crate::ui::rounding;
 use crate::ui::rounding::RoundedCorners as _;
 use crate::ui::scm::status::{status_color, status_glyph};
 
-/// What the right panel's shared probe asks git for, and so what an overlay
-/// opened from the sidebar shows.
-///
-/// The panel's own contract, not a default the rest of the file leans on: it
-/// is read where the panel's request is issued, where the panel's answer is
-/// filed away, and at the one entry point that has no source of its own to
-/// name. Whether an overlay may reuse the panel's snapshot is settled by that
-/// snapshot's own `source`, and whether an overlay has gone stale by the
-/// overlay's — so when the panel splits into staged and unstaged groups, this
-/// constant is the only thing that has to move.
-const PANEL_DIFF_SOURCE: DiffSource = DiffSource::Head;
-
 pub(crate) enum DiffLoad {
     Loading,
     Ready(Arc<DiffSnapshot>),
@@ -101,7 +89,9 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_diff_overlay(host, cwd, PANEL_DIFF_SOURCE, focus, window, cx)
+        // The sidebar's `+N −M` is `diff --numstat HEAD`, so opening it has
+        // to show the same span. The panel names its own source per group.
+        self.open_diff_overlay(host, cwd, DiffSource::Head, focus, window, cx)
     }
 
     pub(crate) fn open_diff_overlay(
@@ -142,18 +132,7 @@ impl Tty7App {
             }
             None => {}
         }
-        // Skipping the "Reading…" flash is only allowed when the panel's
-        // snapshot answers the same question this overlay is asking. The
-        // snapshot says which question that was, so this stays right through
-        // whatever the panel decides to probe for next.
-        let seed = match (&self.right_panel.diff_cwd, &self.right_panel.diff) {
-            (Some(panel_key), Some(Some(snap)))
-                if snap.source == source && *panel_key == (host, cwd.clone()) =>
-            {
-                DiffLoad::Ready(Arc::clone(snap))
-            }
-            _ => DiffLoad::Loading,
-        };
+        let seed = DiffLoad::Loading;
         let epoch = match &seed {
             DiffLoad::Ready(snap) => Some(scm_epoch(cx, host, &snap.root)),
             _ => None,
@@ -233,15 +212,6 @@ impl Tty7App {
         self.spawn_diff_probe_for(host, cwd, source, cx);
     }
 
-    pub(crate) fn spawn_shared_diff_probe(
-        &mut self,
-        host: crate::ui::host_ops::SharedHost,
-        cwd: PathBuf,
-        cx: &mut Context<Self>,
-    ) {
-        self.spawn_diff_probe_for(host, cwd, PANEL_DIFF_SOURCE, cx)
-    }
-
     pub(crate) fn spawn_diff_probe_for(
         &mut self,
         host: crate::ui::host_ops::SharedHost,
@@ -304,21 +274,6 @@ impl Tty7App {
                 Some(snap) => DiffLoad::Ready(Arc::clone(snap)),
                 None => DiffLoad::NotARepo,
             };
-            landed = true;
-        }
-        if *source != PANEL_DIFF_SOURCE {
-            if landed {
-                cx.notify();
-            }
-            return;
-        }
-        let key = (host, cwd.to_path_buf());
-        if self.right_panel.diff_pending.as_ref() == Some(&key) {
-            self.right_panel.diff_pending = None;
-            landed = true;
-        }
-        if self.right_panel.diff_cwd.as_ref() == Some(&key) {
-            self.right_panel.diff = Some(snap);
             landed = true;
         }
         if landed {

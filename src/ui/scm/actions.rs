@@ -80,15 +80,6 @@ impl Tty7App {
         let Some(host) = HostRegistry::get(cx, repo.host) else {
             return;
         };
-        if op.is_network() {
-            // The epoch `run_git_op` bumps when it lands is the only signal
-            // there is that a push has finished, so record the one we started
-            // from and let the branch row spin until it moves.
-            let at = cx
-                .default_global::<crate::terminal::git_data::ScmData>()
-                .epoch(repo.host, &repo.root);
-            self.scm.network = Some((repo.clone(), at));
-        }
         let Some(loss) = op.destructive() else {
             self.run_git_op(host, repo.root, op, window, cx);
             return;
@@ -119,7 +110,10 @@ impl Tty7App {
             return;
         };
         match intent {
-            ScmIntent::Refresh => self.scm_invalidate(&repo, cx),
+            ScmIntent::Refresh => {
+                self.scm_invalidate(repo.host, &repo.root, cx);
+                cx.notify();
+            }
             ScmIntent::StageAll => self.scm_op(repo, GitOp::StageAll, window, cx),
             ScmIntent::UnstageAll => self.scm_op(repo, GitOp::UnstageAll, window, cx),
             ScmIntent::DiscardAll => self.scm_discard_all(repo, window, cx),

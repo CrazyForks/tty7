@@ -5,11 +5,9 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, h_flex, v_flex,
 };
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::PaneProcs;
-use crate::terminal::git_diff::DiffSnapshot;
 use crate::ui::app::{
     CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App, tile_trailing_inset,
     tile_trailing_inset_sm,
@@ -24,9 +22,6 @@ const RESIZE_HANDLE_WIDTH: f32 = 8.;
 
 #[derive(Default)]
 pub(crate) struct RightPanelState {
-    pub(crate) diff_cwd: Option<(crate::ui::host_ops::HostId, PathBuf)>,
-    pub(crate) diff: Option<Option<Arc<DiffSnapshot>>>,
-    pub(crate) diff_pending: Option<(crate::ui::host_ops::HostId, PathBuf)>,
     pub(crate) procs_pane: Option<u64>,
     pub(crate) procs: Option<PaneProcs>,
     pub(crate) procs_loading: bool,

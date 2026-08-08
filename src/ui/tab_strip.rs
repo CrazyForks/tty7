@@ -390,13 +390,17 @@ impl Tty7App {
 
     pub(crate) fn right_panel_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let active_tab = self.right_panel_tab;
-        let changed = match &self.right_panel.diff {
-            Some(Some(snap)) => {
-                let n = snap.files.len() + snap.untracked_count();
-                (n > 0).then_some(n)
-            }
-            _ => None,
-        };
+        // The count the source control tile carries. It reads the same status
+        // the panel draws, so the badge and the group headers can never
+        // disagree — and it counts entries, not files, because a path that is
+        // both staged and modified is two things to do, which is what the
+        // groups show.
+        let changed = self
+            .scm
+            .active_repo()
+            .and_then(|repo| crate::terminal::git_data::status_of(cx, repo.host, &repo.root))
+            .map(|status| status.entries.len())
+            .filter(|n| *n > 0);
         [
             (
                 RightPanelTab::Info,

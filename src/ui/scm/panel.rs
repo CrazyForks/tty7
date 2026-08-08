@@ -291,20 +291,19 @@ impl Tty7App {
             .into_any_element()
     }
 
-    /// Whether a network operation dispatched from here is still running.
+    /// Whether a network operation against this repository is still running.
     ///
-    /// There is no completion callback to hang this off, but `run_git_op`
-    /// bumps the repository's epoch when it lands — so an epoch that has not
-    /// moved since the dispatch means the operation has not finished.
-    fn scm_network_busy(&self, repo: &RepoKey, cx: &mut Context<Self>) -> bool {
-        let Some((sent, at)) = &self.scm.network else {
-            return false;
-        };
-        sent == repo
-            && cx
-                .default_global::<crate::terminal::git_data::ScmData>()
-                .epoch(repo.host, &repo.root)
-                == *at
+    /// Asks the slot counter `run_git_op` claims from, which is the operation
+    /// itself rather than a proxy for it: the epoch moves for a `.git` event
+    /// or a file save too, so watching that would drop the spinner in the
+    /// middle of a slow push.
+    ///
+    /// Read through `try_global`, never `default_global` — this runs from
+    /// `render`, and taking the global mutably there queues a global-observer
+    /// effect on every frame.
+    fn scm_network_busy(&self, repo: &RepoKey, cx: &gpui::App) -> bool {
+        cx.try_global::<crate::terminal::git_data::ScmData>()
+            .is_some_and(|data| data.network_slots(repo.host, &repo.root) > 0)
     }
 
     /// How many repositories other than this one the panel could switch to.
@@ -1407,13 +1406,7 @@ impl Tty7App {
             return;
         }
         self.scm.last_tab_status = Some(seen);
-        self.scm_invalidate(&repo, cx);
-    }
-
-    /// Send the next look at a repository back to git.
-    pub(crate) fn scm_invalidate(&mut self, repo: &RepoKey, cx: &mut Context<Self>) {
-        cx.default_global::<crate::terminal::git_data::ScmData>()
-            .bump(repo.host, &repo.root);
+        self.scm_invalidate(repo.host, &repo.root, cx);
         cx.notify();
     }
 

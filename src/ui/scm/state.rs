@@ -66,10 +66,6 @@ pub(crate) struct ScmPanelState {
     /// the switcher is never older than the last operation.
     pub(crate) branches: HashMap<RepoKey, (u64, Vec<String>)>,
     pub(crate) branches_loading: HashSet<RepoKey>,
-    /// A network operation in flight, and the epoch it was dispatched at.
-    /// `run_git_op` bumps the epoch when it finishes, which is the only
-    /// completion signal available from outside it.
-    pub(crate) network: Option<(RepoKey, u64)>,
     /// The inline "name your branch" input, present only while it is open.
     pub(crate) new_branch: Option<Entity<InputState>>,
     /// Unsent commit messages, one per working tree.
