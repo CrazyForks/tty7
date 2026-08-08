@@ -937,10 +937,19 @@ impl Tty7App {
             .bg(background)
             .text_color(foreground)
             .track_focus(&focus_handle)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                if ev.keystroke.key.as_str() == "escape" {
-                    this.close_settings_checked(window, cx);
+            // Escape peels one layer at a time. With the theme picker open that
+            // layer is the picker: closing the whole page instead threw away a
+            // panel the user had opened a moment ago, and left them to walk
+            // back to Appearance to try again.
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.key.as_str() != "escape" {
+                    return;
                 }
+                if show_theme_panel {
+                    this.close_theme_panel(window, cx);
+                    return;
+                }
+                this.close_settings_checked(window, cx);
             }))
             .child(sidebar)
             .child(content_pane)
