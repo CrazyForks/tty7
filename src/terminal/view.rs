@@ -4660,6 +4660,7 @@ impl TerminalView {
 
         let theme = cx.theme();
         let lh = self.line_height;
+        let cell = self.cell_width.as_f32();
         let row = |i: usize| {
             let cand = items[i];
             let selected = s.index == Some(i);
@@ -4674,6 +4675,7 @@ impl TerminalView {
             } else {
                 cand.text.clone()
             };
+            let budget = description_budget(cell, label.chars().count());
             div()
                 .h(lh)
                 .flex()
@@ -4687,7 +4689,12 @@ impl TerminalView {
                 .child(icon)
                 .child(div().flex_shrink_0().child(label))
                 .when_some(cand.description.clone(), |d, desc| {
-                    d.child(div().ml_2().text_color(theme.muted_foreground).child(desc))
+                    d.child(
+                        div()
+                            .ml_2()
+                            .text_color(theme.muted_foreground)
+                            .child(elide(&desc, budget)),
+                    )
                 })
                 .into_any_element()
         };
@@ -4726,7 +4733,7 @@ impl TerminalView {
                 .flex_col()
                 .py_1()
                 .min_w(px(120.))
-                .max_w(px(480.))
+                .max_w(px(COMPLETION_MENU_MAX_W))
                 .overflow_hidden()
                 .bg(theme.popover)
                 .border_1()
@@ -5498,6 +5505,40 @@ fn fig_query_param<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// Where the completion menu stops growing.
+const COMPLETION_MENU_MAX_W: f32 = 480.;
+
+/// How many characters of a candidate's description fit beside its name.
+///
+/// The menu is monospaced and clips whatever runs past its edge, so a long
+/// description used to end mid-word — "…or a symli" — with nothing to say it
+/// had been cut. The row spends its width on `px_2` either side, the kind
+/// icon, the gap after it and the margin before the description; whatever is
+/// left, in cells, is the description's.
+fn description_budget(cell_width: f32, label_cells: usize) -> usize {
+    const ROW_CHROME: f32 = 8. + 8. + 16. + 6. + 8.;
+    if cell_width <= 0. {
+        return 0;
+    }
+    let free = COMPLETION_MENU_MAX_W - ROW_CHROME - label_cells as f32 * cell_width;
+    (free / cell_width).floor().max(0.) as usize
+}
+
+/// `text` cut to `budget` characters, with the last one spent on an ellipsis.
+/// A budget too small to say anything with returns nothing rather than a bare
+/// "…", which reads as a description that is there but unreadable.
+fn elide(text: &str, budget: usize) -> String {
+    if text.chars().count() <= budget {
+        return text.to_string();
+    }
+    if budget < 2 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(budget - 1).collect();
+    out.push('…');
+    out
+}
+
 fn menu_layout(
     total_rows: usize,
     srow: usize,
@@ -5655,11 +5696,11 @@ mod tests {
     };
     use super::{SCROLL_ANIM_FRAME, scroll_anim_step};
     use super::{
-        drag_scroll_step, encode_mouse, escape_candidate, expand_file_command_template,
-        fallback_chain, fig_icon_emoji, fig_icon_glyph, focus_report_bytes, input_overflow_shift,
-        input_overlay_rows, menu_layout, paste_bytes, select_end_copy, shell_escape_path,
-        should_show_context_menu, smooth_scroll_step, submit_bytes, trim_trailing_spaces,
-        wheel_route, wrapped_click_index,
+        description_budget, drag_scroll_step, elide, encode_mouse, escape_candidate,
+        expand_file_command_template, fallback_chain, fig_icon_emoji, fig_icon_glyph,
+        focus_report_bytes, input_overflow_shift, input_overlay_rows, menu_layout, paste_bytes,
+        select_end_copy, shell_escape_path, should_show_context_menu, smooth_scroll_step,
+        submit_bytes, trim_trailing_spaces, wheel_route, wrapped_click_index,
     };
     use super::{
         remote_paste_spec, staged_path_for_pane, stages_clipboard_image, staging_cache,
@@ -6765,6 +6806,40 @@ mod tests {
         assert_eq!(input_overflow_shift(20, 2, 3, 22), 1);
         assert_eq!(input_overflow_shift(21, 29, 30, 22), 29);
         assert_eq!(input_overflow_shift(21, 0, 30, 22), 21);
+    }
+
+    #[test]
+    fn a_description_that_fits_is_left_alone() {
+        assert_eq!(elide("Show commit logs", 40), "Show commit logs");
+        // Exactly the budget is still a fit; nothing is spent on an ellipsis.
+        assert_eq!(elide("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn an_overlong_description_ends_in_an_ellipsis_inside_its_budget() {
+        let out = elide("Move or rename a file, a directory, or a symlink", 12);
+        assert_eq!(out.chars().count(), 12, "the ellipsis is inside the budget");
+        assert!(out.ends_with('…'));
+        assert!(out.starts_with("Move or ren"));
+    }
+
+    #[test]
+    fn a_budget_with_no_room_to_say_anything_says_nothing() {
+        // A lone "…" reads as a description that is there but unreadable.
+        assert_eq!(elide("Show commit logs", 1), "");
+        assert_eq!(elide("Show commit logs", 0), "");
+    }
+
+    #[test]
+    fn the_description_budget_is_what_the_name_leaves_of_the_menu() {
+        // A 9px cell: 46px of row chrome, so a bare row leaves (480-46)/9 cells.
+        assert_eq!(description_budget(9., 0), 48);
+        // Every cell the name takes is one the description does not get.
+        assert_eq!(description_budget(9., 10), 38);
+        // A name that fills the menu on its own leaves nothing, and never
+        // underflows into a huge budget.
+        assert_eq!(description_budget(9., 200), 0);
+        assert_eq!(description_budget(0., 10), 0);
     }
 
     #[test]
