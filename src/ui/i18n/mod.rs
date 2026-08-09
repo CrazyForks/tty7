@@ -374,6 +374,9 @@ l10n_keys! {
     SettingsOfflineMachines,
     SettingsSyncWithSystem,
     SettingsSyncWithSystemDesc,
+    SettingsLegiblePalette,
+    SettingsLegiblePaletteDesc,
+    SettingsSearchLegiblePaletteKeywords,
     SettingsChangeTheme,
     SettingsThemes,
     SettingsThemesCloseTooltip,
@@ -469,6 +472,7 @@ l10n_keys! {
     SettingsDaemonStaleDesc,
     UpdateDialogTitle,
     UpdateDialogDetail,
+    UpdateDialogDetailWindows,
     UpdateDialogDetailManual,
     UpdateDialogCannotSelfUpdate,
     UpdateDialogLater,
@@ -503,6 +507,7 @@ l10n_keys! {
     SettingsAgentOpencode,
     SettingsAgentPi,
     SettingsAgentGrokBuild,
+    SettingsAgentOhMyPi,
     SettingsSearchAppHttpProxyKeywords,
     SettingsSearchAboutKeywords,
     SettingsSearchAutoDownloadKeywords,
@@ -543,6 +548,7 @@ l10n_keys! {
     SettingsSearchNewTabPositionKeywords,
     SettingsSearchNotifyOnCommandFinishKeywords,
     SettingsSearchNotifyThresholdKeywords,
+    SettingsSearchOhMyPiKeywords,
     SettingsSearchOpacityKeywords,
     SettingsSearchOpenFilesWithKeywords,
     SettingsSearchOpencodeKeywords,
@@ -993,7 +999,7 @@ l10n_keys! {
     AppRestartServerDialectNewerDetail,
     AppRestartServerOldDetail,
     AppRestart,
-    AppRestartServerNotSsh,
+    AppRestartServerNoServer,
     AppRestartServerBody,
     AppWorktreeRemoveDetailDirty,
     AppWorktreeRemoveDetailClean,
@@ -1220,6 +1226,7 @@ mod tests {
             L10nKey::SettingsAgentCodex,
             L10nKey::SettingsAgentCopilotCli,
             L10nKey::SettingsAgentGrokBuild,
+            L10nKey::SettingsAgentOhMyPi,
             L10nKey::SettingsAgentOpencode,
             L10nKey::SettingsAgentPi,
             // A language is named in its own language on every locale's list.
@@ -1231,6 +1238,9 @@ mod tests {
             L10nKey::PanelShell,
             L10nKey::PanelAgent,
             L10nKey::PanelSsh,
+            // The zh copy calls the background process "server" throughout —
+            // this heading is that word on its own.
+            L10nKey::SettingsServer,
             // "Shell" and "Agent" are the words the Chinese- and
             // Japanese-speaking developer audience uses for these; a
             // translation here would be less clear, not more.
