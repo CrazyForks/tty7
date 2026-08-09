@@ -1238,10 +1238,15 @@ impl TerminalView {
     /// either nothing is running or the shell never told us — and a terminal
     /// that guessed would raise this question on every single close.
     pub fn busy(&self) -> Option<PaneBusy> {
+        use crate::core::cli_agent::AgentStatus;
+        // `Done` is the opposite of busy: the turn is over, and the badge
+        // saying so is exactly what sends a reader to close the tab. Only a
+        // turn still in flight — running, or stopped on a question — is work
+        // that closing would cut short.
         if let Some(agent) = self.agent()
             && self
                 .agent_session()
-                .is_some_and(|s| s.status != crate::core::cli_agent::AgentStatus::Idle)
+                .is_some_and(|s| matches!(s.status, AgentStatus::Working | AgentStatus::Waiting))
         {
             return Some(PaneBusy::Agent(agent.display_name()));
         }
@@ -7166,6 +7171,54 @@ mod gpui_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("the prompt report never reached the view");
+    }
+
+    #[gpui::test]
+    fn an_agent_that_has_finished_its_turn_is_not_busy(cx: &mut TestAppContext) {
+        use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
+
+        crate::core::config::pin_test_config_dir();
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Agent(Some(CLIAgent::Claude))
+            .encode(&mut daemon)
+            .unwrap();
+
+        let report = |status: AgentStatus, daemon: &mut UnixStream| {
+            DaemonMsg::AgentStatus(Some(AgentSessionState {
+                status,
+                message: None,
+                session_id: Some("sid-abc".into()),
+                launch_argv: Some(vec!["claude".into()]),
+                rich: true,
+                cwd: None,
+                activity: 0,
+            }))
+            .encode(daemon)
+            .unwrap();
+        };
+        let settled = |want: Option<PaneBusy>, cx: &mut TestAppContext| {
+            for _ in 0..200 {
+                if window.update(cx, |view, _, _| view.busy()).unwrap() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+
+        report(AgentStatus::Working, &mut daemon);
+        assert!(
+            settled(Some(PaneBusy::Agent("Claude Code")), cx),
+            "a turn in flight is work closing would cut short"
+        );
+
+        // The green Done badge is what sends a reader to close the tab. Asking
+        // "Claude Code is still working" there is both false and in the way.
+        report(AgentStatus::Done, &mut daemon);
+        assert!(
+            settled(None, cx),
+            "a finished turn must not hold the tab open"
+        );
     }
 
     #[gpui::test]
