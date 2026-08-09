@@ -101,7 +101,9 @@ fn max_lanes(panel_w: f32, collapsed: bool) -> usize {
     if collapsed {
         return 1;
     }
-    let fit = (panel_w * GRAPH_GUTTER_SHARE / GRAPH_LANE_W).floor();
+    // The share buys the whole gutter, insets included — budgeting only the
+    // lane strip would overrun it by a lane at every width.
+    let fit = ((panel_w * GRAPH_GUTTER_SHARE - GRAPH_PAD_L - GRAPH_PAD_R) / GRAPH_LANE_W).floor();
     if !fit.is_finite() {
         return GRAPH_MIN_LANES;
     }
@@ -1415,10 +1417,20 @@ mod tests {
     #[test]
     fn the_gutter_narrows_with_the_panel_and_folds_to_one() {
         // 260px is the default panel; 216px is about as narrow as it gets.
-        assert_eq!(max_lanes(260., false), 6);
-        assert_eq!(max_lanes(216., false), 5);
-        assert_eq!(max_lanes(160., false), 4);
-        assert_eq!(max_lanes(120., false), 3);
+        assert_eq!(max_lanes(260., false), 5);
+        assert_eq!(max_lanes(216., false), 4);
+        assert_eq!(max_lanes(320., false), 6);
+        assert_eq!(max_lanes(160., false), GRAPH_MIN_LANES);
+        // The gutter it asks for has to fit inside the share it was given.
+        for w in [120., 160., 216., 260., 320., 600.] {
+            let cap = max_lanes(w, false);
+            assert!(
+                cap == GRAPH_MIN_LANES || gutter_width(cap) <= w * GRAPH_GUTTER_SHARE,
+                "{w}px: a {cap}-lane gutter is {}px of a {}px budget",
+                gutter_width(cap),
+                w * GRAPH_GUTTER_SHARE
+            );
+        }
         // Below the floor the gutter stops shrinking: three lanes is the least
         // that can show a branch leaving and coming back.
         assert_eq!(max_lanes(40., false), GRAPH_MIN_LANES);
