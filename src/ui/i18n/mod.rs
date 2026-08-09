@@ -175,6 +175,16 @@ l10n_keys! {
     SettingsOpacityDesc,
     SettingsBlur,
     SettingsBlurDesc,
+    SettingsBlurAutoDesc,
+    SettingsBackdrop,
+    SettingsBackdropDesc,
+    SettingsSearchBackdropKeywords,
+    SettingsBackdropAuto,
+    SettingsBackdropBlur,
+    SettingsBackdropMica,
+    SettingsBackdropMicaAlt,
+    SettingsBackdropAcrylic,
+    SettingsBackdropOff,
     FollowTheme,
     SettingsDimInactivePanes,
     SettingsDimInactivePanesDesc,
@@ -1231,6 +1241,13 @@ mod tests {
             L10nKey::SettingsAgentOhMyPi,
             L10nKey::SettingsAgentOpencode,
             L10nKey::SettingsAgentPi,
+            // Windows names its backdrop materials, and Japanese Windows keeps
+            // those names in Latin script — so does this list. Chinese does
+            // translate them (云母 / 亚克力), which is what Microsoft's own
+            // zh-CN copy uses, so only the ja side reads as English here.
+            L10nKey::SettingsBackdropMica,
+            L10nKey::SettingsBackdropMicaAlt,
+            L10nKey::SettingsBackdropAcrylic,
             // A language is named in its own language on every locale's list.
             L10nKey::SettingsLanguageEnglish,
             L10nKey::SettingsLanguageChinese,

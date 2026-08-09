@@ -43,8 +43,9 @@ log.workspace = true
 # Smart double-click selection patterns (URL/email/path). Already in the tree
 # transitively, so pinning it here adds no new native code.
 regex = "1"
-# SIMD byte search for `MarkScanner`'s Text-state fast path (`terminal::marks`),
-# which scans every output batch the client receives — the same skip-ahead the
+# SIMD byte search for `ParkedCursorScanner`'s fast path
+# (`terminal::parked_cursor`), which scans every output batch the client
+# receives — the same skip-ahead the
 # tokenizers in `tty7-core` already use. Already in the tree via `tty7-core`,
 # so this pins no new code.
 memchr = "2"
@@ -141,6 +142,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Registry",
+    "Wdk_System_SystemServices",
+    "Win32_System_SystemInformation",
     # `MessageBeep` (the terminal bell in `terminal::view`) is a user32 export,
     # but the Win32 metadata files it under Diagnostics::Debug, so that is the
     # module the binding needs — nothing here pulls in dbghelp.

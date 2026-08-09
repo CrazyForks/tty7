@@ -12,7 +12,6 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, CursorShape, CursorStyle};
 
-use crate::terminal::marks::{MarkEvent, MarkScanner};
 use crate::terminal::parked_cursor::{CursorCut, ParkedCursorRepair, ParkedCursorScanner};
 
 use std::collections::VecDeque;
@@ -75,9 +74,9 @@ struct ReaderSignals {
     child_exited: Arc<AtomicBool>,
     zle_reading: Arc<AtomicBool>,
     shell_vi_mode: Arc<AtomicBool>,
+    running_command: Arc<Mutex<String>>,
     auth: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>>,
     phase: Arc<Mutex<Option<SshPhase>>>,
-    marks: crate::terminal::marks::Marks,
     /// Kitty-graphics images the daemon lifted out of the stream (issue #213),
     /// anchored to the grid for the paint path to blit. Shared with the reader,
     /// which places/deletes them as `DaemonMsg::Image`/`DeleteImage` frames land.
@@ -170,17 +169,23 @@ pub struct RemoteTerminal {
     child_exited: Arc<AtomicBool>,
     zle_reading: Arc<AtomicBool>,
     shell_vi_mode: Arc<AtomicBool>,
+    /// The line the shell said it is running, from the OSC 133;C mark, still
+    /// percent-escaped as the integration sent it. Empty while at a prompt.
+    ///
+    /// This is the only place the *text* of a running command exists on the
+    /// client: the frame the daemon sends says a command runs, not which one.
+    /// The close confirmation has to name what it is about to end.
+    running_command: Arc<Mutex<String>>,
     auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>>,
     ssh_phase: Arc<Mutex<Option<SshPhase>>>,
     ssh_endpoint: Option<(String, u16)>,
     auto_supplied_password: bool,
     agent: Arc<Mutex<Option<CLIAgent>>>,
     agent_session: Arc<Mutex<Option<AgentSessionState>>>,
-    marks: crate::terminal::marks::Marks,
     /// Kitty-graphics images placed on this pane's grid (issue #213).
     /// Written by the reader thread from out-of-band `Image`/`DeleteImage`
-    /// frames, read by the paint path — same shared-handle discipline as
-    /// `marks`, since only the client holds the grid the anchors are relative to.
+    /// frames, read by the paint path — only the client holds the grid the
+    /// anchors are relative to, so the store lives here rather than in the daemon.
     images: crate::terminal::images::ImageStore,
     route: PaneRoute,
     proxy: EventProxy,
@@ -407,9 +412,9 @@ impl RemoteTerminal {
                 child_exited: self.child_exited.clone(),
                 zle_reading: self.zle_reading.clone(),
                 shell_vi_mode: self.shell_vi_mode.clone(),
+                running_command: self.running_command.clone(),
                 auth: self.auth_prompts.clone(),
                 phase: self.ssh_phase.clone(),
-                marks: self.marks.clone(),
                 images: self.images.clone(),
             },
         );
@@ -456,10 +461,10 @@ impl RemoteTerminal {
         let child_exited = Arc::new(AtomicBool::new(false));
         let zle_reading = Arc::new(AtomicBool::new(false));
         let shell_vi_mode = Arc::new(AtomicBool::new(false));
+        let running_command: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let ssh_phase: Arc<Mutex<Option<SshPhase>>> = Arc::new(Mutex::new(None));
-        let marks = crate::terminal::marks::Marks::new();
         let images = crate::terminal::images::ImageStore::new();
 
         let reader_quit = Arc::new(AtomicBool::new(false));
@@ -479,9 +484,9 @@ impl RemoteTerminal {
                 child_exited: child_exited.clone(),
                 zle_reading: zle_reading.clone(),
                 shell_vi_mode: shell_vi_mode.clone(),
+                running_command: running_command.clone(),
                 auth: auth_prompts.clone(),
                 phase: ssh_phase.clone(),
-                marks: marks.clone(),
                 images: images.clone(),
             },
         );
@@ -502,13 +507,13 @@ impl RemoteTerminal {
             child_exited,
             zle_reading,
             shell_vi_mode,
+            running_command,
             auth_prompts,
             ssh_phase,
             ssh_endpoint: None,
             auto_supplied_password: false,
             agent,
             agent_session,
-            marks,
             images,
             route: PaneRoute::Local,
             proxy,
@@ -569,9 +574,9 @@ impl RemoteTerminal {
                     child_exited,
                     zle_reading,
                     shell_vi_mode,
+                    running_command,
                     auth,
                     phase,
-                    marks,
                     images,
                 } = signals;
                 crate::core::threads::promote_to_user_interactive();
@@ -580,7 +585,6 @@ impl RemoteTerminal {
                 let mut osc = OscNotifyScanner::default();
                 let mut mode_tok = OscTokenizer::new(&[b"133"]);
                 let mut zle_tok = OscTokenizer::new(&[b"133"]);
-                let mut mark_scan = MarkScanner::new();
                 let mut cursor_scan = ParkedCursorScanner::new();
                 let mut parked_cursor = ParkedCursorRepair::default();
                 let mut pending: Vec<u8> = buffered;
@@ -627,18 +631,13 @@ impl RemoteTerminal {
                     macro_rules! flush_batch {
                         () => {
                             if !out_batch.is_empty() {
-                                // Both scanners report an offset one past the
-                                // sequence they matched, so the batch splits at
-                                // each of them: advance the emulator to the cut,
-                                // act on the state that sequence left behind,
-                                // carry on. In offset order, since a frame can
-                                // carry marks and cursor shows both.
-                                let mut cuts: Vec<(usize, Cut)> = Vec::new();
-                                mark_scan
-                                    .feed(&out_batch, |off, ev| cuts.push((off, Cut::Mark(ev))));
-                                cursor_scan
-                                    .feed(&out_batch, |off, c| cuts.push((off, Cut::Cursor(c))));
-                                cuts.sort_by_key(|(off, _)| *off);
+                                // The scanner reports an offset one past the
+                                // sequence it matched, in ascending order, so the
+                                // batch splits at each of them: advance the
+                                // emulator to the cut, act on the state that
+                                // sequence left behind, carry on.
+                                let mut cuts: Vec<(usize, CursorCut)> = Vec::new();
+                                cursor_scan.feed(&out_batch, |off, c| cuts.push((off, c)));
                                 {
                                     let t0 = trace.then(std::time::Instant::now);
                                     let mut term = term.lock();
@@ -653,12 +652,7 @@ impl RemoteTerminal {
                                         for (off, cut) in cuts {
                                             processor.advance(&mut *term, &out_batch[at..off]);
                                             at = off;
-                                            match cut {
-                                                Cut::Mark(ev) => record_mark(&term, &marks, ev),
-                                                Cut::Cursor(vis) => {
-                                                    parked_cursor.apply(&mut term, vis);
-                                                }
-                                            }
+                                            parked_cursor.apply(&mut term, cut);
                                         }
                                         processor.advance(&mut *term, &out_batch[at..]);
                                     }
@@ -684,7 +678,14 @@ impl RemoteTerminal {
                                     if let Some(mark) = payload.strip_prefix(b"133;") {
                                         match mark.first() {
                                             Some(b'B') => {
-                                                zle_reading.store(true, Ordering::Relaxed)
+                                                zle_reading.store(true, Ordering::Relaxed);
+                                                // Back at a prompt: whatever
+                                                // ran is over, so the name of
+                                                // it must not outlive it into
+                                                // the next close question.
+                                                if let Ok(mut cmd) = running_command.lock() {
+                                                    cmd.clear();
+                                                }
                                             }
                                             Some(b'V') => {
                                                 shell_vi_mode.store(
@@ -692,6 +693,22 @@ impl RemoteTerminal {
                                                         .is_some_and(|v| v.first() == Some(&b'1')),
                                                     Ordering::Relaxed,
                                                 );
+                                            }
+                                            Some(b'C') => {
+                                                zle_reading.store(false, Ordering::Relaxed);
+                                                // `C` alone is a command start
+                                                // with no line to report — the
+                                                // PowerShell path sends that —
+                                                // and leaves the field empty
+                                                // rather than holding a stale
+                                                // one.
+                                                let line = mark
+                                                    .strip_prefix(b"C;")
+                                                    .map(|c| String::from_utf8_lossy(c).into_owned())
+                                                    .unwrap_or_default();
+                                                if let Ok(mut cmd) = running_command.lock() {
+                                                    *cmd = line;
+                                                }
                                             }
                                             _ => zle_reading.store(false, Ordering::Relaxed),
                                         }
@@ -786,8 +803,9 @@ impl RemoteTerminal {
                             // around it. Flush the pending text first so the grid
                             // cursor sits where the sender drew the image, then
                             // anchor the placement to that cell in scroll-stable
-                            // absolute-row coordinates (the same formula
-                            // `record_mark` uses), so it tracks scrolling.
+                            // absolute-row coordinates (`history_size -
+                            // display_offset + cursor_line`), so it tracks
+                            // scrolling.
                             DaemonMsg::Image(frame) => {
                                 flush_batch!();
                                 if let Some(img) =
@@ -1108,10 +1126,6 @@ impl RemoteTerminal {
         self.agent.lock().ok().and_then(|g| *g)
     }
 
-    pub fn marks(&self) -> crate::terminal::marks::Marks {
-        self.marks.clone()
-    }
-
     /// The kitty-graphics image store for this pane. Cheap handle clone — the
     /// store is an `Arc<Mutex<..>>` shared with the reader thread, which places
     /// and deletes images as out-of-band frames arrive from the daemon.
@@ -1129,6 +1143,16 @@ impl RemoteTerminal {
 
     pub fn shell_vi_mode(&self) -> bool {
         self.shell_vi_mode.load(Ordering::Relaxed)
+    }
+
+    /// The line the shell reported running, still percent-escaped. Empty at a
+    /// prompt, and empty for a shell whose integration marks the start of a
+    /// command without naming it.
+    pub fn running_command(&self) -> String {
+        self.running_command
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default()
     }
 
     pub fn size(&self) -> TermSize {
@@ -1509,27 +1533,6 @@ impl RemoteTerminal {
             }
         }
         query(pane_id).unwrap_or_default()
-    }
-}
-
-/// Something in the pty stream the reader has to act on at the byte where it
-/// appeared, rather than after the whole batch has been parsed.
-enum Cut {
-    Mark(MarkEvent),
-    Cursor(CursorCut),
-}
-
-fn record_mark(term: &Term<EventProxy>, marks: &crate::terminal::marks::Marks, event: MarkEvent) {
-    use alacritty_terminal::grid::Dimensions as _;
-    match event {
-        MarkEvent::Prompt => {
-            let grid = term.grid();
-            let row = grid.history_size() as i64 - grid.display_offset() as i64
-                + i64::from(grid.cursor.point.line.0);
-            marks.begin(row, String::new());
-        }
-        MarkEvent::Command(cmd) => marks.set_text(cmd),
-        MarkEvent::Done(exit) => marks.finish(exit),
     }
 }
 
@@ -3426,47 +3429,6 @@ mod tests {
     }
 
     #[test]
-    fn marks_record_the_row_each_one_landed_on() {
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-        let poll = |want: usize| {
-            for _ in 0..200 {
-                if term.marks().list().len() == want {
-                    return true;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            false
-        };
-
-        let mut stream = Vec::new();
-        stream.extend_from_slice(b"\x1b]133;A\x07");
-        stream.extend_from_slice(b"\x1b]133;C;echo one\x07");
-        stream.extend_from_slice(b"one\r\n");
-        stream.extend_from_slice(b"\x1b]133;D;0\x07");
-        stream.extend_from_slice(b"\x1b]133;A\x07");
-        stream.extend_from_slice(b"\x1b]133;C;false\x07");
-        stream.extend_from_slice(b"\r\n");
-        stream.extend_from_slice(b"\x1b]133;D;1\x07");
-        DaemonMsg::Output(stream).encode(&mut daemon_side).unwrap();
-        daemon_side.flush().unwrap();
-
-        assert!(poll(2), "both commands recorded");
-        let marks = term.marks().list();
-        assert_eq!(marks[0].text, "echo one");
-        assert_eq!(marks[0].exit, Some(0));
-        assert_eq!(marks[1].text, "false");
-        assert_eq!(marks[1].exit, Some(1), "a failure keeps its exit code");
-        assert!(
-            marks[1].row > marks[0].row,
-            "the second prompt is further down the scrollback ({} vs {}) — equal rows \
-             would mean the advance wasn't split at the marks",
-            marks[0].row,
-            marks[1].row
-        );
-    }
-
-    #[test]
     fn zle_reading_follows_live_prompt_end_marks() {
         let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
         let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
@@ -3516,6 +3478,56 @@ mod tests {
             .unwrap();
         daemon_side.flush().unwrap();
         assert!(poll(false), "C (command start) should disarm zle_reading");
+    }
+
+    #[test]
+    fn the_running_command_is_the_line_the_shell_marked_and_ends_with_it() {
+        crate::core::config::pin_test_config_dir();
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let poll = |want: &str| {
+            for _ in 0..200 {
+                if term.running_command() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+        assert_eq!(term.running_command(), "", "nothing runs before a mark");
+
+        // The escaping is the integration's; this side stores it verbatim and
+        // the reader of the field undoes it.
+        DaemonMsg::Output(b"\x1b]133;C;printf '100%25'\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(
+            poll("printf '100%25'"),
+            "C should record the line it carried, got {:?}",
+            term.running_command()
+        );
+
+        // Back at a prompt the command is over — holding the name would make
+        // the next close question ask about something that already finished.
+        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(""), "a new prompt clears the running command");
+
+        // A bare `C` starts a command without naming it (the PowerShell path).
+        // It must not leave the previous name standing.
+        DaemonMsg::Output(b"\x1b]133;C;cargo build\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll("cargo build"));
+        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(""), "an unnamed command start does not inherit a name");
     }
 
     #[test]
