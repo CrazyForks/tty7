@@ -10,7 +10,8 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Sizable as _,
+    h_flex, v_flex,
 };
 
 use crate::daemon::protocol::{
@@ -691,10 +692,12 @@ impl Tty7App {
         let sub = cx.subscribe_in(
             &input,
             window,
-            |this, _input, ev: &InputEvent, _window, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. }) {
-                    this.sftp_commit_edit(cx);
-                }
+            |this, _input, ev: &InputEvent, _window, cx| match ev {
+                InputEvent::PressEnter { .. } => this.sftp_commit_edit(cx),
+                // OK is disabled while the box is empty, so the form has to
+                // redraw as the name is typed.
+                InputEvent::Change => cx.notify(),
+                _ => {}
             },
         );
         self.sftp_panel.editing = Some(edit);
@@ -1210,6 +1213,10 @@ impl Tty7App {
                 input,
             ),
         };
+        // An empty box names nothing to create, rename to, or set. Committing
+        // one returned in silence, so OK read as broken rather than as not yet
+        // applicable — the same thing the worktree prompt's Create used to do.
+        let can_commit = !input.read(cx).value().trim().is_empty();
         Some(
             v_flex()
                 .id("panel-sftp-edit")
@@ -1252,6 +1259,7 @@ impl Tty7App {
                                 .label(t(L10nKey::Ok))
                                 .xsmall()
                                 .primary()
+                                .disabled(!can_commit)
                                 .on_click(cx.listener(|this, _, _w, cx| this.sftp_commit_edit(cx))),
                         ),
                 ),
