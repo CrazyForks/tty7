@@ -4727,7 +4727,18 @@ impl TerminalView {
         let srow = srow.saturating_sub(self.input_scroll_rows());
 
         const MAX_ROWS: usize = 10;
-        let total_rows = self.terminal.term.lock().screen_lines();
+        let (total_rows, total_cols) = {
+            let term = self.terminal.term.lock();
+            (term.screen_lines(), term.columns())
+        };
+        // How wide the menu ends up, decided before the rows so their
+        // descriptions can be elided against it. A menu wider than the pane
+        // has its right-hand column clipped by the pane, and the clip takes
+        // the ellipsis with it — which is exactly the mid-word cut the
+        // ellipsis exists to prevent. The history menu below already caps
+        // itself to the grid this way.
+        let grid_w = self.cell_width * (total_cols as f32);
+        let menu_w = px(COMPLETION_MENU_MAX_W).min(grid_w);
         let (place_above, visible, first) = menu_layout(
             total_rows,
             srow,
@@ -4755,7 +4766,7 @@ impl TerminalView {
             } else {
                 cand.text.clone()
             };
-            let budget = description_budget(cell, label.chars().count());
+            let budget = description_budget(cell, label.chars().count(), menu_w.as_f32());
             div()
                 .h(lh)
                 .flex()
@@ -4797,7 +4808,12 @@ impl TerminalView {
         let menu_h = self.line_height * (line_count as f32) + px(10.);
 
         let gap = px(6.);
-        let x = px(GRID_PAD_X) + self.cell_width * (scol as f32);
+        // Anchored under the word being completed, then pulled back inside the
+        // pane if that would hang it over the right edge.
+        let anchor = px(GRID_PAD_X) + self.cell_width * (scol as f32);
+        let x = anchor
+            .min(px(GRID_PAD_X) + grid_w - menu_w)
+            .max(px(GRID_PAD_X));
         let y = if place_above {
             px(GRID_PAD_Y) + self.line_height * (srow as f32) - menu_h - gap
         } else {
@@ -4812,8 +4828,8 @@ impl TerminalView {
                 .flex()
                 .flex_col()
                 .py_1()
-                .min_w(px(120.))
-                .max_w(px(COMPLETION_MENU_MAX_W))
+                .min_w(px(120.).min(menu_w))
+                .max_w(menu_w)
                 .overflow_hidden()
                 .bg(theme.popover)
                 .border_1()
@@ -5595,12 +5611,17 @@ const COMPLETION_MENU_MAX_W: f32 = 480.;
 /// had been cut. The row spends its width on `px_2` either side, the kind
 /// icon, the gap after it and the margin before the description; whatever is
 /// left, in cells, is the description's.
-fn description_budget(cell_width: f32, label_cells: usize) -> usize {
+///
+/// `menu_w` is the width the menu actually got, not the width it would like:
+/// in a pane narrower than [`COMPLETION_MENU_MAX_W`] the menu is capped to the
+/// grid, and a budget measured against the larger number puts the ellipsis
+/// past the edge — which is the same mid-word cut, only harder to see.
+fn description_budget(cell_width: f32, label_cells: usize, menu_w: f32) -> usize {
     const ROW_CHROME: f32 = 8. + 8. + 16. + 6. + 8.;
     if cell_width <= 0. {
         return 0;
     }
-    let free = COMPLETION_MENU_MAX_W - ROW_CHROME - label_cells as f32 * cell_width;
+    let free = menu_w - ROW_CHROME - label_cells as f32 * cell_width;
     (free / cell_width).floor().max(0.) as usize
 }
 
@@ -5796,9 +5817,9 @@ mod tests {
         assert!(!out.contains(" …"), "{out:?}");
     }
     use super::{
-        LoopbackPlan, RawInput, SelectEndCopy, Typeahead, WheelRoute, clipboard_paste_text,
-        compose_notification_title, cwd_is_on_host, display_width, is_typeahead_interrupt,
-        loopback_plan, observe_typeahead_for_owner,
+        COMPLETION_MENU_MAX_W, LoopbackPlan, RawInput, SelectEndCopy, Typeahead, WheelRoute,
+        clipboard_paste_text, compose_notification_title, cwd_is_on_host, display_width,
+        is_typeahead_interrupt, loopback_plan, observe_typeahead_for_owner,
     };
     use super::{SCROLL_ANIM_FRAME, scroll_anim_step};
     use super::{
@@ -6938,14 +6959,19 @@ mod tests {
 
     #[test]
     fn the_description_budget_is_what_the_name_leaves_of_the_menu() {
+        const W: f32 = COMPLETION_MENU_MAX_W;
         // A 9px cell: 46px of row chrome, so a bare row leaves (480-46)/9 cells.
-        assert_eq!(description_budget(9., 0), 48);
+        assert_eq!(description_budget(9., 0, W), 48);
         // Every cell the name takes is one the description does not get.
-        assert_eq!(description_budget(9., 10), 38);
+        assert_eq!(description_budget(9., 10, W), 38);
         // A name that fills the menu on its own leaves nothing, and never
         // underflows into a huge budget.
-        assert_eq!(description_budget(9., 200), 0);
-        assert_eq!(description_budget(0., 10), 0);
+        assert_eq!(description_budget(9., 200, W), 0);
+        assert_eq!(description_budget(0., 10, W), 0);
+        // A pane too narrow for the full menu shrinks the budget with it,
+        // instead of eliding to a width the menu never got.
+        assert!(description_budget(9., 10, 240.) < description_budget(9., 10, W));
+        assert_eq!(description_budget(9., 10, 240.), 11);
     }
 
     #[test]
