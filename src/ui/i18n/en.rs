@@ -88,6 +88,11 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsTypography => "Typography",
         L10nKey::SettingsFontSize => "Font size",
         L10nKey::SettingsFontSizeDesc => "Terminal text size in pixels.",
+        L10nKey::SettingsUiFontSize => "Interface font size",
+        L10nKey::SettingsUiFontSizeDesc => {
+            "Text size everywhere outside the terminal — tabs, panels and settings. \
+             Raise it on a display that is not Retina."
+        }
         L10nKey::SettingsLineHeight => "Line height",
         L10nKey::SettingsLineHeightDesc => "Row spacing as a multiple of the font size.",
         L10nKey::SettingsFontFamily => "Font family",

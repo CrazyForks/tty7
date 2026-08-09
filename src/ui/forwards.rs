@@ -1,4 +1,4 @@
-use gpui::{AnyElement, Context, Div, Entity, FontWeight, Stateful, div, prelude::*, px};
+use gpui::{AnyElement, Context, Div, Entity, FontWeight, Stateful, div, prelude::*, px, rems};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -7,6 +7,7 @@ use crate::daemon::protocol::{ForwardStatus, ManagedForward, SshForwardKind};
 use crate::terminal::view::TerminalView;
 use crate::ui::app::{CONTENT_INSET, Tty7App};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
+use crate::ui::right_panel::{META, TEXT, TEXT_MONO};
 
 /// How far a forward's target endpoint fades when the rule is Dynamic and has
 /// no target to name. The rules editor in Settings and the live Forwards panel
@@ -177,7 +178,7 @@ impl Tty7App {
                         div()
                             .px(px(CONTENT_INSET))
                             .py(px(2.))
-                            .text_size(px(12.))
+                            .text_size(rems(TEXT))
                             .text_color(cx.theme().muted_foreground)
                             .child(crate::ui::i18n::t(crate::ui::i18n::L10nKey::None)),
                     )
@@ -258,7 +259,7 @@ impl Tty7App {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(12.))
+                                    .text_size(rems(TEXT_MONO))
                                     .font_family(mono.clone())
                                     .text_color(if errored { theme.danger } else { muted })
                                     .child(tail),
@@ -268,7 +269,7 @@ impl Tty7App {
                         this.child(
                             div()
                                 .truncate()
-                                .text_size(px(11.))
+                                .text_size(rems(META))
                                 .text_color(muted)
                                 .child(desc),
                         )
@@ -324,12 +325,12 @@ impl Tty7App {
                     div()
                         .flex_none()
                         .w(px(30.))
-                        .text_size(px(11.))
+                        .text_size(rems(META))
                         .text_color(muted)
                         .child(label),
                 )
                 .child(div().flex_1().min_w_0().child(Input::new(host).xsmall()))
-                .child(div().text_size(px(11.)).text_color(muted).child(":"))
+                .child(div().text_size(rems(META)).text_color(muted).child(":"))
                 .child(div().w(px(52.)).child(Input::new(port).xsmall()))
         };
 

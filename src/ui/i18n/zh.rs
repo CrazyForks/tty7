@@ -82,6 +82,10 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsTypography => "字体排版",
         L10nKey::SettingsFontSize => "字号",
         L10nKey::SettingsFontSizeDesc => "终端文字大小（像素）。",
+        L10nKey::SettingsUiFontSize => "界面字号",
+        L10nKey::SettingsUiFontSizeDesc => {
+            "终端以外所有地方的文字大小——标签页、面板、设置。非 Retina 显示器上可以调大。"
+        }
         L10nKey::SettingsLineHeight => "行高",
         L10nKey::SettingsLineHeightDesc => "行间距为字号的倍数。",
         L10nKey::SettingsFontFamily => "字体族",

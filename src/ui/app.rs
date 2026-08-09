@@ -92,6 +92,8 @@ const FONT_SIZE_MIN: f32 = 6.0;
 const FONT_SIZE_MAX: f32 = 48.0;
 pub(crate) const FONT_SIZE_STEP: f32 = 1.0;
 
+pub(crate) const UI_FONT_SIZE_STEP: f32 = 1.0;
+
 const LINE_HEIGHT_MIN: f32 = 1.0;
 const LINE_HEIGHT_MAX: f32 = 2.0;
 pub(crate) const LINE_HEIGHT_STEP: f32 = 0.05;
@@ -106,8 +108,12 @@ pub(crate) const TITLE_BAR_HEIGHT: f32 = 40.;
 
 pub(crate) const TILE_SIZE: f32 = 32.;
 pub(crate) const TILE_GLYPH: f32 = 13.;
+/// A tile that sits in a body row rather than in chrome: the box shrinks to
+/// the minimum hit target, but the glyph keeps the chrome size. An 11px glyph
+/// here read as a disabled ornament next to 14px text, and put a second,
+/// smaller folder in the same column as the panel's folder tab.
 pub(crate) const TILE_SIZE_SM: f32 = 24.;
-pub(crate) const TILE_GLYPH_SM: f32 = 11.;
+pub(crate) const TILE_GLYPH_SM: f32 = TILE_GLYPH;
 
 pub(crate) const TILE_GLYPH_LINE: f32 = 16.;
 
@@ -1368,6 +1374,34 @@ impl Tty7App {
 
     pub(crate) fn reset_font_size(&mut self, cx: &mut Context<Self>) {
         self.set_font_size(Config::default().font_size, cx);
+    }
+
+    fn set_ui_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        use crate::core::config::{UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN};
+        let size = size.clamp(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX);
+        let cfg = cx.global_mut::<Config>();
+        if cfg.ui_font_size == size {
+            return;
+        }
+        cfg.ui_font_size = size;
+        cfg.save();
+        // Unlike the settings that only redraw the window they were changed
+        // in, this one re-lays-out every open window, and each reads the new
+        // rem from the global on its own next frame.
+        cx.refresh_windows();
+        cx.notify();
+    }
+
+    pub(crate) fn ui_font_size(&self, cx: &gpui::App) -> f32 {
+        cx.global::<Config>().ui_font_size
+    }
+
+    pub(crate) fn change_ui_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.set_ui_font_size(self.ui_font_size(cx) + delta, cx);
+    }
+
+    pub(crate) fn reset_ui_font_size(&mut self, cx: &mut Context<Self>) {
+        self.set_ui_font_size(Config::default().ui_font_size, cx);
     }
 
     fn set_line_height(&mut self, mul: f32, cx: &mut Context<Self>) {
@@ -5511,6 +5545,11 @@ impl Render for Tty7App {
         #[cfg(test)]
         render_probe::record();
         let prof = crate::ui::perf::enabled().then(std::time::Instant::now);
+        // Every window's root is this view, so setting the rem here is what
+        // makes `ui_font_size` reach the whole interface — the rem ladder
+        // (`text_sm`, `text_xs`, `rems(..)`) resolves against it, and the
+        // terminal grid, sized in absolute px from `font_size`, does not move.
+        window.set_rem_size(px(cx.global::<Config>().ui_font_size));
         self.claim_pending_tab(window, cx);
         self.touch_active_tab();
         if cx.has_active_drag() {

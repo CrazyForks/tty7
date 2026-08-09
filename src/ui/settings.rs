@@ -30,7 +30,7 @@ use crate::core::ssh_profile::{
 };
 use crate::ui::app::{
     FONT_SIZE_STEP, LINE_HEIGHT_STEP, TILE_GLYPH_LINE, TILE_SIZE, TITLE_BAR_HEIGHT, ThemeEdit,
-    Tty7App,
+    Tty7App, UI_FONT_SIZE_STEP,
 };
 use crate::ui::host_ops::HostId;
 use crate::ui::i18n::{L10nKey, t, t_fmt, t_plural};
@@ -1436,6 +1436,22 @@ impl Tty7App {
                 .on_click(cx.listener(|this, _, _w, cx| this.reset_font_size(cx))),
         );
 
+        let ui_font_size = self.ui_font_size(cx);
+        let ui_font_size_control = stepper_row(
+            step("ui-font-dec", "−", 0).on_click(
+                cx.listener(|this, _, _w, cx| this.change_ui_font_size(-UI_FONT_SIZE_STEP, cx)),
+            ),
+            format!("{ui_font_size:.0}"),
+            step("ui-font-inc", "+", 2).on_click(
+                cx.listener(|this, _, _w, cx| this.change_ui_font_size(UI_FONT_SIZE_STEP, cx)),
+            ),
+            Button::new("ui-font-reset")
+                .label(t(L10nKey::Reset))
+                .ghost()
+                .small()
+                .on_click(cx.listener(|this, _, _w, cx| this.reset_ui_font_size(cx))),
+        );
+
         let line_height = self.line_height;
         let line_height_control = stepper_row(
             step("lh-dec", "−", 0).on_click(
@@ -1523,6 +1539,12 @@ impl Tty7App {
                 t(L10nKey::SettingsFontSize),
                 t(L10nKey::SettingsFontSizeDesc),
                 font_size_control,
+                cx,
+            ))
+            .child(self.settings_row(
+                t(L10nKey::SettingsUiFontSize),
+                t(L10nKey::SettingsUiFontSizeDesc),
+                ui_font_size_control,
                 cx,
             ))
             .child(self.settings_row(

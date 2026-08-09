@@ -147,6 +147,8 @@ l10n_keys! {
     SettingsTypography,
     SettingsFontSize,
     SettingsFontSizeDesc,
+    SettingsUiFontSize,
+    SettingsUiFontSizeDesc,
     SettingsLineHeight,
     SettingsLineHeightDesc,
     SettingsFontFamily,

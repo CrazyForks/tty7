@@ -1,4 +1,4 @@
-use gpui::{AnyElement, Context, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Window, div, prelude::*, px, rems};
 use gpui_component::button::Button;
 use gpui_component::input::Input;
 use gpui_component::{
@@ -23,6 +23,30 @@ pub(crate) const MAX_WIDTH_RATIO: f32 = 0.5;
 /// How wide a panel edge is to grab. Both edges a window can drag — the tab
 /// sidebar's and this panel's — are the same target, so they are one number.
 pub(crate) const RESIZE_HANDLE_WIDTH: f32 = 8.;
+
+/// The panel's type scale, in rems, on the same ladder as the rest of the
+/// window.
+///
+/// This panel used to carry its own run of pixel sizes — 12 for body, 11.5/11
+/// under it — which put its *primary* text at the size everything else uses
+/// for *secondary* text, so the panel read a step smaller than the sidebar
+/// beside it, and stayed that size when `ui_font_size` moved. In rems `TEXT`
+/// and `META` are exactly `text_sm()` and `text_xs()`; they are spelled out
+/// only because the mono variants have to be derived from them.
+///
+/// Mono sits a notch under the sans it pairs with: at an equal size its
+/// x-height and stems read a size larger, which turns a label and its value
+/// into two sizes instead of one line. The notch is a rem fraction rather than
+/// a fixed pixel, so the correction scales with the text it is correcting.
+const STEP: f32 = 1. / 16.;
+pub(crate) const TEXT: f32 = 14. * STEP;
+pub(crate) const TEXT_MONO: f32 = TEXT - STEP;
+pub(crate) const META: f32 = 12. * STEP;
+pub(crate) const META_MONO: f32 = META - STEP;
+
+/// Uppercase section headings. Deliberately below `META` — it matches the tab
+/// sidebar's group headings, which are the same thing one panel over.
+const HEADING: f32 = 11. * STEP;
 
 #[derive(Default)]
 pub(crate) struct RightPanelState {
@@ -54,8 +78,14 @@ fn info_label_column(
     window: &mut Window,
     cx: &gpui::App,
 ) -> gpui::Pixels {
-    const MIN: f32 = 46.;
-    const MAX: f32 = 108.;
+    // Shaping needs real pixels, so this is the one place the rem has to be
+    // resolved by hand. Both bounds were measured against a 12px label, so
+    // they are carried as multiples of it rather than as pixels — otherwise
+    // raising `ui_font_size` grows the labels into a clamp fitted to a
+    // smaller face, and every one of them wraps.
+    let label_px = TEXT * window.rem_size().as_f32();
+    let min = 46. / 12. * label_px;
+    let max = 108. / 12. * label_px;
     let font = gpui::Font {
         family: cx.theme().font_family.clone(),
         features: Default::default(),
@@ -70,7 +100,7 @@ fn info_label_column(
                 .text_system()
                 .shape_line(
                     gpui::SharedString::from(*k),
-                    px(12.),
+                    px(label_px),
                     &[gpui::TextRun {
                         len: k.len(),
                         font: font.clone(),
@@ -84,8 +114,8 @@ fn info_label_column(
                 .width
                 .as_f32()
         })
-        .fold(MIN, f32::max);
-    px(widest.clamp(MIN, MAX).ceil())
+        .fold(min, f32::max);
+    px(widest.clamp(min, max).ceil())
 }
 
 impl Tty7App {
@@ -311,7 +341,7 @@ impl Tty7App {
                     .gap(px(7.))
                     .child(
                         div()
-                            .text_size(px(11.5))
+                            .text_size(rems(META))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(cx.theme().secondary_foreground)
                             .child(text.to_uppercase()),
@@ -319,7 +349,7 @@ impl Tty7App {
                     .when_some(count, |this, c| {
                         this.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(rems(META_MONO))
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .text_color(cx.theme().muted_foreground.opacity(0.75))
                                 .child(c),
@@ -392,12 +422,12 @@ impl Tty7App {
             .px(px(CONTENT_INSET))
             .py(px(4.))
             .gap(px(3.))
-            .text_size(px(12.))
+            .text_size(rems(TEXT))
             .text_color(muted)
             .child(text.to_string())
             .children(hint.map(|h| {
                 div()
-                    .text_size(px(11.))
+                    .text_size(rems(META))
                     .text_color(muted.opacity(0.75))
                     .child(h.to_string())
             }))
@@ -485,7 +515,7 @@ impl Tty7App {
                     .items_baseline()
                     .gap(px(9.))
                     .py(px(1.))
-                    .text_size(px(12.))
+                    .text_size(rems(TEXT))
                     .child(
                         div()
                             .flex_none()
@@ -505,6 +535,7 @@ impl Tty7App {
                             h_flex()
                                 .flex_1()
                                 .min_w_0()
+                                .text_size(rems(TEXT_MONO))
                                 .font_family(mono.clone())
                                 .text_color(cx.theme().foreground)
                                 .child(div().min_w_0().flex_shrink(999.).truncate().child(head))
@@ -515,6 +546,7 @@ impl Tty7App {
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .text_size(rems(TEXT_MONO))
                             .font_family(mono.clone())
                             .text_color(cx.theme().foreground)
                             .child(v)
@@ -606,7 +638,7 @@ impl Tty7App {
             .pb(px(if trailing.is_some() { 0. } else { 4. }))
             .child(
                 div()
-                    .text_size(px(10.5))
+                    .text_size(rems(HEADING))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(cx.theme().muted_foreground)
                     .child(text.to_uppercase()),
@@ -633,7 +665,7 @@ impl Tty7App {
                             .min_w_0()
                             .truncate()
                             .pl(px(f32::from(p.depth) * 10.))
-                            .text_size(px(12.))
+                            .text_size(rems(TEXT_MONO))
                             .font_family(mono.clone())
                             .text_color(if p.foreground {
                                 cx.theme().foreground
@@ -681,7 +713,7 @@ impl Tty7App {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(12.))
+                            .text_size(rems(TEXT_MONO))
                             .font_family(mono.clone())
                             .text_color(cx.theme().muted_foreground)
                             .child(p.name.clone()),
@@ -877,7 +909,7 @@ impl Tty7App {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(12.))
+                                    .text_size(rems(TEXT_MONO))
                                     .font_family(mono.clone())
                                     .text_color(cx.theme().foreground)
                                     .child(path),
@@ -886,7 +918,7 @@ impl Tty7App {
                                 this.child(
                                     div()
                                         .flex_none()
-                                        .text_size(px(11.))
+                                        .text_size(rems(META_MONO))
                                         .font_family(mono.clone())
                                         .text_color(cx.theme().success)
                                         .child(format!("+{added}")),
@@ -896,7 +928,7 @@ impl Tty7App {
                                 this.child(
                                     div()
                                         .flex_none()
-                                        .text_size(px(11.))
+                                        .text_size(rems(META_MONO))
                                         .font_family(mono.clone())
                                         .text_color(cx.theme().danger)
                                         .child(format!("−{removed}")),
@@ -910,7 +942,7 @@ impl Tty7App {
                         div()
                             .px(px(4.))
                             .py(px(3.))
-                            .text_size(px(11.5))
+                            .text_size(rems(META))
                             .text_color(cx.theme().muted_foreground)
                             .child(t_plural(L10nKey::PanelMoreChangedFiles, rest, &[])),
                     );
@@ -929,7 +961,7 @@ impl Tty7App {
                             ))
                             .child(
                                 div()
-                                    .text_size(px(11.5))
+                                    .text_size(rems(META))
                                     .text_color(cx.theme().muted_foreground)
                                     .child(t_plural(L10nKey::PanelUntracked, untracked, &[])),
                             ),
@@ -1031,7 +1063,7 @@ pub(crate) fn git_badge(letter: &str, color: gpui::Hsla, mono: &gpui::SharedStri
         .flex_none()
         .w(px(14.))
         .text_center()
-        .text_size(px(10.5))
+        .text_size(rems(META_MONO))
         .font_family(mono.clone())
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(color)
@@ -1051,7 +1083,7 @@ pub(crate) fn info_chip(
         .py(px(1.5))
         .rounded(px(4.))
         .bg(bg)
-        .text_size(px(10.5))
+        .text_size(rems(META_MONO))
         .font_family(mono.clone())
         .text_color(fg)
         .child(text.to_string())

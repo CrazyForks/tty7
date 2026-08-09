@@ -90,6 +90,10 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsTypography => "タイポグラフィ",
         L10nKey::SettingsFontSize => "フォントサイズ",
         L10nKey::SettingsFontSizeDesc => "ターミナルテキストのサイズ（ピクセル）",
+        L10nKey::SettingsUiFontSize => "インターフェースのフォントサイズ",
+        L10nKey::SettingsUiFontSizeDesc => {
+            "ターミナル以外すべての文字サイズ（タブ・パネル・設定）。Retina でないディスプレイでは大きめに"
+        }
         L10nKey::SettingsLineHeight => "行の高さ",
         L10nKey::SettingsLineHeightDesc => "フォントサイズに対する行間の倍率",
         L10nKey::SettingsFontFamily => "フォントファミリー",

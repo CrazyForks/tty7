@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, Div, ExternalPaths, FontWeight, PathPromptOptions, SharedString,
-    Stateful, Subscription, Window, div, prelude::*, px,
+    Stateful, Subscription, Window, div, prelude::*, px, rems,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -22,6 +22,7 @@ use crate::daemon::ssh::sftp::{remote_basename, remote_join, remote_parent, safe
 use crate::terminal::RemoteTerminal;
 use crate::ui::app::{CONTENT_INSET, Tty7App};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
+use crate::ui::right_panel::{META, TEXT};
 
 #[derive(Clone, Copy)]
 enum SftpMenuAction {
@@ -1306,7 +1307,7 @@ impl Tty7App {
             div()
                 .px(px(6.))
                 .py(px(4.))
-                .text_size(px(12.))
+                .text_size(rems(TEXT))
                 .text_color(color)
                 .child(text)
         };
@@ -1573,7 +1574,7 @@ impl Tty7App {
             .on_click(cx.listener(|this, _, _w, cx| this.sftp_toggle_tray(cx)))
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(rems(META))
                     .text_color(muted)
                     .child(if expanded { "⌄" } else { "›" }),
             )
@@ -1582,7 +1583,7 @@ impl Tty7App {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(11.5))
+                    .text_size(rems(META))
                     .text_color(summary_color)
                     .child(summary),
             )
@@ -1619,7 +1620,7 @@ impl Tty7App {
                     div()
                         .px(px(CONTENT_INSET))
                         .py(px(3.))
-                        .text_size(px(11.5))
+                        .text_size(rems(META))
                         .text_color(muted)
                         .child(t(L10nKey::SftpNoTransfers)),
                 )
