@@ -403,7 +403,7 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let files = detail.files.clone().unwrap_or_default();
-        let mut list = v_flex().child(self.panel_subtitle(
+        let list = v_flex().child(self.panel_subtitle(
             &t_plural(L10nKey::ScmFilesChanged, files.len(), &[]),
             true,
             None,

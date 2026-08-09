@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use gpui::Entity;
 use gpui_component::input::InputState;
-use tty7_core::core::git::log::{Commit, CommitFile};
+use tty7_core::core::git::log::{Commit, CommitFile, CommitPage, GraphScope};
 use tty7_core::core::git::status::HeadState;
 
 use crate::ui::host_ops::HostId;
@@ -158,10 +158,30 @@ pub(crate) struct GraphState {
     /// and shifts under you when a ref moves between pages.
     pub(crate) requested: usize,
     pub(crate) loading: bool,
-    /// Filter box. Like `commit_input`, created on first render.
+    /// The page the graph is currently drawn from, and which repository and
+    /// query produced it. `Arc` because paint reads it while the next page is
+    /// being laid out on a worker, and the key so a repository switch shows an
+    /// empty graph rather than the previous repository's history.
+    pub(crate) page: Option<Arc<CommitPage>>,
+    pub(crate) page_key: Option<(RepoKey, u64, GraphScope)>,
+    /// Fold the lane gutter down to a single column. Worth about six
+    /// characters of the message, which at this width is the difference
+    /// between reading a subject and reading its first word.
+    pub(crate) lanes_collapsed: bool,
+    /// Filter box. Like `commit_input`, created on first render — and with the
+    /// subscription that turns typing into a repaint. An `InputState` is its
+    /// own entity; without this the box would take text the list never sees.
     pub(crate) search: Option<Entity<InputState>>,
-    /// `refs/heads/...` the graph is restricted to; empty means all refs.
-    pub(crate) branch_filter: Option<String>,
+    pub(crate) search_sub: Option<gpui::Subscription>,
+    /// An open "name a branch at this commit" input, and the rev it starts
+    /// from. The panel's own naming row cannot serve this: it always creates
+    /// at HEAD, and the whole point here is the commit under the cursor.
+    pub(crate) naming: Option<(Entity<InputState>, String)>,
+    /// Which refs the graph walks from. Three states rather than an
+    /// `Option<branch>`: "this branch and its upstream", "one named branch",
+    /// and "everything" are all reachable from the header's dropdown, and only
+    /// the enum the data layer already takes can express all three.
+    pub(crate) scope: GraphScope,
     /// The selected row, by full sha.
     pub(crate) selected: Option<String>,
     pub(crate) scroll: gpui::ScrollHandle,
