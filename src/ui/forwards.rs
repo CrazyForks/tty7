@@ -73,13 +73,30 @@ impl Tty7App {
                     }),
             )
             .children(reason.map(|reason| {
+                // The reason is whatever ssh said, and it runs past 360px more
+                // often than not — a truncated "…" was the only account of a
+                // rejected key the pane had left, its own output having
+                // scrolled away. Hovering gives the whole sentence back.
+                let full = reason.clone();
                 div()
+                    .id("ssh-strip-reason")
                     .max_w(px(360.))
                     .truncate()
                     .text_color(theme.danger)
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(full.clone()).build(window, cx)
+                    })
                     .child(reason)
             }))
-            .child(div().child("· ⌘⇧R"))
+            // The chord was spelled "⌘⇧R" here. That is one platform's
+            // rendering of one default: off macOS it names a modifier the
+            // keyboard does not have, and either way it kept saying ⌘⇧R after
+            // the user had rebound Reconnect to something else. Ask the keymap,
+            // and say nothing at all when the action carries no binding.
+            .children(
+                crate::ui::home::key_hint("RestartSshSession", cx)
+                    .map(|keys| div().child(format!("· {keys}"))),
+            )
             .child(
                 Button::new("ssh-reconnect")
                     .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Reconnect))
