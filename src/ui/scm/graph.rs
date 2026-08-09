@@ -7,50 +7,78 @@
 //! message is the commit detail view's job, one click away.
 //!
 //! That is also VS Code's own reading of a sidebar graph, and it is why the
-//! conventional-commit prefix is lifted out into a chip rather than left to
-//! eat half the line.
+//! conventional-commit prefix is lifted out into a chip rather than left to eat
+//! half the line, and why the lane gutter folds away on request.
 //!
-//! # Spike (G7·0)
+//! # How it is drawn
 //!
-//! What is below is deliberately a hard-coded three-row figure. It exists to
-//! prove the four load-bearing claims of the rendering plan before any of the
-//! real data is wired to it: that one absolutely-positioned canvas draws
-//! correctly inside a scroll container, that `content_mask` gives usable
-//! culling bounds, that the row `div`s underneath still receive hover and
-//! click through the canvas above them, and that the height drag feels right.
-//! The next commit replaces the fake rows with `CommitPage` and keeps the
-//! shape.
+//! One `canvas` covering the whole list, absolutely positioned over ordinary
+//! interactive rows — never one canvas per row. Every `PrimitiveBatch::Paths`
+//! gpui emits ends the current encoder, opens a render pass, clears a
+//! drawable-sized intermediate texture, rasterises, resolves MSAA and
+//! composites back; forty visible rows would mean forty of those per frame.
+//!
+//! Being on top costs nothing in event terms: `Canvas::id` returns `None` and
+//! it implements no interactivity, so it registers no hitbox in prepaint. The
+//! rows underneath keep gpui's native hover, click, context menu and
+//! scroll-into-view. This was measured, not assumed — see the G7·0 spike commit.
 
 use std::cell::Cell as StdCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    AnyElement, Bounds, Context, Corners, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels,
-    SharedString, Window, canvas, div, fill, prelude::*, px,
+    AnyElement, BorderStyle, Bounds, Context, Corners, Edges, Focusable as _, Hsla, MouseButton,
+    MouseMoveEvent, MouseUpEvent, Pixels, SharedString, Window, canvas, div, fill, point,
+    prelude::*, px, quad,
 };
-use gpui_component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+
+use tty7_core::core::git::log::{
+    Commit, CommitPage, Edge, GRAPH_PAGE, GraphRow, GraphScope, Lane, RefDeco, RefKind,
+};
+use tty7_core::core::git::ops::{GitOp, ResetMode};
 
 use crate::ui::app::{CONTENT_INSET, Tty7App};
+use crate::ui::i18n::{L10nKey, t};
+use crate::ui::presets::{ActiveLanes, LANE_SLOTS, Lanes};
+use crate::ui::right_panel::info_chip;
+use crate::ui::scm::path::{elide_middle, relative_time};
 use crate::ui::scm::state::RepoKey;
 
 /// One commit per row. 20px rather than the file list's 24: a graph row has no
-/// icon column, and the lane geometry reads better when the vertical pitch is
-/// close to the lane pitch.
+/// icon column, and the vertical pitch wants to stay close to the lane pitch or
+/// the diagonal of a merge reads as a much shallower angle than it is.
 const GRAPH_ROW_H: f32 = 20.;
 
 /// Horizontal distance between lane centres.
 const GRAPH_LANE_W: f32 = 12.;
 
-/// Inset before the first lane centre, so lane 0 is not flush against the
-/// panel edge.
+/// Inset before the first lane centre, and the gap between the gutter and the
+/// text column.
 const GRAPH_PAD_L: f32 = 6.;
+const GRAPH_PAD_R: f32 = 6.;
 
 const GRAPH_DOT_R: f32 = 3.;
 const GRAPH_LINE_W: f32 = 1.5;
 
-/// Resting height of the history section, and the range the divider drags it
-/// through. The maximum is a fraction of the panel rather than a constant:
-/// the file list has to keep a usable share of a short window.
+/// Most of the panel's width belongs to the message. Thirty percent is what
+/// leaves five lanes at the 260px default and still keeps a readable column.
+const GRAPH_GUTTER_SHARE: f32 = 0.30;
+
+/// Lanes are capped by what the panel can show, never by what history did.
+const GRAPH_MIN_LANES: usize = 3;
+const GRAPH_MAX_LANES: usize = LANE_SLOTS;
+
+/// The cap can never exceed the palette, or two columns on screen would come
+/// out the same colour and the whole point of colouring by lane is lost.
+const _: () = assert!(GRAPH_MAX_LANES <= LANE_SLOTS);
+
+/// Resting height of the history section and the range the divider drags it
+/// through. The ceiling is a share of the window rather than a constant: the
+/// file list has to keep a usable part of a short one.
 const GRAPH_H_DEFAULT: f32 = 220.;
 const GRAPH_H_MIN: f32 = 88.;
 const GRAPH_H_MAX_RATIO: f32 = 0.65;
@@ -58,13 +86,44 @@ const GRAPH_H_MAX_RATIO: f32 = 0.65;
 /// The divider's grab area, matching `RESIZE_HANDLE_WIDTH` on the other axis.
 const GRAPH_HANDLE_H: f32 = 6.;
 
+/// Ref chips are the widest optional thing on a row, so they get a hard cap
+/// and lose their middle rather than the message losing its column.
+const GRAPH_REF_CHARS: usize = 14;
+
+/// How many lanes fit, given the panel's width.
+///
+/// A pure projection over the width, deliberately: dragging the panel narrower
+/// must not re-run the layout pass or renumber a colour. Folding the gutter
+/// collapses it to a single column, which is worth about six characters of the
+/// message — at this width, the difference between reading a subject and
+/// reading its first word.
+fn max_lanes(panel_w: f32, collapsed: bool) -> usize {
+    if collapsed {
+        return 1;
+    }
+    let fit = (panel_w * GRAPH_GUTTER_SHARE / GRAPH_LANE_W).floor();
+    if !fit.is_finite() {
+        return GRAPH_MIN_LANES;
+    }
+    (fit as usize).clamp(GRAPH_MIN_LANES, GRAPH_MAX_LANES)
+}
+
+/// Fold a true lane onto a visible column.
+///
+/// Everything past the cap shares the last column. Pure projection, never fed
+/// back into the layout: the same page re-projects for free at any width, with
+/// no recomputation and no colour changing under the reader.
+fn project(lane: Lane, max_lanes: usize) -> Lane {
+    lane.min(max_lanes.saturating_sub(1) as Lane)
+}
+
 /// Snap a lane centre to a device pixel *before* the quad is built.
 ///
-/// `paint_quad` snaps the bounds it is given, but it does that to each edge
-/// independently: an unsnapped centre makes `[cx - w/2, cx + w/2]` round out
-/// to one physical pixel on some rows and two on others, and a column of lines
-/// that changes width as it scrolls is the most visible artefact this element
-/// can produce. Same reasoning, same shape as `powerline_solid_edge`.
+/// `paint_quad` snaps the bounds it is handed, but each edge independently: an
+/// unsnapped centre makes `[cx - w/2, cx + w/2]` round out to one physical
+/// pixel on some rows and two on others, and a column of lines that changes
+/// width as it scrolls is the most visible artefact this element can produce.
+/// Same shape as `powerline_solid_edge` in the terminal renderer.
 fn snap(x: f32, scale: f32) -> f32 {
     if !scale.is_finite() || scale <= 0. {
         return x;
@@ -72,181 +131,349 @@ fn snap(x: f32, scale: f32) -> f32 {
     (x * scale).round() / scale
 }
 
-/// Centre of `lane`, in the canvas's own coordinate space.
-fn lane_center_x(lane: u16, scale: f32) -> f32 {
+/// Centre of a visible column, relative to the gutter's left edge.
+fn lane_center_x(column: Lane, scale: f32) -> f32 {
     snap(
-        GRAPH_PAD_L + GRAPH_LANE_W * lane as f32 + GRAPH_LANE_W / 2.,
+        GRAPH_PAD_L + GRAPH_LANE_W * column as f32 + GRAPH_LANE_W / 2.,
         scale,
     )
+}
+
+/// Total width of the gutter for a given cap.
+fn gutter_width(max_lanes: usize) -> f32 {
+    GRAPH_PAD_L + GRAPH_LANE_W * max_lanes as f32 + GRAPH_PAD_R
+}
+
+/// Split a conventional-commit prefix off the subject.
+///
+/// Returns the type, whether it was marked breaking, and what is left. This
+/// repository's subjects spend an average of 12.7 characters on the prefix,
+/// which is half of what a 260px panel has to give — and the type is exactly
+/// the part that renders better as three coloured characters than as prose.
+///
+/// Strict on purpose. Only a lowercase ASCII type, an optional parenthesised
+/// scope, an optional `!`, then `": "`. `Note: see below` and `TODO: fix` are
+/// not conventional commits and keep their whole line.
+fn split_conventional(subject: &str) -> (Option<(&str, bool)>, &str) {
+    let bytes = subject.as_bytes();
+    let type_len = bytes.iter().take_while(|b| b.is_ascii_lowercase()).count();
+    // Two is `ci`; past twelve it is prose that happens to start lowercase.
+    if !(2..=12).contains(&type_len) {
+        return (None, subject);
+    }
+    let mut i = type_len;
+    if bytes.get(i) == Some(&b'(') {
+        match bytes[i..].iter().position(|b| *b == b')') {
+            // An empty scope, `feat(): x`, is malformed; treat the line as prose.
+            Some(0 | 1) => return (None, subject),
+            Some(close) => i += close + 1,
+            None => return (None, subject),
+        }
+    }
+    let breaking = bytes.get(i) == Some(&b'!');
+    if breaking {
+        i += 1;
+    }
+    // The space matters: `fix:it` is not a conventional commit, and without it
+    // a URL-bearing subject would be cut at `https:`.
+    if bytes.get(i) != Some(&b':') || bytes.get(i + 1) != Some(&b' ') {
+        return (None, subject);
+    }
+    let rest = subject[i + 2..].trim_start();
+    if rest.is_empty() {
+        return (None, subject);
+    }
+    (Some((&subject[..type_len], breaking)), rest)
+}
+
+/// Which colour a visible column draws with.
+///
+/// A column is the overflow bundle only when the page really is wider than the
+/// cap. Deciding that per page rather than per row keeps a column from changing
+/// colour as the reader scrolls past the one merge that widened history.
+fn column_ink(column: Lane, color: u16, max_lanes: usize, overflowing: bool, lanes: &Lanes) -> u32 {
+    if overflowing && column as usize + 1 == max_lanes {
+        return lanes.overflow;
+    }
+    lanes.ink[(color as usize).min(LANE_SLOTS - 1)]
+}
+
+/// The segments of one row's band, already folded onto visible columns.
+///
+/// Deduplicated by column, which is what makes the overflow bundle work: five
+/// lanes sharing the last column produce one line, not five stacked on each
+/// other at five different alphas. Later writers win, and the caller feeds
+/// edges in `paint_rank` order, so the node's own line lands over anything
+/// merely passing behind it.
+#[derive(Default)]
+struct Band {
+    top: [Option<u32>; GRAPH_MAX_LANES],
+    bottom: [Option<u32>; GRAPH_MAX_LANES],
+    /// `(left column, right column, colour)`, at most one per pair.
+    turns: Vec<(Lane, Lane, u32)>,
+}
+
+impl Band {
+    fn turn(&mut self, a: Lane, b: Lane, ink: u32) {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        match self.turns.iter_mut().find(|t| t.0 == lo && t.1 == hi) {
+            Some(existing) => existing.2 = ink,
+            None => self.turns.push((lo, hi, ink)),
+        }
+    }
+}
+
+/// Fold one row's edges into the segments that will be painted.
+fn band_of(row: &GraphRow, max_lanes: usize, overflowing: bool, lanes: &Lanes) -> Band {
+    let mut band = Band::default();
+    let node = project(row.node, max_lanes);
+    for edge in &row.edges {
+        let ink = |column: Lane| column_ink(column, edge.color(), max_lanes, overflowing, lanes);
+        match *edge {
+            Edge::Pass { lane, .. } => {
+                let c = project(lane, max_lanes);
+                band.top[c as usize] = Some(ink(c));
+                band.bottom[c as usize] = Some(ink(c));
+            }
+            Edge::In { from, .. } => {
+                let c = project(from, max_lanes);
+                band.top[c as usize] = Some(ink(c));
+                if c != node {
+                    band.turn(c, node, ink(c));
+                }
+            }
+            Edge::Out { to, .. } => {
+                let c = project(to, max_lanes);
+                band.bottom[c as usize] = Some(ink(c));
+                if c != node {
+                    band.turn(node, c, ink(c));
+                }
+            }
+        }
+    }
+    band
+}
+
+/// Everything the paint closure needs, snapshotted at render time so nothing
+/// reaches back into the view from inside the frame.
+struct GraphPaint {
+    page: Arc<CommitPage>,
+    max_lanes: usize,
+    overflowing: bool,
+    lanes: Lanes,
+    /// The fill behind a node ring, so a merge reads as a ring and not as a
+    /// disc with a hole punched through to whatever is under the panel.
+    surface: Hsla,
+    /// Whether a "load more" band follows the last row.
+    more: bool,
+}
+
+/// Paint the whole gutter in one pass.
+///
+/// Deliberately *not* wrapped in `paint_layer` per line, which is what Zed's
+/// own graph does. A layer is a full-drawable render pass; a dozen of them per
+/// frame is a dozen. Overlap ordering is already handled — `BoundsTree` hands
+/// every overlapping primitive an increasing order — and within a row the
+/// caller has sorted edges by `paint_rank` so the node's line is last. If a
+/// future change makes something here look wrong in z, the fix is the sort
+/// order, not a layer.
+fn paint_graph(p: &GraphPaint, bounds: Bounds<Pixels>, window: &mut Window) {
+    let started = std::time::Instant::now();
+    let scale = window.scale_factor();
+    let top = bounds.origin.y.as_f32();
+    let left = bounds.origin.x.as_f32();
+    let rows = &p.page.rows;
+
+    // The canvas is as tall as the whole list, so most of it is off screen.
+    // The mask is the viewport; only the band it allows is worth iterating.
+    let mask = window.content_mask().bounds;
+    let first = (((mask.origin.y.as_f32() - top) / GRAPH_ROW_H).floor() as isize).max(0) as usize;
+    let last = ((((mask.origin.y + mask.size.height).as_f32() - top) / GRAPH_ROW_H).ceil() as isize)
+        .max(0) as usize;
+
+    let cx_of = |column: Lane| left + lane_center_x(column, scale);
+    let vline = |x: f32, y0: f32, y1: f32| {
+        Bounds::from_corners(
+            point(px(x - GRAPH_LINE_W / 2.), px(y0)),
+            point(px(x + GRAPH_LINE_W / 2.), px(y1)),
+        )
+    };
+
+    for (i, row) in rows
+        .iter()
+        .enumerate()
+        .take(last.min(rows.len()))
+        .skip(first)
+    {
+        let y0 = top + i as f32 * GRAPH_ROW_H;
+        let mid = y0 + GRAPH_ROW_H / 2.;
+        let band = band_of(row, p.max_lanes, p.overflowing, &p.lanes);
+
+        for (column, ink) in band.top.iter().enumerate() {
+            if let Some(ink) = ink {
+                window.paint_quad(fill(vline(cx_of(column as Lane), y0, mid), gpui::rgb(*ink)));
+            }
+        }
+        for (column, ink) in band.bottom.iter().enumerate() {
+            if let Some(ink) = ink {
+                window.paint_quad(fill(
+                    vline(cx_of(column as Lane), mid, y0 + GRAPH_ROW_H),
+                    gpui::rgb(*ink),
+                ));
+            }
+        }
+        // Cross-lane turns are right angles, which is what tig, lazygit and
+        // `git log --graph` all draw and what reads unambiguously at a 12px
+        // pitch. Curves would mean paths, and paths mean a render pass each.
+        // Swapping them in later touches only this loop: a curve consumes the
+        // same `(lo, hi, mid)` a right angle does.
+        //
+        // The horizontal runs half a line width past both centres, which is
+        // exactly what fills the two outside corners the vertical stubs leave
+        // open. Without it a turn shows a notch at every elbow.
+        for (lo, hi, ink) in &band.turns {
+            window.paint_quad(fill(
+                Bounds::from_corners(
+                    point(
+                        px(cx_of(*lo) - GRAPH_LINE_W / 2.),
+                        px(mid - GRAPH_LINE_W / 2.),
+                    ),
+                    point(
+                        px(cx_of(*hi) + GRAPH_LINE_W / 2.),
+                        px(mid + GRAPH_LINE_W / 2.),
+                    ),
+                ),
+                gpui::rgb(*ink),
+            ));
+        }
+
+        let node = project(row.node, p.max_lanes);
+        let ink = gpui::rgb(column_ink(
+            node,
+            row.color,
+            p.max_lanes,
+            p.overflowing,
+            &p.lanes,
+        ));
+        let cx = cx_of(node);
+        let dot = |r: f32| {
+            Bounds::from_corners(
+                point(px(cx - r), px(mid - r)),
+                point(px(cx + r), px(mid + r)),
+            )
+        };
+        // A rounded quad rather than a path: the quad shader's rounding is an
+        // exact SDF with analytic anti-aliasing, where `PathBuilder` fills every
+        // vertex's `st` with `(0, 1)` and so falls back on 4x MSAA alone.
+        if row.parents > 1 {
+            // A merge is a ring. It is the one row shape a reader scans for,
+            // and an outline reads at 6px where a second fill colour does not.
+            let r = GRAPH_DOT_R + 1.;
+            window.paint_quad(quad(
+                dot(r),
+                Corners::all(px(r)),
+                p.surface,
+                Edges::all(px(GRAPH_LINE_W)),
+                ink,
+                BorderStyle::Solid,
+            ));
+        } else if row.parents == 0 {
+            // A root has nothing below it; hollow says "the line stops here"
+            // without needing a second glyph.
+            window.paint_quad(quad(
+                dot(GRAPH_DOT_R),
+                Corners::all(px(GRAPH_DOT_R)),
+                p.surface,
+                Edges::all(px(GRAPH_LINE_W)),
+                ink,
+                BorderStyle::Solid,
+            ));
+        } else {
+            window.paint_quad(
+                fill(dot(GRAPH_DOT_R), ink).corner_radii(Corners::all(px(GRAPH_DOT_R))),
+            );
+        }
+    }
+
+    // Past the last row the lanes that are still open get a stub. Without it a
+    // page boundary reads as a row of root commits — every line simply ending.
+    // Under a "load more" row the stubs run the full band instead, so the graph
+    // reads as continuing through the control rather than being cut by it.
+    if last > rows.len() && !p.page.open_lanes.is_empty() {
+        let y0 = top + rows.len() as f32 * GRAPH_ROW_H;
+        for lane in &p.page.open_lanes {
+            let column = project(*lane, p.max_lanes);
+            let ink = column_ink(column, *lane, p.max_lanes, p.overflowing, &p.lanes);
+            let x = cx_of(column);
+            if p.more {
+                let mut c: Hsla = gpui::rgb(ink).into();
+                c.a = 0.3;
+                window.paint_quad(fill(vline(x, y0, y0 + GRAPH_ROW_H), c));
+            } else {
+                // Three steps rather than a gradient: a gradient would be a
+                // second `Background` kind for four pixels of ink.
+                for (step, alpha) in [0.5f32, 0.3, 0.15].into_iter().enumerate() {
+                    let mut c: Hsla = gpui::rgb(ink).into();
+                    c.a = alpha;
+                    let a = y0 + step as f32 * 3.;
+                    window.paint_quad(fill(vline(x, a, a + 3.), c));
+                }
+            }
+        }
+    }
+
+    if crate::ui::perf::enabled() {
+        crate::ui::perf::record("scm.graph.paint", started.elapsed());
+    }
 }
 
 impl Tty7App {
     /// The history section, when it is expanded and has something to draw.
     ///
-    /// Sits below the file list as its own scroll region rather than at the
-    /// end of one: the graph pages, and sharing a scroller would mean scrolling
-    /// back past hundreds of commits to reach the message box.
+    /// Sits below the file list as its own scroll region rather than at the end
+    /// of one: the graph pages, and sharing a scroller would mean scrolling back
+    /// past hundreds of commits to reach the message box.
     pub(crate) fn render_graph_section(
         &mut self,
-        _repo: &RepoKey,
+        repo: &RepoKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !self.scm.graph.expanded {
-            return Some(self.graph_header(cx));
+            // Folded, the section is one line — but it keeps the rule above it,
+            // or it reads as the last row of the file list rather than as a
+            // section of its own.
+            return Some(
+                div()
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(self.graph_header(repo, None, cx))
+                    .into_any_element(),
+            );
         }
+        self.scm_load_graph(repo, cx);
+
         if self.scm.graph.height.get() <= 0. {
             self.scm.graph.height.set(GRAPH_H_DEFAULT);
         }
-        let max = (window.viewport_size().height.as_f32() * GRAPH_H_MAX_RATIO).max(GRAPH_H_MIN);
-        let height = self.scm.graph.height.get().clamp(GRAPH_H_MIN, max);
+        let ceiling = (window.viewport_size().height.as_f32() * GRAPH_H_MAX_RATIO).max(GRAPH_H_MIN);
+        let height = self.scm.graph.height.get().clamp(GRAPH_H_MIN, ceiling);
 
-        // The spike's figure: a straight lane 0, a branch that opens on row 1
-        // and merges back on row 2. Three dots, one elbow each way.
-        let mut rows: Vec<(u16, &'static str)> = vec![
-            (0, "third commit on the trunk"),
-            (1, "a branch opens here"),
-            (0, "and merges back in"),
-        ];
-        // Enough rows that the section actually scrolls, which is the only way
-        // to watch the culling window track the viewport.
-        for _ in 0..30 {
-            rows.push((0, "filler so the section scrolls"));
-        }
-        let lanes = 2u16;
-        let gutter = GRAPH_PAD_L + GRAPH_LANE_W * lanes as f32;
-        let scale = window.scale_factor();
-        let line = cx.theme().accent;
-        let alt = cx.theme().warning;
-        let sf = cx.theme().secondary;
-        let fg = cx.theme().foreground;
+        let page = self.scm.graph.page.clone();
+        let header = self.graph_header(repo, page.as_deref(), cx);
+        let search = self.graph_search(window, cx);
+        let naming = self.graph_naming_row(repo, cx);
+        let query = self.graph_query(cx);
+        let body = match page {
+            None => self.panel_empty(t(L10nKey::PanelLoading), None, cx),
+            Some(page) if page.commits.is_empty() => {
+                self.panel_empty(t(L10nKey::ScmGraphEmpty), None, cx)
+            }
+            Some(page) => self.graph_body(repo, &page, query.as_deref(), cx),
+        };
+        let (backing, handle) = self.graph_resize(ceiling, cx);
 
-        let painted = Rc::new(StdCell::new(0usize));
-        let seen_mask = Rc::new(StdCell::new(0.0f32));
-        let clicks = self.scm.graph.selected.clone();
-
-        let body = div()
-            .relative()
-            .w_full()
-            .h(px(rows.len() as f32 * GRAPH_ROW_H))
-            .child(
-                v_flex().children(
-                    rows.iter()
-                        .enumerate()
-                        .map(|(i, (_, text))| self.graph_spike_row(i, text, cx)),
-                ),
-            )
-            .child(
-                canvas(|_, _, _| (), {
-                    let rows = rows.clone();
-                    let painted = painted.clone();
-                    let seen_mask = seen_mask.clone();
-                    move |bounds: Bounds<Pixels>, _, window: &mut Window, _| {
-                        // Culling: the canvas is as tall as the whole
-                        // content, so only the band the mask allows is
-                        // worth iterating.
-                        let mask = window.content_mask().bounds;
-                        seen_mask.set(mask.size.height.as_f32());
-                        let top = bounds.origin.y.as_f32();
-                        let first = (((mask.origin.y.as_f32() - top) / GRAPH_ROW_H).floor()
-                            as isize)
-                            .max(0) as usize;
-                        let last = ((((mask.origin.y + mask.size.height).as_f32() - top)
-                            / GRAPH_ROW_H)
-                            .ceil() as isize)
-                            .max(0) as usize;
-                        let mut n = 0usize;
-                        for (i, (lane, _)) in rows.iter().enumerate().skip(first).take(last - first)
-                        {
-                            let y0 = top + i as f32 * GRAPH_ROW_H;
-                            let mid = y0 + GRAPH_ROW_H / 2.;
-                            let cx0 = bounds.origin.x.as_f32() + lane_center_x(0, scale);
-                            let cx1 = bounds.origin.x.as_f32() + lane_center_x(1, scale);
-                            let c = if *lane == 0 { line } else { alt };
-                            // Lane 0 runs the full height of every band.
-                            window.paint_quad(fill(
-                                Bounds::from_corners(
-                                    gpui::point(px(cx0 - GRAPH_LINE_W / 2.), px(y0)),
-                                    gpui::point(px(cx0 + GRAPH_LINE_W / 2.), px(y0 + GRAPH_ROW_H)),
-                                ),
-                                line,
-                            ));
-                            n += 1;
-                            // Row 1 opens lane 1 with an elbow, row 2
-                            // closes it with the mirror image.
-                            if i == 1 {
-                                window.paint_quad(fill(
-                                    Bounds::from_corners(
-                                        gpui::point(px(cx0), px(mid - GRAPH_LINE_W / 2.)),
-                                        gpui::point(px(cx1), px(mid + GRAPH_LINE_W / 2.)),
-                                    ),
-                                    alt,
-                                ));
-                                window.paint_quad(fill(
-                                    Bounds::from_corners(
-                                        gpui::point(px(cx1 - GRAPH_LINE_W / 2.), px(mid)),
-                                        gpui::point(
-                                            px(cx1 + GRAPH_LINE_W / 2.),
-                                            px(y0 + GRAPH_ROW_H),
-                                        ),
-                                    ),
-                                    alt,
-                                ));
-                                n += 2;
-                            }
-                            if i == 2 {
-                                window.paint_quad(fill(
-                                    Bounds::from_corners(
-                                        gpui::point(px(cx1 - GRAPH_LINE_W / 2.), px(y0)),
-                                        gpui::point(px(cx1 + GRAPH_LINE_W / 2.), px(mid)),
-                                    ),
-                                    alt,
-                                ));
-                                window.paint_quad(fill(
-                                    Bounds::from_corners(
-                                        gpui::point(px(cx0), px(mid - GRAPH_LINE_W / 2.)),
-                                        gpui::point(px(cx1), px(mid + GRAPH_LINE_W / 2.)),
-                                    ),
-                                    alt,
-                                ));
-                                n += 2;
-                            }
-                            // The node. A rounded quad, not a path: quads
-                            // get the SDF's analytic anti-aliasing, and a
-                            // path would open a whole render pass.
-                            let cxn = if *lane == 0 { cx0 } else { cx1 };
-                            window.paint_quad(
-                                fill(
-                                    Bounds::from_corners(
-                                        gpui::point(px(cxn - GRAPH_DOT_R), px(mid - GRAPH_DOT_R)),
-                                        gpui::point(px(cxn + GRAPH_DOT_R), px(mid + GRAPH_DOT_R)),
-                                    ),
-                                    c,
-                                )
-                                .corner_radii(Corners::all(px(GRAPH_DOT_R))),
-                            );
-                            n += 1;
-                        }
-                        painted.set(n);
-                    }
-                })
-                .absolute()
-                .top_0()
-                .left_0()
-                .w(px(gutter))
-                .h_full(),
-            );
-
-        let scroller = div()
-            .id("scm-graph")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.scm.graph.scroll)
-            .child(body);
-
-        let (backing, handle) = self.graph_resize(max, cx);
-        let _ = clicks;
         Some(
             v_flex()
                 .relative()
@@ -254,67 +481,707 @@ impl Tty7App {
                 .h(px(height))
                 .border_t_1()
                 .border_color(cx.theme().border)
-                .bg(sf)
-                .text_color(fg)
                 .child(backing)
-                .child(self.graph_header(cx))
-                .child(scroller)
+                .child(header)
+                .children(search)
+                .children(naming)
+                .child(body)
                 .child(handle)
                 .into_any_element(),
         )
     }
 
-    fn graph_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let expanded = self.scm.graph.expanded;
-        h_flex()
-            .id("scm-graph-header")
-            .flex_none()
-            .items_center()
-            .gap(px(6.))
-            .h(px(24.))
-            .px(px(CONTENT_INSET))
-            .cursor_pointer()
-            .text_size(px(11.))
-            .text_color(cx.theme().muted_foreground)
-            .child(SharedString::from(if expanded {
-                "▾ Graph (spike)"
-            } else {
-                "▸ Graph (spike)"
-            }))
-            .on_click(cx.listener(|this, _, _, cx| this.scm_toggle_graph(cx)))
-            .into_any_element()
+    /// Which refs the current settings walk from.
+    fn graph_scope(&self) -> GraphScope {
+        self.scm.graph.scope.clone()
     }
 
-    /// One interactive row. Deliberately an ordinary `div`: `Canvas::id`
-    /// returns `None` and it implements no interactivity, so it registers no
-    /// hitbox in prepaint — being drawn on top of these rows changes the
-    /// painting order and nothing about where a click lands.
-    fn graph_spike_row(&self, i: usize, text: &str, cx: &mut Context<Self>) -> AnyElement {
-        let sf = cx.theme().secondary;
-        let id = spike_id(i);
-        let selected = self.scm.graph.selected.as_deref() == Some(id.as_str());
+    /// Ask for a page, at most once per (repository, scope, size).
+    ///
+    /// Paging grows `requested` and re-runs the query rather than paging with
+    /// `--skip`. The layout is deterministic, so a longer run reproduces the
+    /// same prefix row for row — nothing already on screen moves — where
+    /// `--skip` is O(skip) to walk and slides under you the moment a ref moves.
+    fn scm_load_graph(&mut self, repo: &RepoKey, cx: &mut Context<Self>) {
+        // `try_global`, never `default_global`: this runs from `render`, and
+        // taking the global mutably there queues a global-observer effect on
+        // every frame, which is a panel that asks for a frame from inside one.
+        let epoch = cx
+            .try_global::<crate::terminal::git_data::ScmData>()
+            .map_or(0, |data| data.epoch(repo.host, &repo.root));
+        let scope = self.graph_scope();
+        let want = self.scm.graph.requested.max(GRAPH_PAGE);
+        let key = (repo.clone(), epoch, scope.clone());
+        let fresh = self.scm.graph.page_key.as_ref() == Some(&key)
+            && self
+                .scm
+                .graph
+                .page
+                .as_ref()
+                .is_some_and(|p| p.requested >= want);
+        if fresh || self.scm.graph.loading {
+            return;
+        }
+        let Some(host) = crate::ui::host_registry::HostRegistry::get(cx, repo.host) else {
+            return;
+        };
+        self.scm.graph.loading = true;
+        let root = repo.root.clone();
+        let query = scope.clone();
+        crate::ui::host_ops::HostOps::run(
+            host,
+            cx,
+            move |h| tty7_core::core::git::log::load_page(h, &root, &query, want),
+            move |this, page, cx| {
+                this.scm.graph.loading = false;
+                // A page that came back for a scope nobody is looking at any
+                // more is dropped rather than shown for one frame.
+                if let Some(page) = page {
+                    this.scm.graph.page = Some(Arc::new(page));
+                    this.scm.graph.page_key = Some(key);
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// The filter box's text, if it has any.
+    fn graph_query(&self, cx: &Context<Self>) -> Option<String> {
+        let input = self.scm.graph.search.as_ref()?;
+        let text = input.read(cx).value().trim().to_lowercase();
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn graph_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.scm.graph.search.is_none() {
+            let input = cx.new(|cx| {
+                gpui_component::input::InputState::new(window, cx)
+                    .placeholder(t(L10nKey::ScmGraphFilterPlaceholder))
+            });
+            self.scm.graph.search_sub =
+                Some(
+                    cx.subscribe_in(&input, window, |_this, _input, ev, _window, cx| {
+                        if matches!(ev, gpui_component::input::InputEvent::Change) {
+                            cx.notify();
+                        }
+                    }),
+                );
+            self.scm.graph.search = Some(input);
+        }
+        let input = self.scm.graph.search.clone()?;
+        Some(self.panel_search(&input, cx))
+    }
+}
+
+impl Tty7App {
+    /// The scrolling list: rows underneath, one canvas over the gutter.
+    fn graph_body(
+        &mut self,
+        repo: &RepoKey,
+        page: &Arc<CommitPage>,
+        query: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let panel_w = cx.global::<crate::core::config::Config>().right_panel_width;
+        let cap = max_lanes(panel_w, self.scm.graph.lanes_collapsed);
+        let gutter = gutter_width(cap);
+        let now = crate::ui::home::now_secs() as i64;
+
+        // A filtered view drops rows out of the middle of history, and lanes
+        // drawn across a subset would connect commits that are not adjacent.
+        // So the filter hides the gutter entirely and the list becomes a flat
+        // search result — which is what it actually is.
+        let filtering = query.is_some();
+        let rows: Vec<usize> = match query {
+            None => (0..page.commits.len()).collect(),
+            Some(q) => (0..page.commits.len())
+                .filter(|i| matches_query(&page.commits[*i], q))
+                .collect(),
+        };
+        let more = query.is_none() && !page.complete;
+        let bands = rows.len() + usize::from(more);
+
+        // With the gutter gone the text takes the panel's own inset, so a
+        // search result does not sit in a column of empty space.
+        let indent = if filtering { CONTENT_INSET } else { gutter };
+        let list = v_flex().children(
+            rows.iter()
+                .map(|i| self.graph_row(repo, page, *i, indent, now, cx)),
+        );
+        let mut stack = div()
+            .relative()
+            .w_full()
+            .h(px(bands as f32 * GRAPH_ROW_H))
+            .child(list)
+            .children(more.then(|| self.graph_load_more(gutter, cx)));
+
+        if !filtering {
+            let paint = GraphPaint {
+                page: page.clone(),
+                max_lanes: cap,
+                overflowing: page.max_lanes as usize > cap,
+                lanes: cx.global::<ActiveLanes>().0,
+                surface: cx.theme().background,
+                more,
+            };
+            stack = stack.child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| paint_graph(&paint, bounds, window),
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .w(px(gutter))
+                .h_full(),
+            );
+        }
+
+        let scroller = div()
+            .id("scm-graph")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.scm.graph.scroll)
+            .child(stack);
+        crate::ui::scrollbar::with_vertical_scrollbar(
+            "scm-graph-scrollbar",
+            scroller,
+            &self.scm.graph.scroll,
+        )
+    }
+
+    /// One commit.
+    ///
+    /// Column order is fixed and every optional part has a hard cap, so the
+    /// worst case cannot squeeze the message to nothing: type chip, message,
+    /// ref chip, age. The age goes when a ref chip is present — a chip says
+    /// where a branch is, which is worth more here than three characters of
+    /// "3d", and the full timestamp is in the tooltip either way.
+    fn graph_row(
+        &self,
+        repo: &RepoKey,
+        page: &Arc<CommitPage>,
+        i: usize,
+        gutter: f32,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let commit = &page.commits[i];
+        let mono = cx.theme().mono_font_family.clone();
+        let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
+        let selected = self.scm.graph.selected.as_deref() == Some(commit.oid.as_str());
+        let (prefix, subject) = split_conventional(&commit.summary);
+        let deco = commit.refs.first();
+        let extra = commit.refs.len().saturating_sub(1);
+        let oid = commit.oid.clone();
+
         h_flex()
             .id(SharedString::from(format!("scm-graph-row-{i}")))
             .items_center()
+            .gap(px(4.))
             .h(px(GRAPH_ROW_H))
-            .pl(px(GRAPH_PAD_L + GRAPH_LANE_W * 2. + 8.))
+            .pl(px(gutter))
             .pr(px(CONTENT_INSET))
-            .text_size(px(12.))
-            .when(selected, |d| d.bg(cx.theme().accent.opacity(0.28)))
-            .when(!selected, |d| d.hover(|s| s.bg(sf.opacity(0.9))))
             .cursor_pointer()
-            .child(SharedString::from(text.to_string()))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.scm.graph.selected = Some(spike_id(i));
+            .when(selected, |d| d.bg(gpui::rgb(sf.selected)))
+            .when(!selected, |d| d.hover(|s| s.bg(gpui::rgb(sf.hover))))
+            .children(prefix.map(|(kind, breaking)| self.graph_type_chip(kind, breaking, cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().foreground)
+                    .child(SharedString::from(subject.to_string())),
+            )
+            .children(deco.map(|r| self.graph_ref_chip(r, extra, &mono, cx)))
+            .when(deco.is_none(), |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .min_w(px(26.))
+                        .text_size(px(10.5))
+                        .font_family(mono.clone())
+                        .text_color(cx.theme().muted_foreground)
+                        .child(SharedString::from(relative_time(
+                            now,
+                            commit.author.at.unix,
+                        ))),
+                )
+            })
+            .tooltip({
+                let text = commit_tooltip(commit, now);
+                move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(text.clone()).build(window, cx)
+                }
+            })
+            .on_click(cx.listener({
+                let repo = repo.clone();
+                let oid = oid.clone();
+                move |this, _, _, cx| this.graph_open_commit(repo.clone(), oid.clone(), cx)
+            }))
+            .context_menu({
+                let app = cx.entity().downgrade();
+                let repo = repo.clone();
+                let oid = oid.clone();
+                move |menu, _window, cx| {
+                    let danger = cx.theme().danger;
+                    Tty7App::graph_row_context_menu(menu, &repo, &oid, danger, &app)
+                }
+            })
+            .into_any_element()
+    }
+}
+
+impl Tty7App {
+    /// Select a row and hand its commit to the detail view.
+    ///
+    /// Building that view is the commit-detail step's job; from here it is one
+    /// field, so that a click has exactly one meaning however the two land.
+    fn graph_open_commit(&mut self, repo: RepoKey, oid: String, cx: &mut Context<Self>) {
+        self.scm.graph.selected = Some(oid.clone());
+        self.scm.detail = Some(crate::ui::scm::state::CommitDetailView {
+            repo,
+            oid,
+            loading: true,
+        });
+        cx.notify();
+    }
+}
+
+/// Whether a commit answers the filter box.
+///
+/// Subject, author and sha, all case-folded. Not the body: a search that
+/// matches on text the row cannot show is a search whose results look wrong.
+fn matches_query(commit: &Commit, query: &str) -> bool {
+    commit.summary.to_lowercase().contains(query)
+        || commit.author.name.to_lowercase().contains(query)
+        || commit.oid.starts_with(query)
+}
+
+fn commit_tooltip(commit: &Commit, now: i64) -> SharedString {
+    SharedString::from(format!(
+        "{}\n{} · {} · {}",
+        commit.summary,
+        commit.short(),
+        commit.author.name,
+        relative_time(now, commit.author.at.unix)
+    ))
+}
+
+/// The semantic slot a conventional-commit type draws from.
+///
+/// Reusing the semantic ramp rather than inventing a palette: `feat` is the
+/// same green as a success anywhere else in the UI, `fix` the same red as a
+/// danger, and all of them have already been walked to a contrast floor on
+/// every surface. Anything unrecognised is muted, so a repository with its own
+/// vocabulary gets a neutral chip rather than an arbitrary colour.
+fn type_tone(kind: &str, breaking: bool, cx: &gpui::App) -> (Hsla, Hsla) {
+    let theme = cx.theme();
+    // A `!` is the one thing in a subject line worth shouting about, whatever
+    // the type in front of it says.
+    if breaking {
+        return (theme.danger.opacity(0.20), theme.danger);
+    }
+    let ink = match kind {
+        "feat" => theme.success,
+        "fix" => theme.danger,
+        "perf" | "revert" => theme.warning,
+        "docs" => theme.info,
+        _ => theme.muted_foreground,
+    };
+    (ink.opacity(0.16), ink)
+}
+
+impl Tty7App {
+    /// The prefix, as three or four coloured characters.
+    fn graph_type_chip(&self, kind: &str, breaking: bool, cx: &mut Context<Self>) -> AnyElement {
+        let (bg, fg) = type_tone(kind, breaking, cx);
+        div()
+            .flex_none()
+            .px(px(3.))
+            .rounded(px(3.))
+            .bg(bg)
+            .text_size(px(9.5))
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_color(fg)
+            .child(SharedString::from(match breaking {
+                true => format!("{kind}!"),
+                false => kind.to_string(),
+            }))
+            .into_any_element()
+    }
+
+    /// The highest-priority ref on a commit, plus a count of the rest.
+    ///
+    /// `load_page` already sorted them HEAD → local → tag → remote, so the
+    /// first one is the one worth the width.
+    fn graph_ref_chip(
+        &self,
+        deco: &RefDeco,
+        extra: usize,
+        mono: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let (bg, fg, weight) = match deco.kind {
+            // Where you are is the one thing on this row worth a heavier
+            // weight; everything else is context.
+            RefKind::Head => (
+                theme.accent.opacity(0.28),
+                theme.foreground,
+                gpui::FontWeight::SEMIBOLD,
+            ),
+            // Tags are yellow because tags are yellow — in git's own output,
+            // in every other client, and in the reader's memory.
+            RefKind::Tag => (
+                theme.warning.opacity(0.16),
+                theme.warning,
+                gpui::FontWeight::NORMAL,
+            ),
+            _ => (
+                theme.muted.opacity(0.9),
+                theme.muted_foreground,
+                gpui::FontWeight::NORMAL,
+            ),
+        };
+        let label = match extra {
+            0 => elide_middle(&deco.short, GRAPH_REF_CHARS).into_owned(),
+            n => format!("{} +{n}", elide_middle(&deco.short, GRAPH_REF_CHARS)),
+        };
+        div()
+            .flex_none()
+            .max_w(px(72.))
+            .truncate()
+            .font_weight(weight)
+            .child(info_chip(&label, bg, fg, mono))
+            .into_any_element()
+    }
+
+    /// The band under the last row that asks for the next page.
+    ///
+    /// A row rather than a scroll trigger. A remote `git log` is an RPC across
+    /// a host boundary, and scroll-to-load turns one flick of a trackpad into a
+    /// burst of concurrent ones.
+    fn graph_load_more(&self, gutter: f32, cx: &mut Context<Self>) -> AnyElement {
+        let loading = self.scm.graph.loading;
+        h_flex()
+            .id("scm-graph-more")
+            .items_center()
+            .h(px(GRAPH_ROW_H))
+            .pl(px(gutter))
+            .pr(px(CONTENT_INSET))
+            .cursor_pointer()
+            .text_size(px(11.))
+            .text_color(cx.theme().muted_foreground)
+            .hover(|s| s.text_color(cx.theme().foreground))
+            .child(SharedString::from(match loading {
+                true => t(L10nKey::PanelLoading),
+                false => t(L10nKey::ScmGraphLoadMore),
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let now = this.scm.graph.requested.max(GRAPH_PAGE);
+                this.scm.graph.requested = now.saturating_add(GRAPH_PAGE);
                 cx.notify();
             }))
             .into_any_element()
     }
+}
 
-    /// `right_panel_resize` rotated 90°: the same canvas-remembers-bounds plus
-    /// `Rc<Cell>` pair, dragging the top edge of the history section instead of
-    /// the left edge of the panel.
-    fn graph_resize(&self, max: f32, cx: &mut Context<Self>) -> (AnyElement, AnyElement) {
+impl Tty7App {
+    /// The section's own title row: fold, count, gutter toggle, scope picker.
+    fn graph_header(
+        &self,
+        repo: &RepoKey,
+        page: Option<&CommitPage>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let expanded = self.scm.graph.expanded;
+        let muted = cx.theme().muted_foreground;
+        let count = page.map(|p| match p.complete {
+            true => p.commits.len().to_string(),
+            false => format!("{}+", p.commits.len()),
+        });
+        let collapsed = self.scm.graph.lanes_collapsed;
+
+        h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .h(px(24.))
+            .pl(px(CONTENT_INSET))
+            .pr(px(crate::ui::app::tile_trailing_inset_sm()))
+            .child(
+                h_flex()
+                    .id("scm-graph-fold")
+                    .items_center()
+                    .gap(px(4.))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .cursor_pointer()
+                    .child(
+                        Icon::new(match expanded {
+                            true => IconName::ChevronDown,
+                            false => IconName::ChevronRight,
+                        })
+                        .size(px(10.))
+                        .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(muted)
+                            .child(SharedString::from(t(L10nKey::ScmGraphTitle))),
+                    )
+                    .children(count.map(|c| {
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(muted)
+                            .child(SharedString::from(c))
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.scm_toggle_graph(cx))),
+            )
+            .when(expanded, |row| {
+                row.child(
+                    div()
+                        .id("scm-graph-lanes")
+                        .flex_none()
+                        .size(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .when(collapsed, |d| d.bg(cx.theme().secondary))
+                        .hover(|s| s.bg(cx.theme().secondary))
+                        .child(
+                            Icon::new(match collapsed {
+                                true => IconName::ChevronRight,
+                                false => IconName::ChevronLeft,
+                            })
+                            .size(px(11.))
+                            .text_color(muted),
+                        )
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(match collapsed {
+                                true => t(L10nKey::ScmGraphShowLanes),
+                                false => t(L10nKey::ScmGraphFoldLanes),
+                            })
+                            .build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.scm.graph.lanes_collapsed = !this.scm.graph.lanes_collapsed;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("scm-graph-scope")
+                        .ghost()
+                        .xsmall()
+                        .h(px(18.))
+                        .rounded(px(4.))
+                        .label(scope_label(&self.scm.graph.scope))
+                        .text_color(muted)
+                        .dropdown_menu_with_anchor(
+                            gpui::Anchor::TopRight,
+                            self.graph_scope_menu(repo, cx),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn graph_scope_menu(
+        &self,
+        repo: &RepoKey,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static + use<>
+    {
+        let app = cx.entity().downgrade();
+        let branches = self
+            .scm
+            .branches
+            .get(repo)
+            .map(|(_, names)| names.clone())
+            .unwrap_or_default();
+        let scope = self.scm.graph.scope.clone();
+
+        move |menu, _window, _cx| {
+            let mut menu = menu.min_w(px(180.));
+            let pick = |app: &gpui::WeakEntity<Tty7App>, next: GraphScope| {
+                let app = app.clone();
+                move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut gpui::App| {
+                    let _ = app.update(cx, |this, cx| this.graph_set_scope(next.clone(), cx));
+                }
+            };
+            for (label, next) in [
+                (
+                    t(L10nKey::ScmGraphCurrentBranch),
+                    GraphScope::HeadAndUpstream,
+                ),
+                (t(L10nKey::ScmGraphAllBranches), GraphScope::All),
+            ] {
+                menu = menu.item(
+                    PopupMenuItem::new(label)
+                        .checked(scope == next)
+                        .on_click(pick(&app, next)),
+                );
+            }
+            if !branches.is_empty() {
+                menu = menu.separator();
+            }
+            for name in &branches {
+                let next = GraphScope::Refs(vec![format!("refs/heads/{name}")]);
+                menu = menu.item(
+                    PopupMenuItem::new(name.clone())
+                        .checked(scope == next)
+                        .on_click(pick(&app, next)),
+                );
+            }
+            menu
+        }
+    }
+
+    /// Point the graph at a different set of refs, and start it over.
+    ///
+    /// The page count resets with the scope: keeping a grown `requested` would
+    /// make switching to a short branch pull its whole history in one go.
+    fn graph_set_scope(&mut self, scope: GraphScope, cx: &mut Context<Self>) {
+        if self.scm.graph.scope == scope {
+            return;
+        }
+        self.scm.graph.scope = scope;
+        self.scm.graph.requested = GRAPH_PAGE;
+        self.scm.graph.page = None;
+        self.scm.graph.page_key = None;
+        cx.notify();
+    }
+}
+
+fn scope_label(scope: &GraphScope) -> String {
+    match scope {
+        GraphScope::All => t(L10nKey::ScmGraphAllBranches).to_string(),
+        GraphScope::Refs(refs) => refs
+            .first()
+            .map(|r| r.rsplit('/').next().unwrap_or(r).to_string())
+            .unwrap_or_else(|| t(L10nKey::ScmGraphAllBranches).to_string()),
+        _ => t(L10nKey::ScmGraphCurrentBranch).to_string(),
+    }
+}
+
+impl Tty7App {
+    /// The row's verbs.
+    ///
+    /// Every one of them goes through `scm_op`, which is where the confirmation
+    /// for anything that can lose work already lives — a second gate here would
+    /// be a second thing to keep in step with `GitOp::destructive`.
+    fn graph_row_context_menu(
+        menu: PopupMenu,
+        repo: &RepoKey,
+        oid: &str,
+        danger: Hsla,
+        app: &gpui::WeakEntity<Tty7App>,
+    ) -> PopupMenu {
+        let op = |app: &gpui::WeakEntity<Tty7App>, repo: &RepoKey, build: fn(String) -> GitOp| {
+            let app = app.clone();
+            let repo = repo.clone();
+            let rev = oid.to_string();
+            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut gpui::App| {
+                let _ = app.update(cx, |this, cx| {
+                    this.scm_op(repo.clone(), build(rev.clone()), window, cx)
+                });
+            }
+        };
+
+        let mut menu = menu
+            .min_w(px(200.))
+            .item(
+                PopupMenuItem::new(t(L10nKey::ScmCheckoutCommit))
+                    .on_click(op(app, repo, |rev| GitOp::CheckoutDetached { rev })),
+            )
+            .item(
+                PopupMenuItem::new(t(L10nKey::ScmCreateBranchHere)).on_click({
+                    let app = app.clone();
+                    let repo = repo.clone();
+                    let rev = oid.to_string();
+                    move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| {
+                            this.graph_begin_branch_at(repo.clone(), rev.clone(), window, cx)
+                        });
+                    }
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(t(L10nKey::ScmCherryPick)).on_click(op(app, repo, |rev| {
+                    GitOp::CherryPick {
+                        rev,
+                        // A merge cherry-picked without `-m` is an error, and
+                        // the first parent is the only sane default.
+                        mainline: true,
+                        no_commit: false,
+                    }
+                })),
+            )
+            .item(
+                PopupMenuItem::new(t(L10nKey::ScmRevertCommit)).on_click(op(app, repo, |rev| {
+                    GitOp::Revert {
+                        rev,
+                        mainline: true,
+                    }
+                })),
+            )
+            .separator();
+
+        for (label, mode) in [
+            (t(L10nKey::ScmResetSoft), ResetMode::Soft),
+            (t(L10nKey::ScmResetMixed), ResetMode::Mixed),
+            (t(L10nKey::ScmResetHard), ResetMode::Hard),
+        ] {
+            let app = app.clone();
+            let repo = repo.clone();
+            let rev = oid.to_string();
+            // `--hard` is the one entry here that discards work outright, so
+            // it wears the danger colour the same way the tree's Delete does.
+            // The confirmation still comes from `scm_op`; this is the warning
+            // before the warning.
+            let base = match mode {
+                ResetMode::Hard => PopupMenuItem::element(move |_window, _cx| {
+                    div().text_color(danger).child(label)
+                }),
+                _ => PopupMenuItem::new(label),
+            };
+            let item = base.on_click(move |_, window, cx| {
+                let _ = app.update(cx, |this, cx| {
+                    this.scm_op(
+                        repo.clone(),
+                        GitOp::Reset {
+                            rev: rev.clone(),
+                            mode,
+                        },
+                        window,
+                        cx,
+                    )
+                });
+            });
+            menu = menu.item(item);
+        }
+
+        menu.separator()
+            .item(PopupMenuItem::new(t(L10nKey::ScmCopyCommitSha)).on_click({
+                let rev = oid.to_string();
+                move |_, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(rev.clone()))
+            }))
+    }
+
+    /// `right_panel_resize` rotated onto the other axis: a canvas that remembers
+    /// the container's bounds, an `Rc<Cell>` pair for the live value and the
+    /// drag flag, and a one-pixel hairline that only shows on hover or while
+    /// held.
+    fn graph_resize(&self, ceiling: f32, cx: &mut Context<Self>) -> (AnyElement, AnyElement) {
         let container: Rc<StdCell<Option<Bounds<Pixels>>>> = Rc::new(StdCell::new(None));
         let backing = canvas(
             {
@@ -337,9 +1204,10 @@ impl Tty7App {
                             let Some(b) = container.get() else {
                                 return;
                             };
-                            let bottom = b.origin.y + b.size.height;
-                            let raw = (bottom - ev.position.y).as_f32();
-                            height.set(raw.clamp(GRAPH_H_MIN, max));
+                            // Measured from the bottom, because that edge is
+                            // pinned and the top is the one being dragged.
+                            let raw = (b.origin.y + b.size.height - ev.position.y).as_f32();
+                            height.set(raw.clamp(GRAPH_H_MIN, ceiling));
                             window.refresh();
                         }
                     });
@@ -371,12 +1239,11 @@ impl Tty7App {
             .h(px(GRAPH_HANDLE_H))
             .flex()
             .items_center()
-            .justify_center()
             .cursor_row_resize()
             .child(
                 div()
-                    .h(px(1.))
                     .w_full()
+                    .h(px(1.))
                     .when(active, |d| d.bg(cx.theme().drag_border))
                     .group_hover("scm-graph-resize", |s| s.bg(cx.theme().drag_border)),
             )
@@ -393,7 +1260,547 @@ impl Tty7App {
     }
 }
 
-/// Stand-in for the sha the real rows will be keyed by.
-fn spike_id(i: usize) -> String {
-    format!("spike-{i}")
+impl Tty7App {
+    /// Open the inline "name a branch here" input for one commit.
+    ///
+    /// Its own input rather than the panel's naming row: that row always
+    /// branches from HEAD, and a branch created at the wrong commit is a
+    /// silent mistake rather than a visible one.
+    fn graph_begin_branch_at(
+        &mut self,
+        repo: RepoKey,
+        rev: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(t(L10nKey::ScmCreateBranchHere))
+        });
+        let handle = input.read(cx).focus_handle(cx);
+        self.scm.graph.naming = Some((input, rev));
+        self.scm.repo_override = Some(repo);
+        self.scm.override_tab = Some(self.active);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn graph_naming_row(&mut self, repo: &RepoKey, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (input, rev) = self.scm.graph.naming.clone()?;
+        let repo = repo.clone();
+        Some(
+            h_flex()
+                .id("scm-graph-naming")
+                .flex_none()
+                .items_center()
+                .h(px(30.))
+                .px(px(CONTENT_INSET))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(gpui_component::input::Input::new(&input).xsmall()),
+                )
+                .on_key_down(
+                    cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
+                        match ev.keystroke.key.as_str() {
+                            "escape" => {
+                                this.scm.graph.naming = None;
+                                cx.notify();
+                            }
+                            "enter" => {
+                                let Some((input, _)) = this.scm.graph.naming.take() else {
+                                    return;
+                                };
+                                let name = input.read(cx).value().trim().to_string();
+                                cx.notify();
+                                if name.is_empty() {
+                                    return;
+                                }
+                                this.scm_op(
+                                    repo.clone(),
+                                    GitOp::CreateBranch {
+                                        name,
+                                        start: Some(rev.clone()),
+                                        // Naming a branch at an old commit is
+                                        // usually marking a place, not moving to
+                                        // it — and moving would take the working
+                                        // tree with it.
+                                        checkout: false,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::app::test_window::harness;
+    use crate::ui::host_ops::HostId;
+    use gpui::TestAppContext;
+    use smallvec::smallvec;
+    use std::path::PathBuf;
+
+    fn repo() -> RepoKey {
+        RepoKey {
+            host: HostId::LOCAL,
+            root: PathBuf::from("/tmp/tty7-graph-test"),
+        }
+    }
+
+    fn lanes() -> Lanes {
+        Lanes {
+            ink: [0x111111, 0x222222, 0x333333, 0x444444, 0x555555, 0x666666],
+            overflow: 0x999999,
+        }
+    }
+
+    #[test]
+    fn lanes_inside_the_cap_keep_their_own_column() {
+        for cap in GRAPH_MIN_LANES..=GRAPH_MAX_LANES {
+            let columns: Vec<Lane> = (0..cap as Lane).map(|l| project(l, cap)).collect();
+            let mut sorted = columns.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                columns.len(),
+                sorted.len(),
+                "cap {cap} collapsed a real lane"
+            );
+            assert_eq!(columns, (0..cap as Lane).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn everything_past_the_cap_lands_in_the_overflow_column() {
+        let cap = 4;
+        for lane in 4u16..=tty7_core::core::git::log::MAX_LANES {
+            assert_eq!(project(lane, cap), 3, "lane {lane} escaped the last column");
+        }
+        // A single column is the folded gutter, and it has to swallow every lane
+        // rather than saturating into a negative index.
+        for lane in 0u16..8 {
+            assert_eq!(project(lane, 1), 0);
+        }
+    }
+
+    #[test]
+    fn lane_centres_rise_and_land_on_device_pixels() {
+        for scale in [1.0f32, 1.25, 2.0, 3.0] {
+            let mut previous = f32::MIN;
+            for column in 0..GRAPH_MAX_LANES as Lane {
+                let x = lane_center_x(column, scale);
+                assert!(x > previous, "column {column} did not advance at {scale}x");
+                previous = x;
+                let physical = x * scale;
+                assert!(
+                    (physical - physical.round()).abs() < 1e-4,
+                    "column {column} at {scale}x sits at {physical} device pixels"
+                );
+            }
+        }
+        // A nonsense scale must not produce NaN geometry.
+        assert_eq!(lane_center_x(0, 0.), lane_center_x(0, f32::NAN));
+    }
+
+    #[test]
+    fn the_gutter_narrows_with_the_panel_and_folds_to_one() {
+        // 260px is the default panel; 216px is about as narrow as it gets.
+        assert_eq!(max_lanes(260., false), 6);
+        assert_eq!(max_lanes(216., false), 5);
+        assert_eq!(max_lanes(160., false), 4);
+        assert_eq!(max_lanes(120., false), 3);
+        // Below the floor the gutter stops shrinking: three lanes is the least
+        // that can show a branch leaving and coming back.
+        assert_eq!(max_lanes(40., false), GRAPH_MIN_LANES);
+        // And above the palette it stops growing, or two columns would share a
+        // colour.
+        assert_eq!(max_lanes(4000., false), GRAPH_MAX_LANES);
+        assert!(max_lanes(4000., false) <= LANE_SLOTS);
+        assert_eq!(max_lanes(260., true), 1);
+    }
+
+    #[test]
+    fn conventional_prefixes_come_off_and_prose_does_not() {
+        assert_eq!(
+            split_conventional("feat(terminal): localize the menu"),
+            (Some(("feat", false)), "localize the menu")
+        );
+        assert_eq!(
+            split_conventional("fix: a thing"),
+            (Some(("fix", false)), "a thing")
+        );
+        assert_eq!(
+            split_conventional("feat!: drop the old dialect"),
+            (Some(("feat", true)), "drop the old dialect")
+        );
+        assert_eq!(
+            split_conventional("refactor(ui/scm)!: one entry point"),
+            (Some(("refactor", true)), "one entry point")
+        );
+        for prose in [
+            "no prefix here",
+            // Capitalised is not a conventional type.
+            "Merge pull request #1 from x",
+            // No space after the colon.
+            "fix:it",
+            // A bare URL must not be cut at its scheme.
+            "see https://example.invalid for why",
+            // An empty scope is malformed, not a prefix.
+            "feat(): nothing",
+            // Nothing left after the colon is not a subject.
+            "chore: ",
+            "",
+        ] {
+            assert_eq!(
+                split_conventional(prose),
+                (None, prose),
+                "{prose:?} should have been left alone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chinese_subject_survives_the_split_intact() {
+        // Byte indexing over a multibyte subject is exactly how this goes
+        // wrong, so the assertion is on the value, not on not panicking.
+        let subject = "修复终端右键菜单的本地化";
+        assert_eq!(split_conventional(subject), (None, subject));
+        let prefixed = "fix(terminal): 修复终端右键菜单的本地化";
+        assert_eq!(
+            split_conventional(prefixed),
+            (Some(("fix", false)), "修复终端右键菜单的本地化")
+        );
+    }
+
+    /// `4 → node 0 → 4` should be one line bending, not two lines drawn twice.
+    #[test]
+    fn a_band_keeps_one_segment_per_column() {
+        let row = GraphRow {
+            node: 0,
+            color: 0,
+            parents: 2,
+            edges: smallvec![
+                Edge::Pass { lane: 5, color: 5 },
+                Edge::Pass { lane: 7, color: 7 },
+                Edge::In { from: 0, color: 0 },
+                Edge::Out { to: 0, color: 0 },
+                Edge::Out { to: 6, color: 6 },
+            ],
+        };
+        // Cap of three: lanes 5, 6 and 7 all fall into column 2.
+        let band = band_of(&row, 3, true, &lanes());
+        assert_eq!(band.top[0], Some(lanes().ink[0]));
+        assert_eq!(band.top[2], Some(lanes().overflow));
+        assert_eq!(band.bottom[0], Some(lanes().ink[0]));
+        assert_eq!(band.bottom[2], Some(lanes().overflow));
+        assert_eq!(band.top[1], None);
+        // Three lanes bundled into the overflow column produce exactly one
+        // turn, not three stacked on each other.
+        assert_eq!(band.turns.len(), 1);
+        assert_eq!(band.turns[0].0, 0);
+        assert_eq!(band.turns[0].1, 2);
+    }
+
+    #[test]
+    fn a_wide_page_only_neutralises_the_column_that_is_shared() {
+        let l = lanes();
+        // Not overflowing: every column is a real lane and keeps its hue.
+        assert_eq!(column_ink(2, 2, 3, false, &l), l.ink[2]);
+        // Overflowing: only the last column goes neutral.
+        assert_eq!(column_ink(2, 2, 3, true, &l), l.overflow);
+        assert_eq!(column_ink(1, 1, 3, true, &l), l.ink[1]);
+        // A colour index past the palette can only come from a lane that was
+        // projected into the bundle, but clamp anyway rather than panic.
+        assert_eq!(column_ink(0, 99, 3, false, &l), l.ink[LANE_SLOTS - 1]);
+    }
+
+    #[gpui::test]
+    fn folding_the_history_section_survives_a_restart(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (app, mut vcx) = harness(cx);
+
+        // It starts shut: a panel that unfurls two hundred commits the first
+        // time it is opened looks like a mess nobody asked for.
+        assert!(!app.read_with(&vcx, |app, _| app.scm.graph.expanded));
+        app.update(&mut vcx, |app, cx| app.scm_toggle_graph(cx));
+        assert!(app.read_with(&vcx, |app, _| app.scm.graph.expanded));
+        assert!(vcx.update(|_, cx| {
+            cx.global::<crate::core::config::Config>()
+                .scm_graph_expanded
+        }));
+    }
+
+    #[gpui::test]
+    fn the_lane_gutter_folds_and_stays_folded(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (app, mut vcx) = harness(cx);
+
+        // Session state rather than config: unlike the section's own fold, this
+        // is a reading posture for one repository's shape, not a preference.
+        assert!(!app.read_with(&vcx, |app, _| app.scm.graph.lanes_collapsed));
+        app.update(&mut vcx, |app, cx| {
+            app.scm.graph.lanes_collapsed = true;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert!(app.read_with(&vcx, |app, _| app.scm.graph.lanes_collapsed));
+    }
+
+    #[gpui::test]
+    fn opening_a_row_hands_that_commit_to_the_detail_view(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (app, mut vcx) = harness(cx);
+
+        app.update(&mut vcx, |app, cx| {
+            app.graph_open_commit(repo(), "deadbeef".into(), cx)
+        });
+        let (selected, detail) = app.read_with(&vcx, |app, _| {
+            (app.scm.graph.selected.clone(), app.scm.detail.clone())
+        });
+        assert_eq!(selected.as_deref(), Some("deadbeef"));
+        let detail = detail.expect("the row opened a commit");
+        assert_eq!(detail.oid, "deadbeef");
+        assert_eq!(detail.repo, repo());
+        assert!(detail.loading);
+    }
+
+    /// Changing what the graph walks has to throw the page away, not page on
+    /// top of it: the rows of a different scope are a different history.
+    #[gpui::test]
+    fn switching_scope_resets_the_page_and_its_size(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (app, mut vcx) = harness(cx);
+
+        app.update(&mut vcx, |app, cx| {
+            app.scm.graph.requested = GRAPH_PAGE * 3;
+            app.scm.graph.page = Some(Arc::new(empty_page()));
+            app.scm.graph.page_key = Some((repo(), 7, GraphScope::HeadAndUpstream));
+            app.graph_set_scope(GraphScope::All, cx);
+        });
+        app.read_with(&vcx, |app, _| {
+            assert_eq!(app.scm.graph.scope, GraphScope::All);
+            assert_eq!(app.scm.graph.requested, GRAPH_PAGE);
+            assert!(app.scm.graph.page.is_none());
+            assert!(app.scm.graph.page_key.is_none());
+        });
+
+        // Picking the scope that is already showing must not throw the page
+        // away, or every menu open would cost a `git log`.
+        app.update(&mut vcx, |app, cx| {
+            app.scm.graph.page = Some(Arc::new(empty_page()));
+            app.graph_set_scope(GraphScope::All, cx);
+        });
+        assert!(app.read_with(&vcx, |app, _| app.scm.graph.page.is_some()));
+    }
+
+    #[test]
+    fn the_filter_matches_what_a_row_can_show() {
+        let commit = commit_named("feat(ui): the graph", "Ada Lovelace", "c0ffee1234");
+        for hit in ["graph", "GRAPH", "feat", "ada", "Lovelace", "c0ffee"] {
+            assert!(
+                matches_query(&commit, &hit.to_lowercase()),
+                "{hit:?} should have matched"
+            );
+        }
+        // The body is deliberately not searched: a hit the row cannot show
+        // looks like a wrong result.
+        assert!(!matches_query(&commit, "rationale"));
+        // A sha matches as a prefix, the way `git show` takes one — not as a
+        // substring, or every query of hex characters would light up.
+        assert!(!matches_query(&commit, "ffee"));
+    }
+
+    #[test]
+    fn the_scope_button_says_which_history_is_showing() {
+        assert_eq!(
+            scope_label(&GraphScope::HeadAndUpstream),
+            t(L10nKey::ScmGraphCurrentBranch)
+        );
+        assert_eq!(
+            scope_label(&GraphScope::All),
+            t(L10nKey::ScmGraphAllBranches)
+        );
+        // The label is the branch, not the fully qualified ref: `refs/heads/`
+        // is eleven characters of the panel spent saying nothing.
+        assert_eq!(
+            scope_label(&GraphScope::Refs(vec!["refs/heads/feature/auth".into()])),
+            "auth"
+        );
+    }
+
+    fn commit_named(summary: &str, author: &str, oid: &str) -> Commit {
+        use tty7_core::core::git::log::{OffsetTs, Signature};
+        let who = Signature {
+            name: author.to_string(),
+            email: "a@b.invalid".into(),
+            at: OffsetTs {
+                unix: 0,
+                offset_minutes: 0,
+            },
+        };
+        Commit {
+            oid: oid.to_string(),
+            parents: smallvec![],
+            author: who.clone(),
+            committer: who,
+            summary: summary.to_string(),
+            body: "rationale goes in the body".into(),
+            refs: Vec::new(),
+        }
+    }
+
+    fn empty_page() -> CommitPage {
+        CommitPage {
+            commits: Vec::new(),
+            rows: Vec::new(),
+            max_lanes: 0,
+            scope: GraphScope::HeadAndUpstream,
+            requested: GRAPH_PAGE,
+            complete: true,
+            truncated_lanes: false,
+            open_lanes: Vec::new(),
+        }
+    }
+}
+
+/// The one test that has to run against a real repository and a real pane.
+///
+/// A canvas that repaints every frame would make the panel a perpetual motion
+/// machine, and nothing about the code reads as wrong when it does — the only
+/// way to know is to settle the window and count frames. Same shape as the file
+/// tree's own idle tests, including the serial lock: the render probe is
+/// thread-local and two of these at once would count each other's frames.
+#[cfg(test)]
+mod render_idle_gpui_tests {
+    use super::*;
+    use crate::ui::app::{render_probe, test_window};
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use std::path::Path;
+    use tty7_core::core::config::RightPanelTab;
+
+    const BUDGET: u64 = 200;
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Git with the identity and signing pinned, so the test does not depend on
+    /// whatever is in the developer's `~/.gitconfig`.
+    fn git(root: &Path, args: &[&str]) -> bool {
+        let mut full = vec![
+            "-c",
+            "user.name=tty7 test",
+            "-c",
+            "user.email=test@tty7.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        full.extend_from_slice(args);
+        std::process::Command::new("git")
+            .args(&full)
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tty7-graph-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    fn draws_while_idle(vcx: &mut VisualTestContext) -> u64 {
+        render_probe::arm(BUDGET);
+        vcx.background_executor.run_until_parked();
+        vcx.executor()
+            .advance_clock(std::time::Duration::from_secs(3));
+        vcx.background_executor.run_until_parked();
+        render_probe::arm(BUDGET);
+        vcx.executor()
+            .advance_clock(std::time::Duration::from_secs(9));
+        vcx.background_executor.run_until_parked();
+        render_probe::draws()
+    }
+
+    /// Drive frames until the graph has a page, because the query only goes out
+    /// from `render`.
+    fn settle_graph(app: &Entity<Tty7App>, vcx: &mut VisualTestContext) -> Option<Arc<CommitPage>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            app.update_in(vcx, |_, _, cx| cx.notify());
+            vcx.background_executor.run_until_parked();
+            let page = app.update_in(vcx, |app, _, _| app.scm.graph.page.clone());
+            if page.is_some() {
+                vcx.background_executor.run_until_parked();
+                return page;
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[gpui::test]
+    fn an_expanded_graph_with_history_reaches_render_idle(cx: &mut TestAppContext) {
+        let _serial = serial();
+        crate::core::config::pin_test_config_dir();
+        let root = scratch("idle");
+        if !git(&root, &["init", "--quiet"]) {
+            return; // no git on this machine
+        }
+        for n in 0..6 {
+            std::fs::write(root.join(format!("f{n}.txt")), format!("{n}\n")).unwrap();
+            assert!(git(&root, &["add", "-A"]));
+            assert!(git(
+                &root,
+                &["commit", "--quiet", "-m", &format!("feat(x): commit {n}")]
+            ));
+        }
+
+        let (app, mut vcx, _pane) = test_window::harness_with_pane(cx);
+        crate::daemon::protocol::DaemonMsg::Cwd(root.clone())
+            .encode(&mut { _pane })
+            .expect("the pane's socket takes the cwd");
+        app.update_in(&mut vcx, |app, _, cx| {
+            app.right_panel_visible = true;
+            app.right_panel_tab = RightPanelTab::Scm;
+            app.scm.graph.expanded = true;
+            cx.notify();
+        });
+
+        let Some(page) = settle_graph(&app, &mut vcx) else {
+            // A machine where the pane never reported its cwd has nothing to
+            // say about idling; failing here would only be flaky.
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(page.commits.len() >= 6, "the graph loaded no history");
+        assert_eq!(page.rows.len(), page.commits.len());
+
+        assert_eq!(draws_while_idle(&mut vcx), 0);
+        // And it is still expanded and still holding the same page, i.e. the
+        // zero above is idleness and not the section having quietly vanished.
+        app.update_in(&mut vcx, |app, _, _| {
+            assert!(app.scm.graph.expanded);
+            assert!(app.scm.graph.page.is_some());
+            assert!(!app.scm.graph.loading);
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

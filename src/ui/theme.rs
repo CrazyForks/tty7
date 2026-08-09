@@ -283,6 +283,10 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     });
     cx.set_global(surfaces.clone());
     cx.set_global(presets::ActiveAccent(m.accent));
+    // Same treatment as `Surfaces`: derived once here rather than recomputed
+    // in `render`, because the graph reads it once per visible row per frame
+    // and each entry costs a contrast bisection on three surfaces.
+    cx.set_global(presets::ActiveLanes(theme.lanes()));
 
     let t = Theme::global_mut(cx);
     let mut base: Hsla = rgb(m.background).into();
