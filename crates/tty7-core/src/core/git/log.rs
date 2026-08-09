@@ -1702,57 +1702,227 @@ mod tests {
         assert!(!is_rev("HEAD\nrm -rf"));
     }
 
-    #[test]
-    fn this_repo_answers_for_one_commit_and_its_files() {
-        let host = crate::host::local::LocalHost::new();
-        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-        // A source tarball is a legitimate place to run the tests from.
-        let Some(page) = load_page(&*host, here, &GraphScope::Head, 2) else {
-            return;
-        };
-        let Some(head) = page.commits.first() else {
-            return;
-        };
+    // ----- against a real repository -------------------------------------
+    //
+    // Both of these build the history they assert on rather than reading the
+    // tty7 checkout they were compiled in. CI clones shallow (one commit) and
+    // checks a pull request out as a detached HEAD with no local branch, so
+    // "how deep is the history" and "is there a branch" are facts about the
+    // runner, not about this code — and a source tarball has no repository at
+    // all. Owning the fixture is what lets the counts below be exact.
 
-        let shown = load_commit(&*host, here, &head.oid).expect("HEAD is a commit");
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Option<Scratch> {
+        // The pid keeps two concurrent `cargo test` runs off each other's
+        // fixture, since the directory is wiped on the way in.
+        let dir = std::env::temp_dir().join(format!("tty7-scm-log-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(Scratch(dir))
+    }
+
+    /// Runs git with the identity and signing settings pinned: a CI runner has
+    /// no `user.name` at all and would refuse to commit, and a developer may
+    /// have signing turned on globally.
+    fn run(host: &dyn Host, cwd: &Path, args: &[&str]) -> bool {
+        let mut full = vec![
+            "-c",
+            "user.name=tty7 test",
+            "-c",
+            "user.email=test@tty7.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        full.extend_from_slice(args);
+        host.git(cwd, &full).map(|o| o.success()).unwrap_or(false)
+    }
+
+    /// `git init` on a branch named here rather than left to whatever
+    /// `init.defaultBranch` says. `false` means there is no git on this
+    /// machine, which is not a failure.
+    fn init_repo(host: &dyn Host, repo: &Path) -> bool {
+        if !run(host, repo, &["init", "--quiet"]) {
+            return false;
+        }
+        // Not `init -b`: that is git 2.28+, and the branch name is asserted on.
+        assert!(run(
+            host,
+            repo,
+            &["symbolic-ref", "HEAD", "refs/heads/main"]
+        ));
+        true
+    }
+
+    fn commit_file(host: &dyn Host, repo: &Path, path: &str, body: &str, message: &str) {
+        std::fs::write(repo.join(path), body).unwrap();
+        assert!(run(host, repo, &["add", "--", path]));
+        assert!(run(host, repo, &["commit", "--quiet", "-m", message]));
+    }
+
+    #[test]
+    fn a_real_repository_answers_for_one_commit_and_its_files() {
+        let host = crate::host::local::LocalHost::new();
+        let Some(scratch) = scratch("one-commit") else {
+            return;
+        };
+        let repo = &scratch.0;
+        if !init_repo(&*host, repo) {
+            return; // no git on this machine
+        }
+
+        std::fs::write(repo.join("kept.txt"), "one\n").unwrap();
+        std::fs::write(repo.join("moved.txt"), "a\nb\nc\nd\ne\nf\ng\nh\n").unwrap();
+        std::fs::write(repo.join("gone.txt"), "bye\n").unwrap();
+        assert!(run(&*host, repo, &["add", "--", "."]));
+        assert!(run(&*host, repo, &["commit", "--quiet", "-m", "base"]));
+
+        // One commit with four different things in it, because the join of
+        // `--numstat` and `--name-status` is only exercised by a commit that
+        // touches more than one path, and the rename is the record whose two
+        // halves are shaped differently in the two streams.
+        std::fs::write(repo.join("kept.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(repo.join("added.txt"), "new\n").unwrap();
+        assert!(run(&*host, repo, &["mv", "moved.txt", "renamed.txt"]));
+        assert!(run(&*host, repo, &["rm", "--quiet", "--", "gone.txt"]));
+        assert!(run(&*host, repo, &["add", "--", "."]));
+        assert!(run(
+            &*host,
+            repo,
+            &["commit", "--quiet", "-m", "feat: four ways at once"]
+        ));
+        // A second branch, so `local_branches` has to return more than the one
+        // HEAD happens to be on.
+        assert!(run(&*host, repo, &["branch", "side"]));
+
+        let page = load_page(&*host, repo, &GraphScope::Head, 2)
+            .expect("a repository was just created here");
+        let head = page.commits.first().expect("two commits were just made");
+
+        let shown = load_commit(&*host, repo, &head.oid).expect("HEAD is a commit");
         assert_eq!(shown.oid, head.oid);
         assert_eq!(shown.summary, head.summary, "the two formats are the same");
         assert_eq!(shown.parents.as_slice(), head.parents.as_slice());
         assert_eq!(shown.author.at, head.author.at);
-        assert_eq!(load_commit(&*host, here, "-n"), None);
+        assert_eq!(load_commit(&*host, repo, "-n"), None);
 
-        let files = commit_files(&*host, here, &head.oid).expect("HEAD touched something");
-        assert!(!files.is_empty(), "no commit in this repo is empty");
+        let files = commit_files(&*host, repo, &head.oid).expect("HEAD touched something");
         assert!(
             files.iter().all(|f| !f.path.is_empty()),
             "an empty path means the join lost a record: {files:?}"
         );
-        // The whole reason the two commands are run separately.
-        assert!(
-            files
-                .iter()
-                .any(|f| f.added.is_some() || f.removed.is_some() || f.binary),
-            "not one row got its counts: {files:?}"
+        let mut got: Vec<(&str, FileStatus)> =
+            files.iter().map(|f| (f.path.as_str(), f.status)).collect();
+        got.sort_by_key(|(path, _)| *path);
+        assert_eq!(
+            got,
+            [
+                ("added.txt", FileStatus::Added),
+                ("gone.txt", FileStatus::Deleted),
+                ("kept.txt", FileStatus::Modified),
+                ("renamed.txt", FileStatus::Renamed),
+            ],
+            "every path the commit touched, with the letter git gave it: {files:?}"
         );
 
-        let branches = local_branches(&*host, here);
-        assert!(!branches.is_empty(), "this checkout is on a branch");
+        fn file<'a>(files: &'a [CommitFile], path: &str) -> &'a CommitFile {
+            files.iter().find(|f| f.path == path).unwrap()
+        }
+        // The whole reason the two commands are run separately: the counts come
+        // from `--numstat` and the letters from `--name-status`, so a row that
+        // has both is a row the join put back together.
+        assert_eq!(
+            (
+                file(&files, "kept.txt").added,
+                file(&files, "kept.txt").removed
+            ),
+            (Some(1), Some(0))
+        );
+        assert_eq!(
+            (
+                file(&files, "gone.txt").added,
+                file(&files, "gone.txt").removed
+            ),
+            (Some(0), Some(1))
+        );
+        let renamed = file(&files, "renamed.txt");
+        assert_eq!(renamed.orig_path.as_deref(), Some("moved.txt"));
+        assert_eq!((renamed.added, renamed.removed), (Some(0), Some(0)));
+        assert!(files.iter().all(|f| !f.binary));
+
+        let branches = local_branches(&*host, repo);
+        assert_eq!(branches, ["main", "side"], "both of them, in refname order");
         assert!(branches.iter().all(|b| !b.starts_with("refs/heads/")));
     }
 
+    /// The lane layout against a history with a shape, not a straight line:
+    ///
+    /// ```text
+    ///   top          main
+    ///   merge
+    ///   |    \
+    ///   main2 side2
+    ///   main1 side1
+    ///   |    /
+    ///   root
+    /// ```
+    ///
+    /// Seven commits, which is also what makes the paging assertion at the end
+    /// honest — a page of five cannot be the whole history.
     #[test]
-    fn this_repo_lays_out_one_row_per_commit() {
+    fn a_real_repository_lays_out_one_row_per_commit() {
         let host = crate::host::local::LocalHost::new();
-        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-        // Graceful about not being in a repository at all: a source tarball is
-        // a legitimate place to run the tests from.
-        let Some(page) = load_page(&*host, here, &GraphScope::Head, 30) else {
+        let Some(scratch) = scratch("layout") else {
             return;
         };
+        let repo = &scratch.0;
+        if !init_repo(&*host, repo) {
+            return; // no git on this machine
+        }
+
+        commit_file(&*host, repo, "root.txt", "0\n", "root");
+        assert!(run(&*host, repo, &["checkout", "--quiet", "-b", "side"]));
+        commit_file(&*host, repo, "side.txt", "1\n", "side one");
+        commit_file(&*host, repo, "side.txt", "2\n", "side two");
+        assert!(run(&*host, repo, &["checkout", "--quiet", "main"]));
+        commit_file(&*host, repo, "main.txt", "1\n", "main one");
+        commit_file(&*host, repo, "main.txt", "2\n", "main two");
+        // The two branches touch different files, so this merges clean.
+        assert!(run(
+            &*host,
+            repo,
+            &[
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                "merge side",
+                "side"
+            ]
+        ));
+        commit_file(&*host, repo, "main.txt", "3\n", "after the merge");
+
+        let page =
+            load_page(&*host, repo, &GraphScope::Head, 30).expect("a repository was just created");
 
         assert_eq!(page.rows.len(), page.commits.len());
-        assert!(!page.commits.is_empty(), "this repo has commits");
-        assert!(page.max_lanes >= 1);
+        assert_eq!(
+            page.commits.len(),
+            7,
+            "the root, two on the side branch, two on main, the merge, and the one on top"
+        );
+        assert!(page.complete, "thirty asked for, seven exist");
+        assert!(
+            page.max_lanes >= 2,
+            "a branch that forks and merges back needs a second lane: {page:?}"
+        );
         assert!(!page.truncated_lanes);
         assert!(page.rows.iter().all(|r| r.node < page.max_lanes));
         assert!(page.commits.iter().all(|c| is_hex_oid(&c.oid)));
@@ -1764,8 +1934,30 @@ mod tests {
         );
         assert_lanes_line_up(&page.rows);
 
-        let page = load_page(&*host, here, &GraphScope::HeadAndUpstream, 5).unwrap();
+        // Row *i* is commit *i*, which is only worth checking where the two
+        // could come apart: the merge is the one commit with two parents, and
+        // its row is the one that sends a line to each of them.
+        let merges: Vec<usize> = page
+            .commits
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.parents.len() == 2)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(merges.len(), 1, "one merge in the fixture");
+        let row = &page.rows[merges[0]];
+        assert_eq!(row.parents, 2, "the row agrees with the commit beside it");
+        assert_eq!(
+            row.edges
+                .iter()
+                .filter(|e| matches!(e, Edge::Out { .. }))
+                .count(),
+            2,
+            "the merge row leaves for both parents: {row:?}"
+        );
+
+        let page = load_page(&*host, repo, &GraphScope::HeadAndUpstream, 5).unwrap();
         assert_eq!(page.commits.len(), 5);
-        assert!(!page.complete, "five commits is not the whole history");
+        assert!(!page.complete, "five of the seven is not the whole history");
     }
 }
