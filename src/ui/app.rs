@@ -450,7 +450,10 @@ pub struct Tty7App {
     _file_search_sub: Subscription,
     settings: Option<SettingsState>,
     pub(crate) ssh_prompt: crate::ui::ssh_prompt::SshPromptState,
-    pub(crate) close_confirm: Option<(CloseTarget, CloseReason)>,
+    /// A close question is on screen. It carries no target: the answer acts on
+    /// the tab or pane captured when the question was raised, not on whatever
+    /// the app happens to be pointing at by the time it is answered.
+    close_prompt_open: bool,
     window_bounds: Bounds<Pixels>,
     pub(crate) workspace: WorkspaceId,
     pub(crate) workspace_rename: Option<WorkspaceRename>,
@@ -469,9 +472,12 @@ pub struct Tty7App {
     pub(crate) startup_error: Option<gpui::SharedString>,
 }
 
+/// What a raised close question is about. Tabs are named by their id, not their
+/// index: a tab that exits on its own while the question is on screen shifts
+/// every index after it, and answering "Close" must not then end a bystander.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseTarget {
-    Tab(usize),
+    Tab(tty7_core::core::machine::TabId),
     Pane,
 }
 
@@ -865,7 +871,7 @@ impl Tty7App {
             _file_search_sub: file_search_sub,
             settings: None,
             ssh_prompt: crate::ui::ssh_prompt::SshPromptState::new(cx),
-            close_confirm: None,
+            close_prompt_open: false,
             window_bounds: window.window_bounds().get_bounds(),
             workspace,
             workspace_rename: None,
@@ -2629,14 +2635,17 @@ impl Tty7App {
     }
 
     fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.close_confirm.is_none()
-            && let Some(reason) = self.focused_pane_close_reason(window, cx)
-        {
-            self.close_confirm = Some((CloseTarget::Pane, reason));
-            self.ask_before_closing(window, cx);
+        self.close_pane_inner(false, window, cx);
+    }
+
+    /// `confirmed` is set only by the answer to this pane's own close question,
+    /// so it travels with the close rather than being read back off shared
+    /// state a second, unrelated close could have overwritten.
+    fn close_pane_inner(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !confirmed && let Some(reason) = self.focused_pane_close_reason(window, cx) {
+            self.ask_before_closing(CloseTarget::Pane, reason, window, cx);
             return;
         }
-        self.close_confirm = None;
         self.maximized = None;
         let focused = self.tabs.get(self.active).and_then(|tab| {
             tab.pane
@@ -2650,8 +2659,11 @@ impl Tty7App {
             None => return,
         };
         match outcome {
+            // The last pane takes its tab with it. The question was already
+            // asked about this very pane, so carry the answer across rather
+            // than letting the tab re-derive the same reason and ask again.
             CloseOutcome::RemoveSelf => {
-                self.close_tab(self.active, window, cx);
+                self.close_tab_inner(self.active, confirmed, window, cx);
             }
             CloseOutcome::NotFound => {
                 let single = self
@@ -2659,7 +2671,7 @@ impl Tty7App {
                     .get(self.active)
                     .is_some_and(|tab| tab.pane.leaves().len() <= 1);
                 if single {
-                    self.close_tab(self.active, window, cx);
+                    self.close_tab_inner(self.active, confirmed, window, cx);
                 }
             }
             CloseOutcome::Collapsed => {
@@ -2879,17 +2891,25 @@ impl Tty7App {
     }
 
     pub(crate) fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab_inner(index, false, window, cx);
+    }
+
+    /// See [`Self::close_pane_inner`] for what `confirmed` carries.
+    fn close_tab_inner(
+        &mut self,
+        index: usize,
+        confirmed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index >= self.tabs.len() {
             return;
         }
-        let already_confirming =
-            matches!(&self.close_confirm, Some((CloseTarget::Tab(i), _)) if *i == index);
-        if !already_confirming && let Some(reason) = self.tab_close_reason(index, cx) {
-            self.close_confirm = Some((CloseTarget::Tab(index), reason));
-            self.ask_before_closing(window, cx);
+        if !confirmed && let Some(reason) = self.tab_close_reason(index, cx) {
+            let id = self.tabs[index].tree_id.get();
+            self.ask_before_closing(CloseTarget::Tab(id), reason, window, cx);
             return;
         }
-        self.close_confirm = None;
         self.maximized = None;
         self.renaming = None;
         let worktree_cwd = self.tab_host_cwd(index, window, cx);
@@ -3011,14 +3031,17 @@ impl Tty7App {
         if index >= self.tabs.len() {
             return;
         }
-        // A bulk close skips anything that would otherwise raise a question,
-        // rather than stacking one dialog per tab. The tab staying open is its
-        // own explanation.
+        // A bulk close skips the tabs whose profile asked to be warned about,
+        // and closes the rest outright — one dialog per tab is not a question
+        // anyone can answer, and only the first would ever get asked. It
+        // deliberately does *not* skip merely busy tabs: on a working window
+        // that is most of them, and a menu item that quietly closes nothing is
+        // worse than one that closes what it says.
         for i in (0..self.tabs.len()).rev() {
-            if i == index || self.tab_close_reason(i, cx).is_some() {
+            if i == index || self.tab_has_warn_ssh(i, cx) {
                 continue;
             }
-            self.close_tab(i, window, cx);
+            self.close_tab_inner(i, true, window, cx);
         }
     }
 
@@ -3028,11 +3051,12 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Same bargain as `close_other_tabs`.
         for i in ((index + 1)..self.tabs.len()).rev() {
-            if self.tab_close_reason(i, cx).is_some() {
+            if self.tab_has_warn_ssh(i, cx) {
                 continue;
             }
-            self.close_tab(i, window, cx);
+            self.close_tab_inner(i, true, window, cx);
         }
     }
 
@@ -4626,10 +4650,17 @@ impl Tty7App {
     /// The app asks every other question of this class through the platform's
     /// own dialog. This one used to be a bespoke in-app card with no scrim, no
     /// Escape and no click-outside — the two buttons were the only way out.
-    fn ask_before_closing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((target, reason)) = self.close_confirm.clone() else {
+    fn ask_before_closing(
+        &mut self,
+        target: CloseTarget,
+        reason: CloseReason,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.close_prompt_open {
             return;
-        };
+        }
+        self.close_prompt_open = true;
         // ⌘W closes a pane, but when it is the only one in its tab the tab goes
         // with it — the question has to name what actually disappears.
         let ends_the_tab = matches!(target, CloseTarget::Tab(_))
@@ -4650,27 +4681,27 @@ impl Tty7App {
         );
         cx.spawn_in(window, async move |this, cx| {
             let close = matches!(answer.await, Ok(0));
-            let _ = this.update_in(cx, |this, window, cx| match close {
-                true => this.confirm_close(window, cx),
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.close_prompt_open = false;
                 // Cancelled, or the window went away with the question open:
                 // either way the work carries on.
-                false => this.cancel_close(cx),
+                if !close {
+                    cx.notify();
+                    return;
+                }
+                match target {
+                    // The tab may have moved, or gone, while the question was
+                    // up; find it by id and let it be if it is already closed.
+                    CloseTarget::Tab(id) => {
+                        if let Some(i) = this.tabs.iter().position(|t| t.tree_id.get() == id) {
+                            this.close_tab_inner(i, true, window, cx);
+                        }
+                    }
+                    CloseTarget::Pane => this.close_pane_inner(true, window, cx),
+                }
             });
         })
         .detach();
-    }
-
-    pub(crate) fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.close_confirm.as_ref().map(|(t, _)| *t) {
-            Some(CloseTarget::Tab(i)) => self.close_tab(i, window, cx),
-            Some(CloseTarget::Pane) => self.close_pane(window, cx),
-            None => {}
-        }
-    }
-
-    pub(crate) fn cancel_close(&mut self, cx: &mut Context<Self>) {
-        self.close_confirm = None;
-        cx.notify();
     }
 
     /// The first reason this pane should not simply vanish.
@@ -4679,6 +4710,18 @@ impl Tty7App {
             return Some(CloseReason::LiveSsh);
         }
         leaf.read(cx).busy().map(CloseReason::Busy)
+    }
+
+    /// Whether closing this tab would drop a connection the user asked to be
+    /// warned about. Narrower than [`Self::tab_close_reason`] on purpose — see
+    /// the bulk closes, which skip these and only these.
+    fn tab_has_warn_ssh(&self, index: usize, cx: &App) -> bool {
+        self.tabs.get(index).is_some_and(|tab| {
+            tab.pane
+                .terminals()
+                .iter()
+                .any(|l| self.leaf_is_warn_ssh(l, cx))
+        })
     }
 
     fn tab_close_reason(&self, index: usize, cx: &App) -> Option<CloseReason> {
