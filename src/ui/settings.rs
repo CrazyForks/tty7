@@ -1,7 +1,7 @@
 use gpui::{
-    AnyElement, App, Context, Div, Entity, FontWeight, Image, ImageFormat, KeyDownEvent,
-    MouseButton, SharedString, Stateful, Subscription, Window, div, img, prelude::*, px, relative,
-    rgb,
+    AnyElement, App, Background, Context, Div, Entity, FontWeight, Image, ImageFormat,
+    KeyDownEvent, MouseButton, SharedString, Stateful, Subscription, Window, div, img, prelude::*,
+    px, relative, rgb,
 };
 use gpui_component::InteractiveElementExt as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::core::config::{
     BellMode, Config, CursorStyle, NewTabPosition, NotifyMode, TabBarPosition, UpdateChannel,
+    WindowBackdrop,
 };
 use crate::core::keychain::CredentialRef;
 use crate::core::ssh_profile::{
@@ -39,6 +40,15 @@ use crate::ui::rounding::RoundedCorners as _;
 
 fn settings_row_id(label: &str, _desc: &str) -> SharedString {
     SharedString::from(format!("settings-row-{label}"))
+}
+
+/// Whether the reset control has any effective override to clear on this
+/// platform. A synchronized Windows backdrop remains stored elsewhere but is
+/// inert here, so only platforms that expose it locally may count it.
+fn window_overrides_active(config: &Config, backdrop_is_local: bool) -> bool {
+    config.window_opacity.is_some()
+        || config.window_blur.is_some()
+        || (backdrop_is_local && config.window_backdrop != WindowBackdrop::Auto)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -108,6 +118,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: Appearance,
+            title: SettingsLegiblePalette,
+            keywords: SettingsSearchLegiblePaletteKeywords,
+        },
+        SearchEntry {
+            section: Appearance,
             title: SettingsCustomThemes,
             keywords: SettingsSearchCustomThemesKeywords,
         },
@@ -120,6 +135,12 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             section: Appearance,
             title: SettingsBlur,
             keywords: SettingsSearchBlurKeywords,
+        },
+        #[cfg(target_os = "windows")]
+        SearchEntry {
+            section: Appearance,
+            title: SettingsBackdrop,
+            keywords: SettingsSearchBackdropKeywords,
         },
         SearchEntry {
             section: Appearance,
@@ -432,6 +453,8 @@ pub(crate) struct SettingsState {
     pub(crate) font_bold_select: Entity<SelectState<SearchableVec<String>>>,
     pub(crate) font_italic_select: Entity<SelectState<SearchableVec<String>>>,
     pub(crate) language_select: Entity<SelectState<SearchableVec<String>>>,
+    #[cfg(target_os = "windows")]
+    pub(crate) window_backdrop_select: Entity<SelectState<SearchableVec<String>>>,
     pub(crate) shell_program_input: Entity<InputState>,
     pub(crate) shell_args_input: Entity<InputState>,
     pub(crate) wd_path_input: Entity<InputState>,
@@ -732,8 +755,18 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let (background, foreground, header_muted) =
-            (theme.background, theme.foreground, theme.muted_foreground);
+        // The settings panel covers the whole window. Paint it on an opaque
+        // surface so the workspace translucency (window opacity / backdrop
+        // material) never shows through the settings UI — while keeping the
+        // preset's gradient fill instead of collapsing to a flat color.
+        let background: Background = crate::ui::theme::overlay_background(cx);
+        // That opaque fill also covers the theme background image the
+        // workspace root paints, so the panel carries its own copy (dimmed by
+        // the workspace fill, or the settings text would sit straight on the
+        // wallpaper); without it the image would blink out for as long as
+        // settings is open.
+        let background_layers = crate::ui::app::overlay_surface_layers(cx);
+        let (foreground, header_muted) = (theme.foreground, theme.muted_foreground);
 
         let (focus_handle, section, theme_panel_open, search) = match self.active_settings() {
             Some(s) => (
@@ -865,13 +898,15 @@ impl Tty7App {
             SettingsSection::About => self.render_settings_about(cx),
         };
 
+        // No fill of its own: the root already paints the opaque surface and
+        // the background image behind it, and repainting here would hide the
+        // image again in the one pane that fills most of the panel.
         let content_pane = if section == SettingsSection::Ssh {
             v_flex()
                 .id("settings-content")
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .bg(background)
                 .child(content)
         } else {
             v_flex()
@@ -879,7 +914,6 @@ impl Tty7App {
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .bg(background)
                 .overflow_y_scroll()
                 .child(
                     div()
@@ -902,6 +936,7 @@ impl Tty7App {
                     this.close_settings(window, cx);
                 }
             }))
+            .children(background_layers)
             .child(sidebar)
             .child(content_pane)
             .child(
@@ -1327,11 +1362,9 @@ impl Tty7App {
             return div().into_any_element();
         };
         let config = cx.global::<Config>();
-        let overridden = config.window_opacity.is_some() || config.window_blur.is_some();
+        let overridden = window_overrides_active(config, cfg!(target_os = "windows"));
         let dim_inactive_panes = config.dim_inactive_panes;
-        let theme = presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
         let opacity = Tty7App::effective_window_opacity(cx);
-        let blur = cx.global::<Config>().window_blur.unwrap_or(theme.blur);
 
         let opacity_control = h_flex()
             .items_center()
@@ -1349,12 +1382,69 @@ impl Tty7App {
                     .child(format!("{:.0}%", opacity * 100.)),
             )
             .into_any_element();
-        let blur_switch = crate::ui::theme::switch("window-blur", cx)
-            .checked(blur)
-            .on_click(
-                cx.listener(|this, on: &bool, window, cx| this.set_window_blur(*on, window, cx)),
+        // Windows exposes the native backdrop materials directly; macOS keeps
+        // the simple blur toggle, which drives its vibrancy.
+        #[cfg(target_os = "windows")]
+        let blur_control = {
+            // Both selects come from the same SettingsState resolved at the
+            // top of this function (window_opacity_slider), so the None arm
+            // is unreachable today; fall back to an empty control rather
+            // than returning from the whole section — a missing select must
+            // never silently drop the opacity slider and the rest.
+            match self
+                .active_settings()
+                .map(|s| s.window_backdrop_select.clone())
+            {
+                Some(select) => Select::new(&select)
+                    .small()
+                    .w(px(180.))
+                    .h(px(24.))
+                    .menu_max_h(px(224.))
+                    .into_any_element(),
+                None => div().into_any_element(),
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let blur_control =
+            {
+                let theme = presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
+                let blur = config.window_blur.unwrap_or(theme.blur);
+                crate::ui::theme::switch("window-blur", cx)
+                    .checked(blur)
+                    .on_click(cx.listener(|this, on: &bool, window, cx| {
+                        this.set_window_blur(*on, window, cx)
+                    }))
+                    .into_any_element()
+            };
+        // `Auto` is the one backdrop that still defers to the legacy blur
+        // flag, which is shared with the other platforms' vibrancy switch and
+        // travels with a synced config. Offer that switch here exactly when it
+        // has an effect — otherwise a stored `window_blur: true` would blur
+        // the window with no visible control to clear it, short of the reset
+        // button, which also discards the user's opacity.
+        #[cfg(target_os = "windows")]
+        let auto_blur_row = (config.window_backdrop == WindowBackdrop::Auto).then(|| {
+            let theme = presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
+            let blur = config.window_blur.unwrap_or(theme.blur);
+            let control =
+                crate::ui::theme::switch("window-blur", cx)
+                    .checked(blur)
+                    .on_click(cx.listener(|this, on: &bool, window, cx| {
+                        this.set_window_blur(*on, window, cx)
+                    }))
+                    .into_any_element();
+            self.settings_row(
+                t(L10nKey::SettingsBlur),
+                // Not `SettingsBlurDesc` — that one says "(macOS)", which is
+                // exactly wrong here. This row explains the flag's one
+                // remaining job on Windows: feeding the `Auto` material.
+                t(L10nKey::SettingsBlurAutoDesc),
+                control,
+                cx,
             )
-            .into_any_element();
+        });
+        #[cfg(not(target_os = "windows"))]
+        let auto_blur_row: Option<Stateful<Div>> = None;
         let dim_switch = crate::ui::theme::switch("dim-inactive-panes", cx)
             .checked(dim_inactive_panes)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_dim_inactive_panes(*on, cx)))
@@ -1369,11 +1459,20 @@ impl Tty7App {
                 cx,
             ))
             .child(self.settings_row(
-                t(L10nKey::SettingsBlur),
-                t(L10nKey::SettingsBlurDesc),
-                blur_switch,
+                t(if cfg!(target_os = "windows") {
+                    L10nKey::SettingsBackdrop
+                } else {
+                    L10nKey::SettingsBlur
+                }),
+                t(if cfg!(target_os = "windows") {
+                    L10nKey::SettingsBackdropDesc
+                } else {
+                    L10nKey::SettingsBlurDesc
+                }),
+                blur_control,
                 cx,
             ))
+            .children(auto_blur_row)
             .when(overridden, |this| {
                 this.child(
                     h_flex().mt_2().child(
@@ -4151,12 +4250,26 @@ impl Tty7App {
                 this.set_theme_follow_system(*on, window, cx)
             }))
             .into_any_element();
-        let root = v_flex().child(self.settings_row(
-            t(L10nKey::SettingsSyncWithSystem),
-            t(L10nKey::SettingsSyncWithSystemDesc),
-            follow_switch,
-            cx,
-        ));
+        let legible = cx.global::<Config>().theme_legible_palette;
+        let legible_switch = crate::ui::theme::switch("theme-legible-palette", cx)
+            .checked(legible)
+            .on_click(cx.listener(|this, on: &bool, window, cx| {
+                this.set_theme_legible_palette(*on, window, cx)
+            }))
+            .into_any_element();
+        let root = v_flex()
+            .child(self.settings_row(
+                t(L10nKey::SettingsSyncWithSystem),
+                t(L10nKey::SettingsSyncWithSystemDesc),
+                follow_switch,
+                cx,
+            ))
+            .child(self.settings_row(
+                t(L10nKey::SettingsLegiblePalette),
+                t(L10nKey::SettingsLegiblePaletteDesc),
+                legible_switch,
+                cx,
+            ));
         if follow {
             root.child(self.render_theme_card(ThemeSlot::Light, cx))
                 .child(self.render_theme_card(ThemeSlot::Dark, cx))
@@ -5111,6 +5224,28 @@ mod tests {
     }
 
     #[test]
+    fn synced_windows_backdrop_is_only_a_local_override_on_windows() {
+        let mut config = Config::default();
+        config.window_backdrop = WindowBackdrop::MicaAlt;
+
+        assert!(window_overrides_active(&config, true));
+        assert!(!window_overrides_active(&config, false));
+    }
+
+    #[test]
+    fn opacity_and_blur_are_local_overrides_on_every_platform() {
+        let mut opacity = Config::default();
+        opacity.window_opacity = Some(0.8);
+        opacity.window_backdrop = WindowBackdrop::Mica;
+        let mut blur = Config::default();
+        blur.window_blur = Some(true);
+        blur.window_backdrop = WindowBackdrop::Acrylic;
+
+        assert!(window_overrides_active(&opacity, false));
+        assert!(window_overrides_active(&blur, false));
+    }
+
+    #[test]
     fn every_section_has_search_entries() {
         for section in SettingsSection::ALL {
             let n = settings_search_entries()
@@ -5145,7 +5280,7 @@ mod tests {
     #[test]
     fn previously_unsearchable_settings_are_findable() {
         use SettingsSection::*;
-        let cases: &[(&str, SettingsSection)] = &[
+        let mut cases: Vec<(&str, SettingsSection)> = vec![
             ("opacity", Appearance),
             ("blur", Appearance),
             ("completion", Input),
@@ -5160,6 +5295,12 @@ mod tests {
             ("claude", Agents),
             ("symlink", Agents),
         ];
+        #[cfg(target_os = "windows")]
+        cases.extend([
+            ("material", Appearance),
+            ("mica", Appearance),
+            ("acrylic", Appearance),
+        ]);
         for (query, expected) in cases {
             assert_eq!(
                 best_matching_section(query).map(|s| s.profile_label()),

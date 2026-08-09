@@ -114,6 +114,22 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsBlur => "Blur",
         L10nKey::SettingsBlurDesc => "Blur whatever is behind a translucent window (macOS).",
+        L10nKey::SettingsBlurAutoDesc => {
+            "Blur whatever is behind a translucent window. Only applies while Background material is Auto."
+        }
+        L10nKey::SettingsBackdrop => "Background material",
+        L10nKey::SettingsBackdropDesc => {
+            "Native Windows backdrop behind a translucent window. Mica needs Windows 11 22H2, Acrylic needs 1809; older builds fall back automatically."
+        }
+        L10nKey::SettingsSearchBackdropKeywords => {
+            "material backdrop mica acrylic blur frosted window background"
+        }
+        L10nKey::SettingsBackdropAuto => "Auto",
+        L10nKey::SettingsBackdropBlur => "Blur",
+        L10nKey::SettingsBackdropMica => "Mica",
+        L10nKey::SettingsBackdropMicaAlt => "Mica Alt",
+        L10nKey::SettingsBackdropAcrylic => "Acrylic",
+        L10nKey::SettingsBackdropOff => "Off",
         L10nKey::FollowTheme => "Follow theme",
         L10nKey::SettingsDimInactivePanes => "Dim inactive panes",
         L10nKey::SettingsDimInactivePanesDesc => {
@@ -377,6 +393,10 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsSyncWithSystem => "Sync with system",
         L10nKey::SettingsSyncWithSystemDesc => {
             "Follow the OS appearance with separate light and dark themes."
+        }
+        L10nKey::SettingsLegiblePalette => "Legible bright colors",
+        L10nKey::SettingsLegiblePaletteDesc => {
+            "Automatically brighten or darken bright ANSI colors that would be unreadable on the theme background."
         }
         L10nKey::SettingsChangeTheme => "Change theme",
         L10nKey::SettingsThemes => "Themes",
@@ -675,6 +695,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsSearchSyncWithSystemKeywords => {
             "theme dark light auto follow os appearance mode"
+        }
+        L10nKey::SettingsSearchLegiblePaletteKeywords => {
+            "legible contrast bright palette psreadline parameter readable"
         }
         L10nKey::SettingsSearchTabBarPositionKeywords => {
             "tabs vertical sidebar left top layout rail"
@@ -1206,8 +1229,8 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "The server holding your shells predates the version handshake, so this app can't tell what it speaks.\n\nQuit: nothing changes — the server and your shells keep running.\nRestart: tabs come back with fresh shells, and anything running now is killed."
         }
         L10nKey::AppRestart => "Restart",
-        L10nKey::AppRestartServerNotSsh => {
-            "tty7 can only restart the server on machines it reaches over SSH. {label} is served from this computer — stop its workspace instead."
+        L10nKey::AppRestartServerNoServer => {
+            "tty7 has no server of its own to restart on {label} — it is a program this computer runs over --stdio. Stop its workspace instead."
         }
         L10nKey::AppRestartServerBody => {
             "This stops every running shell on this computer — anything still running in them will be terminated. Your tabs and layout are kept and reopened with fresh shells."

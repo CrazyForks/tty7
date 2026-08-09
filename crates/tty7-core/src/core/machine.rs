@@ -70,10 +70,17 @@ pub struct Machine {
     pub panes: Vec<PaneRecord>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
+    /// Proof that a connection is the one holding the workspace, so it stays
+    /// between that connection and the server: it goes over no wire and onto
+    /// no disk. A peer asking who holds a workspace gets the name and the
+    /// time, never the means to pose as them.
+    #[serde(skip)]
     pub token: String,
+    #[serde(default)]
     pub hostname: String,
+    #[serde(default)]
     pub since: u64,
 }
 
@@ -99,7 +106,11 @@ pub struct Workspace {
     pub tabs: Vec<Tab>,
     #[serde(default)]
     pub active_tab: Option<TabId>,
-    #[serde(skip)]
+    /// Who is holding this workspace right now. Answered over the wire so a
+    /// peer can see the workspace is spoken for, but stripped before the
+    /// document is written: an attachment belongs to a live connection, and
+    /// one read back at boot would name a holder that no longer exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<Attachment>,
 }
 
@@ -1061,7 +1072,11 @@ impl MachineStore {
     }
 
     fn persist(&self, m: &Machine) -> io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(m).map_err(io::Error::other)?;
+        let mut doc = m.clone();
+        for ws in &mut doc.workspaces {
+            ws.attachment = None;
+        }
+        let bytes = serde_json::to_vec_pretty(&doc).map_err(io::Error::other)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1158,7 +1173,7 @@ fn load_machine(path: &Path) -> Machine {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Machine::default(),
         Err(e) => {
             log::warn!("could not read {}; quarantining it: {e}", path.display());
-            quarantine_by_rename(path);
+            crate::core::config::quarantine_by_rename(path);
             return Machine::default();
         }
     };
@@ -1171,7 +1186,7 @@ fn load_machine(path: &Path) -> Machine {
         }
         Err(e) => {
             log::warn!("{} does not parse ({e}); quarantining it", path.display());
-            quarantine(path);
+            crate::core::config::quarantine(path);
             Machine::default()
         }
     }
@@ -1201,35 +1216,6 @@ pub(crate) fn withdraw_observations() {
 
 #[cfg(test)]
 pub(crate) static OBSERVE_SLOT: Mutex<()> = Mutex::new(());
-
-fn quarantine(path: &Path) {
-    let aside = quarantine_path(path);
-    match std::fs::copy(path, &aside) {
-        Ok(_) => log::warn!("the previous contents were kept at {}", aside.display()),
-        Err(e) => log::warn!("could not keep a copy at {}: {e}", aside.display()),
-    }
-}
-
-fn quarantine_by_rename(path: &Path) {
-    let aside = quarantine_path(path);
-    match std::fs::rename(path, &aside) {
-        Ok(()) => log::warn!("the previous contents were moved to {}", aside.display()),
-        Err(e) => log::warn!("could not move the file to {}: {e}", aside.display()),
-    }
-}
-
-fn quarantine_path(path: &Path) -> PathBuf {
-    const MAX_QUARANTINED: u32 = 8;
-
-    let base = path.with_extension("json.corrupt");
-    if !base.exists() {
-        return base;
-    }
-    (1..MAX_QUARANTINED)
-        .map(|n| path.with_extension(format!("json.corrupt.{n}")))
-        .find(|candidate| !candidate.exists())
-        .unwrap_or(base)
-}
 
 pub fn default_machine_path() -> io::Result<PathBuf> {
     Ok(data_dir()?.join(MACHINE_FILE))
@@ -1957,6 +1943,23 @@ mod tests {
             MachineStore::open(dir.path().join(MACHINE_FILE)).attachment(ws),
             None
         );
+    }
+
+    #[test]
+    fn an_attachment_travels_by_name_and_never_by_token() {
+        let (store, _dir, ws, _tab) = store_with_tab();
+        store.attach(ws, Attachment::new("secret-token", "laptop"));
+
+        // What `MachineGet` hands a peer: `tty7 ls` reads its ATTACHED column
+        // out of this, so a held workspace has to say so here.
+        let wire = serde_json::to_string(&store.machine()).unwrap();
+        assert!(wire.contains("laptop"), "{wire}");
+        assert!(!wire.contains("secret-token"), "{wire}");
+
+        let seen: Machine = serde_json::from_str(&wire).unwrap();
+        let held = seen.workspaces.iter().find(|w| w.id == ws).unwrap();
+        assert_eq!(held.attachment.as_ref().unwrap().hostname, "laptop");
+        assert!(held.attachment.as_ref().unwrap().token.is_empty());
     }
 
     #[test]

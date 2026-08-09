@@ -118,6 +118,22 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsBlur => "背景のぼかし",
         L10nKey::SettingsBlurDesc => "半透明ウィンドウの背後にあるものをぼかす（macOS）",
+        L10nKey::SettingsBlurAutoDesc => {
+            "半透明ウィンドウの背後にあるものをぼかす。背景マテリアルが「自動」のときのみ有効です"
+        }
+        L10nKey::SettingsBackdrop => "背景マテリアル",
+        L10nKey::SettingsBackdropDesc => {
+            "半透明ウィンドウの背後にあるネイティブ Windows 背景マテリアル。Mica には Windows 11 22H2、Acrylic には 1809 が必要です。古いビルドでは自動的にフォールバックします"
+        }
+        L10nKey::SettingsSearchBackdropKeywords => {
+            "背景 マテリアル ぼかし すりガラス material backdrop mica acrylic blur frosted window background"
+        }
+        L10nKey::SettingsBackdropAuto => "自動",
+        L10nKey::SettingsBackdropBlur => "ぼかし",
+        L10nKey::SettingsBackdropMica => "Mica",
+        L10nKey::SettingsBackdropMicaAlt => "Mica Alt",
+        L10nKey::SettingsBackdropAcrylic => "Acrylic",
+        L10nKey::SettingsBackdropOff => "オフ",
         L10nKey::FollowTheme => "テーマに従う",
         L10nKey::SettingsDimInactivePanes => "非アクティブなペインを暗くする",
         L10nKey::SettingsDimInactivePanesDesc => {
@@ -377,6 +393,10 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsSyncWithSystem => "システムテーマと同期",
         L10nKey::SettingsSyncWithSystemDesc => {
             "OS の外観に従い、ライトとダークのテーマを別々に使用する"
+        }
+        L10nKey::SettingsLegiblePalette => "明色の可読性",
+        L10nKey::SettingsLegiblePaletteDesc => {
+            "テーマ背景でコントラスト不足の明色を自動調整して、可読性を確保します。"
         }
         L10nKey::SettingsChangeTheme => "テーマを変更",
         L10nKey::SettingsThemes => "テーマ一覧",
@@ -717,6 +737,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsSearchSyncWithSystemKeywords => {
             "テーマ ダーク ライト 自動 os 外観 モード sync with system theme dark light auto follow appearance"
+        }
+        L10nKey::SettingsSearchLegiblePaletteKeywords => {
+            "可読 コントラスト 明色 パレット パラメーター 修正 legible bright contrast palette parameter"
         }
         L10nKey::SettingsSearchTabBarPositionKeywords => {
             "タブ 垂直 サイドバー 左 上 レイアウト レール tab bar position tabs vertical sidebar left top rail"
@@ -1241,8 +1264,8 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
             "サーバーはバージョン照合より前のもので、何を話すか分かりません。\n\n終了：何も変わりません。サーバーもシェルも動き続けます。\n再起動：タブは新しいシェルで戻り、いま実行中のものは終了します"
         }
         L10nKey::AppRestart => "再起動",
-        L10nKey::AppRestartServerNotSsh => {
-            "tty7 は SSH で到達できるマシン上のサーバーしか再起動できません。{label} はこのコンピュータで実行されています。代わりにそのワークスペースを止めてください"
+        L10nKey::AppRestartServerNoServer => {
+            "{label} には再起動できる tty7 自身のサーバーがありません。これはこのコンピュータが --stdio で実行しているプログラムです。代わりにそのワークスペースを止めてください"
         }
         L10nKey::AppRestartServerBody => {
             "このコンピュータで実行中のすべてのシェルが停止します。タブとレイアウトは保持され、新しいシェルで開きます"

@@ -43,8 +43,9 @@ log.workspace = true
 # Smart double-click selection patterns (URL/email/path). Already in the tree
 # transitively, so pinning it here adds no new native code.
 regex = "1"
-# SIMD byte search for `MarkScanner`'s Text-state fast path (`terminal::marks`),
-# which scans every output batch the client receives — the same skip-ahead the
+# SIMD byte search for `ParkedCursorScanner`'s fast path
+# (`terminal::parked_cursor`), which scans every output batch the client
+# receives — the same skip-ahead the
 # tokenizers in `tty7-core` already use. Already in the tree via `tty7-core`,
 # so this pins no new code.
 memchr = "2"
@@ -141,6 +142,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Registry",
+    "Wdk_System_SystemServices",
+    "Win32_System_SystemInformation",
     # `MessageBeep` (the terminal bell in `terminal::view`) is a user32 export,
     # but the Win32 metadata files it under Diagnostics::Debug, so that is the
     # module the binding needs — nothing here pulls in dbghelp.
@@ -251,7 +254,7 @@ edition = "2024"
 # they must never drift apart. This is the line a release bump edits (and the
 # one nightly's `awk '/^version = /'` stamps: it is the first such line in the
 # file, since the package entries above are all `version.workspace = true`).
-version = "26.8.1"
+version = "26.8.2"
 
 [workspace.dependencies]
 # Our fork's `tty7` branch carries the local customizations tty7 relies on:
@@ -299,7 +302,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee3
 #
 # Each patch has a guard test in `src/terminal/remote.rs`; drop this fork once
 # both land upstream.
-alacritty_terminal = { git = "https://github.com/l0ng-ai/alacritty", rev = "b79e70484b13308ce766a763531ac25a8302c012" }
+alacritty_terminal = { git = "https://github.com/l0ng-ai/alacritty", rev = "1276f128fbaa8832cbc66210675cbe8aeb570499" }
 
 anyhow = "1"
 log = "0.4"
