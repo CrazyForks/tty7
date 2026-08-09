@@ -185,7 +185,12 @@ impl Tty7App {
         // +N −N asks, and it is the one the reader is looking at. Hand the
         // numbers back before anything renders, or the row can disagree with
         // the overlay it just opened.
-        let mut landed = if let Some(snap) = snap.as_ref() {
+        //
+        // A read that failed is not an answer at all: its totals are whatever
+        // got parsed before git gave up, usually zero. Publishing those wipes
+        // the counts the sidebar already had right — the overlay says so in
+        // words a few lines below, and the row would silently disagree.
+        let mut landed = if let Some(snap) = snap.as_ref().filter(|s| !s.read_failed) {
             let (added, removed) = snap.totals();
             let root = snap.root.clone();
             cx.default_global::<crate::terminal::git_status::GitStatusCache>();
