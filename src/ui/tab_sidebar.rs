@@ -18,14 +18,13 @@ use crate::ui::app::{TITLE_BAR_HEIGHT, Tty7App};
 use crate::ui::hints::tab_badge_label;
 use crate::ui::i18n::{L10nKey, t};
 use crate::ui::reorder::{self, Reorder, Surface};
+use crate::ui::right_panel::RESIZE_HANDLE_WIDTH;
 use crate::ui::tab_strip::{DragTab, REORDER_SLIDE_MS};
 
 const MIN_SIDEBAR_WIDTH: f32 = 180.;
 
 const GRAB_HANDLE_W: f32 = 48.;
 const MAX_SIDEBAR_WIDTH_RATIO: f32 = 0.5;
-
-const RESIZE_HANDLE_WIDTH: f32 = 8.;
 
 const ROW_GAP: f32 = 2.;
 
@@ -51,6 +50,9 @@ impl Tty7App {
             .max(MIN_SIDEBAR_WIDTH);
         let width = self.sidebar_width.get().clamp(MIN_SIDEBAR_WIDTH, max_width);
         let query = self.sidebar_search.read(cx).value().trim().to_lowercase();
+        // Every group drops itself when its rows filter out, so a query that
+        // matches nothing left the sidebar showing only its own search box.
+        let mut any_rows = false;
 
         let mut list = v_flex()
             .id("tab-sidebar-list")
@@ -65,10 +67,15 @@ impl Tty7App {
         let keys: Rc<Vec<Option<PathBuf>>> = Rc::new(self.sidebar_group_keys(cx));
         let sections = sidebar_sections(&keys);
 
+        // ⌘N runs ActivateTabN, which goes through `activate_visual` — the
+        // Nth row as the sidebar lays it out, not the Nth tab in `self.tabs`.
+        // The badge has to be read off the same order or it names a chord that
+        // opens a different tab, so take it from `visual_tab_order` rather than
+        // flattening `sections` a second time here.
         let badge_pos: Vec<usize> = {
             let mut pos = vec![0usize; self.tabs.len()];
-            for (n, i) in sections.iter().flat_map(|s| s.tabs.iter()).enumerate() {
-                pos[*i] = n;
+            for (n, i) in self.visual_tab_order(cx).into_iter().enumerate() {
+                pos[i] = n;
             }
             pos
         };
@@ -79,7 +86,21 @@ impl Tty7App {
                 s.tabs
                     .iter()
                     .map(|&i| (i, self.tab_label(&self.tabs[i], i, Some(window), cx)))
-                    .filter(|(_, label)| query.is_empty() || label.to_lowercase().contains(&query))
+                    // The row shows a truncated title and a branch; the filter
+                    // only ever read the truncated title, so typing the branch
+                    // you can see, or the part of the path the row elided,
+                    // matched nothing.
+                    .filter(|(i, label)| {
+                        query.is_empty()
+                            || label.to_lowercase().contains(&query)
+                            || self.tabs[*i]
+                                .leaf_title(Some(window), cx)
+                                .to_lowercase()
+                                .contains(&query)
+                            || self.tabs[*i]
+                                .git_status(Some(window), cx)
+                                .is_some_and(|g| g.branch.to_lowercase().contains(&query))
+                    })
                     .collect()
             })
             .collect();
@@ -174,13 +195,21 @@ impl Tty7App {
                             .items_center()
                             .gap_1p5()
                             .when_some(git_cwd, |counts, (host, cwd)| {
-                                counts.cursor_pointer().on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_diff_overlay(host, cwd.clone(), window, cx);
-                                    }),
-                                )
+                                // A click target inside a click target: the row
+                                // highlights as a whole, which says nothing
+                                // about the counts being their own button. The
+                                // underline the SFTP breadcrumb uses for
+                                // clickable text says where this one starts.
+                                counts
+                                    .cursor_pointer()
+                                    .hover(|s| s.underline())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_diff_overlay(host, cwd.clone(), window, cx);
+                                        }),
+                                    )
                             });
                         if g.added > 0 {
                             counts = counts.child(
@@ -219,6 +248,15 @@ impl Tty7App {
                         .flex_1()
                         .min_w_0()
                         .gap(px(2.))
+                        .when_some(
+                            self.tab_title_tooltip(tab, i, Some(window), cx),
+                            |col, title| {
+                                col.tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(title.clone())
+                                        .build(window, cx)
+                                })
+                            },
+                        )
                         .child(
                             div()
                                 .w_full()
@@ -293,7 +331,15 @@ impl Tty7App {
                             this.activate(i, window, cx);
                         }),
                     )
-                    .child(self.tab_avatar(agent, agent_status, agent_unread, ssh_dot, 22., cx))
+                    .child(self.tab_avatar(
+                        ("sidebar-avatar", i),
+                        agent,
+                        agent_status,
+                        agent_unread,
+                        ssh_dot,
+                        22.,
+                        cx,
+                    ))
                     .child(label_region)
                     .when(show_badges && badge_pos < 9, |row| {
                         row.child(
@@ -330,20 +376,27 @@ impl Tty7App {
                                 .group_hover(SharedString::from(format!("tab-row-{i}")), |s| {
                                     s.opacity(1.)
                                 })
-                                .child(div().w(px(10.)).h(px(20.)).bg(linear_gradient(
-                                    90.,
-                                    linear_color_stop(fade_from, 0.),
-                                    linear_color_stop(backing, 1.),
-                                )))
+                                .child(div().w(px(10.)).h(px(crate::ui::tab_strip::MIN_TARGET)).bg(
+                                    linear_gradient(
+                                        90.,
+                                        linear_color_stop(fade_from, 0.),
+                                        linear_color_stop(backing, 1.),
+                                    ),
+                                ))
                                 .child(
                                     div().bg(backing).child(
-                                        Button::new(("sidebar-close", i))
-                                            .icon(IconName::Close)
-                                            .ghost()
-                                            .xsmall()
-                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                        crate::ui::tab_strip::hit_target(
+                                            Button::new(("sidebar-close", i))
+                                                .icon(IconName::Close)
+                                                .ghost()
+                                                .xsmall(),
+                                        )
+                                        .tooltip(t(L10nKey::TabContextCloseTab))
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
                                                 this.close_tab(i, window, cx);
-                                            })),
+                                            }),
+                                        ),
                                     ),
                                 ),
                         )
@@ -491,6 +544,7 @@ impl Tty7App {
                     )
                 });
 
+            any_rows = true;
             list = list.child(match (&group_preview, group_slot) {
                 (Some(p), Some(slot)) if p.from == slot => {
                     deferred(block.relative().top(p.held)).into_any_element()
@@ -511,6 +565,20 @@ impl Tty7App {
                 }
                 _ => block.into_any_element(),
             });
+        }
+
+        if !any_rows && !query.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_3()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(crate::ui::i18n::t_fmt(
+                        crate::ui::i18n::L10nKey::SettingsNothingMatches,
+                        &[("query", &query)],
+                    )),
+            );
         }
 
         let controls = h_flex()
@@ -555,7 +623,11 @@ impl Tty7App {
                         cx,
                     )
                     .rounded_lg()
-                    .tooltip(t(L10nKey::TabTooltipHideSidebar))
+                    .tooltip(crate::ui::tab_strip::chord_hint(
+                        t(L10nKey::TabTooltipHideSidebar),
+                        "ToggleLeftPanel",
+                        cx,
+                    ))
                     .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
                 ),
             );
@@ -969,6 +1041,40 @@ mod tests {
         assert_eq!(flat.len(), 1);
         assert_eq!(flat[0].name, None);
         assert_eq!(flat[0].tabs, vec![0, 1]);
+    }
+
+    /// The badge on a row and the tab ⌘N opens are two readings of one order,
+    /// taken in two places. Grouping makes them diverge from `self.tabs`
+    /// order — tab 3 sits in the second row here — so if they are ever read
+    /// off different things, the badge names a chord that opens another tab.
+    #[test]
+    fn a_row_badge_names_the_chord_that_opens_that_row() {
+        let keys = vec![
+            Some(p("/w/beta")),
+            None,
+            Some(p("/w/alpha")),
+            Some(p("/w/beta")),
+        ];
+        // What `visual_tab_order` returns for a left tab bar.
+        let order: Vec<usize> = sidebar_sections(&keys)
+            .into_iter()
+            .flat_map(|s| s.tabs)
+            .collect();
+        assert_eq!(order, vec![0, 3, 2, 1]);
+
+        let mut badge_pos = vec![0usize; keys.len()];
+        for (n, i) in order.iter().copied().enumerate() {
+            badge_pos[i] = n;
+        }
+        for (row, tab) in order.iter().copied().enumerate() {
+            // ActivateTabN → activate_visual(N - 1) → order[N - 1].
+            let chord = tab_badge_label(badge_pos[tab]);
+            let opens = order[badge_pos[tab]];
+            assert_eq!(
+                opens, tab,
+                "row {row} badges ⌘{chord}, which opens tab {opens}"
+            );
+        }
     }
 
     #[test]

@@ -551,25 +551,29 @@ impl Pane<PaneSlot> {
                 .size_full();
 
                 let line_color = if dragging.get() { active } else { idle };
-                let divider = div()
-                    .group("split-divider")
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
+                // The gutter stays 5px so the split looks the same; the target
+                // is the 8px the sidebar and right-panel edges already hand
+                // you. The extra 1.5px a side reaches into the pane's own 8px
+                // GRID_PAD_X, so it never covers a cell of terminal text.
+                let overhang =
+                    (crate::ui::right_panel::RESIZE_HANDLE_WIDTH - DIVIDER_THICKNESS).max(0.) / 2.;
+                let grab = div()
+                    .occlude()
+                    .absolute()
                     .when(row, |d| {
-                        d.w(px(DIVIDER_THICKNESS)).h_full().cursor_col_resize()
+                        d.top_0()
+                            .h_full()
+                            .left(px(-overhang))
+                            .w(px(DIVIDER_THICKNESS + overhang * 2.))
+                            .cursor_col_resize()
                     })
                     .when(!row, |d| {
-                        d.h(px(DIVIDER_THICKNESS)).w_full().cursor_row_resize()
+                        d.left_0()
+                            .w_full()
+                            .top(px(-overhang))
+                            .h(px(DIVIDER_THICKNESS + overhang * 2.))
+                            .cursor_row_resize()
                     })
-                    .child(
-                        div()
-                            .when(row, |d| d.w(px(1.)).h_full())
-                            .when(!row, |d| d.h(px(1.)).w_full())
-                            .bg(line_color)
-                            .group_hover("split-divider", |s| s.bg(active)),
-                    )
                     .on_mouse_down(MouseButton::Left, {
                         let dragging = dragging.clone();
                         move |_ev, window, _cx| {
@@ -577,6 +581,23 @@ impl Pane<PaneSlot> {
                             window.refresh();
                         }
                     });
+                let divider = div()
+                    .group("split-divider")
+                    .flex_none()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(row, |d| d.w(px(DIVIDER_THICKNESS)).h_full())
+                    .when(!row, |d| d.h(px(DIVIDER_THICKNESS)).w_full())
+                    .child(
+                        div()
+                            .when(row, |d| d.w(px(1.)).h_full())
+                            .when(!row, |d| d.h(px(1.)).w_full())
+                            .bg(line_color)
+                            .group_hover("split-divider", |s| s.bg(active)),
+                    )
+                    .child(grab);
 
                 div()
                     .size_full()

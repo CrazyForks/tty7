@@ -32,6 +32,7 @@ pub(crate) struct DiffOverlayState {
     pub(crate) loading: bool,
     pub(crate) expanded: HashMap<String, bool>,
     pub(crate) focus: Option<String>,
+    pub(crate) scroll: gpui::ScrollHandle,
 }
 
 /// Paints the full-window diff surface without inheriting workspace opacity.
@@ -111,6 +112,7 @@ impl Tty7App {
             loading: false,
             expanded: HashMap::new(),
             focus,
+            scroll: gpui::ScrollHandle::new(),
         });
         window.focus(&focus_handle, cx);
         self.spawn_diff_probe(cx);
@@ -193,7 +195,25 @@ impl Tty7App {
         snap: Option<Arc<DiffSnapshot>>,
         cx: &mut Context<Self>,
     ) {
-        let mut landed = false;
+        // A diff read is a fresher answer to the question the sidebar's
+        // +N −N asks, and it is the one the reader is looking at. Hand the
+        // numbers back before anything renders, or the row can disagree with
+        // the overlay it just opened.
+        //
+        // A read that failed is not an answer at all: its totals are whatever
+        // got parsed before git gave up, usually zero. Publishing those wipes
+        // the counts the sidebar already had right — the overlay says so in
+        // words a few lines below, and the row would silently disagree.
+        let mut landed = if let Some(snap) = snap.as_ref().filter(|s| !s.read_failed) {
+            let (added, removed) = snap.totals();
+            let root = snap.root.clone();
+            cx.default_global::<crate::terminal::git_status::GitStatusCache>();
+            cx.update_global::<crate::terminal::git_status::GitStatusCache, _>(|cache, _| {
+                cache.note_counts(host, &root, added, removed)
+            })
+        } else {
+            false
+        };
         for tab in self.tabs.iter_mut() {
             let Some(overlay) = tab
                 .diff_overlay
@@ -264,9 +284,13 @@ impl Tty7App {
             DiffLoad::Ready(snap) if empty_snapshot(snap) => {
                 self.diff_message(t(L10nKey::DiffWorkingTreeClean), cx)
             }
-            DiffLoad::Ready(snap) => {
-                self.diff_file_list(snap, &overlay.expanded, focused_file(snap, overlay), cx)
-            }
+            DiffLoad::Ready(snap) => self.diff_file_list(
+                snap,
+                &overlay.expanded,
+                focused_file(snap, overlay),
+                &overlay.scroll,
+                cx,
+            ),
         };
 
         let header = self.diff_header(overlay, window, cx);
@@ -461,6 +485,7 @@ impl Tty7App {
         snap: &DiffSnapshot,
         expanded: &HashMap<String, bool>,
         focused: Option<usize>,
+        scroll: &gpui::ScrollHandle,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let stats = snap.stats();
@@ -499,13 +524,19 @@ impl Tty7App {
         if focused.is_none() && !snap.untracked.is_empty() {
             list = list.child(self.diff_untracked_section(snap, cx));
         }
-        div()
-            .id("diff-overlay-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .child(list)
-            .into_any_element()
+        // A whole working tree can scroll past here with nothing to say how
+        // far it runs or where in it you are — the one long document in the
+        // app without the bar every other scroll area has.
+        crate::ui::scrollbar::with_vertical_scrollbar(
+            "diff-overlay-scrollbar",
+            div()
+                .id("diff-overlay-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(scroll)
+                .child(list),
+            scroll,
+        )
     }
 
     fn diff_oversized_notice(

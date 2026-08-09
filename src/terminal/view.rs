@@ -142,7 +142,7 @@ pub struct TerminalView {
     pub font_size: Pixels,
     pub line_height_mul: f32,
     pub cell_width: Pixels,
-    line_height: Pixels,
+    pub(super) line_height: Pixels,
     selecting: bool,
     drag_scroll: Option<DragScroll>,
     drag_scroll_epoch: u64,
@@ -169,6 +169,12 @@ pub struct TerminalView {
     pub(super) search_regex: bool,
     pub(super) search_regex_error: bool,
     pub(super) search_last_query: String,
+    /// Bumped by every wakeup that reaches an open search bar, so the pending
+    /// rescan can tell "the pane went quiet" from "more output landed".
+    pub(super) search_scan_epoch: u64,
+    /// Whether a rescan is already waiting out the debounce. One task at a
+    /// time, however fast the pane is printing.
+    pub(super) search_scan_armed: bool,
     pub bell_flash: bool,
     pub report_mouse: bool,
     last_at_prompt: bool,
@@ -338,6 +344,47 @@ fn compose_notification_title(
         (Some(lead), Some(workspace)) => format!("{lead} · {workspace}"),
         (Some(only), None) | (None, Some(only)) => only,
         (None, None) => "tty7".to_string(),
+    }
+}
+
+/// The longest command line to put in a confirmation. The shell sends up to
+/// 512 bytes; a dialog asking whether to end your work should still read as a
+/// sentence.
+const BUSY_COMMAND_MAX: usize = 60;
+
+/// Undo the escaping the shell integration applies to an OSC 133;C payload so
+/// it cannot break OSC framing: `%` and the four control bytes. Anything else
+/// is left exactly as the user typed it.
+fn unescape_mark_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let (decoded, width) = match tail.get(..3) {
+            Some("%25") => ("%", 3),
+            Some("%1B") | Some("%07") | Some("%0D") => ("", 3),
+            Some("%0A") => (" ", 3),
+            _ => ("%", 1),
+        };
+        out.push_str(decoded);
+        rest = &tail[width..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn clamp_command(cmd: &str) -> String {
+    let cmd = cmd.trim();
+    match cmd.chars().count() > BUSY_COMMAND_MAX {
+        false => cmd.to_string(),
+        true => format!(
+            "{}…",
+            cmd.chars()
+                .take(BUSY_COMMAND_MAX)
+                .collect::<String>()
+                .trim_end()
+        ),
     }
 }
 
@@ -1057,6 +1104,8 @@ impl TerminalView {
             search_regex: false,
             search_regex_error: false,
             search_last_query: String::new(),
+            search_scan_epoch: 0,
+            search_scan_armed: false,
             bell_flash: false,
             last_at_prompt: false,
             last_typeahead_blocked: false,
@@ -1234,6 +1283,47 @@ impl TerminalView {
         self.terminal.agent_session()
     }
 
+    /// What this pane is in the middle of, when it can say so. `None` means
+    /// either nothing is running or the shell never told us — and a terminal
+    /// that guessed would raise this question on every single close.
+    pub fn busy(&self) -> Option<PaneBusy> {
+        use crate::core::cli_agent::AgentStatus;
+        // `Done` is the opposite of busy: the turn is over, and the badge
+        // saying so is exactly what sends a reader to close the tab. Only a
+        // turn still in flight — running, or stopped on a question — is work
+        // that closing would cut short.
+        if let Some(agent) = self.agent()
+            && self
+                .agent_session()
+                .is_some_and(|s| matches!(s.status, AgentStatus::Working | AgentStatus::Waiting))
+        {
+            return Some(PaneBusy::Agent(agent.display_name()));
+        }
+        // Without shell integration `at_prompt` is permanently false, so
+        // `running_since` is permanently Some. Only trust it when the shell is
+        // actually reporting.
+        if !self.terminal.shell_active() {
+            return None;
+        }
+        self.running_since?;
+        // Prefer what the shell said it was running. `running_title` is only
+        // the window title as it stood when the command began, and a prompt
+        // that titles by directory — a very common setup — made this ask
+        // "tty7 is still running. Closing ends it." about a folder. The
+        // OSC 133;C mark carries the submitted line itself.
+        let named = Some(clamp_command(&unescape_mark_text(
+            &self.terminal.running_command(),
+        )))
+        .filter(|t| !t.is_empty());
+        Some(PaneBusy::Command(match named {
+            Some(cmd) => cmd,
+            None => match self.running_title.trim().is_empty() {
+                true => self.title.clone(),
+                false => self.running_title.clone(),
+            },
+        }))
+    }
+
     pub fn agent_result_unread(&self) -> bool {
         self.agent_result_unread
     }
@@ -1300,7 +1390,11 @@ impl TerminalView {
             cx.emit(AuthPromptReady);
         }
         match ev {
-            AlacEvent::Wakeup => cx.notify(),
+            AlacEvent::Wakeup => {
+                // The grid moved under whatever the search bar last measured.
+                self.note_output_under_search(cx);
+                cx.notify();
+            }
             AlacEvent::Title(title) => {
                 self.title = title;
                 cx.notify();
@@ -2072,6 +2166,12 @@ impl TerminalView {
         if !self.accepts_input(cx) {
             return;
         }
+        // Same reason as `commit_text`: what is pasted lands on the prompt, so
+        // the prompt is what has to be on screen. Neither branch below moved
+        // the viewport, and a paste is a bigger change than a keystroke to
+        // make out of sight. This also clears the selection, which the tail of
+        // this function used to do on its own.
+        self.jump_to_prompt();
         if self.input_active() {
             let trimmed = text.strip_suffix('\n').unwrap_or(&text);
             self.cmd.insert_str(trimmed);
@@ -2089,7 +2189,6 @@ impl TerminalView {
             .mode()
             .contains(TermMode::BRACKETED_PASTE);
         self.write_gap_text(&text, paste_bytes(&text, bracketed), cx);
-        self.terminal.term.lock().selection = None;
         cx.notify();
     }
 
@@ -3962,6 +4061,14 @@ impl TerminalView {
         if self.terminal.exited || text.is_empty() || !self.accepts_input(cx) {
             return;
         }
+        // Typing goes to the prompt, so the view has to be looking at it.
+        // Only the last branch below used to do this, which is the branch
+        // taken when tty7 is *not* driving the line — so scrolling up and
+        // typing did the one thing it must never do at a shell prompt:
+        // accepted the characters somewhere the user could not see them.
+        // `handle_editor_key` has always jumped, so Left and Backspace came
+        // back to the prompt and the letters between them did not.
+        self.jump_to_prompt();
         if let Some(rs) = self.reverse_search.as_mut() {
             rs.push_query(text, &self.history, &self.history_frecency);
             self.cursor_visible = true;
@@ -3980,7 +4087,6 @@ impl TerminalView {
         }
         self.write_gap_text(text, text.as_bytes().to_vec(), cx);
         self.cursor_visible = true;
-        self.jump_to_prompt();
         cx.notify();
     }
 
@@ -4563,12 +4669,17 @@ impl TerminalView {
 
         let cursor_on = self.cursor_visible;
         let cursor_style = cx.global::<Config>().cursor_style;
+        let block_cursor = cursor_style == crate::core::config::CursorStyle::Block;
+        // A block caret is drawn as reverse video on the cell it covers, not as
+        // a translucent tint over it — the way every other terminal draws one,
+        // and the only way the caret keeps the contrast the theme gave it.
+        let caret_ink = crate::ui::presets::caret_ink(caret_col, theme.background, fg);
         let caret_bar = move || {
             use crate::core::config::CursorStyle;
             let base = div().absolute().left_0().bg(caret_col);
             match cursor_style {
                 CursorStyle::Bar => base.top(caret_top).w(px(1.5)).h(caret_h),
-                CursorStyle::Block => base.top(px(0.)).w_full().h(lh).bg(caret_col.opacity(0.5)),
+                CursorStyle::Block => base.top(px(0.)).w_full().h(lh),
                 CursorStyle::Underline => {
                     let uh = px(2.);
                     base.top(lh - uh).w_full().h(uh)
@@ -4576,6 +4687,7 @@ impl TerminalView {
             }
         };
         let cell = |color: gpui::Hsla, ch: char, selected: bool, caret: bool, underline: bool| {
+            let inverted = caret && block_cursor;
             let w = cell_w * (display_width(ch) as f32);
             let mut d = div()
                 .relative()
@@ -4584,15 +4696,17 @@ impl TerminalView {
                 .h(lh)
                 .flex()
                 .items_center()
-                .text_color(color);
-            if selected {
+                .text_color(if inverted { caret_ink } else { color });
+            if inverted {
+                d = d.bg(caret_col);
+            } else if selected {
                 d = d.bg(sel_bg);
             }
             if underline {
                 d = d.border_b_1().border_color(fg);
             }
             d = d.child(ch.to_string());
-            if caret {
+            if caret && !inverted {
                 d = d.child(caret_bar());
             }
             d.into_any_element()
@@ -4705,7 +4819,18 @@ impl TerminalView {
         let srow = srow.saturating_sub(self.input_scroll_rows());
 
         const MAX_ROWS: usize = 10;
-        let total_rows = self.terminal.term.lock().screen_lines();
+        let (total_rows, total_cols) = {
+            let term = self.terminal.term.lock();
+            (term.screen_lines(), term.columns())
+        };
+        // How wide the menu ends up, decided before the rows so their
+        // descriptions can be elided against it. A menu wider than the pane
+        // has its right-hand column clipped by the pane, and the clip takes
+        // the ellipsis with it — which is exactly the mid-word cut the
+        // ellipsis exists to prevent. The history menu below already caps
+        // itself to the grid this way.
+        let grid_w = self.cell_width * (total_cols as f32);
+        let menu_w = px(COMPLETION_MENU_MAX_W).min(grid_w);
         let (place_above, visible, first) = menu_layout(
             total_rows,
             srow,
@@ -4718,6 +4843,7 @@ impl TerminalView {
 
         let theme = cx.theme();
         let lh = self.line_height;
+        let cell = self.cell_width.as_f32();
         let row = |i: usize| {
             let cand = items[i];
             let selected = s.index == Some(i);
@@ -4732,6 +4858,7 @@ impl TerminalView {
             } else {
                 cand.text.clone()
             };
+            let budget = description_budget(cell, label.chars().count(), menu_w.as_f32());
             div()
                 .h(lh)
                 .flex()
@@ -4745,7 +4872,12 @@ impl TerminalView {
                 .child(icon)
                 .child(div().flex_shrink_0().child(label))
                 .when_some(cand.description.clone(), |d, desc| {
-                    d.child(div().ml_2().text_color(theme.muted_foreground).child(desc))
+                    d.child(
+                        div()
+                            .ml_2()
+                            .text_color(theme.muted_foreground)
+                            .child(elide(&desc, budget)),
+                    )
                 })
                 .into_any_element()
         };
@@ -4768,7 +4900,12 @@ impl TerminalView {
         let menu_h = self.line_height * (line_count as f32) + px(10.);
 
         let gap = px(6.);
-        let x = px(GRID_PAD_X) + self.cell_width * (scol as f32);
+        // Anchored under the word being completed, then pulled back inside the
+        // pane if that would hang it over the right edge.
+        let anchor = px(GRID_PAD_X) + self.cell_width * (scol as f32);
+        let x = anchor
+            .min(px(GRID_PAD_X) + grid_w - menu_w)
+            .max(px(GRID_PAD_X));
         let y = if place_above {
             px(GRID_PAD_Y) + self.line_height * (srow as f32) - menu_h - gap
         } else {
@@ -4783,8 +4920,8 @@ impl TerminalView {
                 .flex()
                 .flex_col()
                 .py_1()
-                .min_w(px(120.))
-                .max_w(px(480.))
+                .min_w(px(120.).min(menu_w))
+                .max_w(menu_w)
                 .overflow_hidden()
                 .bg(theme.popover)
                 .border_1()
@@ -4792,7 +4929,10 @@ impl TerminalView {
                 .rounded(px(6.))
                 .font_family(self.font.family.clone())
                 .text_size(self.font_size)
-                .text_color(theme.popover_foreground)
+                // Resting rows sit back so the selected row, which paints
+                // itself in the full foreground, is the brightest line in
+                // the menu — matching what the row icons already do.
+                .text_color(theme.muted_foreground)
                 .children(footer(hidden_above, format!("↑ {hidden_above} more")))
                 .children(rows)
                 .children(footer(hidden_below, format!("↓ {hidden_below} more"))),
@@ -4830,7 +4970,7 @@ impl TerminalView {
             let base = if selected {
                 theme.foreground
             } else {
-                theme.popover_foreground
+                theme.muted_foreground
             };
 
             let mut spans: Vec<gpui::AnyElement> = Vec::new();
@@ -4936,7 +5076,7 @@ impl TerminalView {
                 .rounded(px(6.))
                 .font_family(self.font.family.clone())
                 .text_size(self.font_size)
-                .text_color(theme.popover_foreground)
+                .text_color(theme.muted_foreground)
                 .children(footer(hidden_above, format!("↑ {hidden_above} more")))
                 .children(rows)
                 .children(footer(hidden_below, format!("↓ {hidden_below} more"))),
@@ -5009,6 +5149,13 @@ fn observe_typeahead_for_owner(
     if !sync_typeahead_owner_state(typeahead, last_blocked, blocked) {
         typeahead.observe(input, *last_blocked);
     }
+}
+
+/// Why closing a pane would end work that is still going on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaneBusy {
+    Command(String),
+    Agent(&'static str),
 }
 
 impl Focusable for TerminalView {
@@ -5546,6 +5693,45 @@ fn fig_query_param<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// Where the completion menu stops growing.
+const COMPLETION_MENU_MAX_W: f32 = 480.;
+
+/// How many characters of a candidate's description fit beside its name.
+///
+/// The menu is monospaced and clips whatever runs past its edge, so a long
+/// description used to end mid-word — "…or a symli" — with nothing to say it
+/// had been cut. The row spends its width on `px_2` either side, the kind
+/// icon, the gap after it and the margin before the description; whatever is
+/// left, in cells, is the description's.
+///
+/// `menu_w` is the width the menu actually got, not the width it would like:
+/// in a pane narrower than [`COMPLETION_MENU_MAX_W`] the menu is capped to the
+/// grid, and a budget measured against the larger number puts the ellipsis
+/// past the edge — which is the same mid-word cut, only harder to see.
+fn description_budget(cell_width: f32, label_cells: usize, menu_w: f32) -> usize {
+    const ROW_CHROME: f32 = 8. + 8. + 16. + 6. + 8.;
+    if cell_width <= 0. {
+        return 0;
+    }
+    let free = menu_w - ROW_CHROME - label_cells as f32 * cell_width;
+    (free / cell_width).floor().max(0.) as usize
+}
+
+/// `text` cut to `budget` characters, with the last one spent on an ellipsis.
+/// A budget too small to say anything with returns nothing rather than a bare
+/// "…", which reads as a description that is there but unreadable.
+fn elide(text: &str, budget: usize) -> String {
+    if text.chars().count() <= budget {
+        return text.to_string();
+    }
+    if budget < 2 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(budget - 1).collect();
+    out.push('…');
+    out
+}
+
 fn menu_layout(
     total_rows: usize,
     srow: usize,
@@ -5718,18 +5904,44 @@ fn drag_scroll_step(overshoot: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_busy_command_name_undoes_the_shell_escaping() {
+        use super::unescape_mark_text;
+        // The integration escapes % and the four bytes that would break OSC
+        // framing; everything else is the line as typed.
+        assert_eq!(unescape_mark_text("printf '100%25'"), "printf '100%'");
+        assert_eq!(unescape_mark_text("a%1Bb%07c%0Dd"), "abcd");
+        assert_eq!(unescape_mark_text("one%0Atwo"), "one two");
+        // A bare % the shell somehow left alone must survive rather than eat
+        // the next two characters.
+        assert_eq!(unescape_mark_text("50% off"), "50% off");
+        assert_eq!(unescape_mark_text("cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn a_busy_command_name_stays_short_enough_to_read() {
+        use super::{BUSY_COMMAND_MAX, clamp_command};
+        assert_eq!(clamp_command("  sleep 300  "), "sleep 300");
+        let long = "cargo ".repeat(40);
+        let out = clamp_command(&long);
+        assert!(out.ends_with('…'), "{out:?}");
+        assert!(out.chars().count() <= BUSY_COMMAND_MAX + 1, "{out:?}");
+        // No dangling space before the ellipsis.
+        assert!(!out.contains(" …"), "{out:?}");
+    }
     use super::{
-        LoopbackPlan, RawInput, SelectEndCopy, Typeahead, WheelRoute, clipboard_paste_text,
-        compose_notification_title, cwd_is_on_host, display_width, is_typeahead_interrupt,
-        loopback_plan, observe_typeahead_for_owner,
+        COMPLETION_MENU_MAX_W, LoopbackPlan, RawInput, SelectEndCopy, Typeahead, WheelRoute,
+        clipboard_paste_text, compose_notification_title, cwd_is_on_host, display_width,
+        is_typeahead_interrupt, loopback_plan, observe_typeahead_for_owner,
     };
     use super::{SCROLL_ANIM_FRAME, scroll_anim_step};
     use super::{
-        drag_scroll_step, encode_mouse, escape_candidate, expand_file_command_template,
-        fallback_chain, fig_icon_emoji, fig_icon_glyph, focus_report_bytes, input_overflow_shift,
-        input_overlay_rows, menu_layout, paste_bytes, select_end_copy, shell_escape_path,
-        should_show_context_menu, smooth_scroll_step, submit_bytes, trim_trailing_spaces,
-        wheel_route, wrapped_click_index,
+        description_budget, drag_scroll_step, elide, encode_mouse, escape_candidate,
+        expand_file_command_template, fallback_chain, fig_icon_emoji, fig_icon_glyph,
+        focus_report_bytes, input_overflow_shift, input_overlay_rows, menu_layout, paste_bytes,
+        select_end_copy, shell_escape_path, should_show_context_menu, smooth_scroll_step,
+        submit_bytes, trim_trailing_spaces, wheel_route, wrapped_click_index,
     };
     use super::{
         remote_paste_spec, staged_path_for_pane, stages_clipboard_image, staging_cache,
@@ -6915,6 +7127,45 @@ mod tests {
     }
 
     #[test]
+    fn a_description_that_fits_is_left_alone() {
+        assert_eq!(elide("Show commit logs", 40), "Show commit logs");
+        // Exactly the budget is still a fit; nothing is spent on an ellipsis.
+        assert_eq!(elide("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn an_overlong_description_ends_in_an_ellipsis_inside_its_budget() {
+        let out = elide("Move or rename a file, a directory, or a symlink", 12);
+        assert_eq!(out.chars().count(), 12, "the ellipsis is inside the budget");
+        assert!(out.ends_with('…'));
+        assert!(out.starts_with("Move or ren"));
+    }
+
+    #[test]
+    fn a_budget_with_no_room_to_say_anything_says_nothing() {
+        // A lone "…" reads as a description that is there but unreadable.
+        assert_eq!(elide("Show commit logs", 1), "");
+        assert_eq!(elide("Show commit logs", 0), "");
+    }
+
+    #[test]
+    fn the_description_budget_is_what_the_name_leaves_of_the_menu() {
+        const W: f32 = COMPLETION_MENU_MAX_W;
+        // A 9px cell: 46px of row chrome, so a bare row leaves (480-46)/9 cells.
+        assert_eq!(description_budget(9., 0, W), 48);
+        // Every cell the name takes is one the description does not get.
+        assert_eq!(description_budget(9., 10, W), 38);
+        // A name that fills the menu on its own leaves nothing, and never
+        // underflows into a huge budget.
+        assert_eq!(description_budget(9., 200, W), 0);
+        assert_eq!(description_budget(0., 10, W), 0);
+        // A pane too narrow for the full menu shrinks the budget with it,
+        // instead of eliding to a width the menu never got.
+        assert!(description_budget(9., 10, 240.) < description_budget(9., 10, W));
+        assert_eq!(description_budget(9., 10, 240.), 11);
+    }
+
+    #[test]
     fn menu_layout_prefers_below_and_flips_above_when_cramped() {
         assert_eq!(menu_layout(24, 3, 5, 0, 10), (false, 5, 0));
         assert_eq!(menu_layout(24, 22, 5, 0, 10), (true, 5, 0));
@@ -7023,7 +7274,7 @@ pub(crate) fn quiet_test_ssh_pane(
 mod gpui_tests {
     use super::*;
     use crate::daemon::protocol::{ClientMsg, DaemonMsg};
-    use gpui::{TestAppContext, point};
+    use gpui::{Entity, TestAppContext, point};
     use std::os::unix::net::UnixStream;
 
     fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, UnixStream) {
@@ -7043,6 +7294,45 @@ mod gpui_tests {
             TerminalView::with_terminal(terminal, 1, window, cx)
         });
         (window, daemon_side)
+    }
+
+    /// The same pane, but hung under a `gpui_component::Root` the way the real
+    /// window hangs it.
+    ///
+    /// `harness` makes the view its own root, which is enough for anything
+    /// that never paints — but gpui-component's text input reaches for `Root`
+    /// while painting, so any test that lets a frame draw with the search bar
+    /// (or any other input) on screen needs this one instead.
+    fn rooted_harness(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<gpui_component::Root>,
+        Entity<TerminalView>,
+        UnixStream,
+    ) {
+        crate::core::config::pin_test_config_dir();
+        cx.executor().allow_parking();
+        let (client_side, daemon_side) = UnixStream::pair().unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(Config::default());
+        });
+        let built: std::rc::Rc<std::cell::RefCell<Option<Entity<TerminalView>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let out = built.clone();
+        let window = cx.add_window(move |window, cx| {
+            let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
+                .expect("socketpair-backed terminal");
+            let view = cx.new(|cx| TerminalView::with_terminal(terminal, 1, window, cx));
+            *out.borrow_mut() = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.background_executor.run_until_parked();
+        let view = built.borrow_mut().take().expect("the pane was built");
+        (window, view, daemon_side)
     }
 
     fn prompt_ready(
@@ -7067,6 +7357,54 @@ mod gpui_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("the prompt report never reached the view");
+    }
+
+    #[gpui::test]
+    fn an_agent_that_has_finished_its_turn_is_not_busy(cx: &mut TestAppContext) {
+        use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
+
+        crate::core::config::pin_test_config_dir();
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Agent(Some(CLIAgent::Claude))
+            .encode(&mut daemon)
+            .unwrap();
+
+        let report = |status: AgentStatus, daemon: &mut UnixStream| {
+            DaemonMsg::AgentStatus(Some(AgentSessionState {
+                status,
+                message: None,
+                session_id: Some("sid-abc".into()),
+                launch_argv: Some(vec!["claude".into()]),
+                rich: true,
+                cwd: None,
+                activity: 0,
+            }))
+            .encode(daemon)
+            .unwrap();
+        };
+        let settled = |want: Option<PaneBusy>, cx: &mut TestAppContext| {
+            for _ in 0..200 {
+                if window.update(cx, |view, _, _| view.busy()).unwrap() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+
+        report(AgentStatus::Working, &mut daemon);
+        assert!(
+            settled(Some(PaneBusy::Agent("Claude Code")), cx),
+            "a turn in flight is work closing would cut short"
+        );
+
+        // The green Done badge is what sends a reader to close the tab. Asking
+        // "Claude Code is still working" there is both false and in the way.
+        report(AgentStatus::Done, &mut daemon);
+        assert!(
+            settled(None, cx),
+            "a finished turn must not hold the tab open"
+        );
     }
 
     #[gpui::test]
@@ -8614,6 +8952,50 @@ mod gpui_tests {
             .unwrap();
     }
 
+    /// The one thing typing at a prompt must never do is land where the
+    /// person typing cannot see it.
+    #[gpui::test]
+    fn typing_brings_the_view_back_to_the_prompt(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        prompt_ready(&window, cx, &mut daemon);
+        window
+            .update(cx, |view, _w, cx| {
+                assert!(
+                    view.input_active(),
+                    "this is the branch that was leaving the view parked"
+                );
+                scroll_into_history(view, 10);
+                view.commit_text("l", cx);
+                assert_eq!(
+                    display_offset(view),
+                    0,
+                    "the character went in while the viewport stayed in the scrollback"
+                );
+                assert_eq!(view.cmd.text(), "l", "and it did reach the line");
+            })
+            .unwrap();
+    }
+
+    /// A paste is a larger change than a keystroke to make out of sight, and
+    /// it went the same way.
+    #[gpui::test]
+    fn pasting_brings_the_view_back_to_the_prompt(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        prompt_ready(&window, cx, &mut daemon);
+        window
+            .update(cx, |view, _w, cx| {
+                scroll_into_history(view, 10);
+                view.paste("cargo test\n".to_string(), cx);
+                assert_eq!(display_offset(view), 0, "the paste landed off screen");
+                assert_eq!(
+                    view.cmd.text(),
+                    "cargo test",
+                    "and the trailing newline is still dropped"
+                );
+            })
+            .unwrap();
+    }
+
     /// A trackpad is already a continuous stream — animating it would only put
     /// lag between the fingers and the grid. It is told apart by its phase, not
     /// by its delta type or size: a flick moves further in one event than a
@@ -9508,6 +9890,78 @@ mod gpui_tests {
                 assert!(view.search.is_none());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn output_under_an_open_search_bar_is_searched_too(cx: &mut TestAppContext) {
+        let (window, view, mut daemon) = rooted_harness(cx);
+
+        fn wait_for(cx: &mut TestAppContext, view: &Entity<TerminalView>, needle: char) {
+            for _ in 0..200 {
+                let seen = cx.update(|cx| {
+                    let v = view.read(cx);
+                    let term = v.terminal.term.lock();
+                    let grid = term.grid();
+                    (0..grid.screen_lines() as i32)
+                        .any(|l| (0..grid.columns()).any(|c| grid[Line(l)][Column(c)].c == needle))
+                });
+                if seen {
+                    return;
+                }
+                cx.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("the pane never printed {needle:?}");
+        }
+
+        DaemonMsg::Output(b"world 1\r\n".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        wait_for(cx, &view, '1');
+
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| {
+                    v.open_search(window, cx);
+                    let input = v.search.as_ref().unwrap().input.clone();
+                    input.update(cx, |s, cx| s.set_value("world", window, cx));
+                    v.recompute_matches(cx);
+                    assert_eq!(v.search.as_ref().unwrap().matches.len(), 1);
+                });
+            })
+            .unwrap();
+
+        // A second line arrives while the bar is up. Until it is rescanned the
+        // count still says 1, and the one highlight it does draw has slid onto
+        // whatever line took the old one's place.
+        DaemonMsg::Output(b"world 2\r\n".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        wait_for(cx, &view, '2');
+        for _ in 0..8 {
+            cx.executor()
+                .advance_clock(super::super::search::SCAN_DEBOUNCE * 2);
+            cx.run_until_parked();
+        }
+
+        cx.update(|cx| {
+            let v = view.read(cx);
+            let search = v.search.as_ref().expect("the bar is still open");
+            assert_eq!(
+                search.matches.len(),
+                2,
+                "the line printed under the open bar has to be counted too"
+            );
+            assert_eq!(
+                search.current_index,
+                Some(0),
+                "and the match the user was standing on is still the one they are on"
+            );
+            assert!(
+                !v.search_scan_armed,
+                "the debounce has to settle, not rescan forever"
+            );
+        });
     }
 
     #[gpui::test]

@@ -120,6 +120,15 @@ pub struct Config {
     pub font_features: Option<FontFeatures>,
     pub font_size: f32,
     pub line_height: f32,
+    /// The interface's root font size, in pixels — everything outside the
+    /// terminal grid is sized against it.
+    ///
+    /// It is the CSS-style `rem` the whole chrome is laid out in, not one
+    /// label's size: raising it scales panel text, section headings and the
+    /// spacing derived from them together. Its own default matches the size
+    /// the chrome was drawn at, so an existing config renders unchanged.
+    #[serde(default = "default_ui_font_size")]
+    pub ui_font_size: f32,
     pub theme: String,
     pub theme_preset: String,
     pub theme_follow_system: bool,
@@ -451,6 +460,7 @@ impl Default for Config {
             font_features: None,
             font_size: 15.0,
             line_height: 1.4,
+            ui_font_size: default_ui_font_size(),
             theme: "light".to_string(),
             theme_preset: "light".to_string(),
             theme_follow_system: false,
@@ -550,6 +560,13 @@ impl Config {
             self.line_height = Config::default().line_height;
         }
         self.line_height = self.line_height.clamp(0.5, 4.0);
+        if !self.ui_font_size.is_finite() || self.ui_font_size <= 0.0 {
+            self.ui_font_size = default_ui_font_size();
+        }
+        // The whole chrome is a multiple of this, so a wild value does not
+        // shrink one label — it makes the window unusable. Keep the range to
+        // sizes the layout still holds together at.
+        self.ui_font_size = self.ui_font_size.clamp(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX);
         self.scrollback_limit = self.scrollback_limit.clamp(100, MAX_SCROLLBACK);
         if !self.mouse_scroll_multiplier.is_finite() || self.mouse_scroll_multiplier <= 0.0 {
             self.mouse_scroll_multiplier = Config::default().mouse_scroll_multiplier;
@@ -796,6 +813,17 @@ fn default_right_panel_width() -> f32 {
     260.
 }
 
+/// The rem the chrome has always been laid out against — gpui's own default,
+/// which is what `text_sm()` and `text_xs()` resolve 14px and 12px from. Left
+/// alone, the interface looks exactly as it did before the size was settable.
+pub const UI_FONT_SIZE_DEFAULT: f32 = 16.0;
+pub const UI_FONT_SIZE_MIN: f32 = 12.0;
+pub const UI_FONT_SIZE_MAX: f32 = 24.0;
+
+fn default_ui_font_size() -> f32 {
+    UI_FONT_SIZE_DEFAULT
+}
+
 fn default_sidebar_width() -> f32 {
     220.0
 }
@@ -1012,6 +1040,35 @@ mod tests {
         assert!(lh.is_finite() && lh > 0.0);
 
         assert_eq!(sanitized(15.0, 1.4), (15.0, 1.4));
+    }
+
+    #[test]
+    fn a_config_written_before_ui_font_size_existed_keeps_the_chrome_it_had() {
+        // The whole interface is laid out against this, so a missing field
+        // must not resolve to serde's 0.0 — that collapses every window the
+        // user already has, on upgrade, without them touching a setting.
+        let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        assert_eq!(cfg.ui_font_size, UI_FONT_SIZE_DEFAULT);
+    }
+
+    #[test]
+    fn sanitize_holds_ui_font_size_to_sizes_the_layout_survives() {
+        let sanitized = |ui_font_size: f32| {
+            let mut cfg = Config {
+                ui_font_size,
+                ..Config::default()
+            };
+            cfg.sanitize();
+            cfg.ui_font_size
+        };
+
+        assert_eq!(sanitized(0.0), UI_FONT_SIZE_DEFAULT);
+        assert_eq!(sanitized(f32::NAN), UI_FONT_SIZE_DEFAULT);
+        assert_eq!(sanitized(-3.0), UI_FONT_SIZE_DEFAULT);
+        assert_eq!(sanitized(1000.0), UI_FONT_SIZE_MAX);
+        assert_eq!(sanitized(2.0), UI_FONT_SIZE_MIN);
+        // A size the user actually picked comes back untouched.
+        assert_eq!(sanitized(18.0), 18.0);
     }
 
     struct TestDir(std::path::PathBuf);

@@ -640,8 +640,8 @@ pub(crate) fn claim_mailbox() -> std::sync::MutexGuard<'static, ()> {
     MAILBOX_TURN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub fn mismatch_answers() -> [&'static str; 2] {
-    [t(L10nKey::Cancel), t(L10nKey::RemoteMismatchReplaceServer)]
+pub fn mismatch_answers() -> [gpui::PromptButton; 2] {
+    crate::ui::confirm_answers(t(L10nKey::RemoteMismatchReplaceServer), t(L10nKey::Cancel))
 }
 
 pub fn mismatch_detail(m: &MismatchedRemoteDaemon) -> String {
@@ -949,7 +949,11 @@ mod tests {
             wanted_version: "0.9.1".into(),
         });
         for answer in mismatch_answers() {
-            assert!(detail.contains(answer), "{answer} is unexplained: {detail}");
+            let label = answer.label();
+            assert!(
+                detail.contains(label.as_ref()),
+                "{label} is unexplained: {detail}"
+            );
         }
     }
 

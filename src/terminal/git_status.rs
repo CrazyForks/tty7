@@ -70,6 +70,35 @@ impl GitStatusCache {
         }
     }
 
+    /// Corrects a repo's line counts from a working-tree diff that was just
+    /// read.
+    ///
+    /// The counts here are refreshed on an edge — a command finishing, the
+    /// directory changing, the window coming back — and a diff read by the
+    /// Changes panel or the diff overlay is a fresher answer to the same
+    /// question. Without this the sidebar can say +27 −8 while the overlay it
+    /// opens says +3 −1. Only the numbers move; the branch, the root and the
+    /// probe's own schedule are left alone.
+    pub fn note_counts(&mut self, host: HostId, root: &Path, added: u32, removed: u32) -> bool {
+        let Some(status) = self.status.get(host, root) else {
+            return false;
+        };
+        if status.added == added && status.removed == removed {
+            return false;
+        }
+        let branch = status.branch.clone();
+        self.status.insert(
+            host,
+            root.to_path_buf(),
+            GitStatus {
+                branch,
+                added,
+                removed,
+            },
+        );
+        true
+    }
+
     pub fn finish_probe(
         &mut self,
         host: HostId,
@@ -133,6 +162,31 @@ mod tests {
             counts: Some((0, 0)),
         }
     }
+    #[test]
+    fn a_diff_read_corrects_the_counts_without_touching_the_branch() {
+        let mut cache = GitStatusCache::default();
+        let cwd = Path::new("/repo/sub");
+        cache.finish_probe(L, cwd, Some(snap("/repo", "main", Some((27, 8)))));
+
+        assert!(cache.note_counts(L, Path::new("/repo"), 3, 1));
+        let got = cache.status_for(L, cwd).unwrap();
+        assert_eq!((got.added, got.removed), (3, 1));
+        assert_eq!(got.branch, "main", "only the numbers move");
+
+        // Nothing to say when the diff agrees with what is already there.
+        assert!(!cache.note_counts(L, Path::new("/repo"), 3, 1));
+    }
+
+    #[test]
+    fn a_diff_for_a_repo_nobody_probed_is_dropped() {
+        // The counts hang off a root the probe established. Without one there
+        // is no row to correct, and inventing an entry would leave it with no
+        // branch to show.
+        let mut cache = GitStatusCache::default();
+        assert!(!cache.note_counts(L, Path::new("/elsewhere"), 3, 1));
+        assert!(cache.status_for(L, Path::new("/elsewhere")).is_none());
+    }
+
     #[test]
     fn cwds_in_one_repo_share_a_snapshot() {
         let mut cache = GitStatusCache::default();

@@ -465,20 +465,21 @@ fn prompt_update(update: &AvailableUpdate, window: &mut Window, cx: &mut App) {
             ],
         )
     };
-    // "Later" is index 0 deliberately: Escape, a closed window, or a dropped
-    // channel all land there, and that choice has to be the one that changes
-    // nothing. Skipping a version is a decision people should have to reach for
-    // — it lives in Settings, not one stray keystroke away.
-    let buttons: Vec<&str> = if update.installable {
+    // "Later" is the cancel answer: it takes Escape, and a closed window or a
+    // dropped channel falls through to it too, so the outcome nobody chose is
+    // always the one that changes nothing. Skipping a version is a decision
+    // people should have to reach for — it lives in Settings, not one stray
+    // keystroke away.
+    let buttons: Vec<gpui::PromptButton> = if update.installable {
         vec![
-            t(L10nKey::UpdateDialogLater),
-            t(L10nKey::UpdateDialogNextLaunch),
-            t(L10nKey::SettingsUpdateAndRelaunch),
+            gpui::PromptButton::ok(t(L10nKey::SettingsUpdateAndRelaunch)),
+            gpui::PromptButton::ok(t(L10nKey::UpdateDialogNextLaunch)),
+            gpui::PromptButton::cancel(t(L10nKey::UpdateDialogLater)),
         ]
     } else {
         vec![
-            t(L10nKey::UpdateDialogLater),
-            t(L10nKey::SettingsUpdateViewRelease),
+            gpui::PromptButton::ok(t(L10nKey::SettingsUpdateViewRelease)),
+            gpui::PromptButton::cancel(t(L10nKey::UpdateDialogLater)),
         ]
     };
     let answer = window.prompt(
@@ -492,13 +493,15 @@ fn prompt_update(update: &AvailableUpdate, window: &mut Window, cx: &mut App) {
     cx.spawn(async move |cx| {
         let installable = update.installable;
         match answer.await {
+            Ok(0) if installable => {
+                cx.update(install_available);
+            }
+            Ok(0) => open_releases_page(),
             Ok(1) if installable => {
                 cx.update(|cx| stage_for_next_launch(update, cx));
             }
-            Ok(1) => open_releases_page(),
-            Ok(2) => {
-                cx.update(install_available);
-            }
+            // "Later" — index 1 or 2 depending on the shape — plus a dropped
+            // channel and a closed window. All of them change nothing.
             _ => remind_later(),
         }
     })

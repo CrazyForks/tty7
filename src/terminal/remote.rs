@@ -74,6 +74,7 @@ struct ReaderSignals {
     child_exited: Arc<AtomicBool>,
     zle_reading: Arc<AtomicBool>,
     shell_vi_mode: Arc<AtomicBool>,
+    running_command: Arc<Mutex<String>>,
     auth: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>>,
     phase: Arc<Mutex<Option<SshPhase>>>,
     /// Kitty-graphics images the daemon lifted out of the stream (issue #213),
@@ -168,6 +169,13 @@ pub struct RemoteTerminal {
     child_exited: Arc<AtomicBool>,
     zle_reading: Arc<AtomicBool>,
     shell_vi_mode: Arc<AtomicBool>,
+    /// The line the shell said it is running, from the OSC 133;C mark, still
+    /// percent-escaped as the integration sent it. Empty while at a prompt.
+    ///
+    /// This is the only place the *text* of a running command exists on the
+    /// client: the frame the daemon sends says a command runs, not which one.
+    /// The close confirmation has to name what it is about to end.
+    running_command: Arc<Mutex<String>>,
     auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>>,
     ssh_phase: Arc<Mutex<Option<SshPhase>>>,
     ssh_endpoint: Option<(String, u16)>,
@@ -295,9 +303,9 @@ impl RemoteTerminal {
         .encode(&mut stream)?;
         let pane_id = match DaemonMsg::read(&mut stream)? {
             DaemonMsg::Spawned { pane_id } => pane_id,
-            DaemonMsg::Error(msg) => {
-                return Err(anyhow::anyhow!("daemon refused Spawn: {msg}"));
-            }
+            // Passed through, not wrapped: the caller already logs which
+            // spawn this was, and the window shows only this text.
+            DaemonMsg::Error(msg) => return Err(anyhow::anyhow!(msg)),
             other => {
                 return Err(anyhow::anyhow!(
                     "unexpected daemon reply to Spawn: {other:?}"
@@ -404,6 +412,7 @@ impl RemoteTerminal {
                 child_exited: self.child_exited.clone(),
                 zle_reading: self.zle_reading.clone(),
                 shell_vi_mode: self.shell_vi_mode.clone(),
+                running_command: self.running_command.clone(),
                 auth: self.auth_prompts.clone(),
                 phase: self.ssh_phase.clone(),
                 images: self.images.clone(),
@@ -452,6 +461,7 @@ impl RemoteTerminal {
         let child_exited = Arc::new(AtomicBool::new(false));
         let zle_reading = Arc::new(AtomicBool::new(false));
         let shell_vi_mode = Arc::new(AtomicBool::new(false));
+        let running_command: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let ssh_phase: Arc<Mutex<Option<SshPhase>>> = Arc::new(Mutex::new(None));
@@ -474,6 +484,7 @@ impl RemoteTerminal {
                 child_exited: child_exited.clone(),
                 zle_reading: zle_reading.clone(),
                 shell_vi_mode: shell_vi_mode.clone(),
+                running_command: running_command.clone(),
                 auth: auth_prompts.clone(),
                 phase: ssh_phase.clone(),
                 images: images.clone(),
@@ -496,6 +507,7 @@ impl RemoteTerminal {
             child_exited,
             zle_reading,
             shell_vi_mode,
+            running_command,
             auth_prompts,
             ssh_phase,
             ssh_endpoint: None,
@@ -562,6 +574,7 @@ impl RemoteTerminal {
                     child_exited,
                     zle_reading,
                     shell_vi_mode,
+                    running_command,
                     auth,
                     phase,
                     images,
@@ -665,7 +678,14 @@ impl RemoteTerminal {
                                     if let Some(mark) = payload.strip_prefix(b"133;") {
                                         match mark.first() {
                                             Some(b'B') => {
-                                                zle_reading.store(true, Ordering::Relaxed)
+                                                zle_reading.store(true, Ordering::Relaxed);
+                                                // Back at a prompt: whatever
+                                                // ran is over, so the name of
+                                                // it must not outlive it into
+                                                // the next close question.
+                                                if let Ok(mut cmd) = running_command.lock() {
+                                                    cmd.clear();
+                                                }
                                             }
                                             Some(b'V') => {
                                                 shell_vi_mode.store(
@@ -673,6 +693,22 @@ impl RemoteTerminal {
                                                         .is_some_and(|v| v.first() == Some(&b'1')),
                                                     Ordering::Relaxed,
                                                 );
+                                            }
+                                            Some(b'C') => {
+                                                zle_reading.store(false, Ordering::Relaxed);
+                                                // `C` alone is a command start
+                                                // with no line to report — the
+                                                // PowerShell path sends that —
+                                                // and leaves the field empty
+                                                // rather than holding a stale
+                                                // one.
+                                                let line = mark
+                                                    .strip_prefix(b"C;")
+                                                    .map(|c| String::from_utf8_lossy(c).into_owned())
+                                                    .unwrap_or_default();
+                                                if let Ok(mut cmd) = running_command.lock() {
+                                                    *cmd = line;
+                                                }
                                             }
                                             _ => zle_reading.store(false, Ordering::Relaxed),
                                         }
@@ -1107,6 +1143,16 @@ impl RemoteTerminal {
 
     pub fn shell_vi_mode(&self) -> bool {
         self.shell_vi_mode.load(Ordering::Relaxed)
+    }
+
+    /// The line the shell reported running, still percent-escaped. Empty at a
+    /// prompt, and empty for a shell whose integration marks the start of a
+    /// command without naming it.
+    pub fn running_command(&self) -> String {
+        self.running_command
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default()
     }
 
     pub fn size(&self) -> TermSize {
@@ -3432,6 +3478,56 @@ mod tests {
             .unwrap();
         daemon_side.flush().unwrap();
         assert!(poll(false), "C (command start) should disarm zle_reading");
+    }
+
+    #[test]
+    fn the_running_command_is_the_line_the_shell_marked_and_ends_with_it() {
+        crate::core::config::pin_test_config_dir();
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let poll = |want: &str| {
+            for _ in 0..200 {
+                if term.running_command() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+        assert_eq!(term.running_command(), "", "nothing runs before a mark");
+
+        // The escaping is the integration's; this side stores it verbatim and
+        // the reader of the field undoes it.
+        DaemonMsg::Output(b"\x1b]133;C;printf '100%25'\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(
+            poll("printf '100%25'"),
+            "C should record the line it carried, got {:?}",
+            term.running_command()
+        );
+
+        // Back at a prompt the command is over — holding the name would make
+        // the next close question ask about something that already finished.
+        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(""), "a new prompt clears the running command");
+
+        // A bare `C` starts a command without naming it (the PowerShell path).
+        // It must not leave the previous name standing.
+        DaemonMsg::Output(b"\x1b]133;C;cargo build\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll("cargo build"));
+        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(""), "an unnamed command start does not inherit a name");
     }
 
     #[test]

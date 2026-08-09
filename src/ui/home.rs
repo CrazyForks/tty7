@@ -21,13 +21,16 @@ const LOGO: [&str; 4] = [
 
 const LOGO_PX: f32 = 20.0;
 
-const HOME_SHORTCUTS: [&str; 7] = [
+/// What a window with no tabs open can actually do. `SplitRight`/`SplitDown`
+/// were listed here too, but both need a pane to split and return without a
+/// word when there is none — the home page was advertising two chords that do
+/// nothing from the only screen that offers them. `ReopenClosedTab` earns its
+/// row only while something is on the closed stack.
+const HOME_SHORTCUTS: [&str; 5] = [
     "NewTab",
     "ReopenClosedTab",
     "ToggleSwitcher",
     "TogglePalette",
-    "SplitRight",
-    "SplitDown",
     "OpenSettings",
 ];
 
@@ -69,6 +72,14 @@ pub(crate) fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+const DAY: u64 = 86_400;
+const WEEK: u64 = 7 * DAY;
+/// A twelfth of a year, not 30 days. Dividing by 30 would report "0 months
+/// ago" for the five days between the last whole week and the first whole
+/// 30-day month; a twelfth tiles the year with no such seam.
+const MONTH: u64 = 31_536_000 / 12;
+const YEAR: u64 = 365 * DAY;
+
 pub(crate) fn relative_time(now: u64, then: u64) -> String {
     if then == 0 || then >= now {
         return t(L10nKey::HomeTimeJustNow).to_string();
@@ -78,10 +89,16 @@ pub(crate) fn relative_time(now: u64, then: u64) -> String {
         s if s < 60 => t(L10nKey::HomeTimeJustNow).to_string(),
         s if s < 3_600 => t_plural(L10nKey::HomeTimeMinutesAgo, (s / 60) as usize, &[]),
         s if s < 7_200 => t(L10nKey::HomeTimeHourAgo).to_string(),
-        s if s < 86_400 => t_plural(L10nKey::HomeTimeHoursAgo, (s / 3_600) as usize, &[]),
-        s if s < 172_800 => t(L10nKey::HomeTimeYesterday).to_string(),
-        s if s < 604_800 => t_plural(L10nKey::HomeTimeDaysAgo, (s / 86_400) as usize, &[]),
-        _ => t(L10nKey::HomeTimeOverWeekAgo).to_string(),
+        s if s < DAY => t_plural(L10nKey::HomeTimeHoursAgo, (s / 3_600) as usize, &[]),
+        s if s < 2 * DAY => t(L10nKey::HomeTimeYesterday).to_string(),
+        s if s < WEEK => t_plural(L10nKey::HomeTimeDaysAgo, (s / DAY) as usize, &[]),
+        // The ladder used to stop here, so a workspace last opened a year ago
+        // and one opened eight days ago both read "over a week ago". In the
+        // switcher, where recency is the whole reason the line is there, that
+        // collapsed the interesting half of the range into one label.
+        s if s < MONTH => t_plural(L10nKey::HomeTimeWeeksAgo, (s / WEEK) as usize, &[]),
+        s if s < YEAR => t_plural(L10nKey::HomeTimeMonthsAgo, (s / MONTH) as usize, &[]),
+        _ => t(L10nKey::HomeTimeOverYearAgo).to_string(),
     }
 }
 
@@ -100,7 +117,27 @@ pub(crate) fn display_path(path: &std::path::Path) -> String {
         .chars()
         .skip(shortened.chars().count() - PICKER_PATH_MAX)
         .collect();
-    format!("…{tail}")
+    format!("…{}", snap_to_separator(&tail))
+}
+
+/// Drops a leading half-component from a front-elided path.
+///
+/// Cutting at a character count lands mid-name as often as not, and the
+/// remainder reads as a directory that exists: "…eeply/nested/projects" offers
+/// "eeply" with the same weight as "nested". A partial name carries no
+/// information the rest of the path does not, so it goes — unless it is the
+/// longer half, which happens when a single component overruns the whole
+/// budget and there is nothing else left to show.
+fn snap_to_separator(tail: &str) -> &str {
+    let Some(cut) = tail.find('/') else {
+        return tail;
+    };
+    let (dropped, kept) = tail.split_at(cut);
+    if dropped.is_empty() || dropped.chars().count() <= kept.chars().count() {
+        kept
+    } else {
+        tail
+    }
 }
 
 pub(crate) fn key_hint(action: &str, cx: &App) -> Option<String> {
@@ -152,8 +189,12 @@ impl Tty7App {
         ));
 
         let closed_hint = self.closed.last().and_then(closed_tab_label);
+        let nothing_to_reopen = self.closed.is_empty();
         let mut list = v_flex().gap_2().w(px(300.)).text_sm().text_color(muted);
         for action in HOME_SHORTCUTS {
+            if action == "ReopenClosedTab" && nothing_to_reopen {
+                continue;
+            }
             let emphasized = closed_hint.is_some() && action == "ReopenClosedTab";
             let label = home_shortcut_label(action, closed_hint.as_deref());
             list = list.child(
@@ -170,6 +211,14 @@ impl Tty7App {
         }
 
         let status = self.render_remote_status_strip(cx);
+        let failure = self.startup_error.clone().map(|text| {
+            div()
+                .max_w(px(420.))
+                .text_sm()
+                .text_center()
+                .text_color(cx.theme().danger)
+                .child(text)
+        });
 
         v_flex()
             .id("home-page")
@@ -188,11 +237,13 @@ impl Tty7App {
                 }
             }))
             .child(logo)
+            .children(failure)
             .children(status)
             .child(list)
             .with_animation(
                 "home-fade-in",
-                Animation::new(Duration::from_millis(150)),
+                Animation::new(Duration::from_millis(crate::ui::tab_strip::TRANSITION_MS))
+                    .with_easing(gpui::ease_out_quint()),
                 |page, delta| page.opacity(delta),
             )
     }
@@ -339,13 +390,40 @@ mod tests {
         assert_eq!(relative_time(now, now - 4 * 3600), "4 hours ago");
         assert_eq!(relative_time(now, now - 90_000), "yesterday");
         assert_eq!(relative_time(now, now - 3 * 86_400), "3 days ago");
-        assert_eq!(relative_time(now, now - 30 * 86_400), "over a week ago");
+        assert_eq!(relative_time(now, now - 10 * 86_400), "1 week ago");
+        assert_eq!(relative_time(now, now - 31 * 86_400), "1 month ago");
 
         set_locale("zh-CN");
         assert_eq!(relative_time(now, now - 30), "刚刚");
         assert_eq!(relative_time(now, now - 120), "2 分钟前");
         assert_eq!(relative_time(now, now - 3600), "1 小时前");
         assert_eq!(relative_time(now, now - 90_000), "昨天");
+    }
+
+    /// Every step of the ladder has to hand off to the next one without
+    /// leaving a gap that rounds down to zero — "0 months ago" is the kind of
+    /// label a coarser boundary produces and nobody notices until it ships.
+    #[test]
+    fn relative_time_never_counts_down_to_zero_between_ranges() {
+        set_locale("en");
+        // Far enough from the epoch that subtracting years stays positive.
+        let now = 400_000_000u64;
+        for days in 7..=400u64 {
+            let label = relative_time(now, now - days * 86_400);
+            assert!(
+                !label.starts_with('0'),
+                "{days} days ago rendered as {label:?}"
+            );
+        }
+        // The handoffs themselves, spelled out.
+        assert_eq!(relative_time(now, now - 6 * 86_400), "6 days ago");
+        assert_eq!(relative_time(now, now - 7 * 86_400), "1 week ago");
+        // Weeks run to a twelfth of a year, so day 30 is still four weeks.
+        assert_eq!(relative_time(now, now - 30 * 86_400), "4 weeks ago");
+        assert_eq!(relative_time(now, now - 31 * 86_400), "1 month ago");
+        assert_eq!(relative_time(now, now - 364 * 86_400), "11 months ago");
+        assert_eq!(relative_time(now, now - 365 * 86_400), "over a year ago");
+        assert_eq!(relative_time(now, now - 3_000 * 86_400), "over a year ago");
     }
 
     #[test]
@@ -372,11 +450,60 @@ mod tests {
         ));
         assert!(long.starts_with('…'), "{long} should be front-elided");
         assert!(long.ends_with("thing"), "{long} must keep the tail");
-        assert_eq!(long.chars().count(), PICKER_PATH_MAX + 1);
+        // Snapping to a separator can only shorten what the char budget kept.
+        assert!(long.chars().count() <= PICKER_PATH_MAX + 1);
+
+        // A cut that lands mid-name drops the fragment rather than passing it
+        // off as a directory.
+        let midname = display_path(std::path::Path::new(
+            "/Users/tester/verylongish/deeply/nested/projects/area/thing",
+        ));
+        assert_eq!(midname, "…/deeply/nested/projects/area/thing");
 
         match saved {
             Some(home) => unsafe { std::env::set_var("HOME", home) },
             None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// The fragment only goes when the rest of the path can stand without it.
+    #[test]
+    fn a_path_that_is_one_huge_name_keeps_what_it_can() {
+        // Nothing to snap to.
+        assert_eq!(snap_to_separator("abcdefghij"), "abcdefghij");
+        // The fragment is the longer half, so dropping it would leave almost
+        // nothing — better a partial name than "…/ui".
+        assert_eq!(
+            snap_to_separator("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ui"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ui"
+        );
+        // Already on a boundary: nothing is dropped.
+        assert_eq!(snap_to_separator("/src/ui/i18n"), "/src/ui/i18n");
+    }
+
+    #[test]
+    fn every_home_shortcut_ships_with_a_chord_to_show() {
+        let defaults = crate::ui::keymap::default_bindings();
+        for action in HOME_SHORTCUTS {
+            let key = defaults
+                .iter()
+                .find(|(a, _)| *a == action)
+                .unwrap_or_else(|| panic!("{action} is not a bindable action"))
+                .1;
+            assert!(
+                !key.is_empty(),
+                "{action} has no default chord, so its home row would read as a bare label"
+            );
+        }
+    }
+
+    #[test]
+    fn the_home_list_leaves_out_what_an_empty_window_cannot_do() {
+        for action in ["SplitRight", "SplitDown", "CloseActiveTab", "RenameTab"] {
+            assert!(
+                !HOME_SHORTCUTS.contains(&action),
+                "{action} needs a pane, and the home page is what a window shows without one"
+            );
         }
     }
 

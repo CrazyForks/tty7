@@ -444,12 +444,12 @@ impl Tty7App {
             PromptLevel::Warning,
             &title,
             Some(&detail),
-            &[t(L10nKey::Cancel), t(L10nKey::SettingsInstall)],
+            &crate::ui::confirm_answers(t(L10nKey::SettingsInstall), t(L10nKey::Cancel)),
             cx,
         );
         cx.spawn(async move |_, _| {
             let decision = match answer.await {
-                Ok(1) => InstallDecision::Approve,
+                Ok(0) => InstallDecision::Approve,
                 _ => InstallDecision::Decline,
             };
             pending.answer(decision);
@@ -458,26 +458,48 @@ impl Tty7App {
     }
 
     pub(crate) fn prompt_remote_daemon_mismatch(window: &mut Window, cx: &mut Context<Self>) {
-        for mismatch in crate::daemon::install::take_mismatched_remote_daemons() {
-            let title = remote_connect::mismatch_title(&mismatch);
-            let detail = remote_connect::mismatch_detail(&mismatch);
-            let answer = window.prompt(
-                PromptLevel::Warning,
-                &title,
-                Some(&detail),
-                &remote_connect::mismatch_answers(),
-                cx,
-            );
-            cx.spawn(async move |this, cx| {
-                if !matches!(answer.await, Ok(1)) {
-                    return;
-                }
-                let _ = this.update_in(cx, |this, window, cx| {
+        let queue = crate::daemon::install::take_mismatched_remote_daemons();
+        Self::ask_next_daemon_mismatch(queue, window, cx);
+    }
+
+    /// One question at a time. Reconnecting to three machines whose servers are
+    /// all behind used to raise three native modals in a single pass, stacked
+    /// on each other, each about a machine the previous one did not name.
+    fn ask_next_daemon_mismatch(
+        mut queue: Vec<crate::daemon::install::MismatchedRemoteDaemon>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mismatch) = queue.pop() else {
+            return;
+        };
+        let title = remote_connect::mismatch_title(&mismatch);
+        let detail = remote_connect::mismatch_detail(&mismatch);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(&detail),
+            &remote_connect::mismatch_answers(),
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let answered = answer.await;
+            let restart = matches!(answered, Ok(0));
+            // The window went away with the question open. Arm the rest again
+            // rather than swallowing machines nobody was ever asked about.
+            if answered.is_err() {
+                queue.push(mismatch.clone());
+                crate::daemon::install::record_remote_mismatches(queue);
+                return;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                if restart {
                     this.restart_mismatched_remote_server(mismatch, window, cx);
-                });
-            })
-            .detach();
-        }
+                }
+                Self::ask_next_daemon_mismatch(queue, window, cx);
+            });
+        })
+        .detach();
     }
 
     fn restart_mismatched_remote_server(
@@ -507,11 +529,11 @@ impl Tty7App {
             PromptLevel::Warning,
             &t_fmt(L10nKey::RemoteRestartTitle, &[("machine", &label)]),
             Some(&t_fmt(L10nKey::RemoteRestartBody, &[("machine", &label)])),
-            &[t(L10nKey::Cancel), t(L10nKey::RestartServer)],
+            &crate::ui::confirm_answers(t(L10nKey::RestartServer), t(L10nKey::Cancel)),
             cx,
         );
         cx.spawn(async move |this, cx| {
-            if !matches!(answer.await, Ok(1)) {
+            if !matches!(answer.await, Ok(0)) {
                 return;
             }
             let _ = this.update_in(cx, |this, window, cx| {
@@ -575,11 +597,14 @@ impl Tty7App {
             PromptLevel::Warning,
             &t_fmt(L10nKey::RemoteMismatchTitle, &[("machine", &label)]),
             Some(&t_fmt(L10nKey::RemoteReplaceBody, &[("machine", &label)])),
-            &[t(L10nKey::Cancel), t(L10nKey::RemoteMismatchReplaceServer)],
+            &crate::ui::confirm_answers(
+                t(L10nKey::RemoteMismatchReplaceServer),
+                t(L10nKey::Cancel),
+            ),
             cx,
         );
         cx.spawn(async move |this, cx| {
-            if !matches!(answer.await, Ok(1)) {
+            if !matches!(answer.await, Ok(0)) {
                 return;
             }
             let _ = this.update_in(cx, |this, window, cx| {

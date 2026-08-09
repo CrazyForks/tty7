@@ -42,6 +42,13 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::action(t(L10nKey::AppMenuNewWorkspace), NewWorkspace),
             MenuItem::action(t(L10nKey::AppMenuNewWorktreeTab), NewWorktreeTab),
             MenuItem::separator(),
+            // SSH is one of the reasons to pick tty7 and it had no entry in the
+            // menu bar at all — the only routes were ⌘P and Settings, both of
+            // which you have to already know about. Same labels as the palette,
+            // so there is still one name per thing.
+            MenuItem::action(t(L10nKey::CmdSshManageProfiles), OpenSshProfiles),
+            MenuItem::action(t(L10nKey::CmdSshReconnect), RestartSshSession),
+            MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuSplitRight), SplitRight),
             MenuItem::action(t(L10nKey::AppMenuSplitDown), SplitDown),
             MenuItem::separator(),
@@ -88,13 +95,25 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::action(t(L10nKey::AppMenuCodePanel), ToggleCodePanel),
             MenuItem::action(t(L10nKey::AppMenuTabBarPosition), ToggleTabSidebar),
             MenuItem::separator(),
+            MenuItem::action(t(L10nKey::CmdSshRemoteFiles), ToggleSftp),
+            MenuItem::action(t(L10nKey::CmdSshPortForwarding), ShowSshForwards),
+            MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuFocusNextPane), FocusNextPane),
             MenuItem::action(t(L10nKey::AppMenuFocusPreviousPane), FocusPrevPane),
-            MenuItem::action(t(L10nKey::AppMenuZoomPane), ToggleMaximizePane),
+            // No "Zoom Pane" here. It is bound to ⇧⌘↵, and gpui's macOS menu
+            // builder has no key equivalent for `enter`: it hands AppKit the
+            // literal string "enter", which takes the "e" — so the item drew
+            // itself as ⇧⌘E, which is Code Panel's chord, and pressing it
+            // opened the code panel. A menu item that teaches the wrong key and
+            // points at another command is worse than no menu item. Zoom Pane
+            // keeps its place in ⌘P, in a pane's own menu (drawn by us, with
+            // the right chord), and on the Keybindings page.
             MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuClearScrollback), ClearScrollback),
-            MenuItem::separator(),
-            MenuItem::action(t(L10nKey::AppMenuEnterFullscreen), ToggleFullscreen),
+            // No "Enter Full Screen" here: AppKit puts its own at the bottom of
+            // any menu named View, so ours sat directly above it — the same
+            // command twice, under two different shortcuts. ⌘↵ still works and
+            // is listed on the Keybindings page.
         ]),
         Menu::new(t(L10nKey::AppMenuWindow)).items(window_menu_items(cx)),
         Menu::new(t(L10nKey::AppMenuHelp)).items([
@@ -589,11 +608,21 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.foreground = rgb(m.foreground).into();
     t.border = rgb(m.border).into();
     t.secondary = rgb(m.secondary).into();
+    // Ink, not fill. gpui-component resolves both of these from its *stock*
+    // foreground, so a button's label and the detail panel's section headings
+    // were the only text in the window not written in the preset's own colour.
+    t.button_foreground = rgb(m.foreground).into();
+    t.secondary_foreground = rgb(m.foreground).into();
     t.muted = rgb(m.muted).into();
     t.muted_foreground = rgb(m.muted_foreground).into();
     t.popover = rgb(m.popover).into();
     t.tokens.popover = Hsla::from(rgb(m.popover)).into();
     t.tokens.popover_foreground = Hsla::from(rgb(m.foreground)).into();
+    // The field beside the token, not a duplicate of it: gpui-component reads
+    // this one for every tooltip, dropdown menu and date picker it draws. Left
+    // unset it keeps the stock near-white, so menus and tooltips ignored the
+    // preset and came out brighter than the window they float over.
+    t.popover_foreground = rgb(m.foreground).into();
 
     let accent_fill = rgb(surfaces.popover.cursor);
     let accent_text: Hsla = rgb(m.foreground).into();
@@ -687,6 +716,18 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.tokens.button_info_active = fill_active.into();
     t.tokens.button_info_foreground = on_fill.into();
 
+    // The command-line highlighter paints commands, flags, paths, strings and
+    // operators with these, and the find bar flags a bad regex with `red`.
+    // Unset they hold gpui-component's stock ramp, one ramp for every dark
+    // preset and one for every light one — so the line you were typing kept a
+    // palette the output right above it had already left behind.
+    t.red = rgb(theme.ansi_ink(1)).into();
+    t.green = rgb(theme.ansi_ink(2)).into();
+    t.yellow = rgb(theme.ansi_ink(3)).into();
+    t.blue = rgb(theme.ansi_ink(4)).into();
+    t.magenta = rgb(theme.ansi_ink(5)).into();
+    t.cyan = rgb(theme.ansi_ink(6)).into();
+
     t.link = rgb(sem.link.ink).into();
     t.link_hover = rgb(presets::mix(sem.link.ink, m.foreground, 0.25)).into();
     t.link_active = rgb(presets::mix(sem.link.ink, m.background, 0.20)).into();
@@ -702,6 +743,15 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.tokens.background = Hsla::from(rgb(m.background)).into();
     t.tokens.switch_thumb = Hsla::from(rgb(knob)).into();
     t.tokens.switch = Hsla::from(rgb(surfaces.window.selected)).into();
+
+    // A filled slider track means the same thing an on switch does — "this is
+    // the value you set" — so it gets the same colour, and its knob is the same
+    // knob. Left alone the bar falls back to `tokens.primary`, the near-black we
+    // give primary buttons, and the thumb to `primary_foreground`, which on a
+    // dark theme is a black disc on a dark page. Side by side on one settings
+    // page the two controls disagreed about what a set value looks like.
+    t.tokens.slider_bar = Hsla::from(rgb(m.accent)).into();
+    t.tokens.slider_thumb = Hsla::from(rgb(knob)).into();
 
     t.caret = rgb(m.caret).into();
     t.selection = rgb(m.selection).into();
@@ -756,6 +806,12 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     t.tokens.button_secondary_active = button_active.into();
 
     t.ring = rgb(m.accent).into();
+    // Every splitter and panel edge lights up with this while you drag it, and
+    // the drop target for a dragged-in file tints with it. Unset it is a fixed
+    // blue from gpui-component's stock theme — the same blue under all nine
+    // presets. It is an interaction highlight, so it belongs with the focus
+    // ring and the on-switch.
+    t.drag_border = rgb(m.accent).into();
 
     #[cfg(target_os = "macos")]
     if let Some(window) = window.as_deref_mut() {

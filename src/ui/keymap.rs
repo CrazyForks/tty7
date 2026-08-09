@@ -6,6 +6,9 @@ use crate::terminal::view::{
     ClearScrollback, CopyText, FindInTerminal, FindNext, FindPrevious, InsertNewline,
     InsertNewlineFallback, PasteText,
 };
+use crate::ui::i18n::{L10nKey, t, t_fmt};
+use crate::ui::palette::CommandGroup;
+use crate::ui::settings::humanize_action;
 use crate::ui::theme::set_menus;
 
 #[derive(Default)]
@@ -18,6 +21,23 @@ pub fn init(cx: &mut App) {
     bindings.push(KeyBinding::new("secondary-+", IncreaseFontSize, None));
     bindings.push(KeyBinding::new("tab", SendTab, Some("Terminal")));
     bindings.push(KeyBinding::new("shift-tab", SendBackTab, Some("Terminal")));
+    // The switcher's footer tells you Tab is the way across to the tab column
+    // once a query is in the box. gpui-component's Root binds `tab` to its
+    // focus walker, actions are dispatched before key listeners, and the panel
+    // was therefore losing every Tab to the ellipsis button in its own header —
+    // ring and all. A binding on the panel's own context is deeper in the
+    // dispatch path, so it wins.
+    bindings.push(KeyBinding::new("tab", SwitcherAcross, Some("Switcher")));
+    bindings.push(KeyBinding::new(
+        "shift-tab",
+        SwitcherAcrossBack,
+        Some("Switcher"),
+    ));
+    // The palette has nowhere for Tab to go — the arrows walk the list and
+    // Enter runs it — but Root's focus walker still had somewhere to send it:
+    // out of the modal, onto whichever chrome tile is behind it, ring and all.
+    bindings.push(KeyBinding::new("tab", NoAction {}, Some("Palette")));
+    bindings.push(KeyBinding::new("shift-tab", NoAction {}, Some("Palette")));
     cx.bind_keys(bindings);
     cx.set_global(BoundKeystrokes(bound_keystrokes(&effective)));
 
@@ -312,11 +332,312 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
         ("ToggleSftp", ""),
         ("ShowSshForwards", ""),
         ("ToggleCodePanel", "secondary-shift-e"),
+        // Implemented, dispatchable, and until now unbindable: `set_binding`
+        // only fills slots that exist here, so `"ShowRightPanelInfo": "ctrl-1"`
+        // in config.json was dropped without a word, and the Keybindings page —
+        // which reads this list — never showed them at all.
+        ("ShowRightPanelInfo", ""),
+        ("ShowRightPanelChanges", ""),
+        ("ShowRightPanelFiles", ""),
         ("EditorSave", "secondary-s"),
         ("OpenSshProfiles", ""),
         ("RestartSshSession", "secondary-shift-r"),
         ("Quit", per_platform("secondary-q", "secondary-shift-q")),
     ]
+}
+
+/// Where an action sits on the Keybindings page, and what it is called there.
+///
+/// The page used to render `humanize_action`'s CamelCase split — English in a
+/// three-locale app, and a fourth vocabulary on top of the menu bar, the
+/// palette and the docs ("Toggle Maximize Pane" for what everything else calls
+/// Zoom Pane). This routes both the name and the section through the strings
+/// the rest of the app already uses.
+pub(crate) fn action_entry(action: &str) -> (CommandGroup, String) {
+    authored_entry(action).unwrap_or_else(|| {
+        // An action with no entry still renders, under Application and with its
+        // name split on capitals — a new action shows up on the page rather
+        // than disappearing from it. `every_action_has_an_authored_name` is
+        // what keeps that from being how the page looks.
+        (CommandGroup::Application, humanize_action(action))
+    })
+}
+
+fn authored_entry(action: &str) -> Option<(CommandGroup, String)> {
+    // The numbered families are one row each in nine copies; a templated label
+    // beats nine hand-written strings per locale.
+    if let Some(n) = action.strip_prefix("ActivateTab") {
+        return Some((
+            CommandGroup::TabsPanes,
+            t_fmt(L10nKey::KeybindGoToTab, &[("n", n)]),
+        ));
+    }
+    if let Some(n) = action.strip_prefix("SelectWorkspace") {
+        return Some((
+            CommandGroup::Workspaces,
+            t_fmt(L10nKey::KeybindGoToWorkspace, &[("n", n)]),
+        ));
+    }
+    Some(match action {
+        "NewTab" => (CommandGroup::TabsPanes, t(L10nKey::CmdNewTab).to_string()),
+        "CloseActiveTab" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdClosePaneTab).to_string(),
+        ),
+        "RenameTab" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdRenameTab).to_string(),
+        ),
+        "NewWorktreeTab" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdNewWorktreeTab).to_string(),
+        ),
+        "CloseOtherTabs" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdCloseOtherTabs).to_string(),
+        ),
+        "CloseTabsToTheRight" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdCloseTabsToTheRight).to_string(),
+        ),
+        "CopyWorkingDirectory" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdCopyWorkingDirectory).to_string(),
+        ),
+        "MarkTabUnread" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdMarkTabAsUnread).to_string(),
+        ),
+        "ReopenClosedTab" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdReopenClosedTab).to_string(),
+        ),
+        "SplitRight" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdSplitRight).to_string(),
+        ),
+        "SplitDown" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdSplitDown).to_string(),
+        ),
+        "ToggleMaximizePane" => (CommandGroup::TabsPanes, t(L10nKey::CmdZoomPane).to_string()),
+        "FocusNextPane" => (CommandGroup::TabsPanes, t(L10nKey::CmdNextPane).to_string()),
+        "FocusPrevPane" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdPreviousPane).to_string(),
+        ),
+        "FocusPaneLeft" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdFocusPaneLeft).to_string(),
+        ),
+        "FocusPaneRight" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdFocusPaneRight).to_string(),
+        ),
+        "FocusPaneUp" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdFocusPaneUp).to_string(),
+        ),
+        "FocusPaneDown" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdFocusPaneDown).to_string(),
+        ),
+        "ResizePaneLeft" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdResizePaneLeft).to_string(),
+        ),
+        "ResizePaneRight" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdResizePaneRight).to_string(),
+        ),
+        "ResizePaneUp" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdResizePaneUp).to_string(),
+        ),
+        "ResizePaneDown" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdResizePaneDown).to_string(),
+        ),
+        "SwapPaneNext" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdSwapPaneNext).to_string(),
+        ),
+        "SwapPanePrev" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdSwapPanePrevious).to_string(),
+        ),
+        "NextTab" => (CommandGroup::TabsPanes, t(L10nKey::CmdNextTab).to_string()),
+        "PrevTab" => (
+            CommandGroup::TabsPanes,
+            t(L10nKey::CmdPreviousTab).to_string(),
+        ),
+        "NewWorkspace" => (
+            CommandGroup::Workspaces,
+            t(L10nKey::CmdNewWorkspace).to_string(),
+        ),
+        "RenameWorkspace" => (
+            CommandGroup::Workspaces,
+            t(L10nKey::CmdRenameWorkspace).to_string(),
+        ),
+        "StopWorkspace" => (
+            CommandGroup::Workspaces,
+            t(L10nKey::CmdStopWorkspace).to_string(),
+        ),
+        "DeleteWorkspace" => (
+            CommandGroup::Workspaces,
+            t(L10nKey::CmdDeleteWorkspace).to_string(),
+        ),
+        "ToggleSwitcher" => (
+            CommandGroup::Workspaces,
+            t(L10nKey::CmdSwitchWorkspace).to_string(),
+        ),
+        "IncreaseFontSize" => (
+            CommandGroup::View,
+            t(L10nKey::AppMenuIncreaseFontSize).to_string(),
+        ),
+        "DecreaseFontSize" => (
+            CommandGroup::View,
+            t(L10nKey::AppMenuDecreaseFontSize).to_string(),
+        ),
+        "ResetFontSize" => (CommandGroup::View, t(L10nKey::CmdResetFontSize).to_string()),
+        "ToggleFullscreen" => (
+            CommandGroup::View,
+            t(L10nKey::CmdEnterFullScreen).to_string(),
+        ),
+        "ToggleTabSidebar" => (
+            CommandGroup::View,
+            t(L10nKey::AppMenuTabBarPosition).to_string(),
+        ),
+        "ToggleLeftPanel" => (
+            CommandGroup::View,
+            t(L10nKey::AppMenuLeftSidebar).to_string(),
+        ),
+        "ToggleRightPanel" => (
+            CommandGroup::View,
+            t(L10nKey::AppMenuRightPanel).to_string(),
+        ),
+        "ToggleCodePanel" => (CommandGroup::View, t(L10nKey::AppMenuCodePanel).to_string()),
+        "ShowRightPanelInfo" => (
+            CommandGroup::View,
+            t(L10nKey::CmdRightPanelInfo).to_string(),
+        ),
+        "ShowRightPanelChanges" => (
+            CommandGroup::View,
+            t(L10nKey::CmdRightPanelChanges).to_string(),
+        ),
+        "ShowRightPanelFiles" => (
+            CommandGroup::View,
+            t(L10nKey::CmdRightPanelFiles).to_string(),
+        ),
+        "FindInTerminal" => (
+            CommandGroup::Terminal,
+            t(L10nKey::CmdFindInTerminal).to_string(),
+        ),
+        "FindNext" => (CommandGroup::Terminal, t(L10nKey::CmdFindNext).to_string()),
+        "FindPrevious" => (
+            CommandGroup::Terminal,
+            t(L10nKey::CmdFindPrevious).to_string(),
+        ),
+        "ClearScrollback" => (
+            CommandGroup::Terminal,
+            t(L10nKey::CmdClearScrollback).to_string(),
+        ),
+        "CopyText" => (CommandGroup::Terminal, t(L10nKey::CmdCopy).to_string()),
+        "PasteText" => (CommandGroup::Terminal, t(L10nKey::CmdPaste).to_string()),
+        "InsertNewline" => (
+            CommandGroup::Terminal,
+            t(L10nKey::KeybindInsertNewline).to_string(),
+        ),
+        "EditorSave" => (CommandGroup::Terminal, t(L10nKey::Save).to_string()),
+        "OpenSshProfiles" => (
+            CommandGroup::Ssh,
+            t(L10nKey::CmdSshManageProfiles).to_string(),
+        ),
+        "RestartSshSession" => (CommandGroup::Ssh, t(L10nKey::CmdSshReconnect).to_string()),
+        "ToggleSftp" => (CommandGroup::Ssh, t(L10nKey::CmdSshRemoteFiles).to_string()),
+        "ShowSshForwards" => (
+            CommandGroup::Ssh,
+            t(L10nKey::CmdSshPortForwarding).to_string(),
+        ),
+        "ForkAgentSession" => (CommandGroup::Agents, t(L10nKey::CmdForkSession).to_string()),
+        "ForkAgentSessionRight" => (
+            CommandGroup::Agents,
+            t(L10nKey::KeybindForkSessionRight).to_string(),
+        ),
+        "ForkAgentSessionLeft" => (
+            CommandGroup::Agents,
+            t(L10nKey::KeybindForkSessionLeft).to_string(),
+        ),
+        "ForkAgentSessionDown" => (
+            CommandGroup::Agents,
+            t(L10nKey::KeybindForkSessionDown).to_string(),
+        ),
+        "ForkAgentSessionUp" => (
+            CommandGroup::Agents,
+            t(L10nKey::KeybindForkSessionUp).to_string(),
+        ),
+        "CopyAgentSessionId" => (
+            CommandGroup::Agents,
+            t(L10nKey::CmdCopySessionId).to_string(),
+        ),
+        "TogglePalette" => (
+            CommandGroup::Application,
+            t(L10nKey::AppMenuCommandPalette).to_string(),
+        ),
+        "OpenSettings" => (
+            CommandGroup::Application,
+            t(L10nKey::CmdSettings).to_string(),
+        ),
+        "ShowKeyboardShortcuts" => (
+            CommandGroup::Application,
+            t(L10nKey::CmdKeyboardShortcuts).to_string(),
+        ),
+        "About" => (
+            CommandGroup::Application,
+            t(L10nKey::CmdAboutTty7).to_string(),
+        ),
+        "CheckForUpdates" => (
+            CommandGroup::Application,
+            t(L10nKey::CmdCheckForUpdates).to_string(),
+        ),
+        "OpenDocumentation" => (
+            CommandGroup::Application,
+            t(L10nKey::CmdDocumentation).to_string(),
+        ),
+        "OpenDiscord" => (
+            CommandGroup::Application,
+            t(L10nKey::CmdJoinDiscord).to_string(),
+        ),
+        "ReportIssue" => (
+            CommandGroup::Application,
+            t(L10nKey::CmdReportIssue).to_string(),
+        ),
+        "HideApp" => (
+            CommandGroup::Application,
+            t(L10nKey::AppMenuHideApp).to_string(),
+        ),
+        "HideOthers" => (
+            CommandGroup::Application,
+            t(L10nKey::AppMenuHideOthers).to_string(),
+        ),
+        "ShowAll" => (
+            CommandGroup::Application,
+            t(L10nKey::AppMenuShowAll).to_string(),
+        ),
+        "MinimizeWindow" => (
+            CommandGroup::Application,
+            t(L10nKey::AppMenuMinimize).to_string(),
+        ),
+        "ZoomWindow" => (
+            CommandGroup::Application,
+            t(L10nKey::AppMenuZoom).to_string(),
+        ),
+        "Quit" => (
+            CommandGroup::Application,
+            t(L10nKey::CmdQuitTty7).to_string(),
+        ),
+        _ => return None,
+    })
 }
 
 pub(crate) fn effective_bindings(cx: &App) -> Vec<(String, String)> {
@@ -335,8 +656,11 @@ pub(crate) fn effective_bindings(cx: &App) -> Vec<(String, String)> {
 }
 
 fn set_binding(effective: &mut [(String, String)], action: &str, key: String) {
-    if let Some(slot) = effective.iter_mut().find(|(a, _)| a == action) {
-        slot.1 = key;
+    match effective.iter_mut().find(|(a, _)| a == action) {
+        Some(slot) => slot.1 = key,
+        // A hand-edited config.json with a typo used to vanish into this
+        // branch. The Keybindings page lists every name that works.
+        None => log::warn!("keybinding for unknown action {action:?} ignored"),
     }
 }
 
@@ -626,6 +950,63 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_dispatchable_action_has_a_slot_to_bind_it_in() {
+        // `make_binding` is what turns an action name into a real binding, and
+        // `default_bindings` is the only list `set_binding` will write into. An
+        // action in the first but not the second cannot be bound at all — not
+        // from config.json, which drops it silently, and not from the
+        // Keybindings page, which reads the second.
+        let bindable: std::collections::HashSet<&str> =
+            default_bindings().into_iter().map(|(a, _)| a).collect();
+        for action in [
+            "ShowRightPanelInfo",
+            "ShowRightPanelChanges",
+            "ShowRightPanelFiles",
+        ] {
+            assert!(bindable.contains(action), "{action} has nowhere to bind to");
+            assert!(
+                make_binding(action, "ctrl-1").is_some(),
+                "{action} has a slot but nothing to dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn every_action_has_an_authored_name() {
+        crate::ui::i18n::set_locale("en");
+        let missing: Vec<&str> = default_bindings()
+            .into_iter()
+            .map(|(a, _)| a)
+            .filter(|a| authored_entry(a).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these actions would render on the Keybindings page as a CamelCase \
+             split of their internal name, in English, in a three-locale app: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_page_speaks_the_same_words_as_the_rest_of_the_app() {
+        crate::ui::i18n::set_locale("en");
+        // The four names the critique found for one action; the menu bar, the
+        // palette and the docs all say Zoom Pane.
+        assert_eq!(action_entry("ToggleMaximizePane").1, "Zoom Pane");
+        assert_eq!(action_entry("CloseActiveTab").1, "Close Pane / Tab");
+        assert_eq!(action_entry("ClearScrollback").1, "Clear Scrollback");
+        assert_eq!(action_entry("TogglePalette").1, "Command Palette…");
+        assert_eq!(action_entry("ToggleSwitcher").1, "Switch Workspace…");
+        // The numbered families are templated, not nine strings per locale.
+        assert_eq!(action_entry("ActivateTab3").1, "Go to Tab 3");
+        assert_eq!(action_entry("SelectWorkspace7").1, "Go to Workspace 7");
+        // And they land in the section they belong to.
+        assert_eq!(action_entry("ActivateTab3").0, CommandGroup::TabsPanes);
+        assert_eq!(action_entry("SelectWorkspace7").0, CommandGroup::Workspaces);
+        assert_eq!(action_entry("ToggleSftp").0, CommandGroup::Ssh);
+        assert_eq!(action_entry("ForkAgentSessionUp").0, CommandGroup::Agents);
+    }
 
     #[cfg(target_os = "macos")]
     const SECONDARY: &str = "⌘";

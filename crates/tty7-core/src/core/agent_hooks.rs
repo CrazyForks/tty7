@@ -465,26 +465,43 @@ pub fn hooks_state(target: &HookTarget, agent: HookAgent) -> HooksState {
     }
 }
 
-pub fn install_hooks(target: &HookTarget, agent: HookAgent) -> anyhow::Result<String> {
+/// What an install or uninstall actually did.
+///
+/// These land in a note the user reads in Settings, and this crate cannot
+/// reach `src/ui/i18n`, which owns every user-visible string. Returning a
+/// sentence from here meant a Chinese or Japanese UI reported "Installed" in
+/// English; returning the outcome lets the caller word it in the user's
+/// language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookOutcome {
+    Installed,
+    /// Installed on a remote, where `codex features enable hooks` still has to
+    /// be run once by hand.
+    InstalledEnableCodexThere,
+    /// Installed, but running `codex features enable hooks` here failed.
+    InstalledCodexEnableFailed(String),
+    Removed,
+    /// The agent has no config file at all.
+    NothingInstalled,
+    /// The config is there, but holds no tty7 hooks.
+    NoTty7Hooks,
+}
+
+pub fn install_hooks(target: &HookTarget, agent: HookAgent) -> anyhow::Result<HookOutcome> {
     let path = agent.target_path(target);
     match agent {
         HookAgent::Claude => {
             hook_map_install(target, &path, agent, CLAUDE_HOOK_EVENTS)?;
-            Ok("Installed".to_string())
+            Ok(HookOutcome::Installed)
         }
         HookAgent::Codex => {
             hook_map_install(target, &path, agent, CODEX_HOOK_EVENTS)?;
             if !target.is_local() {
-                return Ok(
-                    "Installed — run `codex features enable hooks` once on that machine"
-                        .to_string(),
-                );
+                return Ok(HookOutcome::InstalledEnableCodexThere);
             }
             Ok(match enable_codex_hooks_feature() {
-                Ok(()) => "Installed".to_string(),
-                Err(e) => format!(
-                    "Installed, but couldn't run `codex features enable hooks` ({e}) — run it once manually"
-                ),
+                Ok(()) => HookOutcome::Installed,
+                Err(e) => HookOutcome::InstalledCodexEnableFailed(e.to_string()),
             })
         }
         HookAgent::Copilot
@@ -495,12 +512,12 @@ pub fn install_hooks(target: &HookTarget, agent: HookAgent) -> anyhow::Result<St
             let content = owned_file_content(target, agent)
                 .ok_or_else(|| anyhow::anyhow!("{agent:?} has no owned file"))?;
             owned_file_install(target, &path, &content, &agent.marker())?;
-            Ok("Installed".to_string())
+            Ok(HookOutcome::Installed)
         }
     }
 }
 
-pub fn uninstall_hooks(target: &HookTarget, agent: HookAgent) -> anyhow::Result<String> {
+pub fn uninstall_hooks(target: &HookTarget, agent: HookAgent) -> anyhow::Result<HookOutcome> {
     let path = agent.target_path(target);
     match agent {
         HookAgent::Claude | HookAgent::Codex => hook_map_uninstall(target, &path, agent),
@@ -522,7 +539,7 @@ pub fn refresh_hooks(target: &HookTarget) -> usize {
             Ok(summary) => {
                 refreshed += 1;
                 log::info!(
-                    "refreshed stale {} hooks at {}: {summary}",
+                    "refreshed stale {} hooks at {}: {summary:?}",
                     agent.display_name(),
                     agent.target_display(target)
                 );
@@ -690,11 +707,11 @@ fn hook_map_uninstall(
     target: &HookTarget,
     path: &Path,
     agent: HookAgent,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<HookOutcome> {
     let text = match target.read(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok("Nothing installed; nothing to remove".to_string());
+            return Ok(HookOutcome::NothingInstalled);
         }
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
     };
@@ -718,10 +735,10 @@ fn hook_map_uninstall(
         hooks.retain(|_, entries| entries.as_array().is_none_or(|list| !list.is_empty()));
     }
     if removed == 0 {
-        return Ok("No tty7 hooks found; nothing to remove".to_string());
+        return Ok(HookOutcome::NoTty7Hooks);
     }
     target.write(path, serde_json::to_string_pretty(&root)?.as_bytes())?;
-    Ok("Removed".to_string())
+    Ok(HookOutcome::Removed)
 }
 
 fn marker_command<'a>(matcher: &'a serde_json::Value, marker: &str) -> Option<&'a str> {
@@ -826,11 +843,15 @@ fn owned_file_install(
     target.write(path, content.as_bytes())
 }
 
-fn owned_file_uninstall(target: &HookTarget, path: &Path, marker: &str) -> anyhow::Result<String> {
+fn owned_file_uninstall(
+    target: &HookTarget,
+    path: &Path,
+    marker: &str,
+) -> anyhow::Result<HookOutcome> {
     let contents = match target.read(path) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok("Nothing installed; nothing to remove".to_string());
+            return Ok(HookOutcome::NothingInstalled);
         }
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
     };
@@ -846,7 +867,7 @@ fn owned_file_uninstall(target: &HookTarget, path: &Path, marker: &str) -> anyho
     {
         let _ = target.host.remove(parent, false);
     }
-    Ok("Removed".to_string())
+    Ok(HookOutcome::Removed)
 }
 
 fn copilot_hooks_json(target: &HookTarget) -> Option<String> {
@@ -1323,9 +1344,10 @@ mod tests {
         }
 
         let summary = install_hooks(&target, HookAgent::Codex).expect("codex install succeeds");
-        assert!(
-            summary.contains("codex features enable hooks"),
-            "remote codex install has to hand the flag back to the user: {summary}"
+        assert_eq!(
+            summary,
+            HookOutcome::InstalledEnableCodexThere,
+            "a remote codex install has to hand the leftover step back to the caller"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

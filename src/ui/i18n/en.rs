@@ -9,18 +9,17 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::FilterHosts => "Filter hosts…",
         L10nKey::SearchCommandsOrHost => "Search or type user@host to connect…",
         L10nKey::SearchTheme => "Search…",
-        L10nKey::Search => "Search",
-        L10nKey::SearchWorkspacesAndMachines => "Search workspaces, tabs and machines",
+        L10nKey::SearchWorkspacesAndMachines => "Search workspaces, tabs, and machines…",
         L10nKey::SearchFonts => "Search fonts…",
-        L10nKey::SearchFind => "Find",
+        L10nKey::SearchFind => "Find…",
         L10nKey::SearchMatchCase => "Match case",
         L10nKey::SearchUseRegex => "Use regular expression",
         L10nKey::NewFolderName => "New folder name",
         L10nKey::NewFileName => "New file name",
         L10nKey::HomeNewTab => "New Tab",
         L10nKey::HomeReopenClosedTab => "Reopen Closed Tab",
-        L10nKey::HomeSwitchWorkspace => "Switch Workspace",
-        L10nKey::HomeCommandPalette => "Command Palette",
+        L10nKey::HomeSwitchWorkspace => "Switch Workspace…",
+        L10nKey::HomeCommandPalette => "Command Palette…",
         L10nKey::HomeSplitRight => "Split Right",
         L10nKey::HomeSplitDown => "Split Down",
         L10nKey::HomeSettings => "Settings…",
@@ -33,8 +32,13 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::Delete => "Delete",
         L10nKey::NoMatchingCommands => "No matching commands",
         L10nKey::ConnectSshHint => "Type user@host to connect over SSH instead.",
-        L10nKey::EditHint => "→ edit",
+        L10nKey::EditHint => "edit",
         L10nKey::OpenFileFromTree => "Open a file from the file tree",
+        L10nKey::TreeDirLoading => "Reading…",
+        L10nKey::TreeDirEmpty => "Empty",
+        L10nKey::TreeDirHiddenOnly => "Only hidden files",
+        L10nKey::TreeDirUnreadable => "Could not be read",
+        L10nKey::TreeSearchCapped => "First {n} matches",
         L10nKey::FileChangedOnDisk => "File changed on disk",
         L10nKey::Reload => "Reload",
         L10nKey::KeepMine => "Keep mine",
@@ -58,6 +62,10 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::QuitAndStop => "Quit and Stop",
         L10nKey::CloseSshConnectionTitle => "Close this SSH connection?",
         L10nKey::CloseSshConnectionBody => "The connection is live. Closing will end it.",
+        L10nKey::ClosePaneBusyTitle => "Close this pane?",
+        L10nKey::CloseTabBusyTitle => "Close this tab?",
+        L10nKey::CloseBusyCommandBody => "{what} is still running. Closing ends it.",
+        L10nKey::CloseBusyAgentBody => "{agent} is still working. Closing ends its turn.",
         L10nKey::Keep => "Keep",
         L10nKey::SettingsNavAppearance => "Appearance",
         L10nKey::SettingsNavTerminal => "Terminal",
@@ -80,6 +88,11 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsTypography => "Typography",
         L10nKey::SettingsFontSize => "Font size",
         L10nKey::SettingsFontSizeDesc => "Terminal text size in pixels.",
+        L10nKey::SettingsUiFontSize => "Interface font size",
+        L10nKey::SettingsUiFontSizeDesc => {
+            "Text size everywhere outside the terminal — tabs, panels and settings. \
+             Raise it on a display that is not Retina."
+        }
         L10nKey::SettingsLineHeight => "Line height",
         L10nKey::SettingsLineHeightDesc => "Row spacing as a multiple of the font size.",
         L10nKey::SettingsFontFamily => "Font family",
@@ -153,6 +166,10 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsAnsiColors => "ANSI colors",
         L10nKey::SettingsCustomThemes => "Custom themes",
+        L10nKey::SettingsThemesRejected => "Not loaded from the themes folder",
+        L10nKey::ThemeDuplicateFailed => "Could not duplicate the theme",
+        L10nKey::ThemeSaveFailed => "Could not save the theme",
+        L10nKey::OpenInFileManagerFailed => "Could not open {path}",
         L10nKey::SettingsCustomThemesIntro => {
             "Duplicate a theme to edit its colors here, or drop your own in the themes folder: a tty7 YAML theme or an iTerm2 .itermcolors scheme."
         }
@@ -164,7 +181,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsNothingMatches => "Nothing matches {query}.",
         L10nKey::SettingsInTty7 => "In tty7",
         L10nKey::SettingsImportFromSshConfig => "Import from ~/.ssh/config",
-        L10nKey::SettingsExpandAllGroups => "Expand all groups",
+        L10nKey::SettingsExpandAllGroups => "Expand All Groups",
         L10nKey::SettingsNoHostsYet => "No hosts yet",
         L10nKey::SettingsNothingSelected => "Nothing selected",
         L10nKey::SettingsTypeAddressToConnect => {
@@ -180,12 +197,15 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsDefaultsIntro => {
             "Every host starts from these. Any host can override one under its own Advanced."
         }
-        L10nKey::SettingsCopyAddress => "Copy address",
+        L10nKey::SettingsCopyAddress => "Copy Address",
         L10nKey::SettingsDuplicate => "Duplicate",
-        L10nKey::SettingsForgetPassword => "Forget password",
+        L10nKey::SettingsForgetPassword => "Forget Password",
         L10nKey::SettingsForgotPasswordFor => "Forgot saved password for {endpoint}",
+        L10nKey::SettingsDeleteProfileBody => {
+            "The password saved for it goes too, unless another connection still uses the same address."
+        }
         L10nKey::SettingsCouldntForgetPassword => {
-            "Couldn't forget password for {endpoint}: {error}"
+            "Could not forget the saved password for {endpoint}: {error}"
         }
         L10nKey::SettingsSecurity => "Security",
         L10nKey::SettingsSecurityIntro => {
@@ -200,6 +220,11 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "Ask for confirmation before closing a tab or pane with a live SSH session."
         }
         L10nKey::SettingsNewHost => "New host",
+        L10nKey::SettingsDiscardChangesTitle => "Discard unsaved changes?",
+        L10nKey::SettingsDiscardChangesBody => {
+            "The connection you are editing has changes that were never saved."
+        }
+        L10nKey::SettingsKeepEditing => "Keep Editing",
         L10nKey::SettingsName => "Name",
         L10nKey::SettingsNameDesc => "A label for this connection.",
         L10nKey::SettingsHost => "Host",
@@ -218,10 +243,10 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "Name of another profile to tunnel through (blank = direct)."
         }
         L10nKey::SettingsNoneSummary => "(none)",
-        L10nKey::SettingsNoneLower => "none",
         L10nKey::SettingsPortForwarding => "Port forwarding",
         L10nKey::SettingsRulesOpenedWithConnection => "1 rule, opened with the connection",
         L10nKey::SettingsAddRule => "+ Add rule",
+        L10nKey::SettingsRemoveRule => "Remove rule",
         L10nKey::SettingsFwdLegendLocal => "L — a local port reaches the remote side",
         L10nKey::SettingsFwdLegendRemote => "R — a remote port reaches this machine",
         L10nKey::SettingsFwdLegendDynamic => "D — dynamic SOCKS proxy",
@@ -233,6 +258,12 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsAdvancedSummary => {
             "algorithms / keepalive / proxies / X11 / login scripts"
         }
+        L10nKey::SettingsGroupAuthentication => "Authentication",
+        L10nKey::SettingsGroupProxies => "Proxies",
+        L10nKey::SettingsGroupAlgorithms => "Algorithms",
+        L10nKey::SettingsGroupConnection => "Connection",
+        L10nKey::SettingsGroupSession => "Session",
+        L10nKey::SettingsGroupSecurity => "Security",
         L10nKey::SettingsIdentityFiles => "Identity files",
         L10nKey::SettingsIdentityFilesDesc => "Private-key paths, one per line (%h/%r expand).",
         L10nKey::SettingsAgentForwarding => "Agent forwarding",
@@ -251,7 +282,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsMacsDesc => "Comma-separated (blank = default).",
         L10nKey::SettingsHostKeyAlgorithms => "Host-key algorithms",
         L10nKey::SettingsHostKeyAlgorithmsDesc => "Comma-separated (blank = default).",
-        L10nKey::SettingsCompression => "Compression",
+        L10nKey::SettingsCompression => "Compression algorithms",
         L10nKey::SettingsJumpHostVia => "via {jump_name}",
         L10nKey::SettingsConnected => "connected",
         L10nKey::SettingsProfileCopied => "{name} (copy)",
@@ -266,7 +297,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsX11ForwardingDesc => "Request X11 forwarding (needs XQuartz on macOS).",
         L10nKey::SettingsShellIntegration => "Shell integration",
         L10nKey::SettingsShellIntegrationDesc => {
-            "Let the remote shell report prompts, exit codes and directory."
+            "Let the remote shell report prompts, exit codes, and the working directory."
         }
         L10nKey::SettingsLoginScripts => "Login scripts",
         L10nKey::SettingsLoginScriptsDesc => "Commands sent after the shell opens, one per line.",
@@ -284,11 +315,11 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsProgram => "Program",
         L10nKey::SettingsProgramDesc => {
-            "Executable name on PATH or an absolute path. e.g. zsh, fish, pwsh."
+            "Executable name on PATH or an absolute path (e.g. zsh, fish, pwsh)."
         }
         L10nKey::SettingsArguments => "Arguments",
         L10nKey::SettingsArgumentsDesc => {
-            "Space-separated launch flags. e.g. -l for a login shell."
+            "Space-separated launch flags (e.g. -l for a login shell)."
         }
         L10nKey::SettingsStartIn => "Start in",
         L10nKey::SettingsStartInDesc => {
@@ -400,6 +431,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsChangeTheme => "Change theme",
         L10nKey::SettingsThemes => "Themes",
+        L10nKey::SettingsThemesCloseTooltip => "Close Themes (Esc)",
         L10nKey::SettingsThemePanelManual => "Change your current theme.",
         L10nKey::SettingsThemePanelLight => "Choose the theme for light mode.",
         L10nKey::SettingsThemePanelDark => "Choose the theme for dark mode.",
@@ -450,7 +482,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsWindow => "Window",
         L10nKey::NotifyModeNever => "Never",
-        L10nKey::NotifyModeUnfocused => "When Unfocused",
+        L10nKey::NotifyModeUnfocused => "When unfocused",
         L10nKey::NotifyModeAlways => "Always",
         L10nKey::SettingsStartupNormal => "Normal",
         L10nKey::SettingsStartupMaximized => "Maximized",
@@ -475,30 +507,40 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "With a prefix active, a bare prefix key reaches the shell after a ~1s pause, and prefix + an unbound key is sent through to the terminal."
         }
         L10nKey::SettingsRestoreAllDefaults => "Restore all defaults",
+        L10nKey::SettingsRestoreAllDefaultsBody => {
+            "Every key you have rebound goes back to its default. There is no undo."
+        }
+        L10nKey::KeybindGoToTab => "Go to Tab {n}",
+        L10nKey::KeybindGoToWorkspace => "Go to Workspace {n}",
+        L10nKey::KeybindInsertNewline => "Insert Newline",
+        L10nKey::KeybindForkSessionRight => "Fork Session Right",
+        L10nKey::KeybindForkSessionLeft => "Fork Session Left",
+        L10nKey::KeybindForkSessionDown => "Fork Session Down",
+        L10nKey::KeybindForkSessionUp => "Fork Session Up",
         L10nKey::SettingsAboutDesc1 => {
             "A terminal workbench: persistent sessions, remote work, agents."
         }
         L10nKey::SettingsVersion => "Version",
         L10nKey::SettingsUpdates => "Updates",
-        L10nKey::SettingsUpdateAndRelaunch => "Update and Relaunch",
-        L10nKey::SettingsUpdateViewRelease => "View Release",
+        L10nKey::SettingsUpdateAndRelaunch => "Update and relaunch",
+        L10nKey::SettingsUpdateViewRelease => "View release",
         L10nKey::SettingsUpdateChecking => "Checking for updates…",
         L10nKey::SettingsUpdateUpToDate => "You're running the latest version.",
         L10nKey::SettingsUpdateDownloadingPercent => "Downloading the update… {percent}% of {size}",
         L10nKey::SettingsUpdateDownloadingBytes => "Downloading the update… {received}",
         L10nKey::SettingsUpdateVerifying => "Verifying the downloaded update…",
         L10nKey::SettingsUpdateInstalling => "Relaunching with the update…",
-        L10nKey::SettingsUpdateCheckNow => "Check Now",
-        L10nKey::SettingsUpdateCancel => "Cancel Download",
-        L10nKey::SettingsUpdateRetry => "Try Again",
+        L10nKey::SettingsUpdateCheckNow => "Check now",
+        L10nKey::SettingsUpdateCancel => "Cancel download",
+        L10nKey::SettingsUpdateRetry => "Try again",
         L10nKey::SettingsUpdateDismiss => "Dismiss",
-        L10nKey::SettingsUpdateDownloadManually => "Download Manually",
+        L10nKey::SettingsUpdateDownloadManually => "Download manually",
         L10nKey::SettingsUpdateFailedTitle => "Updating to {version} failed.",
         L10nKey::SettingsUpdateReady => "Version {version} is downloaded and ready to install.",
         L10nKey::SettingsUpdateReadyNextLaunch => {
             "It will be installed the next time you start tty7."
         }
-        L10nKey::SettingsUpdateInstallNow => "Install and Relaunch",
+        L10nKey::SettingsUpdateInstallNow => "Install and relaunch",
         L10nKey::SettingsUpdateDiscard => "Discard",
         L10nKey::SettingsAutoDownload => "Download updates in the background",
         L10nKey::SettingsAutoDownloadDesc => {
@@ -510,14 +552,13 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsUpdateChannelStable => "Stable",
         L10nKey::SettingsUpdateChannelNightly => "Nightly",
-        L10nKey::SettingsDaemonStale => "The background service is still running {build}.",
+        L10nKey::SettingsDaemonStale => "The background server is still running {build}.",
         L10nKey::SettingsDaemonStaleDesc => {
-            "tty7 was updated in place, so the app is new but your panes are still served by the previous build. Restarting the service picks up the new one and ends every process running in your panes — shells, agents and SSH sessions alike. There is no hurry: pick a moment when your panes are idle."
+            "tty7 was updated in place, so the app is new but your panes are still served by the previous build. Restarting the server picks up the new one and ends every process running in your panes — shells, agents, and SSH sessions alike. There is no hurry: pick a moment when your panes are idle."
         }
-        L10nKey::SettingsDaemonStaleRestart => "Restart Service",
         L10nKey::UpdateDialogTitle => "Update available",
         L10nKey::UpdateDialogDetail => {
-            "tty7 {version} is available — you're on {current}. Installing restarts the app; the background service keeps running, so whatever is open in your panes survives."
+            "tty7 {version} is available — you're on {current}. Installing restarts the app; the background server keeps running, so whatever is open in your panes survives."
         }
         L10nKey::UpdateDialogDetailWindows => {
             "tty7 {version} is available — you're on {current}. Installing restarts the app and the background service: processes running in your panes are ended, and your tabs and layout come back with fresh shells."
@@ -562,12 +603,18 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsCheckUpdatesOnLaunch => "Check for updates on launch",
         L10nKey::SettingsCommandLine => "Command line",
         L10nKey::SettingsCommandLineDesc => {
-            "Put the bundled `tty7` command on your PATH at launch, so scripts and coding agents can drive tty7 from any terminal. Inside a tty7 pane it works either way. Turn this off if you keep your own `tty7` — one you built or installed yourself — and do not want it shadowed. Takes effect at next launch."
+            "Put the bundled tty7 command on your PATH at launch, so scripts and coding agents can drive tty7 from any terminal. Inside a tty7 pane it works either way. Turn this off if you keep your own tty7 — one you built or installed yourself — and do not want it shadowed. Takes effect at next launch."
         }
-        L10nKey::SettingsInstallCliOnPath => "Install the `tty7` command on PATH",
+        L10nKey::SettingsInstallCliOnPath => "Install the tty7 command on PATH",
         L10nKey::SettingsServer => "Server",
         L10nKey::SettingsServerDesc => {
             "Restarts the background server that keeps your shells running. This ends every shell on this computer; your tabs and layout reopen with fresh ones."
+        }
+        L10nKey::SettingsHowShellsWorkBody => {
+            "Your shells run in a background server, not inside this window. Quitting tty7 \
+             leaves them running: reopen it and your tabs, layout, and working directories \
+             come back with the same shells still in them. Closing a tab ends its shell; \
+             \"Restart server\" and \"Quit and Stop Server\" end all of them."
         }
         L10nKey::SettingsRestartServer => "Restart server…",
         L10nKey::SettingsAppHttpProxy => "Proxy for updates",
@@ -589,6 +636,12 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "proxy http https socks socks5 clash v2ray network download update"
         }
         L10nKey::SettingsSearchAnsiColorsKeywords => "palette 16 terminal colours theme",
+        L10nKey::SettingsSearchBackgroundImageKeywords => {
+            "background image wallpaper picture photo backdrop theme"
+        }
+        L10nKey::SettingsSearchImageOpacityKeywords => {
+            "background image opacity strength fade wallpaper"
+        }
         L10nKey::SettingsSearchArgumentsKeywords => "shell flags login args",
         L10nKey::SettingsSearchBlurKeywords => {
             "transparency translucent frosted vibrancy window background"
@@ -599,9 +652,8 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsSearchCodexKeywords => "agent integration hooks install openai codex",
         L10nKey::SettingsSearchCommandLineToolKeywords => {
-            "cli tty7 path shell command install symlink terminal iterm agent script"
+            "command line tool cli tty7 path shell command install symlink terminal iterm agent script"
         }
-        L10nKey::SettingsSearchCommandLineToolTitle => "Command line tool",
         L10nKey::SettingsSearchCopilotCliKeywords => {
             "agent integration hooks install github copilot"
         }
@@ -609,7 +661,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsSearchCursorBlinkKeywords => "caret blinking flash",
         L10nKey::SettingsSearchCursorShapeKeywords => "caret block bar underline beam",
         L10nKey::SettingsSearchCustomThemesKeywords => {
-            "theme duplicate edit colors folder yaml import"
+            "theme duplicate edit colors folder yaml import background image wallpaper"
         }
         L10nKey::SettingsSearchDetectUrlsKeywords => "links hyperlink clickable open",
         L10nKey::SettingsSearchDiffPreviewFromCountsKeywords => {
@@ -680,6 +732,18 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "restore session previous tabs splits reopen launch startup layout"
         }
         L10nKey::SettingsSearchScrollSpeedKeywords => "mouse wheel multiplier scrolling",
+        L10nKey::SettingsSearchSmoothScrollKeywords => {
+            "smooth animation ease wheel notch trackpad scrolling"
+        }
+        L10nKey::SettingsSearchUpdateChannelKeywords => {
+            "update channel stable nightly release prerelease build"
+        }
+        L10nKey::SettingsSearchCheckUpdatesOnLaunchKeywords => {
+            "update check launch startup automatic release"
+        }
+        L10nKey::SettingsSearchAutoDownloadKeywords => {
+            "update download background install metered connection"
+        }
         L10nKey::SettingsSearchScrollbackKeywords => "history buffer lines scroll",
         L10nKey::SettingsSearchShowTrayIconKeywords => {
             "tray menu bar status item agent attention system icon"
@@ -729,12 +793,12 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SftpPanelTitleFiles => "Files",
         L10nKey::SftpTooltipRefresh => "Refresh",
         L10nKey::SftpTooltipMore => "More",
-        L10nKey::SftpMenuNewFolder => "New folder",
-        L10nKey::SftpMenuNewFile => "New file",
+        L10nKey::SftpMenuNewFolder => "New Folder",
+        L10nKey::SftpMenuNewFile => "New File",
         L10nKey::SftpMenuUpload => "Upload…",
-        L10nKey::SftpMenuGotoShellCwd => "Go to shell directory",
-        L10nKey::SftpMenuHideTransferHistory => "Hide transfer history",
-        L10nKey::SftpMenuTransferHistory => "Transfer history",
+        L10nKey::SftpMenuGotoShellCwd => "Go to Shell Directory",
+        L10nKey::SftpMenuHideTransferHistory => "Hide Transfer History",
+        L10nKey::SftpMenuTransferHistory => "Transfer History",
         L10nKey::SftpEditNewFolder => "New folder",
         L10nKey::SftpEditNewFile => "New file",
         L10nKey::SftpEditRename => "Rename",
@@ -742,7 +806,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SftpLoading => "Loading…",
         L10nKey::SftpEmptyDirectory => "Empty directory.",
         L10nKey::SftpContextOpen => "Open",
-        L10nKey::SftpContextFollowSymlink => "Follow symlink",
+        L10nKey::SftpContextFollowSymlink => "Follow Symlink",
         L10nKey::SftpContextRename => "Rename",
         L10nKey::SftpContextChmod => "chmod…",
         L10nKey::SftpTransferSummaryRunning => "{count} transferring · {pct}%",
@@ -758,6 +822,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::ForwardPanelTitle => "Forwards",
         L10nKey::ForwardDisconnected => "Disconnected",
         L10nKey::ForwardDisconnectedFrom => "Disconnected from {host}",
+        L10nKey::SshEditProfile => "Edit connection…",
         L10nKey::ForwardTooltipAdd => "Add forward",
         L10nKey::ForwardTooltipRemove => "Remove",
         L10nKey::ForwardLocal => "Local",
@@ -773,7 +838,13 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::FileTreeDeleteTitle => "Delete \"{name}\"?",
         L10nKey::FileTreeDeleteFolderBody => "The folder and everything inside it will be deleted.",
         L10nKey::FileTreeDeleteFileBody => "The file will be deleted.",
-        L10nKey::FileTreeDeleteFailed => "Delete failed",
+        L10nKey::SftpDeleteFolderBody => {
+            "The folder and everything inside it will be deleted on {host}. There is no trash on the far side."
+        }
+        L10nKey::SftpDeleteFileBody => {
+            "The file will be deleted on {host}. There is no trash on the far side."
+        }
+        L10nKey::FileTreeDeleteFailed => "Could not delete {name}",
         L10nKey::FileTreeContextOpen => "Open",
         L10nKey::FileTreeContextCdHere => "cd Here",
         L10nKey::FileTreeContextInsertPath => "Insert Path in Terminal",
@@ -786,10 +857,10 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::FileTreeContextShowDotfiles => "Show Dotfiles",
         L10nKey::SshPromptNewKey => "new {fingerprint}",
         L10nKey::SshPromptOldKey => "old {old_fingerprint}",
-        L10nKey::EditorCantOpen => "Can't open {path}: {e}",
-        L10nKey::EditorCantRead => "Can't read {path}: {e}",
+        L10nKey::EditorCantOpen => "Could not open {path}: {e}",
+        L10nKey::EditorCantRead => "Could not read {path}: {e}",
         L10nKey::EditorNotUtf8 => "\"{path}\" is not valid UTF-8",
-        L10nKey::EditorSaveFailed => "Save failed",
+        L10nKey::EditorSaveFailed => "Could not save {name}",
         L10nKey::EditorUnsavedChanges => "\"{name}\" has unsaved changes",
         L10nKey::EditorDiscard => "Discard",
         L10nKey::EditorNoFileOpen => "No file open",
@@ -847,27 +918,27 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::DiffReading => "Reading diff…",
         L10nKey::DiffNotARepo => "Not a git repository",
         L10nKey::DiffReadFailed => {
-            "Couldn't read the working-tree diff — retrying on the next refresh."
+            "Could not read the working-tree diff — retrying on the next refresh."
         }
         L10nKey::DiffWorkingTreeClean => "Working tree clean",
         L10nKey::DiffCloseTooltip => "Close Diff (Esc)",
         L10nKey::DiffChangedFiles => "{count} changed files",
         L10nKey::DiffUntrackedCount => " · {count} untracked",
         L10nKey::DiffMoreFiles => {
-            "… and {count} more changed files — run `git diff` in the terminal to see them."
+            "… and {count} more changed files — run git diff in the terminal to see them."
         }
         L10nKey::DiffOversizedNotice => {
-            "This working tree is too large to render efficiently ({summary}). Every file is collapsed — expand individual files, or run `git diff` in the terminal."
+            "This working tree is too large to render efficiently ({summary}). Every file is collapsed — expand individual files, or run git diff in the terminal."
         }
         L10nKey::DiffTruncatedPerFile => {
-            "Diff truncated at {limit} lines — run `git diff` in the terminal for the rest."
+            "Diff truncated at {limit} lines — run git diff in the terminal for the rest."
         }
         L10nKey::DiffTruncatedBudget => {
-            "Body not loaded — this working tree is past tty7's diff budget. Run `git diff` in the terminal for this file."
+            "Body not loaded — this working tree is past tty7's diff budget. Run git diff in the terminal for this file."
         }
         L10nKey::DiffUntrackedHeader => "Untracked files ({count})",
         L10nKey::DiffMoreUntracked => {
-            "… and {count} more — run `git status` in the terminal to see them."
+            "… and {count} more — run git status in the terminal to see them."
         }
         L10nKey::DiffLines => "{count} diff lines",
         L10nKey::DiffChangedLines => {
@@ -878,7 +949,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::DiffPerFileCap => "the per-file cap",
         L10nKey::DiffUntrackedSummary => "{count} untracked",
         L10nKey::PendingConnecting => "Connecting to {machine}…",
-        L10nKey::PendingUnreachable => "Couldn't reach {machine}",
+        L10nKey::PendingUnreachable => "Could not reach {machine}",
         L10nKey::WorktreePromptNeedsName => "The worktree needs a name",
         L10nKey::WorktreePromptTitle => "New Worktree Tab",
         L10nKey::WorktreePromptName => "Worktree Name",
@@ -893,7 +964,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::HomeTimeHoursAgo => "{count} hours ago",
         L10nKey::HomeTimeYesterday => "yesterday",
         L10nKey::HomeTimeDaysAgo => "{count} days ago",
-        L10nKey::HomeTimeOverWeekAgo => "over a week ago",
+        L10nKey::HomeTimeWeeksAgo => "{count} weeks ago",
+        L10nKey::HomeTimeMonthsAgo => "{count} months ago",
+        L10nKey::HomeTimeOverYearAgo => "over a year ago",
         L10nKey::HomeReopenNamed => "Reopen \"{name}\"",
         L10nKey::RemoteStripDisconnected => "Not connected to {machine}",
         L10nKey::RemoteStripConnecting => "Connecting to {machine}…",
@@ -980,7 +1053,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
              {machine}. Quit tty7 (which stops the daemon) and open it again, then retry."
         }
         L10nKey::RemoteProfileMissing => "that saved SSH profile no longer exists",
-        L10nKey::RemoteAliasMissing => "`{alias}` is no longer in ~/.ssh/config",
+        L10nKey::RemoteAliasMissing => "\"{alias}\" is no longer in ~/.ssh/config",
         L10nKey::RemoteWslNoSsh => "a WSL workspace has no SSH connection",
         L10nKey::RemoteLocalStdioNoSsh => "a local --stdio workspace has no SSH connection",
         L10nKey::RemoteHostNotTty7 => "{machine} answered, but not as a tty7 server: {error}",
@@ -1010,13 +1083,17 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SwitcherDisconnect => "Disconnect",
         L10nKey::SwitcherOpenInNewWindow => "Open in New Window",
         L10nKey::SwitcherRename => "Rename…",
-        L10nKey::SwitcherPickAWorkspace => "Pick a workspace to see its tabs",
-        L10nKey::SwitcherNoTabs => "No tabs in this workspace",
-        L10nKey::SwitcherTabsAfterOpening => "Open this workspace to see its tabs",
+        L10nKey::SwitcherPickAWorkspace => "Pick a workspace to see its tabs.",
+        L10nKey::SwitcherNoTabs => "No tabs in this workspace.",
+        L10nKey::SwitcherNoTabMatch => "No tab matches.",
+        L10nKey::SwitcherTabsAfterOpening => "Open this workspace to see its tabs.",
+        L10nKey::SwitcherOpenToManage => "Open this workspace to rename or stop it.",
+        L10nKey::SwitcherConnectToUse => "Connect to this machine to open a workspace on it.",
         L10nKey::SwitcherTabCount => "{n} tabs",
         L10nKey::SwitcherTabCountOne => "1 tab",
         L10nKey::SwitcherActiveTab => "active",
         L10nKey::SwitcherHoldToSwitch => "Tab to move · release to switch",
+        L10nKey::SwitcherTabToCrossColumns => "Tab to cross columns",
         L10nKey::SshPromptPasswordFor => "Password for {user}@{host}",
         L10nKey::SshPromptPassphraseFor => "Passphrase for {key_path}",
         L10nKey::SshPromptTwoFactor => "Two-factor authentication",
@@ -1029,6 +1106,12 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SshPromptUnlock => "Unlock",
         L10nKey::SshPromptSubmit => "Submit",
         L10nKey::HostOpsError => "{context}: {error}",
+        L10nKey::IoDenied => "You do not have permission.",
+        L10nKey::IoGone => "It is not there any more.",
+        L10nKey::IoNoSpace => "There is no space left on the disk.",
+        L10nKey::IoReadOnly => "That location is read-only.",
+        L10nKey::IoBusy => "Something else has it open.",
+        L10nKey::IoTimedOut => "The machine did not answer in time.",
         L10nKey::TreeWindowOpenedEmpty => {
             "This window's server never handed over its tabs, so it opened empty. Nothing was lost — they come back when it answers. If it doesn't, run \"Restart Server\" from the command palette."
         }
@@ -1040,7 +1123,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::CmdGroupAgents => "Agents",
         L10nKey::CmdGroupApplication => "Application",
         L10nKey::CmdNewTab => "New Tab",
-        L10nKey::CmdNewWorktreeTab => "New Worktree Tab",
+        L10nKey::CmdNewWorktreeTab => "New Worktree Tab…",
         L10nKey::CmdNewWorktreeTabSubtitle => "isolated checkout on a fresh branch",
         L10nKey::CmdRenameTab => "Rename Tab…",
         L10nKey::CmdSplitRight => "Split Right",
@@ -1123,6 +1206,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::CmdQuickConnectSaveProfile => "Save \"{target}\" as profile…",
         L10nKey::CmdRecent => "Recent",
         L10nKey::AppRestartServerTitle => "Restart Server?",
+        L10nKey::AppRestartServerFailed => "Could not restart the background server: {error}",
         L10nKey::AppRestartServerMismatchDetail => {
             "The server holding your shells is build v{build}, protocol {protocol}; this app speaks {ours}. They can't talk, so your tabs are out of reach.\n\nQuit: nothing changes — the server and your shells keep running.\nRestart: tabs come back with fresh shells, and anything running now is killed."
         }
@@ -1152,6 +1236,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::AppWorktreeKeep => "Keep",
         L10nKey::AppReopenTabFailed => "Could not reopen the tab: no terminal started",
         L10nKey::AppOpenTerminalFailed => "Could not open a terminal: {error}",
+        L10nKey::AppTabsNotRestored => "{count} tabs from last time could not be reopened",
         L10nKey::AppSshConnectionFailed => "SSH connection failed: {error}",
         L10nKey::AppSshReconnectFailed => "SSH reconnect failed: {error}",
         L10nKey::AppSplitPaneFailed => "Could not split the pane: {error}",
@@ -1184,6 +1269,22 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::AppThemeColorAccent => "Accent",
         L10nKey::AppThemeColorCursor => "Cursor",
         L10nKey::AppThemeColorSelection => "Selection",
+        L10nKey::AppThemeAnsiBlack => "Black",
+        L10nKey::AppThemeAnsiRed => "Red",
+        L10nKey::AppThemeAnsiGreen => "Green",
+        L10nKey::AppThemeAnsiYellow => "Yellow",
+        L10nKey::AppThemeAnsiBlue => "Blue",
+        L10nKey::AppThemeAnsiMagenta => "Magenta",
+        L10nKey::AppThemeAnsiCyan => "Cyan",
+        L10nKey::AppThemeAnsiWhite => "White",
+        L10nKey::AppThemeAnsiBrightBlack => "Bright black",
+        L10nKey::AppThemeAnsiBrightRed => "Bright red",
+        L10nKey::AppThemeAnsiBrightGreen => "Bright green",
+        L10nKey::AppThemeAnsiBrightYellow => "Bright yellow",
+        L10nKey::AppThemeAnsiBrightBlue => "Bright blue",
+        L10nKey::AppThemeAnsiBrightMagenta => "Bright magenta",
+        L10nKey::AppThemeAnsiBrightCyan => "Bright cyan",
+        L10nKey::AppThemeAnsiBrightWhite => "Bright white",
         L10nKey::AppAgentHooksThisComputer => "This Computer",
         L10nKey::AppAgentHooksRemoteMachine => "Remote machine",
         L10nKey::AppAgentHooksNoHomeDir => {
@@ -1193,7 +1294,18 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "Not connected to this machine, so its agent config can't be read or written. Open a workspace on it and come back."
         }
         L10nKey::AppAgentHooksHomeDirUnresolved => "cannot resolve home directory",
-        L10nKey::AppAgentHooksOpFailed => "Failed: {error}",
+        L10nKey::AppAgentHooksInstalled => "Installed",
+        L10nKey::AppAgentHooksInstalledEnableCodexThere => {
+            "Installed — run `codex features enable hooks` once on that machine"
+        }
+        L10nKey::AppAgentHooksInstalledCodexEnableFailed => {
+            "Installed, but could not run `codex features enable hooks` ({error}) — run it once manually"
+        }
+        L10nKey::AppAgentHooksRemoved => "Removed",
+        L10nKey::AppAgentHooksNothingInstalled => "Nothing installed; nothing to remove",
+        L10nKey::AppAgentHooksNoTty7Hooks => "No tty7 hooks found; nothing to remove",
+        L10nKey::AppAgentHooksInstallFailed => "Could not install hooks: {error}",
+        L10nKey::AppAgentHooksRemoveFailed => "Could not remove hooks: {error}",
         L10nKey::AppKeybindingDisplacedNote => {
             "{action} took the shortcut from {previous}, which is now unset."
         }
@@ -1204,7 +1316,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::AppSshParseInvalidPort => "Invalid port \"{value}\"",
         L10nKey::AppSshParseUnsupportedOption => "Unsupported option \"{option}\"",
         L10nKey::AppSshParseEnterHost => "Enter a host to connect to",
-        L10nKey::AppSshParseBadHost => "Can't parse host \"{host}\"",
+        L10nKey::AppSshParseBadHost => "Invalid host \"{host}\"",
         L10nKey::AppMenuMinimize => "Minimize",
         L10nKey::AppMenuZoom => "Zoom",
         L10nKey::SwitcherStatusRestarting => "restarting…",
@@ -1215,11 +1327,20 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsFontDefault => "Default (match primary)",
         L10nKey::ForwardDescriptionPlaceholder => "what it's for",
         L10nKey::SettingsShellDefaultLoginShell => "your login shell",
+        L10nKey::SettingsShellDetected => "Shells tty7 found",
         L10nKey::SftpErrorUnexpectedReply => "unexpected reply: {reply}",
         L10nKey::SftpErrorUnsafeRemoteName => "refusing unsafe remote name {name}",
+        L10nKey::SftpErrorNoFreeLocalName => {
+            "no free name left in Downloads for {name} — move or delete the older copies"
+        }
+        L10nKey::SftpReplaceTitle => "Replace what is already there?",
+        L10nKey::SftpReplaceBody => {
+            "{names} already exist in this folder. Uploading overwrites them."
+        }
+        L10nKey::Replace => "Replace",
         L10nKey::SftpErrorInvalidOctalMode => "invalid octal mode",
         L10nKey::PanelMoreChangedFiles => {
-            "… and {count} more changed files — run `git diff` to see them."
+            "… and {count} more changed files — run git diff to see them."
         }
         L10nKey::PanelUntracked => "{count} untracked",
         L10nKey::AppMenuAbout => "About tty7",
@@ -1237,7 +1358,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::AppMenuHelp => "Help",
         L10nKey::AppMenuNewTab => "New Tab",
         L10nKey::AppMenuNewWorkspace => "New Workspace",
-        L10nKey::AppMenuNewWorktreeTab => "New Worktree Tab",
+        L10nKey::AppMenuNewWorktreeTab => "New Worktree Tab…",
         L10nKey::AppMenuSplitRight => "Split Right",
         L10nKey::AppMenuSplitLeft => "Split Left",
         L10nKey::AppMenuSplitDown => "Split Down",
@@ -1274,7 +1395,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::AppMenuFocusPreviousPane => "Focus Previous Pane",
         L10nKey::AppMenuZoomPane => "Zoom Pane",
         L10nKey::AppMenuClearScrollback => "Clear Scrollback",
-        L10nKey::AppMenuEnterFullscreen => "Enter Full Screen",
         L10nKey::AppMenuDocumentation => "tty7 Documentation",
         L10nKey::AppMenuKeyboardShortcuts => "Keyboard Shortcuts",
         L10nKey::AppMenuJoinDiscord => "Join the Discord",
@@ -1284,6 +1404,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::TrayShowTty7 => "Show tty7",
         L10nKey::TrayNotifications => "Notifications",
         L10nKey::TrayAgentNeedsInput => "needs input",
+        L10nKey::AgentStatusWorking => "Working",
+        L10nKey::AgentStatusWaiting => "Needs input",
+        L10nKey::AgentStatusDone => "Done",
         L10nKey::NotifyCommandFinished => "Command finished after {secs}s",
         L10nKey::NotifyCommandFinishedWithCommand => "{command} — finished after {secs}s",
         L10nKey::NotifyAgentFinished => "Finished after {secs}s",
@@ -1324,17 +1447,27 @@ pub fn translate_variant_en(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::SettingsOfflineMachines, "other") => {
             "{count} more saved machines are not connected — open a workspace on one to install its hooks there."
         }
+        (L10nKey::SftpReplaceBody, "one") => {
+            "{names} already exists in this folder. Uploading overwrites it."
+        }
+        (L10nKey::SftpReplaceBody, "other") => {
+            "{names} already exist in this folder. Uploading overwrites them."
+        }
+        (L10nKey::AppTabsNotRestored, "one") => "1 tab from last time could not be reopened",
+        (L10nKey::AppTabsNotRestored, "other") => {
+            "{count} tabs from last time could not be reopened"
+        }
         (L10nKey::PanelUntracked, "zero") => "0 untracked",
         (L10nKey::PanelUntracked, "one") => "1 untracked",
         (L10nKey::PanelUntracked, "other") => "{count} untracked",
         (L10nKey::PanelMoreChangedFiles, "zero") => {
-            "… and 0 more changed files — run `git diff` to see them."
+            "… and 0 more changed files — run git diff to see them."
         }
         (L10nKey::PanelMoreChangedFiles, "one") => {
-            "… and 1 more changed file — run `git diff` to see it."
+            "… and 1 more changed file — run git diff to see it."
         }
         (L10nKey::PanelMoreChangedFiles, "other") => {
-            "… and {count} more changed files — run `git diff` to see them."
+            "… and {count} more changed files — run git diff to see them."
         }
         (L10nKey::DiffChangedFiles, "zero") => "0 changed files",
         (L10nKey::DiffChangedFiles, "one") => "1 changed file",
@@ -1343,25 +1476,25 @@ pub fn translate_variant_en(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::DiffUntrackedCount, "one") => " · 1 untracked",
         (L10nKey::DiffUntrackedCount, "other") => " · {count} untracked",
         (L10nKey::DiffMoreFiles, "zero") => {
-            "… and 0 more changed files — run `git diff` in the terminal to see them."
+            "… and 0 more changed files — run git diff in the terminal to see them."
         }
         (L10nKey::DiffMoreFiles, "one") => {
-            "… and 1 more changed file — run `git diff` in the terminal to see it."
+            "… and 1 more changed file — run git diff in the terminal to see it."
         }
         (L10nKey::DiffMoreFiles, "other") => {
-            "… and {count} more changed files — run `git diff` in the terminal to see them."
+            "… and {count} more changed files — run git diff in the terminal to see them."
         }
         (L10nKey::DiffUntrackedHeader, "zero") => "Untracked files (0)",
         (L10nKey::DiffUntrackedHeader, "one") => "Untracked files (1)",
         (L10nKey::DiffUntrackedHeader, "other") => "Untracked files ({count})",
         (L10nKey::DiffMoreUntracked, "zero") => {
-            "… and 0 more — run `git status` in the terminal to see them."
+            "… and 0 more — run git status in the terminal to see them."
         }
         (L10nKey::DiffMoreUntracked, "one") => {
-            "… and 1 more — run `git status` in the terminal to see it."
+            "… and 1 more — run git status in the terminal to see it."
         }
         (L10nKey::DiffMoreUntracked, "other") => {
-            "… and {count} more — run `git status` in the terminal to see them."
+            "… and {count} more — run git status in the terminal to see them."
         }
         (L10nKey::DiffUntrackedSummary, "zero") => "0 untracked",
         (L10nKey::DiffUntrackedSummary, "one") => "1 untracked",
@@ -1372,6 +1505,10 @@ pub fn translate_variant_en(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::HomeTimeHoursAgo, "other") => "{count} hours ago",
         (L10nKey::HomeTimeDaysAgo, "one") => "1 day ago",
         (L10nKey::HomeTimeDaysAgo, "other") => "{count} days ago",
+        (L10nKey::HomeTimeWeeksAgo, "one") => "1 week ago",
+        (L10nKey::HomeTimeWeeksAgo, "other") => "{count} weeks ago",
+        (L10nKey::HomeTimeMonthsAgo, "one") => "1 month ago",
+        (L10nKey::HomeTimeMonthsAgo, "other") => "{count} months ago",
         (L10nKey::WindowStopShells, "zero") => {
             "Its layout and working directories will be forgotten."
         }

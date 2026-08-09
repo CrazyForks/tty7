@@ -113,6 +113,34 @@ struct SpawnConfig {
     remote: Option<RemoteContext>,
 }
 
+/// Why a configured shell cannot be run, in one sentence, before anything
+/// tries. Without it a missing program arrives at the window wrapped four
+/// deep — "daemon refused Spawn: spawn failed: Unable to spawn … (ENOENT: No
+/// such file or directory)" — and the one fact that matters is buried in it.
+///
+/// Only a program given as a path can be checked here; a bare name is resolved
+/// through PATH by the OS, and guessing at that would be worse than silence.
+fn shell_program_problem(program: &str) -> Option<String> {
+    let path = std::path::Path::new(program);
+    if path.components().count() < 2 {
+        return None;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Some(format!("no such shell on this machine: {program}"));
+    };
+    if meta.is_dir() {
+        return Some(format!("the configured shell is a directory: {program}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Some(format!("the configured shell is not executable: {program}"));
+        }
+    }
+    None
+}
+
 fn build_spawn_config(
     pane: u64,
     cwd: Option<PathBuf>,
@@ -121,6 +149,12 @@ fn build_spawn_config(
 ) -> anyhow::Result<SpawnConfig> {
     let initial_cwd = initial_working_directory(cwd);
     let configured = choose_shell(shell, crate::core::config::shell_command());
+    if let Some(problem) = configured
+        .as_ref()
+        .and_then(|c| shell_program_problem(&c.program))
+    {
+        anyhow::bail!(problem);
+    }
     let remote = wsl_remote_context(configured.as_ref());
     let (cmd, integration_dir) = build_shell_command(configured, &initial_cwd, pane, workspace)?;
     Ok(SpawnConfig {
@@ -2317,6 +2351,51 @@ mod tests {
     use super::*;
     use crate::core::kitty_graphics::ImageDelete;
     use std::path::Path;
+
+    #[test]
+    fn a_shell_that_cannot_run_is_named_once_not_wrapped_four_deep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not-a-shell");
+        let problem = shell_program_problem(&missing.to_string_lossy()).expect("a problem");
+        assert!(problem.contains("no such shell"), "{problem}");
+        assert!(problem.contains("not-a-shell"), "{problem}");
+        // One sentence: none of the layers this used to arrive wrapped in.
+        assert!(!problem.contains("ENOENT"), "{problem}");
+        assert!(!problem.contains("Unable to spawn"), "{problem}");
+
+        // A directory is a different mistake and says so.
+        let as_dir = dir.path().to_string_lossy().to_string();
+        assert!(
+            shell_program_problem(&as_dir)
+                .expect("a problem")
+                .contains("directory")
+        );
+
+        // A bare name goes through PATH; guessing at it here would be worse
+        // than saying nothing.
+        assert_eq!(shell_program_problem("zsh"), None);
+
+        // Something real passes. The test binary is the one path guaranteed
+        // to exist and carry the execute bit on every platform this runs on —
+        // `/bin/sh` named a file that is simply absent on Windows, so the
+        // check meant to prove a good shell passes proved the opposite there.
+        let real = std::env::current_exe().expect("the running test binary");
+        assert_eq!(shell_program_problem(&real.to_string_lossy()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_without_the_execute_bit_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("not-executable");
+        std::fs::write(&path, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let problem = shell_program_problem(&path.to_string_lossy()).expect("a problem");
+        assert!(problem.contains("not executable"), "{problem}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(shell_program_problem(&path.to_string_lossy()), None);
+    }
 
     #[test]
     fn initial_working_directory_skips_paths_that_are_not_directories() {

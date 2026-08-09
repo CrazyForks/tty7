@@ -33,7 +33,8 @@ pub async fn authenticate(
         } => remaining_methods,
     };
 
-    let mut last_reason = "authentication failed".to_string();
+    let mut last_reason: Option<String> = None;
+    let mut attempted = false;
 
     for family in method_order(spec.auth_mode) {
         if !remaining.is_empty() && !remaining.contains(&family) {
@@ -52,20 +53,57 @@ pub async fn authenticate(
                 remaining_methods,
                 reason,
             } => {
+                attempted = true;
                 if let Some(m) = remaining_methods
                     && !m.is_empty()
                 {
                     remaining = m;
                 }
                 if let Some(r) = reason {
-                    last_reason = r;
+                    last_reason = Some(r);
                 }
             }
             Outcome::Skipped => {}
         }
     }
 
-    Err(last_reason)
+    // "authentication failed" was the answer to two different situations, and
+    // the more confusing one is that nothing was ever tried: no key on disk, no
+    // agent, or a connection pinned to a method this server does not offer.
+    // Saying "failed" there sends people looking for a wrong password.
+    Err(match (attempted, last_reason) {
+        (_, Some(reason)) => reason,
+        (true, None) => "authentication failed".to_string(),
+        (false, None) => nothing_to_try(spec.auth_mode, &remaining),
+    })
+}
+
+/// Every method this connection would have used was either unavailable here or
+/// not offered by the server, so the round ended without a single attempt.
+fn nothing_to_try(mode: SshAuthMode, remaining: &MethodSet) -> String {
+    let offered: Vec<&str> = [
+        (MethodKind::PublicKey, "publickey"),
+        (MethodKind::Password, "password"),
+        (MethodKind::KeyboardInteractive, "keyboard-interactive"),
+        (MethodKind::GssapiWithMic, "gssapi-with-mic"),
+    ]
+    .into_iter()
+    .filter(|(k, _)| remaining.contains(k))
+    .map(|(_, name)| name)
+    .collect();
+
+    let wanted = match mode {
+        SshAuthMode::Auto => "no authentication method could be tried",
+        SshAuthMode::Gssapi => "gssapi-with-mic could not be tried",
+        SshAuthMode::PublicKey => "no usable private key was found",
+        SshAuthMode::Agent => "no agent identity was available",
+        SshAuthMode::Password => "password auth could not be tried",
+        SshAuthMode::KeyboardInteractive => "keyboard-interactive could not be tried",
+    };
+    match offered.is_empty() {
+        true => wanted.to_string(),
+        false => format!("{wanted}; the server offers {}", offered.join(", ")),
+    }
 }
 
 fn method_order(mode: SshAuthMode) -> Vec<MethodKind> {
@@ -741,6 +779,31 @@ fn home_dir() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_round_with_no_attempt_says_so_instead_of_saying_it_failed() {
+        // Nothing on this machine could satisfy the connection, and the server
+        // says what it would take. "authentication failed" here sends people
+        // looking for a wrong password that was never sent.
+        let offers = MethodSet::from(&[MethodKind::PublicKey][..]);
+        let msg = nothing_to_try(SshAuthMode::Auto, &offers);
+        assert!(
+            msg.contains("no authentication method could be tried"),
+            "{msg}"
+        );
+        assert!(msg.contains("publickey"), "{msg}");
+        assert!(!msg.contains("failed"), "{msg}");
+
+        // A connection pinned to one method names that method.
+        let msg = nothing_to_try(SshAuthMode::PublicKey, &offers);
+        assert!(msg.contains("no usable private key"), "{msg}");
+
+        // A server that offered nothing leaves the sentence without a tail
+        // rather than with an empty list.
+        let msg = nothing_to_try(SshAuthMode::Auto, &MethodSet::empty());
+        assert!(!msg.contains("offers"), "{msg}");
+        assert!(!msg.ends_with(' '), "{msg}");
+    }
 
     #[test]
     fn identity_path_expands_tokens_and_tilde() {

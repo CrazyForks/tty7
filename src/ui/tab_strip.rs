@@ -11,9 +11,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::core::actions::{
-    OpenSettings, SelectWorkspace1, SelectWorkspace2, SelectWorkspace3, SelectWorkspace4,
-    SelectWorkspace5, SelectWorkspace6, SelectWorkspace7, SelectWorkspace8, SelectWorkspace9,
-    TogglePalette,
+    CloseActiveTab, CloseOtherTabs, CloseTabsToTheRight, CopyAgentSessionId, CopyWorkingDirectory,
+    ForkAgentSession, MarkTabUnread, NewWorktreeTab, OpenSettings, RenameTab, SelectWorkspace1,
+    SelectWorkspace2, SelectWorkspace3, SelectWorkspace4, SelectWorkspace5, SelectWorkspace6,
+    SelectWorkspace7, SelectWorkspace8, SelectWorkspace9, SplitDown, SplitRight, TogglePalette,
 };
 use crate::core::config::RightPanelTab;
 use crate::core::shells::DetectedShell;
@@ -23,7 +24,11 @@ use crate::ui::hints::tab_badge_label;
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::reorder::{self, Reorder, Surface};
 
-pub(crate) const REORDER_SLIDE_MS: u64 = 140;
+/// One duration and one curve for every transition the app runs, so a fade and
+/// a slide read as the same hand. Long enough to be seen as movement, short
+/// enough that nobody waits on it.
+pub(crate) const TRANSITION_MS: u64 = 140;
+pub(crate) const REORDER_SLIDE_MS: u64 = TRANSITION_MS;
 const CHIP_GAP: f32 = 6.;
 
 pub(crate) const GRAB_HANDLE_W: f32 = 80.;
@@ -130,13 +135,13 @@ impl Render for DragTab {
     }
 }
 
-/// Says what the workspace head does, with its shortcut. The name alone was
-/// redundant — it is already the button's label.
-fn switcher_hint(cx: &gpui::App) -> String {
-    let what = t(L10nKey::HomeSwitchWorkspace);
-    match crate::ui::home::key_hint("ToggleSwitcher", cx) {
-        Some(keys) => format!("{what}  {keys}"),
-        None => what.to_string(),
+/// What a chrome tile says on hover: what it does, then the chord that does it.
+/// The tile's own name is no use as a tooltip — the workspace head already
+/// wears it as its label.
+pub(crate) fn chord_hint(what: &str, action: &str, cx: &gpui::App) -> SharedString {
+    match crate::ui::home::key_hint(action, cx) {
+        Some(keys) => SharedString::from(format!("{what}  {keys}")),
+        None => SharedString::from(what.to_string()),
     }
 }
 
@@ -152,11 +157,46 @@ pub(crate) fn chrome_tile_variant_for(selected: bool, cx: &gpui::App) -> ButtonC
         } else {
             cx.theme().sidebar_foreground
         })
-        .hover(cx.theme().sidebar_accent)
+        // `sidebar_accent` is the surface's *selected* step, and it was handed
+        // to hover as well — so a hovered tile wore the fill of a selected one
+        // and, with the right panel open, two tiles read as current at once.
+        // Hover takes the step the palette derives for it. (A selected button
+        // never renders the hover style, so this only reaches the rest.)
+        .hover(gpui::rgb(cx.global::<crate::ui::presets::Surfaces>().sidebar.hover).into())
         .active(cx.theme().sidebar_accent)
 }
 
 pub(crate) const BUTTON_ICON_SCALE: f32 = 0.75;
+
+/// WCAG 2.2 SC 2.5.8 puts the desktop floor for a pointer target at 24×24, and
+/// gpui-component renders an icon-only `.xsmall()` button as a 20×20 box (18×18
+/// where the chrome overrode it). Grow only the box: the glyph keeps its size,
+/// so the chrome looks unchanged and simply stops being fiddly to hit.
+pub(crate) const MIN_TARGET: f32 = 24.;
+
+pub(crate) fn hit_target(button: Button) -> Button {
+    button.w(px(MIN_TARGET)).h(px(MIN_TARGET))
+}
+
+/// The narrowest a chip gets: its `min_w`, which flex-shrink cannot go under.
+const CHIP_MIN_W: f32 = 100.;
+
+/// The run of chips to draw when they cannot all fit.
+///
+/// The row clips what overflows, so past a certain tab count the chips at the
+/// end simply were not drawn — including, right after ⌘T, the tab that was
+/// just opened and made active. Slide the run instead: keep it anchored at the
+/// first tab until the active one would fall off the right edge, then move it
+/// by as little as it takes to hold the active chip.
+fn visible_chips(order: &[usize], active: usize, avail: f32) -> Vec<usize> {
+    let fits = ((avail / (CHIP_MIN_W + CHIP_GAP)).floor() as usize).max(1);
+    if order.len() <= fits {
+        return order.to_vec();
+    }
+    let at = order.iter().position(|&i| i == active).unwrap_or(0);
+    let start = at.saturating_sub(fits - 1).min(order.len() - fits);
+    order[start..start + fits].to_vec()
+}
 
 pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> Button {
     chrome_tile_sized(button, TILE_SIZE, TILE_GLYPH, selected, cx)
@@ -175,6 +215,19 @@ pub(crate) fn chrome_tile_sized(
         .with_size(px(glyph / BUTTON_ICON_SCALE))
         .w(px(tile))
         .h(px(tile))
+}
+
+/// The words behind the status dot's colour.
+pub(crate) fn agent_status_label(
+    status: Option<crate::core::cli_agent::AgentStatus>,
+) -> Option<&'static str> {
+    use crate::core::cli_agent::AgentStatus;
+    match status? {
+        AgentStatus::Idle => None,
+        AgentStatus::Working => Some(t(L10nKey::AgentStatusWorking)),
+        AgentStatus::Waiting => Some(t(L10nKey::AgentStatusWaiting)),
+        AgentStatus::Done => Some(t(L10nKey::AgentStatusDone)),
+    }
 }
 
 pub(crate) const LIVE_DOT: u32 = 0x22C55E;
@@ -217,7 +270,7 @@ pub(crate) fn workspace_avatar(
                 .child(initial)
                 .when(!current, |disc| disc.opacity(0.55)),
         )
-        .children(dot.map(|rgb| Tty7App::status_dot(rgb, 0, size, cx.theme().popover)))
+        .children(dot.map(|rgb| Tty7App::status_dot(rgb, 0, size, cx.theme().popover, false)))
 }
 
 pub(crate) fn select_workspace_action(index: usize) -> Option<Box<dyn gpui::Action>> {
@@ -315,7 +368,11 @@ impl Tty7App {
                     .w_full()
                     .h(px(30.))
                     .rounded_md()
-                    .tooltip(SharedString::from(switcher_hint(cx)))
+                    .tooltip(chord_hint(
+                        t(L10nKey::HomeSwitchWorkspace),
+                        "ToggleSwitcher",
+                        cx,
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_switcher(window, cx);
                     })),
@@ -375,11 +432,14 @@ impl Tty7App {
                         cx,
                     )
                     .rounded_lg()
-                    .tooltip(if panel_open {
-                        t(L10nKey::TabTooltipHideDetailPanel)
-                    } else {
-                        t(L10nKey::TabTooltipShowDetailPanel)
-                    })
+                    .tooltip(chord_hint(
+                        match panel_open {
+                            true => t(L10nKey::TabTooltipHideDetailPanel),
+                            false => t(L10nKey::TabTooltipShowDetailPanel),
+                        },
+                        "ToggleRightPanel",
+                        cx,
+                    ))
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.toggle_right_panel(cx);
                     })),
@@ -441,7 +501,17 @@ impl Tty7App {
         .collect()
     }
 
-    fn status_dot(rgb: u32, unread: usize, size: f32, ring: gpui::Hsla) -> gpui::AnyElement {
+    /// Working and Done differ only in hue (blue vs green), and Waiting vs Done
+    /// — the pair that actually decides whether you go and look — is amber vs
+    /// green, the pair red-green colour vision separates worst. Give Waiting a
+    /// hole so it is a different *shape*, not just a different colour.
+    fn status_dot(
+        rgb: u32,
+        unread: usize,
+        size: f32,
+        ring: gpui::Hsla,
+        hollow: bool,
+    ) -> gpui::AnyElement {
         let d = (size * 0.42).max(7.);
         let bg = ring;
         if unread > 0 {
@@ -474,12 +544,19 @@ impl Tty7App {
                 .border_2()
                 .border_color(bg)
                 .bg(gpui::rgb(rgb))
+                .when(hollow, |dot| {
+                    dot.flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().size(px((d * 0.36).max(2.5))).rounded_full().bg(bg))
+                })
                 .into_any_element()
         }
     }
 
     pub(crate) fn tab_avatar(
         &self,
+        id: impl Into<gpui::ElementId>,
         agent: Option<crate::core::cli_agent::CLIAgent>,
         status: Option<crate::core::cli_agent::AgentStatus>,
         unread: usize,
@@ -488,6 +565,7 @@ impl Tty7App {
         cx: &App,
     ) -> gpui::AnyElement {
         let base = div()
+            .id(id)
             .flex_shrink_0()
             .size(px(size))
             .flex()
@@ -495,12 +573,26 @@ impl Tty7App {
             .justify_center();
         match agent {
             Some(agent) => {
+                let hollow = status == Some(crate::core::cli_agent::AgentStatus::Waiting);
                 let dot = status
                     .and_then(|s| s.dot_rgb())
-                    .map(|rgb| Self::status_dot(rgb, unread, size, cx.theme().background));
+                    .map(|rgb| Self::status_dot(rgb, unread, size, cx.theme().background, hollow));
+                // Which agent this is, and what it wants, were carried entirely
+                // by a brand hue and a nine-pixel dot. Say it in words too.
+                let tip = match agent_status_label(status) {
+                    Some(state) => format!("{} — {state}", agent.display_name()),
+                    None => agent.display_name().to_string(),
+                };
                 base.relative()
                     .rounded_full()
                     .bg(gpui::rgb(agent.accent_rgb()))
+                    // Codex and Grok are both pure black, which is the window
+                    // fill on a dark theme — the disc dissolves and leaves the
+                    // glyph floating. A hairline keeps it a disc in any theme.
+                    .when(
+                        crate::ui::presets::needs_edge(agent.accent_rgb(), cx.theme().background),
+                        |d| d.border_1().border_color(cx.theme().border),
+                    )
                     .child(
                         gpui::svg()
                             .path(agent.icon_path())
@@ -508,6 +600,9 @@ impl Tty7App {
                             .text_color(gpui::white()),
                     )
                     .when_some(dot, |b, dot| b.child(dot))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                    })
                     .into_any_element()
             }
             None => base
@@ -521,10 +616,35 @@ impl Tty7App {
                         .text_color(cx.theme().foreground.opacity(0.65)),
                 )
                 .when_some(ssh, |b, rgb| {
-                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background))
+                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background, false))
                 })
                 .into_any_element(),
         }
+    }
+
+    /// The full title behind a shortened one, for the row to name on hover.
+    ///
+    /// `tab_label` hands back a path elided to its last three segments and then
+    /// capped, and the chip truncates whatever is left over — so a tab could
+    /// read `…/a/b/c` with no way to find out which `a` that was. `None` when
+    /// nothing was dropped, so tabs that already show their whole name stay
+    /// quiet under the pointer.
+    pub(crate) fn tab_title_tooltip(
+        &self,
+        tab: &Tab,
+        index: usize,
+        window: Option<&Window>,
+        cx: &App,
+    ) -> Option<SharedString> {
+        if tab.name.as_ref().is_some_and(|n| !n.trim().is_empty()) {
+            return None;
+        }
+        let raw = tab.leaf_title(window, cx);
+        let raw = raw.trim();
+        if raw.is_empty() || raw == self.tab_label(tab, index, window, cx) {
+            return None;
+        }
+        Some(SharedString::from(abbreviate_home(raw).into_owned()))
     }
 
     pub(crate) fn tab_label(
@@ -560,6 +680,10 @@ impl Tty7App {
         let shells = self.shells.shells.clone();
         let default_name = self.default_shell_label(cx);
         let app = cx.entity().downgrade();
+        // Every other tile in this row names itself on hover — Switch
+        // Workspace, More, Hide Sidebar. The three New Tab buttons that come
+        // through here were the ones left silent.
+        let button = button.tooltip(chord_hint(t(L10nKey::AppMenuNewTab), "NewTab", cx));
         button.dropdown_menu(move |menu, _window, _cx| {
             let mut menu = menu.min_w(px(220.));
             for shell in &shells {
@@ -622,12 +746,22 @@ impl Tty7App {
         let has_cwd = cwd.is_some();
         let mut menu = menu.min_w(px(200.));
 
-        menu = menu.item(PopupMenuItem::new(t(L10nKey::AppMenuRenameTab)).on_click({
-            let app = app.clone();
-            move |_, window, cx| {
-                let _ = app.update(cx, |this, cx| this.start_rename(index, window, cx));
-            }
-        }));
+        // Every item here acts on *this* tab, so the work is done by the click
+        // handler and the action is carried only so `PopupMenu` can look its
+        // chord up and print it. The handler wins when both are set. Without
+        // this the tab menu was the one context menu in the app that taught no
+        // shortcuts — right-clicking a pane offered "Split Right ⌘D" while
+        // right-clicking its tab offered a bare "Split Right".
+        menu = menu.item(
+            PopupMenuItem::new(t(L10nKey::AppMenuRenameTab))
+                .action(Box::new(RenameTab))
+                .on_click({
+                    let app = app.clone();
+                    move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| this.start_rename(index, window, cx));
+                    }
+                }),
+        );
 
         let tab = this.tabs.get(index);
         if tab.is_some_and(|t| t.agent(cx).is_some()) {
@@ -635,6 +769,7 @@ impl Tty7App {
                 == Some(crate::core::cli_agent::AgentStatus::Done);
             menu = menu.item(
                 PopupMenuItem::new(t(L10nKey::TabContextMarkUnread))
+                    .action(Box::new(MarkTabUnread))
                     .disabled(!done)
                     .on_click({
                         let app = app.clone();
@@ -648,12 +783,15 @@ impl Tty7App {
         let in_repo = this.tab_is_in_repo(index, window, cx);
         if in_repo {
             menu = menu.separator().item(
-                PopupMenuItem::new(t(L10nKey::AppMenuNewWorktreeTab)).on_click({
-                    let app = app.clone();
-                    move |_, window, cx| {
-                        let _ = app.update(cx, |this, cx| this.new_worktree_tab(index, window, cx));
-                    }
-                }),
+                PopupMenuItem::new(t(L10nKey::AppMenuNewWorktreeTab))
+                    .action(Box::new(NewWorktreeTab))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ =
+                                app.update(cx, |this, cx| this.new_worktree_tab(index, window, cx));
+                        }
+                    }),
             );
         }
 
@@ -665,47 +803,61 @@ impl Tty7App {
                 menu = menu.separator();
             }
             let forkable = session.forkable();
-            menu = menu.item(PopupMenuItem::new(label).disabled(!forkable).on_click({
-                let app = app.clone();
-                let source = source.clone();
-                move |_, window, cx| {
-                    let source = source.clone();
-                    let _ = app.update(cx, |this, cx| {
-                        this.fork_agent_session(
-                            index,
-                            source,
-                            crate::ui::app::ForkPlacement::NewTab,
-                            window,
-                            cx,
-                        )
-                    });
-                }
-            }));
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .action(Box::new(ForkAgentSession))
+                    .disabled(!forkable)
+                    .on_click({
+                        let app = app.clone();
+                        let source = source.clone();
+                        move |_, window, cx| {
+                            let source = source.clone();
+                            let _ = app.update(cx, |this, cx| {
+                                this.fork_agent_session(
+                                    index,
+                                    source,
+                                    crate::ui::app::ForkPlacement::NewTab,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                    }),
+            );
         }
 
         menu = menu
             .separator()
-            .item(PopupMenuItem::new(t(L10nKey::AppMenuSplitRight)).on_click({
-                let app = app.clone();
-                move |_, window, cx| {
-                    let _ = app.update(cx, |this, cx| {
-                        this.activate(index, window, cx);
-                        this.split(Axis::Horizontal, window, cx);
-                    });
-                }
-            }))
-            .item(PopupMenuItem::new(t(L10nKey::AppMenuSplitDown)).on_click({
-                let app = app.clone();
-                move |_, window, cx| {
-                    let _ = app.update(cx, |this, cx| {
-                        this.activate(index, window, cx);
-                        this.split(Axis::Vertical, window, cx);
-                    });
-                }
-            }));
+            .item(
+                PopupMenuItem::new(t(L10nKey::AppMenuSplitRight))
+                    .action(Box::new(SplitRight))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.activate(index, window, cx);
+                                this.split(Axis::Horizontal, window, cx);
+                            });
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(t(L10nKey::AppMenuSplitDown))
+                    .action(Box::new(SplitDown))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.activate(index, window, cx);
+                                this.split(Axis::Vertical, window, cx);
+                            });
+                        }
+                    }),
+            );
 
         menu = menu.separator().item(
             PopupMenuItem::new(t(L10nKey::AppMenuCopyWorkingDirectory))
+                .action(Box::new(CopyWorkingDirectory))
                 .disabled(!has_cwd)
                 .on_click(move |_, _window, cx| {
                     if let Some(cwd) = cwd.as_ref() {
@@ -719,6 +871,7 @@ impl Tty7App {
         if let Some(session_id) = agent_session.map(|(_, s)| s.session_id) {
             menu = menu.item(
                 PopupMenuItem::new(t(L10nKey::AppMenuCopySessionId))
+                    .action(Box::new(CopyAgentSessionId))
                     .disabled(session_id.is_none())
                     .on_click(move |_, _window, cx| {
                         if let Some(id) = session_id.as_ref() {
@@ -730,15 +883,18 @@ impl Tty7App {
 
         menu.separator()
             .item(
-                PopupMenuItem::new(t(L10nKey::TabContextCloseTab)).on_click({
-                    let app = app.clone();
-                    move |_, window, cx| {
-                        let _ = app.update(cx, |this, cx| this.close_tab(index, window, cx));
-                    }
-                }),
+                PopupMenuItem::new(t(L10nKey::TabContextCloseTab))
+                    .action(Box::new(CloseActiveTab))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| this.close_tab(index, window, cx));
+                        }
+                    }),
             )
             .item(
                 PopupMenuItem::new(t(L10nKey::AppMenuCloseOtherTabs))
+                    .action(Box::new(CloseOtherTabs))
                     .disabled(tab_count <= 1)
                     .on_click({
                         let app = app.clone();
@@ -754,6 +910,7 @@ impl Tty7App {
                 } else {
                     t(L10nKey::AppMenuCloseTabsRight)
                 })
+                .action(Box::new(CloseTabsToTheRight))
                 .disabled(index + 1 >= tab_count)
                 .on_click({
                     let app = app.clone();
@@ -773,22 +930,38 @@ impl Tty7App {
     ) -> impl IntoElement + use<> {
         let active = self.active;
         let show_badges = self.mod_hint_badges;
+        // On macOS an open detail panel draws its own chrome in the title bar,
+        // so the strip stops at the panel's edge rather than running the width
+        // of the window. Sizing it to the whole viewport made it overrun that
+        // edge, and what got pushed out past it was the New Tab button.
+        let panel_w = match cfg!(target_os = "macos") && self.right_panel_open(cx) {
+            true => self.right_panel_px(window, cx),
+            false => 0.,
+        };
         let strip_w = if cfg!(target_os = "macos") {
-            (window.viewport_size().width - px(80.)).max(px(160.))
+            (window.viewport_size().width - px(80. + panel_w)).max(px(160.))
         } else {
             (window.viewport_size().width - px(114.)).max(px(140.))
         };
         let chrome_band_w = (!cfg!(target_os = "macos") && self.right_panel_open(cx)).then(|| {
             (self.right_panel_px(window, cx) - crate::ui::app::WINDOW_CONTROLS_W - 1.).max(0.)
         });
-        let corner_w = chrome_band_w.unwrap_or_else(|| {
-            let trailing_pad = if cfg!(target_os = "macos") {
-                tile_trailing_inset()
-            } else {
-                4.
-            };
-            trailing_pad + crate::ui::app::TILE_SIZE + 2. + crate::ui::app::TILE_SIZE
-        });
+        // `corner_w` reserves the trailing window chrome. With the panel open on
+        // macOS that chrome belongs to the panel's own header, which the strip
+        // now stops short of, so reserving for it here would charge the chips
+        // for it twice.
+        let corner_w = if panel_w > 0. {
+            0.
+        } else {
+            chrome_band_w.unwrap_or_else(|| {
+                let trailing_pad = if cfg!(target_os = "macos") {
+                    tile_trailing_inset()
+                } else {
+                    4.
+                };
+                trailing_pad + crate::ui::app::TILE_SIZE + 2. + crate::ui::app::TILE_SIZE
+            })
+        };
         let fixed_w = 3. * CHIP_GAP + crate::ui::app::TILE_SIZE + corner_w;
         let chips_avail = (strip_w - px(fixed_w + GRAB_HANDLE_W)).max(px(80.));
         let mut chips = h_flex()
@@ -813,6 +986,7 @@ impl Tty7App {
             }
             None => (0..self.tabs.len()).collect(),
         };
+        let display = visible_chips(&display, active, f32::from(chips_avail));
 
         for i in display {
             if !show_chips {
@@ -822,6 +996,7 @@ impl Tty7App {
             let tab = &self.tabs[i];
             let is_active = i == active;
             let label = self.tab_label(tab, i, Some(window), cx);
+            let full_title = self.tab_title_tooltip(tab, i, Some(window), cx);
             let ssh_dot = self.tab_ssh_dot(tab, cx);
             let agent = tab.agent(cx);
             let agent_status = tab.agent_status(cx);
@@ -847,6 +1022,11 @@ impl Tty7App {
                     .truncate()
                     .text_sm()
                     .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
+                    .when_some(full_title, |d, title| {
+                        d.tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(title.clone()).build(window, cx)
+                        })
+                    })
                     .child(label)
                     .into_any_element(),
             };
@@ -876,7 +1056,7 @@ impl Tty7App {
                 .justify_between()
                 .gap_1p5()
                 .h(px(30.))
-                .min_w(px(100.))
+                .min_w(px(CHIP_MIN_W))
                 .flex_shrink(1.)
                 .pl_3()
                 .pr_1p5()
@@ -926,6 +1106,7 @@ impl Tty7App {
                 })
                 .when_some(agent, |chip, agent| {
                     chip.child(self.tab_avatar(
+                        ("tab-avatar", i),
                         Some(agent),
                         agent_status,
                         agent_unread,
@@ -964,26 +1145,32 @@ impl Tty7App {
                     chip.child(
                         h_flex()
                             .absolute()
-                            .top(px(5.))
+                            // 3 + MIN_TARGET + 3 centres the button in the 30px chip.
+                            .top(px(3.))
                             .right(px(6.))
                             .opacity(0.)
                             .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
                                 s.opacity(1.)
                             })
-                            .child(div().w(px(10.)).h(px(20.)).bg(linear_gradient(
+                            .child(div().w(px(10.)).h(px(MIN_TARGET)).bg(linear_gradient(
                                 90.,
                                 linear_color_stop(fade_from, 0.),
                                 linear_color_stop(backing, 1.),
                             )))
                             .child(
                                 div().bg(backing).child(
-                                    Button::new(("tab-close", i))
-                                        .icon(IconName::Close)
-                                        .ghost()
-                                        .xsmall()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                    hit_target(
+                                        Button::new(("tab-close", i))
+                                            .icon(IconName::Close)
+                                            .ghost()
+                                            .xsmall(),
+                                    )
+                                    .tooltip(t(L10nKey::TabContextCloseTab))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
                                             this.close_tab(i, window, cx);
-                                        })),
+                                        },
+                                    )),
                                 ),
                             ),
                     )
@@ -1068,7 +1255,11 @@ impl Tty7App {
                             cx,
                         )
                         .rounded_lg()
-                        .tooltip(t(L10nKey::TabTooltipShowSidebar))
+                        .tooltip(chord_hint(
+                            t(L10nKey::TabTooltipShowSidebar),
+                            "ToggleLeftPanel",
+                            cx,
+                        ))
                         .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
                     ),
                 )
@@ -1109,6 +1300,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_visible_agent_state_has_words_for_it() {
+        use crate::core::cli_agent::AgentStatus;
+        crate::ui::i18n::set_locale("en");
+        // Idle draws no dot, so it has nothing to name.
+        assert_eq!(agent_status_label(None), None);
+        assert_eq!(agent_status_label(Some(AgentStatus::Idle)), None);
+        // Every state that does draw a dot can be read out loud.
+        for status in [
+            AgentStatus::Working,
+            AgentStatus::Waiting,
+            AgentStatus::Done,
+        ] {
+            assert!(status.dot_rgb().is_some());
+            assert!(
+                agent_status_label(Some(status)).is_some_and(|s| !s.is_empty()),
+                "{status:?} paints a dot with no words behind it"
+            );
+        }
+        // Waiting is the state worth acting on; it must not read as Done.
+        assert_ne!(
+            agent_status_label(Some(AgentStatus::Waiting)),
+            agent_status_label(Some(AgentStatus::Done))
+        );
+    }
+
+    #[test]
+    fn a_brand_disc_that_matches_the_window_gets_an_edge() {
+        use crate::ui::presets::needs_edge;
+        let dark: gpui::Hsla = gpui::rgb(0x111111).into();
+        let light: gpui::Hsla = gpui::rgb(0xffffff).into();
+        let codex = crate::core::cli_agent::CLIAgent::Codex.accent_rgb();
+        let claude = crate::core::cli_agent::CLIAgent::Claude.accent_rgb();
+
+        assert_eq!(codex, 0x000000, "Codex's disc is pure black");
+        assert!(
+            needs_edge(codex, dark),
+            "a black disc on a dark window is not a disc"
+        );
+        assert!(!needs_edge(codex, light));
+        assert!(!needs_edge(claude, dark) && !needs_edge(claude, light));
+    }
+
+    #[test]
     fn short_title_strips_user_host_and_shows_shallow_path_in_full() {
         assert_eq!(short_title("user@host:~/projects/app"), "~/projects/app");
         assert_eq!(short_title("/usr/local/bin"), "/usr/local/bin");
@@ -1136,6 +1370,49 @@ mod tests {
         let out = short_title(&long);
         assert_eq!(out.chars().count(), 41);
         assert!(out.ends_with('…'));
+    }
+
+    /// One chip is 100 wide plus a 6 gap, so this is "room for exactly four".
+    const FOUR_CHIPS: f32 = 4. * (CHIP_MIN_W + CHIP_GAP);
+
+    #[test]
+    fn every_chip_is_drawn_while_they_all_fit() {
+        let order: Vec<usize> = (0..4).collect();
+        assert_eq!(visible_chips(&order, 0, FOUR_CHIPS), order);
+        assert_eq!(visible_chips(&order, 3, FOUR_CHIPS), order);
+        assert_eq!(visible_chips(&[0, 1], 1, FOUR_CHIPS), vec![0, 1]);
+    }
+
+    #[test]
+    fn the_run_stays_put_until_the_active_chip_would_fall_off() {
+        let order: Vec<usize> = (0..9).collect();
+        // Anchored at the first tab for as long as the active one is inside it.
+        assert_eq!(visible_chips(&order, 0, FOUR_CHIPS), vec![0, 1, 2, 3]);
+        assert_eq!(visible_chips(&order, 3, FOUR_CHIPS), vec![0, 1, 2, 3]);
+        // Then it slides by exactly as much as it has to.
+        assert_eq!(visible_chips(&order, 4, FOUR_CHIPS), vec![1, 2, 3, 4]);
+        assert_eq!(visible_chips(&order, 8, FOUR_CHIPS), vec![5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn the_active_chip_is_always_among_the_drawn_ones() {
+        let order: Vec<usize> = (0..40).collect();
+        for active in 0..40 {
+            for avail in [0., 1., 80., FOUR_CHIPS, 4000.] {
+                let shown = visible_chips(&order, active, avail);
+                assert!(
+                    shown.contains(&active),
+                    "active {active} missing at {avail}px: {shown:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reordered_run_is_sliced_in_its_own_order() {
+        // Mid-drag the strip renders `preview.order`, not 0..n.
+        let order = vec![3, 0, 1, 2, 4, 5];
+        assert_eq!(visible_chips(&order, 5, FOUR_CHIPS), vec![1, 2, 4, 5]);
     }
 
     #[test]

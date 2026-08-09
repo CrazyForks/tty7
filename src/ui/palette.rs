@@ -284,7 +284,7 @@ pub enum CommandGroup {
 }
 
 impl CommandGroup {
-    const ORDER: [CommandGroup; 7] = [
+    pub(crate) const ORDER: [CommandGroup; 7] = [
         CommandGroup::TabsPanes,
         CommandGroup::Workspaces,
         CommandGroup::View,
@@ -294,7 +294,7 @@ impl CommandGroup {
         CommandGroup::Application,
     ];
 
-    fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         match self {
             CommandGroup::TabsPanes => t(L10nKey::CmdGroupTabsPanes),
             CommandGroup::Workspaces => t(L10nKey::CmdGroupWorkspaces),
@@ -586,6 +586,18 @@ fn command_score(query: &str, cmd: &Command) -> Option<i32> {
     }
 }
 
+/// A bounded nudge, not a re-ranking. Two commands that match the query about
+/// equally well should come out in the order they actually get run, but a
+/// command used daily must not outrank a plainly better match — a single extra
+/// matched character is worth 16 before bonuses.
+fn frecency_bonus(used: f64) -> i32 {
+    const CEILING: f64 = 24.0;
+    if used <= 0.0 {
+        return 0;
+    }
+    (used.ln_1p() * 8.0).min(CEILING).round() as i32
+}
+
 #[derive(Clone)]
 struct Section {
     title: Option<SharedString>,
@@ -645,6 +657,10 @@ impl PaletteDelegate {
             .collect();
         recent.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         recent.truncate(RECENT_ROWS);
+        // Promoting a command to Recent moves it; it does not clone it. Leaving
+        // it in its group too meant the five rows you use most were the five
+        // rows the list showed twice.
+        let promoted: Vec<&str> = recent.iter().filter_map(|(_, c)| c.kind.id()).collect();
         if !recent.is_empty() {
             sections.push(Section {
                 title: Some(t(L10nKey::CmdRecent).into()),
@@ -657,6 +673,7 @@ impl PaletteDelegate {
                 .commands
                 .iter()
                 .filter(|c| c.group == group)
+                .filter(|c| !c.kind.id().is_some_and(|id| promoted.contains(&id)))
                 .cloned()
                 .collect();
             if !commands.is_empty() {
@@ -757,10 +774,25 @@ impl ListDelegate for PaletteDelegate {
                 }]
             };
         } else {
+            let cfg = cx.global::<Config>();
+            let now = crate::core::config::unix_now();
             let mut scored: Vec<(i32, Command)> = self
                 .commands
                 .iter()
-                .filter_map(|c| command_score(query, c).map(|s| (s, c.clone())))
+                .filter_map(|c| {
+                    let score = command_score(query, c)?;
+                    // Frecency ordered the zero-query list and was then thrown
+                    // away the moment a character was typed, so the command
+                    // someone runs every day stopped floating exactly when
+                    // they started reaching for it.
+                    let used = c
+                        .kind
+                        .id()
+                        .and_then(|id| cfg.command_frecency.get(id))
+                        .map(|u| u.score(now))
+                        .unwrap_or(0.0);
+                    Some((score + frecency_bonus(used), c.clone()))
+                })
                 .collect();
             scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
             let mut commands: Vec<Command> = Vec::new();
@@ -787,7 +819,7 @@ impl ListDelegate for PaletteDelegate {
         Some(
             h_flex()
                 .h(px(PALETTE_ROW_H))
-                .px(px(11.))
+                .px(px(PALETTE_LABEL_INSET))
                 .items_center()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
@@ -846,10 +878,13 @@ impl ListDelegate for PaletteDelegate {
             .child(left);
         if cmd.kind.edit_variant().is_some() {
             row = row.child(
-                div()
+                h_flex()
+                    .items_center()
+                    .gap_1()
                     .text_xs()
                     .text_color(muted)
-                    .child(crate::ui::i18n::t(crate::ui::i18n::L10nKey::EditHint)),
+                    .child(crate::ui::i18n::t(crate::ui::i18n::L10nKey::EditHint))
+                    .child(crate::ui::keymap::key_tokens(EDIT_GESTURE).join("")),
             );
         }
         if let Some(tokens) = keys {
@@ -875,7 +910,7 @@ impl ListDelegate for PaletteDelegate {
             ListItem::new(("palette-row", ix.section * 1000 + ix.row))
                 .selected(Some(ix) == self.selected)
                 .h(px(PALETTE_ROW_H))
-                .mx(px(5.))
+                .mx(px(PALETTE_ROW_MX))
                 .rounded(px(6.))
                 .text_sm()
                 .child(row),
@@ -946,8 +981,17 @@ impl PaletteView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ListState<PaletteDelegate>> {
+        let first = delegate.first_row();
         let list = cx.new(|cx| ListState::new(delegate, window, cx).searchable(true));
-        list.update(cx, |state, cx| state.focus(window, cx));
+        list.update(cx, |state, cx| {
+            // `ListState::new` starts with nothing selected, and it only picks a
+            // row once a query changes. Opening the palette and pressing Return
+            // therefore did nothing at all, and until then no row showed what
+            // Return was aimed at. Every palette anywhere else arms the first
+            // row on open.
+            state.set_selected_index(first, window, cx);
+            state.focus(window, cx);
+        });
         list
     }
 
@@ -1029,6 +1073,36 @@ impl PaletteView {
 impl EventEmitter<PaletteEvent> for PaletteView {}
 
 const PALETTE_ROW_H: f32 = 30.;
+
+/// Left inset of a row's *label*, so a section header can start on the same
+/// pixel column as the rows it introduces. A row is a `ListItem` inset by
+/// `PALETTE_ROW_MX` whose own padding is `px_3`; a header has neither, so it
+/// has to carry the sum itself.
+const PALETTE_ROW_MX: f32 = 5.;
+const PALETTE_LABEL_INSET: f32 = PALETTE_ROW_MX + 12.;
+
+/// The chord that opens the selected row for editing instead of running it.
+///
+/// It cannot be `→`: gpui-component's `Input` binds bare `right` to MoveRight
+/// in its own key context, so with the query field focused the palette never
+/// sees the key — the old `→ edit` badge was advertising a gesture that could
+/// not fire. `⌘↵` is no better; the app binds it to ToggleFullscreen, which
+/// wins for the same reason. `secondary-e` is claimed by neither.
+const EDIT_GESTURE: &str = "secondary-e";
+
+/// Matches `EDIT_GESTURE` against a live keystroke. Keep the two in step.
+fn is_edit_gesture(ks: &gpui::Keystroke) -> bool {
+    if ks.key != "e" {
+        return false;
+    }
+    let m = &ks.modifiers;
+    let secondary = if cfg!(target_os = "macos") {
+        m.platform
+    } else {
+        m.control
+    };
+    secondary && !m.shift && !m.alt
+}
 const PALETTE_VISIBLE_ROWS: f32 = 12.;
 const RECENT_ROWS: usize = 5;
 
@@ -1063,11 +1137,10 @@ impl Render for PaletteView {
             .justify_center()
             .pt(px(120.))
             .bg(scrim)
+            .key_context("Palette")
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
                 let ks = &ev.keystroke;
-                let is_edit_gesture = (ks.key == "enter" && ks.modifiers.platform)
-                    || (ks.key == "right" && !ks.modifiers.platform);
-                if is_edit_gesture {
+                if is_edit_gesture(ks) {
                     if let Some(edit) = this.selected_edit_command(cx) {
                         cx.stop_propagation();
                         cx.emit(PaletteEvent::Confirm(edit));
@@ -1093,6 +1166,21 @@ mod tests {
             .into_iter()
             .map(|c| c.title)
             .collect()
+    }
+
+    #[test]
+    fn frecency_nudges_without_overruling_the_match() {
+        assert_eq!(frecency_bonus(0.0), 0, "an unused command gets nothing");
+        assert!(frecency_bonus(1.0) > 0, "one use is worth something");
+        // Monotone in usage.
+        assert!(frecency_bonus(20.0) > frecency_bonus(1.0));
+        // Bounded: never worth more than one and a half matched characters,
+        // so a command run a thousand times still loses to a better match.
+        assert!(
+            frecency_bonus(1_000.0) <= 24,
+            "frecency is a tiebreak, not a ranking"
+        );
+        assert_eq!(frecency_bonus(1_000.0), frecency_bonus(10_000.0));
     }
 
     #[test]
