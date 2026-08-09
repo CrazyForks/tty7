@@ -3964,6 +3964,14 @@ impl TerminalView {
         if self.terminal.exited || text.is_empty() || !self.accepts_input(cx) {
             return;
         }
+        // Typing goes to the prompt, so the view has to be looking at it.
+        // Only the last branch below used to do this, which is the branch
+        // taken when tty7 is *not* driving the line — so scrolling up and
+        // typing did the one thing it must never do at a shell prompt:
+        // accepted the characters somewhere the user could not see them.
+        // `handle_editor_key` has always jumped, so Left and Backspace came
+        // back to the prompt and the letters between them did not.
+        self.jump_to_prompt();
         if let Some(rs) = self.reverse_search.as_mut() {
             rs.push_query(text, &self.history, &self.history_frecency);
             self.cursor_visible = true;
@@ -3982,7 +3990,6 @@ impl TerminalView {
         }
         self.write_gap_text(text, text.as_bytes().to_vec(), cx);
         self.cursor_visible = true;
-        self.jump_to_prompt();
         cx.notify();
     }
 
@@ -8586,6 +8593,30 @@ mod gpui_tests {
                 );
                 assert_eq!(view.scroll_frac, 0., "and not even a sliver of it");
                 assert!(view.scroll_anim.is_some(), "nothing was left to animate");
+            })
+            .unwrap();
+    }
+
+    /// The one thing typing at a prompt must never do is land where the
+    /// person typing cannot see it.
+    #[gpui::test]
+    fn typing_brings_the_view_back_to_the_prompt(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        prompt_ready(&window, cx, &mut daemon);
+        window
+            .update(cx, |view, _w, cx| {
+                assert!(
+                    view.input_active(),
+                    "this is the branch that was leaving the view parked"
+                );
+                scroll_into_history(view, 10);
+                view.commit_text("l", cx);
+                assert_eq!(
+                    display_offset(view),
+                    0,
+                    "the character went in while the viewport stayed in the scrollback"
+                );
+                assert_eq!(view.cmd.text(), "l", "and it did reach the line");
             })
             .unwrap();
     }
