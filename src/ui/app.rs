@@ -75,7 +75,21 @@ pub(crate) const TITLE_BAR_HEIGHT: f32 = 40.;
 pub(crate) const TILE_SIZE: f32 = 32.;
 pub(crate) const TILE_GLYPH: f32 = 13.;
 pub(crate) const TILE_SIZE_SM: f32 = 24.;
+/// The small tile is both a smaller box and a smaller glyph than
+/// [`TILE_GLYPH`]: it lives beside the right panel's 12px rows, where a 13px
+/// glyph would out-weigh the text it sits next to. The padding below is
+/// derived from it, so the glyph's optical edge still lands at `CONTENT_INSET`
+/// and rows keep their alignment.
 pub(crate) const TILE_GLYPH_SM: f32 = 11.;
+
+/// The tile that lives *inside* a list row rather than beside one, for the
+/// buttons a row reveals on hover.
+///
+/// A box below [`TILE_SIZE_SM`] because of width: three `TILE_SIZE_SM` squares
+/// would eat 72 of the 236px a file name has to live in, where three of these
+/// eat 54.
+pub(crate) const TILE_SIZE_XS: f32 = 18.;
+pub(crate) const TILE_GLYPH_XS: f32 = 11.;
 
 pub(crate) const TILE_GLYPH_LINE: f32 = 16.;
 

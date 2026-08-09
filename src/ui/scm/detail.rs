@@ -12,7 +12,20 @@
 //! This is also where the panel pays back what the graph gave up. A history
 //! row has about 26 characters beside its lanes and this repository's subjects
 //! run to a median of 64, so the graph shows shape and this shows text: the
-//! whole subject, the body, every ref, the parents, and the files.
+//! whole subject, the body, every ref, the parents, how many lines moved, and
+//! the files.
+//!
+//! What it is *not* is a container of its own. It is drawn flush with the
+//! panel, on the panel's fill, in the panel's type scale — the same dense,
+//! low-chrome language as every other body the right panel shows. A
+//! second-level view announces itself by the way back at the top of it and by
+//! being the only thing on screen; it does not need a raised card, a larger
+//! ramp or filled tokens to say so, and an earlier round that gave it all
+//! three read as a foreign design pasted into the app. A later round tried the
+//! ramp on its own — 14/12/11.5 through the whole panel — and it read the same
+//! way: too big for a 260px column, and too loud beside the graph. The sizes
+//! below are the panel's own, and this view has no business being a step above
+//! them.
 
 use std::sync::Arc;
 
@@ -33,6 +46,16 @@ use crate::ui::scm::status::{status_color, status_glyph};
 
 /// A file row, the same height as the working tree's, and inset the same way.
 /// The two lists sit in one column and have to read as one grid.
+///
+/// Both numbers are a 12px row's. gpui leads a plain `div` at phi, so the row's
+/// mono name occupies `round(12 × 1.618) = 19px`, and 24 gives that line 2.5px
+/// of air on each side — dense, which is what a 260px column of paths wants.
+/// The text lands on `CONTENT_INSET` whatever `ROW_INSET` is, since the list
+/// subtracts it outside the row and the row adds it back inside.
+///
+/// Both have to equal `panel.rs`'s pair. That file carries the same two
+/// constants for the same reason, and a reader who opens a commit must not
+/// feel the pitch change under them.
 const ROW_H: f32 = 24.;
 const ROW_INSET: f32 = 4.;
 
@@ -44,6 +67,44 @@ const BODY_LINES: usize = 4;
 /// of 12px in 260px is around 90 characters — longer than every subject in
 /// this repository but a handful, and a cap for the ones that are a paragraph.
 const SUBJECT_LINES: usize = 3;
+
+/// The panel's type ramp, named rather than spelled out at each of its dozen
+/// uses. These are not this view's sizes to choose: they are the steps the
+/// right panel runs on, and the whole point of naming them here is that a
+/// future edit changes a constant instead of drifting one line of the body off
+/// the ramp.
+///
+/// 12px is body text and the loudest thing on screen — the subject, and the
+/// way back, which is the same size worn quietly. 11px is everything that
+/// qualifies it: the byline, the message body, the parents' label, the file
+/// count, the waiting notes. One point of difference is all a qualifier needs
+/// in a column this narrow; the separation is carried by weight and colour,
+/// not by the gap. 10.5px mono is the token size — sha-like strings, ref
+/// chips, the diff counts, and `git_badge`'s status letter. That one is barely
+/// a choice made here: `git_badge` and `info_chip` set their own mono at 10.5,
+/// and an object id has to read as the same kind of thing in this view as it
+/// does in the graph and on a file row.
+///
+/// Emphasis in this panel is weight and colour rather than size, and a fill
+/// only where it carries a meaning of its own — HEAD, and a tag. The subject is
+/// a step up in weight against the full foreground while everything under it is
+/// muted, and that separation is all it needs; it is what a card was briefly
+/// and wrongly asked to do, and what a larger ramp was later asked to do after
+/// that. Both were turned down. Nothing in this view is bigger than the
+/// working tree's rows are.
+///
+/// `right_panel.rs` is where the panel's own steps live, and these are that
+/// ramp under local names that say what each step does *here* — subject,
+/// qualifier, token. If the two ever disagree, that file is the one that is
+/// right.
+///
+/// The changed-file rows deliberately do not read these. They spell 12 and 11
+/// out because they have to stay pixel-identical to `scm_file_row` in
+/// `panel.rs`, and a constant shared with the prose above would let a change
+/// here silently break that.
+const SUBJECT_SIZE: f32 = 12.;
+const SECONDARY_SIZE: f32 = 11.;
+const TOKEN_SIZE: f32 = 10.5;
 
 impl Tty7App {
     /// Show one commit, replacing the working tree in the panel body.
@@ -89,9 +150,13 @@ impl Tty7App {
 
         let mono = cx.theme().mono_font_family.clone();
         let muted = cx.theme().muted_foreground;
-        // Each section insets itself rather than sharing one on the column:
-        // `panel_subtitle` applies `CONTENT_INSET` of its own, and an outer
-        // inset would push it eight pixels right of the rows beneath it.
+        // No surface, no margin: this is the panel's body while a commit is
+        // open, and it starts where every other panel body starts.
+        //
+        // Each section insets itself by `CONTENT_INSET` rather than sharing one
+        // on the column, because the rows that want a hover fill lay themselves
+        // out a `ROW_INSET` short of it so the fill is wider than the text, and
+        // an outer inset would have to be undone by every one of them.
         let mut body = v_flex()
             .py(px(2.))
             .child(self.detail_header_row(detail, &mono, cx));
@@ -112,7 +177,7 @@ impl Tty7App {
                     div()
                         .px(px(CONTENT_INSET))
                         .py(px(4.))
-                        .text_size(px(12.))
+                        .text_size(px(SECONDARY_SIZE))
                         .text_color(muted)
                         .child(if detail.loaded {
                             t(L10nKey::ScmCommitNotFound)
@@ -189,6 +254,14 @@ impl Tty7App {
     /// rendered by the panel and this function only produces the body — see
     /// the note in `render_panel_scm`. Being the first row of the body it
     /// scrolls with the content, which is the one thing lost by the move.
+    ///
+    /// Both halves of the row are chrome and are drawn as chrome: muted, no
+    /// resting fill, the hover doing all the work of saying they are hit
+    /// targets. The loudest text in this view has to be the subject — the row
+    /// above it is a way out and a string to copy, and neither is what the
+    /// reader came to read. The oid is set in the same mono at the same token
+    /// size as the parent links below, so the two read as the same kind of
+    /// thing.
     fn detail_header_row(
         &self,
         detail: &CommitDetailView,
@@ -196,6 +269,8 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let oid = detail.oid.clone();
+        let hover_bg = gpui::rgb(panel_surface(cx).hover);
+        let muted = cx.theme().muted_foreground;
         h_flex()
             .items_center()
             .gap(px(4.))
@@ -208,16 +283,21 @@ impl Tty7App {
                     .gap(px(2.))
                     .px(px(4.))
                     .py(px(1.))
-                    .rounded_md()
+                    .rounded(px(4.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(cx.theme().list_hover))
+                    .hover(|s| s.bg(hover_bg))
                     .on_click(cx.listener(|this, _, _window, cx| this.close_commit_detail(cx)))
+                    // `small()`, which is 14px of glyph beside a 12px label —
+                    // an icon needs a little more box than the text it labels
+                    // to read as the same size, and it is the width of
+                    // `git_badge`'s cell as well.
+                    .child(Icon::new(IconName::ChevronLeft).small().text_color(muted))
                     .child(
-                        Icon::new(IconName::ChevronLeft)
-                            .small()
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(div().text_xs().child(t(L10nKey::ScmBackToChanges))),
+                        div()
+                            .text_size(px(SUBJECT_SIZE))
+                            .text_color(muted)
+                            .child(t(L10nKey::ScmBackToChanges)),
+                    ),
             )
             .child(div().flex_1().min_w_0())
             .child(
@@ -226,10 +306,11 @@ impl Tty7App {
                     .flex_none()
                     .px(px(4.))
                     .py(px(1.))
-                    .rounded_md()
+                    .rounded(px(4.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(cx.theme().list_hover))
-                    .text_size(px(13.))
+                    .hover(|s| s.bg(hover_bg))
+                    .text_size(px(TOKEN_SIZE))
+                    .text_color(muted)
                     .font_family(mono.clone())
                     .tooltip(|window, cx| {
                         gpui_component::tooltip::Tooltip::new(t(L10nKey::ScmCopyCommitSha))
@@ -258,25 +339,33 @@ impl Tty7App {
             .pb(px(4.))
             .gap(px(3.))
             .child(
-                // Wrapping, not truncating: this view exists because the
-                // graph row could only show the first 26 characters.
+                // Wrapping, not truncating: this view exists because the graph
+                // row could only show the first 26 characters. It carries the
+                // weight and the full foreground while everything under it is
+                // muted, and that is the whole of its emphasis — it sits on
+                // the same 12px step as the file rows below it.
                 div()
-                    .text_size(px(12.))
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(SUBJECT_SIZE))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().foreground)
                     .line_clamp(SUBJECT_LINES)
                     .child(SharedString::from(commit.summary.clone())),
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(SECONDARY_SIZE))
                     .text_color(cx.theme().muted_foreground)
                     .child(byline(commit, now_unix())),
             )
             .when(!body.is_empty(), |this| {
                 this.child(
+                    // The secondary size — the same one the byline above it
+                    // and the parents below it are set in. A size of its own
+                    // bought nothing and cost the reader a fourth step in a
+                    // view eight lines tall.
                     div()
                         .pt(px(2.))
-                        .text_size(px(11.5))
+                        .text_size(px(SECONDARY_SIZE))
                         .text_color(cx.theme().muted_foreground)
                         .when(folded, |d| d.line_clamp(BODY_LINES))
                         .child(SharedString::from(body.to_string())),
@@ -288,7 +377,7 @@ impl Tty7App {
                             .w_full()
                             .py(px(1.))
                             .cursor_pointer()
-                            .text_size(px(11.))
+                            .text_size(px(SECONDARY_SIZE))
                             .text_color(cx.theme().info)
                             .on_click(cx.listener(|this, _, _window, cx| {
                                 if let Some(open) = this.scm.detail.as_mut() {
@@ -311,6 +400,27 @@ impl Tty7App {
     ///
     /// The graph row shows one chip and a `+N`; there is no reason to hide any
     /// of them once there is a whole column to put them in.
+    ///
+    /// Exactly two of them get a fill, and they are the two that mean
+    /// something. HEAD is where you are, washed in `accent` under the full
+    /// foreground — one emphasised token on the row. A tag is yellow because a
+    /// tag is yellow everywhere in git. Everything else — the other local
+    /// branches, every remote-tracking ref — is a bare muted span: no fill, and
+    /// therefore no padding either, because padding exists to hold text off a
+    /// background and there is no background to hold it off. A ref name is
+    /// already a word with spaces around it; drawing a box around every one of
+    /// them turns a list of names into a wall of blocks, which is what the
+    /// panel's language is trying not to be.
+    ///
+    /// `theme.accent` is a neutral surface tint in tty7 rather than the brand
+    /// colour, which is exactly why 0.28 of it works: it is a raised patch, not
+    /// a wash of hue, and the foreground stays legible on it. Do not substitute
+    /// `theme.ring` here and then have to drop the opacity to compensate.
+    ///
+    /// What this must never go back to is the bug that predated all of it: the
+    /// fallback arm painted `theme.accent` at *full* opacity under muted text,
+    /// which made `origin/main` louder than the branch you were actually on and
+    /// left HEAD looking like the footnote.
     fn detail_refs(
         &self,
         commit: &Commit,
@@ -330,25 +440,32 @@ impl Tty7App {
         let mut row = h_flex()
             .flex_wrap()
             .items_center()
-            .gap(px(4.))
+            // Six, not four: most of these are bare words now, and words need a
+            // little more air between them than chips whose fills already say
+            // where one ends and the next begins.
+            .gap(px(6.))
             .px(px(CONTENT_INSET))
             .pb(px(6.));
         for deco in &commit.refs {
-            // The same three colours the graph's chips use: a tag is yellow
-            // because a tag is yellow everywhere in git, HEAD is emphasised,
-            // and everything else is quiet.
-            let (bg, color) = match deco.kind {
-                RefKind::Tag => (warning.opacity(0.16), warning),
-                _ if deco.is_head => (accent.opacity(0.28), fg),
-                _ => (accent, muted),
-            };
-            row = row.child(info_chip(&deco.short, bg, color, mono));
+            row = row.child(match deco.kind {
+                RefKind::Tag => info_chip(&deco.short, warning.opacity(0.16), warning, mono),
+                _ if deco.is_head => info_chip(&deco.short, accent.opacity(0.28), fg, mono),
+                _ => ref_span(&deco.short, muted, mono),
+            });
         }
         Some(row.into_any_element())
     }
 
     /// The parents, as links. Following one is the only way to walk history
     /// backwards from a commit the graph's window does not reach.
+    ///
+    /// `theme.info` and nothing else at rest — the panel's link ink, the same
+    /// one the "show more" fold uses a few lines above. A filled pill would
+    /// make the parents a second block competing with the ref chips, and this
+    /// is a link, not a state. The hover fill is what says the oid is a target,
+    /// and it is the same fill, radius and inset the header's two affordances
+    /// use. The oids themselves are token-sized mono, matching the sha in the
+    /// header so that every object id in this view is one recognisable shape.
     fn detail_parents(
         &self,
         detail: &CommitDetailView,
@@ -359,6 +476,11 @@ impl Tty7App {
         if commit.parents.is_empty() {
             return None;
         }
+        let hover_bg = gpui::rgb(panel_surface(cx).hover);
+        let (muted, link) = {
+            let theme = cx.theme();
+            (theme.muted_foreground, theme.info)
+        };
         let mut row = h_flex()
             .flex_wrap()
             .items_center()
@@ -367,8 +489,8 @@ impl Tty7App {
             .pb(px(4.))
             .child(
                 div()
-                    .text_size(px(11.))
-                    .text_color(cx.theme().muted_foreground)
+                    .text_size(px(SECONDARY_SIZE))
+                    .text_color(muted)
                     .child(t(L10nKey::ScmCommitParents)),
             );
         for parent in &commit.parents {
@@ -377,13 +499,14 @@ impl Tty7App {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("scm-detail-parent-{parent}")))
-                    .px(px(3.))
+                    .px(px(4.))
+                    .py(px(1.))
                     .rounded(px(4.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(cx.theme().list_hover))
-                    .text_size(px(11.))
+                    .hover(|s| s.bg(hover_bg))
+                    .text_size(px(TOKEN_SIZE))
                     .font_family(mono.clone())
-                    .text_color(cx.theme().info)
+                    .text_color(link)
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         // No seed: a parent is by definition one step past
                         // whatever the caller had in hand.
@@ -395,6 +518,11 @@ impl Tty7App {
         Some(row.into_any_element())
     }
 
+    /// The summary line and the rows under it.
+    ///
+    /// While the read is out there is no summary line at all. The count used to
+    /// come from `unwrap_or_default()` and so said "no files changed" for as
+    /// long as it took git to answer, which is a claim rather than a wait.
     fn detail_files(
         &self,
         detail: &CommitDetailView,
@@ -402,18 +530,10 @@ impl Tty7App {
         mono: &SharedString,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let files = detail.files.clone().unwrap_or_default();
-        let list = v_flex().child(self.panel_subtitle(
-            &t_plural(L10nKey::ScmFilesChanged, files.len(), &[]),
-            true,
-            None,
-            cx,
-        ));
-        if detail.files.is_none() {
-            return list
-                .child(self.detail_note(t(L10nKey::PanelLoading).to_string(), cx))
-                .into_any_element();
-        }
+        let Some(files) = detail.files.clone() else {
+            return self.detail_note(t(L10nKey::PanelLoading).to_string(), cx);
+        };
+        let list = v_flex().child(self.detail_summary(&files, mono, cx));
         // The label rides along on the source so the overlay's header can say
         // which commit it is showing, and it is deliberately not part of that
         // source's identity — the same commit opened from here and from
@@ -427,13 +547,88 @@ impl Tty7App {
             }),
         };
         // The rows sit in the working tree's own column: laid out one
-        // `ROW_INSET` short of `CONTENT_INSET` and padding themselves back
-        // out, so a hovered row's background is wider than its text.
+        // `ROW_INSET` short of `CONTENT_INSET` and padding themselves back out,
+        // so a hovered row's background is wider than its text.
         let mut rows = v_flex().px(px(CONTENT_INSET - ROW_INSET));
         for file in files.iter() {
             rows = rows.child(self.detail_file_row(detail, &source, file, mono, cx));
         }
         list.child(rows).into_any_element()
+    }
+
+    /// `12 files changed  +340 −118`.
+    ///
+    /// How much the commit is, in one line: the count in words and the size in
+    /// numbers. The counts are the only place in this view where green and red
+    /// appear, which is what lets them be read without a legend — and they are
+    /// mono so the two columns of digits line up against the counts the diff
+    /// overlay shows for the same commit, where the reader is going next.
+    ///
+    /// `−` is U+2212, not a hyphen, matching every other count and gutter mark
+    /// in the diff views: the ASCII one sits too high and too short beside a
+    /// `+` of the same size.
+    ///
+    /// Still not `panel_subtitle`: that helper uppercases its label and puts
+    /// anything in its trailing slot hard against the right edge, because the
+    /// slot was built for a button. Both are wrong here. "3 FILES CHANGED" is
+    /// a heading's voice and this is a sentence about the commit, and the
+    /// counts are not a control off in the corner — they qualify the words and
+    /// have to sit next to them, which is the one thing the layout round got
+    /// right and the user asked to keep.
+    ///
+    /// What the helper *is* copied on is its frame: the hairline and the six
+    /// above it, so the file list starts on exactly the line the working tree's
+    /// does. A rule is how this panel divides sections; the round that replaced
+    /// it with a raised card is the round being undone.
+    ///
+    /// The two paddings are that frame re-derived rather than copied, because
+    /// the tallest line in each block is a different size. gpui leads a plain
+    /// `div` at phi: the helper's 10.5px uppercase label measures
+    /// `round(10.5 × 1.618) = 17px`, and the tallest thing in this row is the
+    /// 11px file count at `round(11 × 1.618) = 18`. The helper's block is
+    /// `6 + 1 + 12 + 17 + 4 = 40px` tall, so this one has 15px of padding to
+    /// spend instead of 16 — half a pixel off each side, which keeps the total
+    /// at 40 *and* puts both lines' optical centre 27.5px below the top of the
+    /// margin, so nothing shifts when the reader opens a commit. Change either
+    /// side's type and this has to be worked out again on both, or one list
+    /// quietly starts a pixel or two below the other and nobody can see why.
+    fn detail_summary(
+        &self,
+        files: &[CommitFile],
+        mono: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let (muted, border) = (theme.muted_foreground, theme.border);
+        let (added_ink, removed_ink) = (theme.success, theme.danger);
+        let counts = diff_totals(files);
+        h_flex()
+            .items_center()
+            .gap(px(6.))
+            .mt(px(6.))
+            .border_t_1()
+            .border_color(border)
+            .px(px(CONTENT_INSET))
+            .pt(px(11.5))
+            .pb(px(3.5))
+            .child(
+                div()
+                    .text_size(px(SECONDARY_SIZE))
+                    .text_color(muted)
+                    .child(t_plural(L10nKey::ScmFilesChanged, files.len(), &[])),
+            )
+            .when_some(counts, |this, (added, removed)| {
+                this.child(
+                    h_flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .text_size(px(TOKEN_SIZE))
+                        .font_family(mono.clone())
+                        .child(div().text_color(added_ink).child(format!("+{added}")))
+                        .child(div().text_color(removed_ink).child(format!("−{removed}"))),
+                )
+            })
+            .into_any_element()
     }
 
     /// The working tree's file row, minus the hover buttons.
@@ -451,7 +646,7 @@ impl Tty7App {
         mono: &SharedString,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
+        let sf = panel_surface(cx);
         let deco = crate::ui::diff_overlay::deco_status(file.status);
         let (name, dir) = split_display_path(&file.path);
         let selected = self.diff_overlay_focus(detail.repo.host, &detail.repo.root)
@@ -490,6 +685,20 @@ impl Tty7App {
             .child(
                 div()
                     .flex_none()
+                    // 12 and, below, 11: written out rather than taken from
+                    // `SUBJECT_SIZE` and `SECONDARY_SIZE`, which happen to
+                    // hold the same two numbers. The prose above this list is
+                    // free to move off the ramp one day; a row is not, because
+                    // it has to stay pixel-identical to `scm_file_row`, and
+                    // sharing a constant with the prose is exactly how that
+                    // would break without anybody touching this function.
+                    //
+                    // Its counterpart spells the same two out for the same
+                    // reason, and says so in a comment pointing back here.
+                    // They happen to be `right_panel`'s `PANEL_TEXT` and
+                    // `PANEL_TEXT_SECONDARY`; a move of that ramp has to be
+                    // carried into both rows by hand, and nothing but these
+                    // two comments says so.
                     .text_size(px(12.))
                     .font_family(mono.clone())
                     .text_color(if deco == DecoStatus::Deleted {
@@ -518,11 +727,64 @@ impl Tty7App {
         div()
             .px(px(CONTENT_INSET))
             .py(px(3.))
-            .text_size(px(11.))
+            .text_size(px(SECONDARY_SIZE))
             .text_color(cx.theme().muted_foreground.opacity(0.75))
             .child(text)
             .into_any_element()
     }
+}
+
+/// The surface every hover and selection in this view is computed against.
+///
+/// The sidebar's, because the right panel is the sidebar and this view paints
+/// nothing under itself. A fill derived from `window` would be a step off a
+/// base that is not there, and `list_hover` is the popover's.
+fn panel_surface(cx: &gpui::App) -> crate::ui::presets::Surface {
+    cx.global::<crate::ui::presets::Surfaces>().sidebar
+}
+
+/// One unemphasised ref, as bare text.
+///
+/// The counterpart to `info_chip` for the arm that has no fill: same mono, same
+/// size, no padding and no radius, so a row of ordinary refs reads as a row of
+/// words rather than a row of empty boxes. `flex_none` because the row wraps
+/// and a ref name must break between names, never inside one.
+fn ref_span(text: &str, ink: gpui::Hsla, mono: &SharedString) -> AnyElement {
+    div()
+        .flex_none()
+        .text_size(px(TOKEN_SIZE))
+        .font_family(mono.clone())
+        .text_color(ink)
+        .child(text.to_string())
+        .into_any_element()
+}
+
+/// The commit's line delta, summed over the files git was able to count.
+///
+/// The numbers are already in hand: `commit_files` joins `--numstat` against
+/// `--name-status`, so every [`CommitFile`] arrives carrying its own `added`
+/// and `removed`. Nothing extra is read to draw this line.
+///
+/// `None` means there is nothing worth printing, which is two cases wearing
+/// one answer. A binary file has no counts at all — `--numstat` prints `-` for
+/// both columns and the fields come through as [`None`] — so a commit that
+/// only touched binaries sums to zero out of zero. A pure rename does have
+/// counts, and they are `0` and `0`. Either way `+0 −0` is a measurement of
+/// nothing, and a line of type that answers a question nobody asked; the file
+/// rows already say what happened.
+///
+/// Summed with `saturating_add` rather than `sum()`, which panics on overflow
+/// in a debug build. This runs in `render`, and a repository that manages four
+/// billion added lines in one commit should get a wrong number, not a crash.
+pub(crate) fn diff_totals(files: &[CommitFile]) -> Option<(u32, u32)> {
+    let fold = |pick: fn(&CommitFile) -> Option<u32>| {
+        files
+            .iter()
+            .filter_map(pick)
+            .fold(0u32, |acc, n| acc.saturating_add(n))
+    };
+    let (added, removed) = (fold(|f| f.added), fold(|f| f.removed));
+    (added > 0 || removed > 0).then_some((added, removed))
 }
 
 /// `Ada Lovelace · 2h`. Author, not committer: a rebase rewrites the second
@@ -550,6 +812,7 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tty7_core::core::git::diff::FileStatus;
     use tty7_core::core::git::log::{OffsetTs, Signature};
 
     fn commit(name: &str, at: i64) -> Commit {
@@ -603,6 +866,72 @@ mod tests {
         assert_eq!(short_oid("abc"), "abc", "a truncated oid is not padded");
         assert_eq!(short_oid(""), "");
     }
+
+    fn file(path: &str, status: FileStatus, counts: Option<(u32, u32)>) -> CommitFile {
+        CommitFile {
+            path: path.into(),
+            orig_path: None,
+            status,
+            added: counts.map(|c| c.0),
+            removed: counts.map(|c| c.1),
+            binary: counts.is_none(),
+        }
+    }
+
+    #[test]
+    fn the_summary_adds_up_every_file_git_could_count() {
+        let files = [
+            file("a.rs", FileStatus::Modified, Some((10, 4))),
+            file("b.rs", FileStatus::Added, Some((2, 0))),
+            file("c.rs", FileStatus::Deleted, Some((0, 8))),
+        ];
+        assert_eq!(diff_totals(&files), Some((12, 12)));
+    }
+
+    /// The two shapes of "there is nothing to print", which have to come back
+    /// as the same answer even though git spells them differently: `-` for a
+    /// binary, and a real pair of zeroes for a rename.
+    #[test]
+    fn a_commit_with_nothing_countable_gets_no_counts_rather_than_zeroes() {
+        let binary = [file("logo.png", FileStatus::Modified, None)];
+        assert_eq!(
+            diff_totals(&binary),
+            None,
+            "`--numstat` printed `-`, so there is no number to show"
+        );
+
+        let renamed = [file("new.rs", FileStatus::Renamed, Some((0, 0)))];
+        assert_eq!(
+            diff_totals(&renamed),
+            None,
+            "a pure rename is counted, and what it counts to is nothing"
+        );
+
+        assert_eq!(diff_totals(&[]), None, "and neither is an empty list");
+    }
+
+    /// A binary alongside real edits must not swallow them, and must not be
+    /// counted as a zero that drags the total down either — it simply is not
+    /// part of the sum.
+    #[test]
+    fn an_uncountable_file_drops_out_of_a_sum_that_still_has_something_in_it() {
+        let mixed = [
+            file("logo.png", FileStatus::Added, None),
+            file("main.rs", FileStatus::Modified, Some((3, 1))),
+        ];
+        assert_eq!(diff_totals(&mixed), Some((3, 1)));
+    }
+
+    /// `render` calls this, so an absurd repository has to give a wrong number
+    /// rather than take the frame down with it.
+    #[test]
+    fn a_total_past_what_a_u32_holds_saturates_instead_of_panicking() {
+        let files = [
+            file("a.rs", FileStatus::Modified, Some((u32::MAX, 1))),
+            file("b.rs", FileStatus::Modified, Some((7, u32::MAX))),
+        ];
+        assert_eq!(diff_totals(&files), Some((u32::MAX, u32::MAX)));
+    }
 }
 
 /// The detail view against a real repository, drawn in a real window.
@@ -640,6 +969,13 @@ mod detail_gpui_tests {
 
     /// Two commits: a root, then one that renames a file, adds a path with a
     /// space in it and writes a body long enough to fold.
+    ///
+    /// HEAD also carries a tag and a second branch, so that a frame drawn over
+    /// it exercises all three arms of `detail_refs` — the filled HEAD chip, the
+    /// filled tag chip and the bare `ref_span` — rather than only the one the
+    /// current branch happens to take. The fallback arm is where the ordinary
+    /// refs used to be painted louder than HEAD, so it is the arm most worth
+    /// putting through layout and paint.
     fn two_commit_repo(name: &str) -> PathBuf {
         let root = scratch(name);
         git(&root, &["init", "--quiet"]);
@@ -662,6 +998,8 @@ mod detail_gpui_tests {
                 "one\ntwo\nthree\nfour\nfive\nsix",
             ],
         );
+        git(&root, &["branch", "sidequest"]);
+        git(&root, &["tag", "v1.0.0"]);
         root
     }
 
@@ -745,6 +1083,19 @@ mod detail_gpui_tests {
             assert!(commit.summary.starts_with("feat(detail):"));
             assert_eq!(commit.parents.len(), 1);
             assert_eq!(commit.body.lines().count(), 6, "long enough to fold");
+
+            // The three arms of `detail_refs`, so the frame drawn below is
+            // known to have gone through all of them and not just the first.
+            let refs = &commit.refs;
+            assert!(refs.iter().any(|r| r.is_head), "the checked-out branch");
+            assert!(
+                refs.iter().any(|r| r.kind == RefKind::Tag),
+                "the tag: {refs:?}"
+            );
+            assert!(
+                refs.iter().any(|r| !r.is_head && r.kind != RefKind::Tag),
+                "and a plain ref, which is the arm drawn without a fill: {refs:?}"
+            );
         });
         let mut listed = paths(&app, &mut vcx);
         listed.sort();
@@ -753,6 +1104,20 @@ mod detail_gpui_tests {
             ["renamed.txt", "with space.txt", "中文名.txt"],
             "the two -z streams joined into one list"
         );
+
+        // The summary's counts come off the same list, with nothing else read
+        // for them. Rename detection is a git config away from changing what
+        // the individual rows say, so this asserts the shape rather than the
+        // arithmetic: two files of one line each were added, so there is a
+        // number to print and it is not zero.
+        app.update_in(&mut vcx, |app, _, _| {
+            let files = app.scm.detail.as_ref().unwrap().files.clone().unwrap();
+            let (added, removed) = diff_totals(&files).expect("a text commit has counts");
+            assert!(
+                added >= 2,
+                "the added lines were summed: +{added} −{removed}"
+            );
+        });
 
         // A real frame, so layout and paint run over every row above.
         render_probe::arm(10_000);

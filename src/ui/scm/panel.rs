@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{AnyElement, Context, Focusable as _, SharedString, Window, div, prelude::*, px};
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::{
@@ -26,10 +26,11 @@ use tty7_core::core::git::status::{
 
 use crate::terminal::git_data::status_of;
 use crate::terminal::git_diff::DiffSource;
-use crate::ui::app::{CONTENT_INSET, Tty7App};
+use crate::ui::app::{CONTENT_INSET, TILE_GLYPH_XS, TILE_SIZE_XS, Tty7App};
 use crate::ui::host_ops::{HostId, SharedHost};
 use crate::ui::i18n::{L10nKey, t, t_fmt, t_plural};
-use crate::ui::right_panel::{git_badge, info_chip};
+use crate::ui::right_panel::{SEARCH_H, git_badge, info_chip};
+use crate::ui::rounding::{CARD_RADIUS, HAIRLINE, RoundedCorners as _, segment_corners};
 use crate::ui::scm::ScmIntent;
 use crate::ui::scm::path::{elide_middle, split_display_path};
 use crate::ui::scm::state::{RepoKey, ScmGroup};
@@ -37,23 +38,29 @@ use crate::ui::scm::status::{status_color, status_glyph};
 
 /// A file row, and the group header above it. Both 24px, so the list reads as
 /// one grid rather than as headers with a list hanging off them.
+///
+/// It is also the height `scm/detail.rs` gives the changed-file rows it shows
+/// for a commit — the two lists are the same list pointed at different trees,
+/// and a reader who opens a commit must not feel the pitch change under them.
 const ROW_H: f32 = 24.;
 
 /// The status letter's column, from `git_badge`. The group chevron sits in a
 /// box of exactly this width so the two line up in one column down the panel.
+///
+/// This is `right_panel::BADGE_W` spelled out where the header can read it,
+/// and the test below pins the two together. They are one column, and a column
+/// drawn from two numbers is a column that will eventually be drawn from two
+/// different numbers.
 const BADGE_W: f32 = 14.;
 
 /// Rows are laid out inside this inset and then pad themselves back out, so a
 /// hovered row's background is wider than its text on both sides.
-const ROW_INSET: f32 = 4.;
-
-/// The row-button tile, one step below `TILE_SIZE_SM`.
 ///
-/// These belong next to the other tile sizes in `app.rs`; they are here
-/// because that file is being rewritten elsewhere this cycle, and moving them
-/// is a one-line change once it settles.
-pub(crate) const TILE_SIZE_XS: f32 = 18.;
-pub(crate) const TILE_GLYPH_XS: f32 = 11.;
+/// The text lands on `CONTENT_INSET` whatever this is — the list subtracts it
+/// outside the row and the row adds it back inside — so all this number sets
+/// is how far the hover fill bleeds past the text. `scm/detail.rs` carries the
+/// same pair for the same reason.
+const ROW_INSET: f32 = 4.;
 
 /// The key context the message box installs, and the one `ScmCommit` is
 /// bound inside. The two are the same string on purpose: a binding whose
@@ -71,6 +78,77 @@ const BRANCH_NAME_CHARS: usize = 24;
 /// with a stale `.gitignore` can put thousands of them in front of the three
 /// changes the user came to look at.
 const UNTRACKED_AUTO_COLLAPSE: usize = 20;
+
+/// The message box at rest, the ceiling it grows to, and the padding inside
+/// its fill.
+///
+/// The box is a soft rounded fill with no outline, which is what
+/// `switcher.rs`'s inline rename field already does and the only shape in the
+/// app for "an input you write into rather than filter with". Every `Input` in
+/// tty7 is `.appearance(false)`; a hairline here, and an accent ring on top of
+/// it when focused, made the commit box the one outlined thing on a panel that
+/// otherwise separates by surface and space alone. The fill it wears instead is
+/// [`field_fill`], deliberately below the ramp's first rung.
+///
+/// The box still has to end up exactly [`SEARCH_H`] tall, which is what makes
+/// every input row in the panel sit on one line, and getting there is
+/// arithmetic rather than a guess:
+///
+/// * gpui-component lays an `Input`'s text out at a fixed `Rems(1.25)` line
+///   height, which at the default 16px rem is `MSG_LINE` = 20px whatever size
+///   the field is set to.
+/// * At `.xsmall()` the field adds no vertical padding of its own — `input_py`
+///   is 0 there — so one row of field measures exactly `MSG_LINE`.
+/// * gpui measures border-box. With the hairline gone its 1px each side has to
+///   come out of the padding or the box would shrink to 28: `5 + 20 + 5` = 30,
+///   and the assertion below refuses to compile if that stops matching the
+///   search strip.
+///
+/// `MSG_PAD_X` absorbs the same lost pixel — 9 against `input_px`'s 4 at
+/// `.xsmall()`, and the two paddings add to the thirteen the hairline version
+/// also reached, which is where the panel's text column is.
+const MSG_LINE: f32 = 20.;
+const MSG_PAD_X: f32 = 9.;
+const MSG_PAD_Y: f32 = 5.;
+const MSG_MIN_H: f32 = MSG_PAD_Y + MSG_LINE + MSG_PAD_Y;
+/// The ceiling, as `MSG_ROWS_MAX` bare lines. It is a rail, not a border-box
+/// sum: the wrapper's own hairline and padding are not in it, so at the very
+/// top of the box's growth the last row is clipped rather than framed.
+const MSG_MAX_H: f32 = MSG_ROWS_MAX as f32 * MSG_LINE;
+
+/// The invariant the comment above describes, made unbreakable: the resting
+/// message box and the panel's search strip are the same height, or this does
+/// not build.
+const _: () = assert!(MSG_MIN_H == SEARCH_H);
+
+/// One line at rest and it grows into the message. The box is one row in a
+/// column of rows, and a box that stands four lines tall before anything has
+/// been typed pushes the file list — the thing the panel is for — off the
+/// bottom of a 260px-wide sidebar.
+const MSG_ROWS: usize = 1;
+const MSG_ROWS_MAX: usize = 6;
+
+/// The commit control: one frame, the label button and the chevron inside it,
+/// and the glyph in the chevron.
+///
+/// A joined split control, sized like the panel's other controls rather than
+/// stretched across it — the row it sits in reads "N staged" on the left and
+/// offers this on the right, so it only has to be as wide as its label.
+///
+/// The frame is a hairline around a 22px interior, which puts it at 24 —
+/// gpui measures border-box, and the hairline is part of what a reader sees.
+/// Twenty-four is the panel's row pitch, so the control sits on the same line
+/// grid as everything above and below it.
+///
+/// The chevron half is a 22px cell, so the divider falls where the eye expects
+/// it rather than a couple of pixels early.
+///
+/// `COMMIT_GLYPH` is the group chevron's size: a caret is an affordance, not
+/// content — it says "there is more here", and it says it at the same size as
+/// every other small mark in the panel.
+const COMMIT_H: f32 = 24.;
+const COMMIT_CHEVRON_W: f32 = 22.;
+const COMMIT_GLYPH: f32 = 11.;
 
 /// How long to wait before asking git again about a directory that answered
 /// with nothing.
@@ -204,12 +282,7 @@ impl Tty7App {
         self.scm_load_branches(repo, cx);
         let mono = cx.theme().mono_font_family.clone();
         let theme = cx.theme();
-        let (accent, warning, muted, fg) = (
-            theme.accent,
-            theme.warning,
-            theme.muted_foreground,
-            theme.foreground,
-        );
+        let (warning, muted, fg) = (theme.warning, theme.muted_foreground, theme.foreground);
         let detached = matches!(status.head, HeadState::Detached { .. });
         let busy = self.scm_network_busy(repo, cx);
         let others = self.scm_other_repos(repo);
@@ -218,6 +291,9 @@ impl Tty7App {
             .flex_none()
             .items_center()
             .gap(px(6.))
+            // Taller than a file row, and what sets it is the `TILE_SIZE_SM`
+            // sync tile at the end plus 2px of air — not the type, which is a
+            // step under it.
             .h(px(28.))
             .pl(px(CONTENT_INSET))
             .pr(px(crate::ui::app::tile_trailing_inset_sm()))
@@ -230,7 +306,11 @@ impl Tty7App {
             // The trigger is a `Button` because that is the one element the
             // dropdown trait is implemented for. `dropdown_caret` turns its
             // label row into `justify_between`, which is what puts the name on
-            // the left and the chevron against the chips.
+            // the left and the chevron against the notes.
+            //
+            // The branch is the most important word on the row, and it earns
+            // that by being in full-strength ink — not by being set larger
+            // than the file names underneath it.
             .child(
                 Button::new("scm-branch")
                     .ghost()
@@ -248,7 +328,7 @@ impl Tty7App {
                         self.scm_branch_menu(repo, status, cx),
                     ),
             )
-            .children(others.map(|count| info_chip(&format!("+{count}"), accent, muted, &mono)))
+            .children(others.map(|count| branch_note(&format!("+{count}"), muted, &mono)))
             .when(detached, |this| {
                 this.child(info_chip(
                     t(L10nKey::ScmDetached),
@@ -265,12 +345,20 @@ impl Tty7App {
                     &mono,
                 )
             }))
+            // Armed-amend is a mode you can forget you are in, which puts it in
+            // the same class as `detached` and a rebase in progress above — so
+            // it gets their tint, not a chip of its own invention.
             .when(self.scm.amend, |this| {
-                this.child(info_chip(t(L10nKey::ScmAmendBadge), accent, muted, &mono))
+                this.child(info_chip(
+                    t(L10nKey::ScmAmendBadge),
+                    warning.opacity(0.16),
+                    warning,
+                    &mono,
+                ))
             })
             .children(
                 tracking_chip(status.upstream.as_deref(), status.ahead_behind)
-                    .map(|text| info_chip(&text, accent, muted, &mono)),
+                    .map(|text| branch_note(&text, muted, &mono)),
             )
             .child(
                 crate::ui::tab_strip::chrome_tile_sized(
@@ -510,6 +598,8 @@ impl Tty7App {
                 .id("scm-new-branch")
                 .flex_none()
                 .items_center()
+                // Every input row in the panel is 30px, and the field inside
+                // it is the `.xsmall()` one that height was derived from.
                 .h(px(30.))
                 .px(px(CONTENT_INSET))
                 .child(div().flex_1().min_w_0().child(Input::new(&input).xsmall()))
@@ -555,6 +645,11 @@ impl Tty7App {
     /// gpui resolves a keystroke by walking outwards from the focused node —
     /// the narrow context wins while the box has focus, and the window keeps
     /// the chord everywhere else.
+    ///
+    /// A hairline and no fill, like every other framed thing in the panel.
+    /// Focus recolours the same hairline to `theme.ring` rather than adding
+    /// anything: a border that appears on focus would move the text by a pixel
+    /// every time the box was clicked, because gpui measures border-box.
     fn scm_commit_box(
         &mut self,
         repo: &RepoKey,
@@ -564,7 +659,7 @@ impl Tty7App {
     ) -> AnyElement {
         let input = self.scm_commit_input(repo, status, window, cx);
         let focused = input.read(cx).focus_handle(cx).is_focused(window);
-        let theme = cx.theme();
+        let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
         div()
             .key_context(COMMIT_KEY_CONTEXT)
             .flex_none()
@@ -572,16 +667,32 @@ impl Tty7App {
             .pt(px(6.))
             .child(
                 div()
-                    // The resting height of `panel_search`, so every input
-                    // row in the panel sits on the same line.
-                    .min_h(px(30.))
-                    .max_h(px(120.))
-                    .rounded(crate::ui::rounding::CARD_RADIUS)
-                    .border_1()
-                    .border_color(if focused { theme.ring } else { theme.border })
-                    .bg(theme.input)
-                    .px(px(8.))
-                    .py(px(6.))
+                    // `MSG_MIN_H` is `panel_search`'s height and the paddings
+                    // are what get it there; see the constants. The maximum is
+                    // a rail rather than the truth — in auto-grow mode the
+                    // input sizes itself off its row count, so `MSG_ROWS_MAX`
+                    // is what actually stops it, and this holds the shape if it
+                    // ever measures itself differently.
+                    .min_h(px(MSG_MIN_H))
+                    .max_h(px(MSG_MAX_H))
+                    .rounded(CARD_RADIUS)
+                    // Half a rung, not a whole one. The hover step is what a
+                    // row wears when the pointer is on it — a transient state —
+                    // and the message box wears its fill all the time, so at
+                    // full strength it read as the loudest thing on an idle
+                    // panel. Focus then takes the whole rung, which keeps the
+                    // two apart without a ring: the caret already says where
+                    // the keystrokes go, and the fill only has to say which
+                    // shape owns them.
+                    .bg(gpui::rgb(match focused {
+                        true => sf.hover,
+                        false => field_fill(sf),
+                    }))
+                    .px(px(MSG_PAD_X))
+                    .py(px(MSG_PAD_Y))
+                    // `.xsmall()` is also what sets the box's height, because
+                    // it is the size whose `input_py` is zero — see the
+                    // `MSG_*` constants.
                     .child(Input::new(&input).appearance(false).xsmall()),
             )
             .into_any_element()
@@ -605,7 +716,7 @@ impl Tty7App {
                 let input = cx.new(|cx| {
                     InputState::new(window, cx)
                         .multi_line(true)
-                        .auto_grow(1, 6)
+                        .auto_grow(MSG_ROWS, MSG_ROWS_MAX)
                         .placeholder(t(L10nKey::ScmCommitPlaceholder))
                 });
                 self.scm.commit_input = Some(input.clone());
@@ -664,6 +775,21 @@ impl Tty7App {
         true
     }
 
+    /// The line under the message box: what is staged on the left, what to do
+    /// about it on the right.
+    ///
+    /// One split control, not a bar across the panel: the label button and the
+    /// chevron share a single hairline frame with a 1px divider between them,
+    /// and the pair is only as wide as the label. Right-aligned, with the
+    /// count it acts on reading along the same line.
+    ///
+    /// Ghost inside the frame in both states, so the panel at rest holds no
+    /// filled slab. The obvious alternative, gpui-component's `.primary()`,
+    /// paints a grey one: `theme.primary` is `mix(foreground, background,
+    /// 0.20)` in tty7, so a "primary" button is a mid-grey block sitting in a
+    /// column of hairlines. What tells the two states apart is the ink —
+    /// full-strength when there is something to commit, muted when there is
+    /// not, which is where the panel sits most of the time.
     fn scm_commit_buttons(
         &self,
         repo: &RepoKey,
@@ -672,85 +798,169 @@ impl Tty7App {
     ) -> AnyElement {
         let plan = commit_plan(status, self.scm.amend, self.scm.draft(repo));
         let repo_for_button = repo.clone();
+        let live = plan.enabled;
+        let staged = status.staged().count();
+        let theme = cx.theme();
+        let (muted, fg) = (theme.muted_foreground, theme.foreground);
+        let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
         h_flex()
             .flex_none()
-            .gap(px(4.))
+            .items_center()
+            .gap(px(8.))
             .px(px(CONTENT_INSET))
             .pt(px(6.))
             .pb(px(8.))
+            // The reading the button acts on, in the row it acts from. It
+            // gives way first: a long count is still a count, and the control
+            // beside it is the thing that has to keep its shape.
             .child(
-                Button::new("scm-commit")
-                    .primary()
-                    .h(px(28.))
+                div()
                     .flex_1()
-                    .label(t(plan.label))
-                    .disabled(!plan.enabled)
-                    .when(!plan.enabled, |b| b.tooltip(t(L10nKey::ScmNothingToCommit)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.scm_commit(repo_for_button.clone(), this.scm.amend, window, cx);
-                    })),
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .child(t_plural(L10nKey::ScmStagedFileCount, staged, &[])),
             )
-            .child(self.scm_commit_menu(repo, cx))
+            .child(
+                // Filled, not outlined, and for the same reason the message box
+                // above it is: nothing else in this panel wears a border, and a
+                // hairline box sitting on the panel's own fill reads as raised
+                // — a shadow nobody drew.
+                //
+                // The frame owns the fill, the rounding *and* the hover, so the
+                // control lights as one shape. Letting each half light itself
+                // is what a split button conventionally does, but this one has
+                // no outline around either half and a seam only a pixel wide:
+                // half a lit pill reads as a paint bug rather than as "this is
+                // the part you are on". The halves still carry
+                // `segment_corners` so their own hit shapes stay inside the
+                // frame's radius — `overflow_hidden` would do that too, and
+                // would take the chevron's popup menu with it.
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .h(px(COMMIT_H))
+                    .rounded(CARD_RADIUS)
+                    .bg(gpui::rgb(field_fill(sf)))
+                    .hover(|s| s.bg(gpui::rgb(sf.hover)))
+                    .child(
+                        // `xsmall` for the same reason the branch trigger is
+                        // `xsmall`: it is the token that sets a `Button`'s
+                        // label to 12px, the panel's own step. The padding and
+                        // the height are set below, so the size token is doing
+                        // nothing here but choosing the type.
+                        Button::new("scm-commit")
+                            // A custom variant, not `.ghost()`: the frame is
+                            // already painted at the ramp's hover rung, and a
+                            // ghost hovers to a colour close enough to it that
+                            // the pointer would get no answer. This walks the
+                            // same two rungs the file rows walk.
+                            .custom(commit_half(cx))
+                            .xsmall()
+                            .label(t(plan.label))
+                            .h_full()
+                            .px(px(10.))
+                            .rounded_corners(segment_corners(0, 2, CARD_RADIUS, HAIRLINE))
+                            // The ink is named here rather than left to the
+                            // variant, so the disabled half greys out: it lands
+                            // over the variant's own paint because
+                            // `refine_style` runs after everything the variant
+                            // does.
+                            .text_color(if live { fg } else { muted })
+                            .disabled(!live)
+                            .when(!live, |b| b.tooltip(t(L10nKey::ScmNothingToCommit)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.scm_commit(
+                                    repo_for_button.clone(),
+                                    this.scm.amend,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    // The seam between the halves is the panel showing through
+                    // the fill, not a line drawn on top of it — a rule would be
+                    // the one stroke left on the panel. A div rather than
+                    // `border_l_1` on the chevron, because a ghost `Button`
+                    // repaints its border colour transparent in every state it
+                    // has and the seam would vanish under the pointer.
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(HAIRLINE)
+                            .h_full()
+                            .bg(gpui::rgb(sf.base)),
+                    )
+                    .child(self.scm_commit_menu(repo, cx)),
+            )
             .into_any_element()
     }
 
+    /// The chevron half of the split control.
+    ///
+    /// Never disabled, whatever the button beside it is doing: stash and amend
+    /// still mean something with nothing staged, and this is the only way to
+    /// reach them.
     fn scm_commit_menu(&self, repo: &RepoKey, cx: &mut Context<Self>) -> AnyElement {
         let amend = self.scm.amend;
-        crate::ui::tab_strip::chrome_tile_sized(
-            Button::new("scm-commit-menu").icon(Icon::new(IconName::ChevronDown)),
-            28.,
-            12.,
-            false,
-            cx,
-        )
-        .rounded(crate::ui::rounding::CARD_RADIUS)
-        .dropdown_menu_with_anchor(gpui::Anchor::TopRight, {
-            let app = cx.entity().downgrade();
-            let repo = repo.clone();
-            move |menu, _window, _cx| {
-                let mut menu = menu.min_w(px(190.));
-                for (label, intent) in [
-                    (L10nKey::ScmCommitButton, ScmIntent::Commit),
-                    (L10nKey::ScmCommitAndPush, ScmIntent::CommitAndPush),
-                    (L10nKey::ScmCommitAndSync, ScmIntent::CommitAndSync),
-                ] {
-                    menu = menu.item(PopupMenuItem::new(t(label)).on_click({
-                        let app = app.clone();
-                        move |_, window, cx| {
-                            let _ =
-                                app.update(cx, |this, cx| this.run_scm_action(intent, window, cx));
-                        }
-                    }));
-                }
-                menu = menu.separator().item(
-                    // A menu item rather than a checkbox row: the panel is
-                    // 260px wide, and the armed state already shows up in the
-                    // button's label and in the chip on the branch row.
-                    PopupMenuItem::new(t(L10nKey::ScmAmendLastCommit))
-                        .checked(amend)
-                        .on_click({
+        Button::new("scm-commit-menu")
+            .custom(commit_half(cx))
+            .icon(Icon::new(IconName::ChevronDown))
+            // `Button` sizes an icon off its own `Size`, so the glyph is asked
+            // for by way of the size that produces it — the same conversion
+            // `chrome_tile_sized` does.
+            .with_size(px(COMMIT_GLYPH / crate::ui::tab_strip::BUTTON_ICON_SCALE))
+            .w(px(COMMIT_CHEVRON_W))
+            .h_full()
+            .rounded_corners(segment_corners(1, 2, CARD_RADIUS, HAIRLINE))
+            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, {
+                let app = cx.entity().downgrade();
+                let repo = repo.clone();
+                move |menu, _window, _cx| {
+                    let mut menu = menu.min_w(px(190.));
+                    for (label, intent) in [
+                        (L10nKey::ScmCommitButton, ScmIntent::Commit),
+                        (L10nKey::ScmCommitAndPush, ScmIntent::CommitAndPush),
+                        (L10nKey::ScmCommitAndSync, ScmIntent::CommitAndSync),
+                    ] {
+                        menu = menu.item(PopupMenuItem::new(t(label)).on_click({
                             let app = app.clone();
-                            move |_, _window, cx| {
+                            move |_, window, cx| {
+                                let _ = app
+                                    .update(cx, |this, cx| this.run_scm_action(intent, window, cx));
+                            }
+                        }));
+                    }
+                    menu = menu.separator().item(
+                        // A menu item rather than a checkbox row: the panel is
+                        // 260px wide, and the armed state already shows up in the
+                        // button's label and in the chip on the branch row.
+                        PopupMenuItem::new(t(L10nKey::ScmAmendLastCommit))
+                            .checked(amend)
+                            .on_click({
+                                let app = app.clone();
+                                move |_, _window, cx| {
+                                    let _ = app.update(cx, |this, cx| {
+                                        this.scm.amend = !this.scm.amend;
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                    menu.separator()
+                        .item(PopupMenuItem::new(t(L10nKey::ScmStashAll)).on_click({
+                            let app = app.clone();
+                            let repo = repo.clone();
+                            move |_, window, cx| {
                                 let _ = app.update(cx, |this, cx| {
-                                    this.scm.amend = !this.scm.amend;
-                                    cx.notify();
+                                    this.scm_stash_all(repo.clone(), window, cx)
                                 });
                             }
-                        }),
-                );
-                menu.separator()
-                    .item(PopupMenuItem::new(t(L10nKey::ScmStashAll)).on_click({
-                        let app = app.clone();
-                        let repo = repo.clone();
-                        move |_, window, cx| {
-                            let _ = app.update(cx, |this, cx| {
-                                this.scm_stash_all(repo.clone(), window, cx)
-                            });
-                        }
-                    }))
-            }
-        })
-        .into_any_element()
+                        }))
+                }
+            })
+            .into_any_element()
     }
 
     /// Title over a scrolling body, with the panel's own scroll handle.
@@ -774,6 +984,13 @@ impl Tty7App {
     }
 
     /// …and `footer` is the history section, which scrolls on its own.
+    ///
+    /// The four bands sit flush on the panel with nothing between them — no
+    /// gutter, no fill, no rounded blocks. What separates them is the same
+    /// thing that separates every other stack of rows in the right panel: the
+    /// rows' own insets and the pause between them. Each band keeps its own
+    /// `CONTENT_INSET`, so the panel's text column stays one column from the
+    /// title to the last commit in the history.
     fn scm_shell_full(
         &self,
         title: AnyElement,
@@ -981,6 +1198,10 @@ impl Tty7App {
         list.into_any_element()
     }
 
+    /// "…and 40 more", and the note about a status git had to truncate.
+    ///
+    /// Secondary: it is prose about the list rather than a row of it, and the
+    /// one thing it must not do is read as another file.
     fn scm_note(&self, text: String, cx: &mut Context<Self>) -> AnyElement {
         div()
             .px(px(ROW_INSET))
@@ -1118,6 +1339,12 @@ impl Tty7App {
                 }
             })
             .child(git_badge(letter, status_color(deco, cx), &mono))
+            // Mono, because a path is a token you compare character by
+            // character.
+            //
+            // `scm/detail.rs` draws the changed-file rows of a commit and
+            // spells this number and the directory's out by hand so the two
+            // lists stay pixel-identical. Moving one means moving the other.
             .child(
                 div()
                     .flex_none()
@@ -1149,10 +1376,6 @@ impl Tty7App {
     }
 
     /// The buttons that appear over a hovered row.
-    ///
-    /// Absolutely positioned and opaque, so they cover the tail of the
-    /// directory rather than pushing it aside: hovering a row must not move a
-    /// single pixel of it, or the list crawls under the pointer.
     fn scm_row_actions(
         &self,
         row: &SharedString,
@@ -1166,17 +1389,7 @@ impl Tty7App {
         // row stays readable and the buttons say why they are dead.
         let writable = entry.path.pathspec().is_some();
         let path = entry.path.as_str();
-        let mut actions = h_flex()
-            .occlude()
-            .absolute()
-            .right(px(ROW_INSET))
-            .top_0()
-            .bottom_0()
-            .items_center()
-            .gap(px(1.))
-            .bg(gpui::rgb(backing))
-            .invisible()
-            .group_hover(row.clone(), |s| s.visible());
+        let mut actions = action_strip(row, backing);
 
         for &(verb, ref icon) in row_verbs(group) {
             let id = SharedString::from(format!("scm-{verb:?}-{group:?}-{path}"));
@@ -1203,17 +1416,7 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let paths = writable_paths(entries);
-        let mut actions = h_flex()
-            .occlude()
-            .absolute()
-            .right(px(ROW_INSET))
-            .top_0()
-            .bottom_0()
-            .items_center()
-            .gap(px(1.))
-            .bg(gpui::rgb(backing))
-            .invisible()
-            .group_hover(row.clone(), |s| s.visible());
+        let mut actions = action_strip(row, backing);
 
         for &(verb, ref icon) in group_verbs(group) {
             let id = SharedString::from(format!("scm-all-{verb:?}-{group:?}"));
@@ -1239,8 +1442,8 @@ impl Tty7App {
         actions.into_any_element()
     }
 
-    /// An 18px tile. Smaller than `TILE_SIZE_SM`, because three of those on a
-    /// row would eat 72 of the 236px a file name has to live in.
+    /// A [`TILE_SIZE_XS`] tile. Smaller than `TILE_SIZE_SM`, because three of
+    /// those on a row would eat 72 of the 236px a file name has to live in.
     fn scm_tile(
         &self,
         id: SharedString,
@@ -1436,6 +1639,43 @@ impl Tty7App {
     }
 }
 
+/// The strip the row and group action buttons live in, revealed by hovering
+/// `row`.
+///
+/// Absolutely positioned and opaque, so it covers the tail of the directory
+/// rather than pushing it aside: hovering a row must not move a single pixel
+/// of it, or the list crawls under the pointer.
+///
+/// It stops the mouse-down by hand instead of calling `occlude()`, which is
+/// the obvious way to keep a click off the row underneath and was what made
+/// the buttons vanish the moment the pointer reached them. `occlude()` is a
+/// *hitbox* behaviour, and gpui inserts hitboxes in prepaint, which never
+/// looks at `visibility` — so the strip blocked the mouse even while it was
+/// invisible. Blocking cuts the hit test short at the blocking hitbox, and the
+/// row's hitbox is behind this one because a parent prepaints before its
+/// children; `group_hover` is nothing more than "is the group's hitbox
+/// hovered", so the row stopped counting as hovered and the strip hid itself
+/// — background, buttons and all — with the pointer sitting right on it. The
+/// buttons' own hitboxes came from prepaint and outlived the paint, so they
+/// went on answering tooltips for glyphs that were no longer drawn.
+///
+/// Stopping propagation buys the same "this click is ours, not the row's"
+/// without lying to the hit test: children register their handlers after this
+/// one and gpui bubbles back to front, so a button still gets its click first.
+fn action_strip(row: &SharedString, backing: u32) -> gpui::Div {
+    h_flex()
+        .absolute()
+        .right(px(ROW_INSET))
+        .top_0()
+        .bottom_0()
+        .items_center()
+        .gap(px(1.))
+        .bg(gpui::rgb(backing))
+        .invisible()
+        .group_hover(row.clone(), |s| s.visible())
+        .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+}
+
 /// Which sections an entry shows up in.
 ///
 /// A file can be staged and unstaged at once (`XY == "MM"`), and then it
@@ -1532,11 +1772,17 @@ pub(crate) fn head_label(head: &HeadState) -> String {
     }
 }
 
-/// The `↑2 ↓1` chip, or nothing.
+/// The `↑2 ↓0` reading, or nothing.
 ///
 /// A branch that is level with its upstream says nothing at all: the quiet
-/// state is the common one, and a chip that is always there stops being read.
+/// state is the common one, and a token that is always there stops being read.
 /// A branch with no upstream offers to publish instead.
+///
+/// Once there *is* something to say, both halves are said, zero included. The
+/// pair is one reading of one distance, and dropping the empty half makes it
+/// change shape as the numbers move — `↑2` becoming `↑2 ↓1` on a fetch is a
+/// different-looking thing in the corner of the eye, where `↑2 ↓0` becoming
+/// `↑2 ↓1` is the same thing with a digit changed.
 pub(crate) fn tracking_chip(
     upstream: Option<&str>,
     ahead_behind: Option<(u32, u32)>,
@@ -1546,10 +1792,65 @@ pub(crate) fn tracking_chip(
     }
     match ahead_behind? {
         (0, 0) => None,
-        (ahead, 0) => Some(format!("↑{ahead}")),
-        (0, behind) => Some(format!("↓{behind}")),
         (ahead, behind) => Some(format!("↑{ahead} ↓{behind}")),
     }
+}
+
+/// A quiet token on the branch row: the tracking distance, or the count of
+/// other repositories.
+///
+/// Not `info_chip`. A chip's fill is what earns it the right to shout, and the
+/// only two things on this row worth shouting are a state you could forget you
+/// are in — detached, mid-rebase, armed to amend — and they already wear the
+/// warning tint. `↑2 ↓0` is a reading, so it reads as text; the row's own 6px
+/// gap is enough to keep it off the branch name without a box around it.
+///
+/// The same quiet mono step the panel's badges and chips are set on, minus the
+/// fill, so a note and a chip still line up as one row of tokens.
+/// The fill under the commit area's two shapes — the message box and the split
+/// button's frame.
+///
+/// Half of the ramp's first rung, not the rung itself. `hover` is what a row
+/// wears while the pointer is on it, which is a state that lasts a moment;
+/// these two wear their fill permanently, and at full strength they were the
+/// loudest thing on an idle panel. Both read from here so they cannot drift
+/// apart: the commit area is one block, and two greys a shade off each other
+/// look like a mistake rather than a hierarchy.
+fn field_fill(sf: crate::ui::presets::Surface) -> u32 {
+    crate::ui::presets::mix(sf.base, sf.hover, 0.5)
+}
+
+/// One half of the split commit control: paints nothing, ever.
+///
+/// Every state is transparent so the frame around both halves is the only
+/// thing that fills, and the control lights as one shape rather than one end.
+/// Two of those states are worth naming, because a stock variant gets them
+/// wrong here in opposite directions:
+///
+/// * `.ghost()` hovers to `sidebar_accent`, which sits close enough to the
+///   frame's own fill that the half would light almost invisibly — the worst of
+///   both, a highlight you can see is uneven but cannot read.
+/// * gpui-component resolves a `Custom` variant's *selected* paint from its
+///   `active` slot, and a dropdown marks its trigger selected for as long as
+///   the menu is open. Anything but transparent there parks a block on the
+///   chevron for the whole time the user is reading the menu.
+fn commit_half(cx: &gpui::App) -> ButtonCustomVariant {
+    let clear = gpui::transparent_black();
+    ButtonCustomVariant::new(cx)
+        .color(clear)
+        .foreground(cx.theme().foreground)
+        .hover(clear)
+        .active(clear)
+}
+
+fn branch_note(text: &str, ink: gpui::Hsla, mono: &SharedString) -> AnyElement {
+    div()
+        .flex_none()
+        .text_size(px(10.5))
+        .font_family(mono.clone())
+        .text_color(ink)
+        .child(text.to_string())
+        .into_any_element()
 }
 
 /// Which sequencer operation is parked in the repository.
@@ -1929,6 +2230,19 @@ mod tests {
         }
     }
 
+    /// The group chevron's box and the status letter's cell are one column.
+    ///
+    /// This is the detail that makes the list look drawn rather than
+    /// assembled: every group arrow sits directly above the `M`s and `A`s of
+    /// the rows it heads. The two widths live in two files — `git_badge` owns
+    /// the letter's cell, this module owns the chevron's box — so nothing but
+    /// this assertion stops one of them from moving on its own. They have to
+    /// keep moving together.
+    #[test]
+    fn the_group_chevron_stands_in_the_status_letters_column() {
+        assert_eq!(BADGE_W, crate::ui::right_panel::BADGE_W);
+    }
+
     fn repo(root: &str) -> RepoKey {
         RepoKey {
             host: HostId::LOCAL,
@@ -2032,13 +2346,15 @@ mod tests {
     #[test]
     fn a_branch_level_with_its_upstream_says_nothing() {
         assert_eq!(tracking_chip(Some("origin/main"), Some((0, 0))), None);
+        // Both halves once there is anything to say, so the reading keeps its
+        // shape as the numbers move.
         assert_eq!(
             tracking_chip(Some("origin/main"), Some((2, 0))).as_deref(),
-            Some("↑2")
+            Some("↑2 ↓0")
         );
         assert_eq!(
             tracking_chip(Some("origin/main"), Some((0, 1))).as_deref(),
-            Some("↓1")
+            Some("↑0 ↓1")
         );
         assert_eq!(
             tracking_chip(Some("origin/main"), Some((2, 1))).as_deref(),
@@ -2443,5 +2759,143 @@ mod render_idle_gpui_tests {
         );
         assert_eq!(draws_while_idle(&mut vcx), 0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// The action strip is the one place in the panel where a hover reveal sits
+/// under the pointer it is reacting to, so it is the one place where "is the
+/// row hovered" and "can the row's hitbox be seen from here" can disagree.
+#[cfg(test)]
+mod action_strip_gpui_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::*;
+    use gpui::{
+        Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+        PlatformInput, Point, Render, TestAppContext, VisualTestContext, point,
+    };
+
+    /// A file row in miniature: a group, something to hover on the left, the
+    /// real strip on the right with one button-sized child in it, and the
+    /// row's own click handler — the one that opens the diff overlay, and the
+    /// one a click on the strip must never reach.
+    #[derive(Default)]
+    struct Row {
+        row_clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for Row {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let id = SharedString::from("row");
+            let clicks = self.row_clicks.clone();
+            // Off the origin, because a fresh test window's pointer sits at
+            // (0, 0) and a row under it would start out hovered.
+            div().pt(px(50.)).pl(px(50.)).child(
+                div()
+                    .id(id.clone())
+                    .group(id.clone())
+                    .relative()
+                    .w(px(300.))
+                    .h(px(ROW_H))
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1))
+                    .child(
+                        action_strip(&id, 0x00EEEEEE).child(
+                            div()
+                                .w(px(TILE_SIZE_XS))
+                                .h(px(TILE_SIZE_XS))
+                                .debug_selector(|| "scm-action".into()),
+                        ),
+                    ),
+            )
+        }
+    }
+
+    fn hover(vcx: &mut VisualTestContext, at: Point<Pixels>) {
+        vcx.update(|window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: at,
+                    pressed_button: None,
+                    modifiers: Modifiers::none(),
+                }),
+                cx,
+            );
+            window.refresh();
+        });
+        vcx.run_until_parked();
+    }
+
+    fn click(vcx: &mut VisualTestContext, at: Point<Pixels>) {
+        hover(vcx, at);
+        vcx.update(|window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: at,
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: at,
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+            window.refresh();
+        });
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_strip_survives_the_pointer_reaching_it(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Row::default());
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("scm-action").is_none(),
+            "an unhovered row draws no buttons"
+        );
+
+        hover(&mut vcx, point(px(70.), px(62.)));
+        let strip = vcx
+            .debug_bounds("scm-action")
+            .expect("hovering the row reveals the buttons");
+
+        // The whole point of the strip: the pointer travels right, onto it.
+        hover(&mut vcx, strip.center());
+        assert!(
+            vcx.debug_bounds("scm-action").is_some(),
+            "the buttons are still drawn with the pointer on top of them"
+        );
+    }
+
+    /// What `occlude()` used to buy, and what replaced it.
+    #[gpui::test]
+    fn a_click_on_the_strip_never_reaches_the_row(cx: &mut TestAppContext) {
+        let row = Row::default();
+        let clicks = row.row_clicks.clone();
+        let window = cx.add_window(|_, _| row);
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+
+        click(&mut vcx, point(px(70.), px(62.)));
+        assert_eq!(clicks.get(), 1, "clicking the row opens the diff");
+
+        let strip = vcx
+            .debug_bounds("scm-action")
+            .expect("the row is hovered, so the strip is up");
+        click(&mut vcx, strip.center());
+        assert_eq!(
+            clicks.get(),
+            1,
+            "but a click on the strip belongs to the strip"
+        );
     }
 }

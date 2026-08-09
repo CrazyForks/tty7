@@ -1,14 +1,31 @@
 //! The history section at the foot of the panel.
 //!
-//! Its job is shape, not text. 260px leaves room for roughly 26 characters
-//! beside the lanes, and this repository's commit subjects run to a median of
-//! 64 — so what a reader gets here is where the branches are, where they
-//! merged, which refs sit where, and how recently anything moved. Reading a
-//! message is the commit detail view's job, one click away.
+//! Its job is shape first and text second. 260px leaves room for roughly 26
+//! characters beside the lanes, and this repository's commit subjects run to a
+//! median of 64 — so what a reader gets here is where the branches are, where
+//! they merged, which refs sit where, and how recently anything moved. Reading
+//! a whole message is the commit detail view's job, one click away.
+//!
+//! # What size everything is
+//!
+//! Three, and no more: 12px for the commit subject and for the
+//! conventional-commit type in front of it, which are one run of text and are
+//! told apart by tone rather than by size; 11px for the section's own heading
+//! and for the "load more" control; and 10.5px for the annotations — the
+//! relative age, the commit count, the ref chip. A sidebar list is dense by
+//! design, and the graph is the densest thing in this panel.
 //!
 //! That is also VS Code's own reading of a sidebar graph, and it is why the
-//! conventional-commit prefix is lifted out into a chip rather than left to eat
-//! half the line, and why the lane gutter folds away on request.
+//! conventional-commit prefix is cut down to its type and demoted to muted ink
+//! rather than left to eat half the line. The lane gutter itself never folds
+//! away: the lanes are the graph, and a graph without them is just a list.
+//!
+//! The section is not a surface of its own. It sits flush on the panel's
+//! `theme.sidebar` fill and is separated from the file list above it by a
+//! hairline, the way every other band of this panel is. The only colour that
+//! gets to be saturated here is a lane's, and the lanes stay in the gutter,
+//! below the text; the rows themselves are ink, muted ink and the sidebar's own
+//! neutral hover and selection fills.
 //!
 //! # How it is drawn
 //!
@@ -51,7 +68,27 @@ use crate::ui::scm::state::RepoKey;
 /// One commit per row. 20px rather than the file list's 24: a graph row has no
 /// icon column, and the vertical pitch wants to stay close to the lane pitch or
 /// the diagonal of a merge reads as a much shallower angle than it is.
+///
+/// It also has to contain the line the subject is set on — gpui leads text at
+/// phi, so 12px occupies `round(12 × 1.618) = 19px`, and 20 is the first even
+/// pitch above it.
 const GRAPH_ROW_H: f32 = 20.;
+
+/// Header of the section itself: fold, title, count, filter tile, scope picker.
+///
+/// The truth, not a wish: the row sets this height explicitly and the tallest
+/// thing inside it is the `GRAPH_TILE` square, so 24 is what a reader measures
+/// — the 18px tile plus 3px of air above and below it. The resize constants
+/// below are counted against it, which is why it has to stay honest.
+const GRAPH_HEADER_H: f32 = 24.;
+
+/// The header's controls: the filter tile and the scope picker beside it.
+///
+/// An 18px square with an 11px glyph, sized against the 11px title beside it:
+/// two thirds of the box, which is the fill that keeps an icon from rattling
+/// around inside its tile.
+const GRAPH_TILE: f32 = 18.;
+const GRAPH_TILE_GLYPH: f32 = 11.;
 
 /// Horizontal distance between lane centres.
 const GRAPH_LANE_W: f32 = 12.;
@@ -61,6 +98,10 @@ const GRAPH_LANE_W: f32 = 12.;
 const GRAPH_PAD_L: f32 = 6.;
 const GRAPH_PAD_R: f32 = 6.;
 
+/// An ordinary node is a 3px disc and a lane line is 1.5px wide: the dot is
+/// 30% of the row's height, which is enough to read as a bead on a string
+/// without closing the gap to the row above. Merges and roots are drawn from
+/// the same radius rather than from a second vocabulary.
 const GRAPH_DOT_R: f32 = 3.;
 const GRAPH_LINE_W: f32 = 1.5;
 
@@ -79,6 +120,13 @@ const _: () = assert!(GRAPH_MAX_LANES <= LANE_SLOTS);
 /// Resting height of the history section and the range the divider drags it
 /// through. The ceiling is a share of the window rather than a constant: the
 /// file list has to keep a usable part of a short one.
+///
+/// Both of the fixed ones are counted in rows against the header: what they
+/// mean is a number of commits, not a number of pixels. 220 is `24 + 9.8 × 20`
+/// — nine commits and most of a tenth, and the fraction is deliberate, because
+/// a row cut by the bottom edge is the only honest way a fixed-height list says
+/// there is more below it. 88 is `24 + 3.2 × 20`, three and a bit, which is the
+/// least that still looks like history rather than like a mistake.
 const GRAPH_H_DEFAULT: f32 = 220.;
 const GRAPH_H_MIN: f32 = 88.;
 const GRAPH_H_MAX_RATIO: f32 = 0.65;
@@ -93,14 +141,8 @@ const GRAPH_REF_CHARS: usize = 14;
 /// How many lanes fit, given the panel's width.
 ///
 /// A pure projection over the width, deliberately: dragging the panel narrower
-/// must not re-run the layout pass or renumber a colour. Folding the gutter
-/// collapses it to a single column, which is worth about six characters of the
-/// message — at this width, the difference between reading a subject and
-/// reading its first word.
-fn max_lanes(panel_w: f32, collapsed: bool) -> usize {
-    if collapsed {
-        return 1;
-    }
+/// must not re-run the layout pass or renumber a colour.
+fn max_lanes(panel_w: f32) -> usize {
     // The share buys the whole gutter, insets included — budgeting only the
     // lane strip would overrun it by a lane at every width.
     let fit = ((panel_w * GRAPH_GUTTER_SHARE - GRAPH_PAD_L - GRAPH_PAD_R) / GRAPH_LANE_W).floor();
@@ -150,8 +192,9 @@ fn gutter_width(max_lanes: usize) -> f32 {
 ///
 /// Returns the type, whether it was marked breaking, and what is left. This
 /// repository's subjects spend an average of 12.7 characters on the prefix,
-/// which is half of what a 260px panel has to give — and the type is exactly
-/// the part that renders better as three coloured characters than as prose.
+/// which is half of what a 260px panel has to give — and the scope in the
+/// middle of it is the part nobody scans for, so it goes. The type stays, in
+/// front of the subject and a shade quieter than it.
 ///
 /// Strict on purpose. Only a lowercase ASCII type, an optional parenthesised
 /// scope, an optional `!`, then `": "`. `Note: see below` and `TODO: fix` are
@@ -263,8 +306,12 @@ struct GraphPaint {
     max_lanes: usize,
     overflowing: bool,
     lanes: Lanes,
-    /// The fill behind a node ring, so a merge reads as a ring and not as a
-    /// disc with a hole punched through to whatever is under the panel.
+    /// The fill behind a hollow node, so a merge reads as a ring and not as a
+    /// disc with a hole punched through to whatever is under the panel. It is
+    /// the panel's own opaque sidebar fill rather than `theme.background`: the
+    /// section is flush with the panel, and `background` carries the window's
+    /// transparency when one is configured, which would let the lane line show
+    /// straight down the middle of the node.
     surface: Hsla,
     /// Whether a "load more" band follows the last row.
     more: bool,
@@ -366,10 +413,14 @@ fn paint_graph(p: &GraphPaint, bounds: Bounds<Pixels>, window: &mut Window) {
         };
         // A rounded quad rather than a path: the quad shader's rounding is an
         // exact SDF with analytic anti-aliasing, where `PathBuilder` fills every
-        // vertex's `st` with `(0, 1)` and so falls back on 4x MSAA alone.
+        // vertex's `st` with `(0, 1)` and so falls back on 4x MSAA alone. The
+        // hollow ones are one bordered quad rather than two concentric fills,
+        // because the border is part of that same SDF — stacking would blend the
+        // inner edge over the outer one's already-blended edge, and a 3px hole
+        // is where that shows.
         if row.parents > 1 {
             // A merge is a ring. It is the one row shape a reader scans for,
-            // and an outline reads at 6px where a second fill colour does not.
+            // and an outline reads at 8px where a second fill colour does not.
             let r = GRAPH_DOT_R + 1.;
             window.paint_quad(quad(
                 dot(r),
@@ -408,17 +459,20 @@ fn paint_graph(p: &GraphPaint, bounds: Bounds<Pixels>, window: &mut Window) {
             let ink = column_ink(column, *lane, p.max_lanes, p.overflowing, &p.lanes);
             let x = cx_of(column);
             if p.more {
-                let mut c: Hsla = gpui::rgb(ink).into();
-                c.a = 0.3;
-                window.paint_quad(fill(vline(x, y0, y0 + GRAPH_ROW_H), c));
+                window.paint_quad(fill(
+                    vline(x, y0, y0 + GRAPH_ROW_H),
+                    Hsla::from(gpui::rgb(ink)).opacity(0.3),
+                ));
             } else {
                 // Three steps rather than a gradient: a gradient would be a
                 // second `Background` kind for four pixels of ink.
+                const STEP: f32 = 3.;
                 for (step, alpha) in [0.5f32, 0.3, 0.15].into_iter().enumerate() {
-                    let mut c: Hsla = gpui::rgb(ink).into();
-                    c.a = alpha;
-                    let a = y0 + step as f32 * 3.;
-                    window.paint_quad(fill(vline(x, a, a + 3.), c));
+                    let a = y0 + step as f32 * STEP;
+                    window.paint_quad(fill(
+                        vline(x, a, a + STEP),
+                        Hsla::from(gpui::rgb(ink)).opacity(alpha),
+                    ));
                 }
             }
         }
@@ -464,7 +518,7 @@ impl Tty7App {
 
         let page = self.scm.graph.page.clone();
         let header = self.graph_header(repo, page.as_deref(), cx);
-        let search = self.graph_search(window, cx);
+        let search = self.graph_search(cx);
         let naming = self.graph_naming_row(repo, cx);
         let query = self.graph_query(cx);
         let body = match page {
@@ -554,24 +608,56 @@ impl Tty7App {
         (!text.is_empty()).then_some(text)
     }
 
-    fn graph_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.scm.graph.search.is_none() {
-            let input = cx.new(|cx| {
-                gpui_component::input::InputState::new(window, cx)
-                    .placeholder(t(L10nKey::ScmGraphFilterPlaceholder))
-            });
-            self.scm.graph.search_sub =
-                Some(
-                    cx.subscribe_in(&input, window, |_this, _input, ev, _window, cx| {
-                        if matches!(ev, gpui_component::input::InputEvent::Change) {
-                            cx.notify();
-                        }
-                    }),
-                );
-            self.scm.graph.search = Some(input);
-        }
+    /// The filter field, drawn only while it is open.
+    ///
+    /// At rest the section is a title and a list; a permanently parked search
+    /// box was a row of chrome above every reading of history, for a thing that
+    /// gets used once a session. It lives behind the header's tile now.
+    fn graph_search(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let input = self.scm.graph.search.clone()?;
         Some(self.panel_search(&input, cx))
+    }
+
+    /// Show the filter field, or take it away again.
+    ///
+    /// The `InputState` *is* the open flag: there is no second boolean to keep
+    /// in step with it, and closing the field drops the entity, which is what
+    /// answers the question a hidden filter always raises. A query cannot go on
+    /// quietly cutting rows out of the list from behind a closed box, because
+    /// there is nothing left holding the text — `graph_query` reads the input
+    /// or reads nothing. The cost is that reopening starts empty, which is the
+    /// right trade for a filter this shallow: retyping four characters is
+    /// cheaper than wondering why history is missing.
+    ///
+    /// Created here rather than on first render, the way `commit_input` still
+    /// is: an `InputState` needs a real window, and the click that asks for one
+    /// has one in hand.
+    fn graph_toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scm.graph.search.take().is_some() {
+            self.scm.graph.search_sub = None;
+            cx.notify();
+            return;
+        }
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(t(L10nKey::ScmGraphFilterPlaceholder))
+        });
+        // Without this the box would take text the list never sees: an
+        // `InputState` is its own entity, and its changes are its own events.
+        self.scm.graph.search_sub =
+            Some(
+                cx.subscribe_in(&input, window, |_this, _input, ev, _window, cx| {
+                    if matches!(ev, gpui_component::input::InputEvent::Change) {
+                        cx.notify();
+                    }
+                }),
+            );
+        let handle = input.read(cx).focus_handle(cx);
+        self.scm.graph.search = Some(input);
+        // A field that appears without the caret in it is a field you have to
+        // click twice.
+        window.focus(&handle, cx);
+        cx.notify();
     }
 }
 
@@ -585,7 +671,7 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let panel_w = cx.global::<crate::core::config::Config>().right_panel_width;
-        let cap = max_lanes(panel_w, self.scm.graph.lanes_collapsed);
+        let cap = max_lanes(panel_w);
         let gutter = gutter_width(cap);
         let now = crate::ui::home::now_secs() as i64;
 
@@ -623,7 +709,10 @@ impl Tty7App {
                 max_lanes: cap,
                 overflowing: page.max_lanes as usize > cap,
                 lanes: cx.global::<ActiveLanes>().0,
-                surface: cx.theme().background,
+                // The hole in a hollow node has to be the exact fill behind it,
+                // or the lane line running underneath shows through. The
+                // section is flush on the panel, so that fill is the sidebar's.
+                surface: gpui::rgb(cx.global::<crate::ui::presets::Surfaces>().sidebar.base).into(),
                 more,
             };
             stack = stack.child(
@@ -656,7 +745,7 @@ impl Tty7App {
     /// One commit.
     ///
     /// Column order is fixed and every optional part has a hard cap, so the
-    /// worst case cannot squeeze the message to nothing: type chip, message,
+    /// worst case cannot squeeze the message to nothing: type prefix, message,
     /// ref chip, age. The age goes when a ref chip is present — a chip says
     /// where a branch is, which is worth more here than three characters of
     /// "3d", and the full timestamp is in the tooltip either way.
@@ -671,6 +760,7 @@ impl Tty7App {
     ) -> AnyElement {
         let commit = &page.commits[i];
         let mono = cx.theme().mono_font_family.clone();
+        // The sidebar's surface, because that is the fill this row sits on.
         let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
         let selected = self.scm.graph.selected.as_deref() == Some(commit.oid.as_str());
         let (prefix, subject) = split_conventional(&commit.summary);
@@ -686,19 +776,42 @@ impl Tty7App {
             .pl(px(gutter))
             .pr(px(CONTENT_INSET))
             .cursor_pointer()
+            // The panel's own neutral selection and hover fills, the same two
+            // the file list above uses. A tinted band would make this one list
+            // in the sidebar announce itself differently from every other.
             .when(selected, |d| d.bg(gpui::rgb(sf.selected)))
             .when(!selected, |d| d.hover(|s| s.bg(gpui::rgb(sf.hover))))
-            .children(prefix.map(|(kind, breaking)| self.graph_type_chip(kind, breaking, cx)))
+            // Prefix and subject are one run of text, so they sit closer than
+            // the row's own gap: two pixels between `feat` and the words it
+            // introduces is about a word space at this size, and reads as one
+            // rather than as the space between two elements. The outer gap
+            // still separates them from the ref chip and the age, which *are*
+            // other elements.
             .child(
-                div()
+                h_flex()
                     .flex_1()
                     .min_w(px(0.))
-                    .truncate()
-                    .text_size(px(12.))
-                    .text_color(cx.theme().foreground)
-                    .child(SharedString::from(subject.to_string())),
+                    .gap(px(2.))
+                    .children(
+                        prefix.map(|(kind, breaking)| self.graph_type_prefix(kind, breaking, cx)),
+                    )
+                    .child(
+                        // The only full-strength ink on the row, and the widest
+                        // thing on it. Everything else — the type, the age, the
+                        // refs, the lanes — is an annotation on this.
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().foreground)
+                            .child(SharedString::from(subject.to_string())),
+                    ),
             )
             .children(deco.map(|r| self.graph_ref_chip(r, extra, &mono, cx)))
+            // The age is a mono token, so its column is measured in characters:
+            // the widest it ever prints is four (`12mo`), and four of the mono
+            // face's advances at 10.5px is 25.2, rounded up to 26.
             .when(deco.is_none(), |d| {
                 d.child(
                     div()
@@ -780,42 +893,53 @@ fn commit_tooltip(commit: &Commit, now: i64) -> SharedString {
     ))
 }
 
-/// The semantic slot a conventional-commit type draws from.
+/// What ink a conventional-commit prefix is set in.
 ///
-/// Reusing the semantic ramp rather than inventing a palette: `feat` is the
-/// same green as a success anywhere else in the UI, `fix` the same red as a
-/// danger, and all of them have already been walked to a contrast floor on
-/// every surface. Anything unrecognised is muted, so a repository with its own
-/// vocabulary gets a neutral chip rather than an arbitrary colour.
-fn type_tone(kind: &str, breaking: bool, cx: &gpui::App) -> (Hsla, Hsla) {
+/// One rule rather than a palette, and the type is not what decides it. The
+/// lane gutter immediately to the left is already a column of colour, so a
+/// green `feat` beside a green lane dot adds a second colour column that says
+/// nothing the dot has not: the reader's eye is pulled twice and told the same
+/// thing once. Muting the whole vocabulary — `feat`, `fix`, `perf`, `docs` and
+/// whatever a repository invents — leaves the row with two levels of text
+/// emphasis, which is all a sidebar has ever needed.
+///
+/// The one exception is a breaking change. A `!` is the single thing in a
+/// subject line worth shouting about, whatever the type in front of it says.
+fn type_tone(breaking: bool, cx: &gpui::App) -> Hsla {
     let theme = cx.theme();
-    // A `!` is the one thing in a subject line worth shouting about, whatever
-    // the type in front of it says.
-    if breaking {
-        return (theme.danger.opacity(0.20), theme.danger);
+    match breaking {
+        true => theme.danger,
+        false => theme.muted_foreground,
     }
-    let ink = match kind {
-        "feat" => theme.success,
-        "fix" => theme.danger,
-        "perf" | "revert" => theme.warning,
-        "docs" => theme.info,
-        _ => theme.muted_foreground,
-    };
-    (ink.opacity(0.16), ink)
 }
 
 impl Tty7App {
-    /// The prefix, as three or four coloured characters.
-    fn graph_type_chip(&self, kind: &str, breaking: bool, cx: &mut Context<Self>) -> AnyElement {
-        let (bg, fg) = type_tone(kind, breaking, cx);
+    /// The prefix, set inline as the first word of the subject.
+    ///
+    /// Deliberately not a chip. A filled pill on every row is a colour column
+    /// running down the panel right beside the one the lanes already draw, and
+    /// because the types are different lengths — `fix`, `chore`, `refactor` —
+    /// the pills gave every subject a different left edge, so nothing in the
+    /// list lined up vertically. With no fill and no padding of its own, the
+    /// two halves read as one sentence and the column starts where the prefix
+    /// does.
+    ///
+    /// Level with the subject at 12px and told apart by tone alone. The two
+    /// halves are one sentence, and a size change mid-sentence is a seam: the
+    /// muting already says which half a reader is meant to skip, and saying it
+    /// twice buys nothing but a ragged line.
+    ///
+    /// Not mono either, for the same reason it is not a chip: the subject
+    /// beside it is not, and a family change mid-run is a seam where the point
+    /// is continuity.
+    fn graph_type_prefix(&self, kind: &str, breaking: bool, cx: &mut Context<Self>) -> AnyElement {
         div()
+            // Never the part that truncates. It is a handful of characters, and
+            // clipping them to buy the subject the same handful is not a trade
+            // — a half-eaten `refac…` costs a reader more than it gives back.
             .flex_none()
-            .px(px(3.))
-            .rounded(px(3.))
-            .bg(bg)
-            .text_size(px(9.5))
-            .font_family(cx.theme().mono_font_family.clone())
-            .text_color(fg)
+            .text_size(px(12.))
+            .text_color(type_tone(breaking, cx))
             .child(SharedString::from(match breaking {
                 true => format!("{kind}!"),
                 false => kind.to_string(),
@@ -837,7 +961,9 @@ impl Tty7App {
         let theme = cx.theme();
         let (bg, fg, weight) = match deco.kind {
             // Where you are is the one thing on this row worth a heavier
-            // weight; everything else is context.
+            // weight; everything else is context. The fill is grey, not brand:
+            // `theme.accent` is a neutral surface tint here, and the only
+            // saturated colour the section spends is a lane's.
             RefKind::Head => (
                 theme.accent.opacity(0.28),
                 theme.foreground,
@@ -850,8 +976,13 @@ impl Tty7App {
                 theme.warning,
                 gpui::FontWeight::NORMAL,
             ),
+            // Everything else — a local branch you are not on, a remote
+            // tracking ref — is context, and context does not get a box. A
+            // filled grey pill here was a third block of surface on a row that
+            // already carries a lane gutter and a subject; unfilled, it reads
+            // as a label sitting after the message, which is what it is.
             _ => (
-                theme.muted.opacity(0.9),
+                gpui::transparent_black(),
                 theme.muted_foreground,
                 gpui::FontWeight::NORMAL,
             ),
@@ -860,6 +991,11 @@ impl Tty7App {
             0 => elide_middle(&deco.short, GRAPH_REF_CHARS).into_owned(),
             n => format!("{} +{n}", elide_middle(&deco.short, GRAPH_REF_CHARS)),
         };
+        // A hard cap, because the chip is the one part of the row whose width
+        // comes from a branch name someone else chose. `GRAPH_REF_CHARS` elides
+        // the middle first; this is the backstop for the widths that survive
+        // it — fourteen characters of `info_chip`'s 10.5px mono plus its
+        // padding, which is about 72.
         div()
             .flex_none()
             .max_w(px(72.))
@@ -883,6 +1019,9 @@ impl Tty7App {
             .pl(px(gutter))
             .pr(px(CONTENT_INSET))
             .cursor_pointer()
+            // A step under the subjects above it: this is a control the list
+            // offers, not a commit, and it should not read as one more row of
+            // history.
             .text_size(px(11.))
             .text_color(cx.theme().muted_foreground)
             .hover(|s| s.text_color(cx.theme().foreground))
@@ -900,7 +1039,22 @@ impl Tty7App {
 }
 
 impl Tty7App {
-    /// The section's own title row: fold, count, gutter toggle, scope picker.
+    /// The section's own title row: fold, title and count on the left, the
+    /// filter tile and the scope picker on the right.
+    ///
+    /// The arrangement is the part worth keeping — a count that reads as part
+    /// of the title, and the two controls collected at the trailing edge rather
+    /// than strung out beside the label. The dress is the panel's: muted ink
+    /// and no control tinted, because nothing here is more important than the
+    /// file list above it.
+    ///
+    /// The title is 11px MEDIUM and the count 10.5px beside it, both muted:
+    /// this is a band label, not a heading a reader is meant to stop at, and
+    /// the rows below it are what the section is for. The count is set in the
+    /// UI font rather than mono — it sits inside the title's own phrase, and a
+    /// family change there would read as a token rather than as part of it.
+    ///
+    /// There is no lane-gutter fold. The lanes are the graph.
     fn graph_header(
         &self,
         repo: &RepoKey,
@@ -909,17 +1063,17 @@ impl Tty7App {
     ) -> AnyElement {
         let expanded = self.scm.graph.expanded;
         let muted = cx.theme().muted_foreground;
+        let filtering = self.scm.graph.search.is_some();
         let count = page.map(|p| match p.complete {
             true => p.commits.len().to_string(),
             false => format!("{}+", p.commits.len()),
         });
-        let collapsed = self.scm.graph.lanes_collapsed;
 
         h_flex()
             .flex_none()
             .items_center()
-            .gap(px(6.))
-            .h(px(24.))
+            .gap(px(4.))
+            .h(px(GRAPH_HEADER_H))
             .pl(px(CONTENT_INSET))
             .pr(px(crate::ui::app::tile_trailing_inset_sm()))
             .child(
@@ -931,6 +1085,9 @@ impl Tty7App {
                     .min_w(px(0.))
                     .cursor_pointer()
                     .child(
+                        // A hair under the title it opens: the chevron is a
+                        // mark, not a word, and at the label's own size it
+                        // starts competing with it for the corner.
                         Icon::new(match expanded {
                             true => IconName::ChevronDown,
                             false => IconName::ChevronRight,
@@ -945,6 +1102,10 @@ impl Tty7App {
                             .text_color(muted)
                             .child(SharedString::from(t(L10nKey::ScmGraphTitle))),
                     )
+                    // The count reads as part of the title, so it sits with it
+                    // rather than at the far end of the row — half a step
+                    // smaller and at normal weight, which is the whole
+                    // difference between the two words in this corner.
                     .children(count.map(|c| {
                         div()
                             .text_size(px(10.5))
@@ -955,43 +1116,32 @@ impl Tty7App {
             )
             .when(expanded, |row| {
                 row.child(
-                    div()
-                        .id("scm-graph-lanes")
-                        .flex_none()
-                        .size(px(18.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .when(collapsed, |d| d.bg(cx.theme().secondary))
-                        .hover(|s| s.bg(cx.theme().secondary))
-                        .child(
-                            Icon::new(match collapsed {
-                                true => IconName::ChevronRight,
-                                false => IconName::ChevronLeft,
-                            })
-                            .size(px(11.))
-                            .text_color(muted),
-                        )
-                        .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(match collapsed {
-                                true => t(L10nKey::ScmGraphShowLanes),
-                                false => t(L10nKey::ScmGraphFoldLanes),
-                            })
-                            .build(window, cx)
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.scm.graph.lanes_collapsed = !this.scm.graph.lanes_collapsed;
-                            cx.notify();
-                        })),
+                    // Lit while the field is open, which is the only signal
+                    // that history is being filtered once the box is gone —
+                    // and it cannot go stale, because closing the box is what
+                    // throws the query away.
+                    crate::ui::tab_strip::chrome_tile_sized(
+                        Button::new("scm-graph-filter").icon(Icon::new(IconName::Search)),
+                        GRAPH_TILE,
+                        GRAPH_TILE_GLYPH,
+                        filtering,
+                        cx,
+                    )
+                    .rounded(px(4.))
+                    .tooltip(t(L10nKey::ScmGraphFilterPlaceholder))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.graph_toggle_search(window, cx)),
+                    ),
                 )
                 .child(
+                    // The same square as the tile beside it, or the two
+                    // controls in this corner sit on different baselines.
                     Button::new("scm-graph-scope")
                         .ghost()
                         .xsmall()
-                        .h(px(18.))
+                        .h(px(GRAPH_TILE))
                         .rounded(px(4.))
+                        .dropdown_caret(true)
                         .label(scope_label(&self.scm.graph.scope))
                         .text_color(muted)
                         .dropdown_menu_with_anchor(
@@ -1294,6 +1444,12 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// The inline "name a branch here" field.
+    ///
+    /// `xsmall`, like every other inline field in this panel: a 20px box in a
+    /// 30px row, which is the input plus 5px of air each side. A taller one
+    /// here would push the list it interrupts down by more than the field is
+    /// worth.
     fn graph_naming_row(&mut self, repo: &RepoKey, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (input, rev) = self.scm.graph.naming.clone()?;
         let repo = repo.clone();
@@ -1308,7 +1464,15 @@ impl Tty7App {
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .child(gpui_component::input::Input::new(&input).xsmall()),
+                        // `appearance(false)` like every other field in the
+                        // app: left on, gpui-component draws its own border and
+                        // fill, which is the one chrome nothing else in this
+                        // panel wears.
+                        .child(
+                            gpui_component::input::Input::new(&input)
+                                .appearance(false)
+                                .xsmall(),
+                        ),
                 )
                 .on_key_down(
                     cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
@@ -1395,8 +1559,9 @@ mod tests {
         for lane in 4u16..=tty7_core::core::git::log::MAX_LANES {
             assert_eq!(project(lane, cap), 3, "lane {lane} escaped the last column");
         }
-        // A single column is the folded gutter, and it has to swallow every lane
-        // rather than saturating into a negative index.
+        // `max_lanes` never goes below `GRAPH_MIN_LANES`, but `project` is a
+        // pure function anyone can call: a one-column cap has to swallow every
+        // lane rather than saturating into a negative index.
         for lane in 0u16..8 {
             assert_eq!(project(lane, 1), 0);
         }
@@ -1422,15 +1587,15 @@ mod tests {
     }
 
     #[test]
-    fn the_gutter_narrows_with_the_panel_and_folds_to_one() {
+    fn the_gutter_narrows_with_the_panel() {
         // 260px is the default panel; 216px is about as narrow as it gets.
-        assert_eq!(max_lanes(260., false), 5);
-        assert_eq!(max_lanes(216., false), 4);
-        assert_eq!(max_lanes(320., false), 6);
-        assert_eq!(max_lanes(160., false), GRAPH_MIN_LANES);
+        assert_eq!(max_lanes(260.), 5);
+        assert_eq!(max_lanes(216.), 4);
+        assert_eq!(max_lanes(320.), 6);
+        assert_eq!(max_lanes(160.), GRAPH_MIN_LANES);
         // The gutter it asks for has to fit inside the share it was given.
         for w in [120., 160., 216., 260., 320., 600.] {
-            let cap = max_lanes(w, false);
+            let cap = max_lanes(w);
             assert!(
                 cap == GRAPH_MIN_LANES || gutter_width(cap) <= w * GRAPH_GUTTER_SHARE,
                 "{w}px: a {cap}-lane gutter is {}px of a {}px budget",
@@ -1440,12 +1605,71 @@ mod tests {
         }
         // Below the floor the gutter stops shrinking: three lanes is the least
         // that can show a branch leaving and coming back.
-        assert_eq!(max_lanes(40., false), GRAPH_MIN_LANES);
+        assert_eq!(max_lanes(40.), GRAPH_MIN_LANES);
         // And above the palette it stops growing, or two columns would share a
         // colour.
-        assert_eq!(max_lanes(4000., false), GRAPH_MAX_LANES);
-        assert!(max_lanes(4000., false) <= LANE_SLOTS);
-        assert_eq!(max_lanes(260., true), 1);
+        assert_eq!(max_lanes(4000.), GRAPH_MAX_LANES);
+        assert!(max_lanes(4000.) <= LANE_SLOTS);
+    }
+
+    /// The two fixed resize constants are counted in rows against the header.
+    ///
+    /// What they are worth is not obvious from their values — 220 is a number,
+    /// "nine commits and most of a tenth" is a decision — so the decision is
+    /// what gets pinned, and a change to the row height or the header has to
+    /// come back through here rather than quietly buying or losing a commit.
+    /// The partial row at the bottom is deliberate: it is the only thing a
+    /// fixed-height list says to admit there is more below it, so the assertion
+    /// is that a real strip of that row survives at both ends.
+    #[test]
+    fn the_section_is_sized_in_commits() {
+        let rows = |h: f32| (h - GRAPH_HEADER_H) / GRAPH_ROW_H;
+        let resting = rows(GRAPH_H_DEFAULT);
+        assert!(
+            (9.5..10.0).contains(&resting),
+            "the resting section shows {resting} commits"
+        );
+        // In pixels, because "a visible sliver" is a pixel count and not a
+        // fraction: at 20px rows the last band shows 16 of its 20 and loses 4.
+        let shown = GRAPH_ROW_H * resting.fract();
+        let cut = GRAPH_ROW_H - shown;
+        assert!(
+            shown >= 3. && cut >= 3.,
+            "{resting} rows shows {shown}px of the last band and cuts {cut}px, \
+             which is not a partial row a reader can see"
+        );
+        let floor = rows(GRAPH_H_MIN);
+        assert!(
+            floor >= 3.,
+            "dragged all the way shut the section shows {floor} commits, which \
+             is not enough of a graph to be one"
+        );
+        assert!(GRAPH_H_MIN < GRAPH_H_DEFAULT);
+        // The ceiling is a share of the window, and the floor has to survive a
+        // window short enough that the share falls under it.
+        assert_eq!((100f32 * GRAPH_H_MAX_RATIO).max(GRAPH_H_MIN), GRAPH_H_MIN);
+    }
+
+    /// Every node fits: inside its row, inside the gutter, and clear of the
+    /// lane line one column over.
+    ///
+    /// The widest one is the merge, which is drawn a pixel larger than the
+    /// others. Nothing about the paint code looks wrong when a node grows past
+    /// its column — it simply overlaps the neighbouring line — so the fit is
+    /// asserted here rather than left to be noticed.
+    #[test]
+    fn nodes_fit_inside_their_row_and_column() {
+        let widest = GRAPH_DOT_R + 1.;
+        assert!(widest * 2. <= GRAPH_ROW_H);
+        assert!(lane_center_x(0, 1.) - widest >= 0.);
+        assert!(widest + GRAPH_LINE_W / 2. < GRAPH_LANE_W);
+        // And a hollow node keeps a hole: a stroke that eats the radius is a
+        // filled dot wearing a ring's name.
+        assert!(GRAPH_DOT_R - GRAPH_LINE_W >= 1.);
+        // The node also has to be worth the row it sits in: a 6px dot in a 20px
+        // row is 30% of it, and a bead much smaller than that stops reading as
+        // one on a string.
+        assert!(GRAPH_DOT_R * 2. >= GRAPH_ROW_H * 0.25);
     }
 
     #[test]
@@ -1499,6 +1723,29 @@ mod tests {
             split_conventional(prefixed),
             (Some(("fix", false)), "修复终端右键菜单的本地化")
         );
+    }
+
+    /// The prefix carries one bit of colour, not six.
+    ///
+    /// A green `feat` beside a green lane dot was exactly the noise this row
+    /// was cleaned up to lose, and `type_tone` no longer being handed the type
+    /// is most of the guard against it coming back. What is left to pin is the
+    /// one exception: a breaking change has to stay visibly apart from
+    /// everything else, or the exception is not worth making.
+    #[gpui::test]
+    fn only_a_breaking_prefix_gets_a_colour(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (_app, mut vcx) = harness(cx);
+
+        vcx.update(|_, cx| {
+            assert_eq!(type_tone(false, cx), cx.theme().muted_foreground);
+            assert_eq!(type_tone(true, cx), cx.theme().danger);
+            assert_ne!(
+                type_tone(true, cx),
+                type_tone(false, cx),
+                "a `!` that looks like every other prefix is not a warning"
+            );
+        });
     }
 
     /// `4 → node 0 → 4` should be one line bending, not two lines drawn twice.
@@ -1557,22 +1804,6 @@ mod tests {
             cx.global::<crate::core::config::Config>()
                 .scm_graph_expanded
         }));
-    }
-
-    #[gpui::test]
-    fn the_lane_gutter_folds_and_stays_folded(cx: &mut TestAppContext) {
-        crate::core::config::pin_test_config_dir();
-        let (app, mut vcx) = harness(cx);
-
-        // Session state rather than config: unlike the section's own fold, this
-        // is a reading posture for one repository's shape, not a preference.
-        assert!(!app.read_with(&vcx, |app, _| app.scm.graph.lanes_collapsed));
-        app.update(&mut vcx, |app, cx| {
-            app.scm.graph.lanes_collapsed = true;
-            cx.notify();
-        });
-        vcx.run_until_parked();
-        assert!(app.read_with(&vcx, |app, _| app.scm.graph.lanes_collapsed));
     }
 
     #[gpui::test]
@@ -1655,6 +1886,57 @@ mod tests {
         // A sha matches as a prefix, the way `git show` takes one — not as a
         // substring, or every query of hex characters would light up.
         assert!(!matches_query(&commit, "ffee"));
+    }
+
+    /// A filter you cannot see must not be filtering.
+    ///
+    /// The field is behind a tile now, and the failure mode a hidden filter
+    /// invites is a reader staring at a list with rows missing and nothing on
+    /// screen to say why. The guard is structural — closing drops the
+    /// `InputState`, and `graph_query` has nowhere else to read text from — so
+    /// this is the test that the structure holds.
+    #[gpui::test]
+    fn closing_the_filter_takes_its_query_with_it(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (app, mut vcx) = harness(cx);
+
+        // At rest there is no field at all, which is what the section looks
+        // like every time it is opened.
+        app.update(&mut vcx, |app, cx| {
+            assert!(app.scm.graph.search.is_none());
+            assert!(app.graph_query(cx).is_none());
+        });
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.graph_toggle_search(window, cx);
+            assert!(app.scm.graph.search.is_some(), "the tile opens the field");
+            assert!(
+                app.scm.graph.search_sub.is_some(),
+                "and wires typing to a repaint, or the list never sees the text"
+            );
+        });
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            let input = app.scm.graph.search.clone().expect("the field is open");
+            input.update(cx, |state, cx| state.set_value("Feat", window, cx));
+        });
+        assert_eq!(
+            app.update(&mut vcx, |app, cx| app.graph_query(cx)),
+            Some("feat".to_string()),
+            "the box filters while it is open"
+        );
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.graph_toggle_search(window, cx)
+        });
+        app.update(&mut vcx, |app, cx| {
+            assert!(app.scm.graph.search.is_none());
+            assert!(app.scm.graph.search_sub.is_none());
+            assert!(
+                app.graph_query(cx).is_none(),
+                "a closed box went on cutting rows out of the list"
+            );
+        });
     }
 
     #[test]

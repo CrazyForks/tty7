@@ -20,6 +20,46 @@ pub(crate) const MAX_WIDTH_RATIO: f32 = 0.5;
 
 const RESIZE_HANDLE_WIDTH: f32 = 8.;
 
+// The right panel's type ramp: four steps, half a point apart, that the Info
+// and Source Control tabs draw from so switching between them does not change
+// the apparent size of the panel. (The Files tab, in `file_tree.rs`, is the
+// one holdout — it renders its rows with `text_sm()` = 14px.) The steps are
+// close together on purpose: the panel is a dense aside next to the terminal,
+// and the differences between them are meant to be felt as hierarchy rather
+// than seen as different type sizes.
+//
+/// Primary content: row text, values, names, empty-state prose.
+pub(crate) const PANEL_TEXT: f32 = 12.;
+/// The panel's own title heading. A half-step under the content beneath it, so
+/// it caps the panel without competing with it — the SEMIBOLD weight and the
+/// caps are what make it read as a title, not the size.
+pub(crate) const PANEL_TEXT_TITLE: f32 = 11.5;
+/// Secondary: directory paths, bylines, hints, counts. One notch below the
+/// content it hangs off, close enough to stay readable.
+pub(crate) const PANEL_TEXT_SECONDARY: f32 = 11.;
+/// The smallest step, for marks rather than prose: group headers (SEMIBOLD,
+/// uppercased), git status letters, and the mono tokens that sit in pills —
+/// pids, ports.
+pub(crate) const PANEL_TEXT_META: f32 = 10.5;
+
+/// gpui lays text out at its default `phi` line height, so one line of
+/// [`PANEL_TEXT`] measures `round(12 × 1.618) = 19px` before any padding. One
+/// pixel on each side is all the key/value rows need to stop touching: 21px.
+const ROW_PAD_Y: f32 = 1.;
+
+/// Height of the search strip.
+///
+/// gpui-component sizes an `Input` border-box, and `.xsmall()` is
+/// `input_h(Size::XSmall)` = `h_5()` = 20px: one `LINE_HEIGHT` of `Rems(1.25)`
+/// = 20px with `input_py(Size::XSmall)` = 0 above and below. (`.appearance(false)`
+/// only drops the background, border and radius; the padding and the height
+/// stay.) Thirty leaves that field 5px of slack top and bottom.
+///
+/// Load-bearing beyond this file: `scm/panel.rs` pins its commit box to the
+/// same height with a `const _: () = assert!(…)`, so the two tabs' top strips
+/// line up.
+pub(crate) const SEARCH_H: f32 = 30.;
+
 #[derive(Default)]
 pub(crate) struct RightPanelState {
     pub(crate) procs_pane: Option<u64>,
@@ -255,16 +295,21 @@ impl Tty7App {
                     .items_baseline()
                     .gap(px(7.))
                     .child(
+                        // The title step of the panel ramp, SEMIBOLD and
+                        // uppercased. It reads as a label rather than as
+                        // content because of the weight and the caps.
                         div()
-                            .text_size(px(11.5))
+                            .text_size(px(PANEL_TEXT_TITLE))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(cx.theme().secondary_foreground)
                             .child(text.to_uppercase()),
                     )
                     .when_some(count, |this, c| {
                         this.child(
+                            // A count is a token hanging off the heading, not
+                            // part of it: one step down, mono, regular weight.
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(PANEL_TEXT_SECONDARY))
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .text_color(cx.theme().muted_foreground.opacity(0.75))
                                 .child(c),
@@ -294,8 +339,10 @@ impl Tty7App {
         h_flex()
             .flex_none()
             .items_center()
+            // 8 here plus the `.xsmall()` field's own 4px of leading padding
+            // is 12px of daylight between the glyph and the first character.
             .gap(px(8.))
-            .h(px(30.))
+            .h(px(SEARCH_H))
             .px(px(CONTENT_INSET))
             .child(
                 Icon::new(IconName::Search)
@@ -342,12 +389,15 @@ impl Tty7App {
             .px(px(CONTENT_INSET))
             .py(px(4.))
             .gap(px(3.))
-            .text_size(px(12.))
+            // The first line is the only thing in the panel when this renders,
+            // so it is content, not an aside: it stays on the primary step.
+            // The hint under it is the aside, and drops to secondary.
+            .text_size(px(PANEL_TEXT))
             .text_color(muted)
             .child(text.to_string())
             .children(hint.map(|h| {
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(PANEL_TEXT_SECONDARY))
                     .text_color(muted.opacity(0.75))
                     .child(h.to_string())
             }))
@@ -430,8 +480,8 @@ impl Tty7App {
                 h_flex()
                     .items_baseline()
                     .gap(px(9.))
-                    .py(px(1.))
-                    .text_size(px(12.))
+                    .py(px(ROW_PAD_Y))
+                    .text_size(px(PANEL_TEXT))
                     .child(
                         div()
                             .flex_none()
@@ -531,8 +581,11 @@ impl Tty7App {
             }))
             .pb(px(if trailing.is_some() { 0. } else { 4. }))
             .child(
+                // A group header sits below the panel's own title in the
+                // hierarchy, so it sits below it in the ramp too: the smallest
+                // step, carried by weight and caps rather than by size.
                 div()
-                    .text_size(px(10.5))
+                    .text_size(px(PANEL_TEXT_META))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(cx.theme().muted_foreground)
                     .child(text.to_uppercase()),
@@ -559,7 +612,7 @@ impl Tty7App {
                             .min_w_0()
                             .truncate()
                             .pl(px(f32::from(p.depth) * 10.))
-                            .text_size(px(12.))
+                            .text_size(px(PANEL_TEXT))
                             .font_family(mono.clone())
                             .text_color(if p.foreground {
                                 cx.theme().foreground
@@ -607,7 +660,7 @@ impl Tty7App {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(12.))
+                            .text_size(px(PANEL_TEXT))
                             .font_family(mono.clone())
                             .text_color(cx.theme().muted_foreground)
                             .child(p.name.clone()),
@@ -741,12 +794,27 @@ impl Tty7App {
     }
 }
 
+/// Width of the fixed cell a git status letter is centred in.
+///
+/// Load-bearing beyond this function: `scm/panel.rs` gives its group-header
+/// chevron box exactly this width so the group arrows and the status letters
+/// stack into one vertical line down the right edge of the panel, and it keeps
+/// its own `BADGE_W` in step. Changing it here without changing it there
+/// breaks that column.
+pub(crate) const BADGE_W: f32 = 14.;
+
+/// A single-letter git status marker in a fixed-width cell.
+///
+/// Mono and SEMIBOLD so `M`, `A`, `D` and `U` all read as the same kind of
+/// mark at a glance, and centred in a cell wide enough for the widest of them
+/// at [`PANEL_TEXT_META`] — that is what makes a column of them line up
+/// instead of drifting with the glyph widths.
 pub(crate) fn git_badge(letter: &str, color: gpui::Hsla, mono: &gpui::SharedString) -> AnyElement {
     div()
         .flex_none()
-        .w(px(14.))
+        .w(px(BADGE_W))
         .text_center()
-        .text_size(px(10.5))
+        .text_size(px(PANEL_TEXT_META))
         .font_family(mono.clone())
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(color)
@@ -754,6 +822,14 @@ pub(crate) fn git_badge(letter: &str, color: gpui::Hsla, mono: &gpui::SharedStri
         .into_any_element()
 }
 
+/// A small filled pill around a mono token — a pid, a port number.
+///
+/// The padding and the radius are derived from the text size: at
+/// [`PANEL_TEXT_META`] the line box is `round(10.5 × 1.618) = 17px`, so 1.5px
+/// of vertical padding makes the pill 20px tall — one pixel more than the 19px
+/// line of [`PANEL_TEXT`] beside it, which is what sets the height of a ports
+/// row. Horizontal padding of 5px is about half an em of breathing room on
+/// each side, and radius 4 is a fifth of the pill's height.
 pub(crate) fn info_chip(
     text: &str,
     bg: gpui::Hsla,
@@ -766,7 +842,7 @@ pub(crate) fn info_chip(
         .py(px(1.5))
         .rounded(px(4.))
         .bg(bg)
-        .text_size(px(10.5))
+        .text_size(px(PANEL_TEXT_META))
         .font_family(mono.clone())
         .text_color(fg)
         .child(text.to_string())

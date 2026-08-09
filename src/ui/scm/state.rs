@@ -164,10 +164,6 @@ pub(crate) struct GraphState {
     /// empty graph rather than the previous repository's history.
     pub(crate) page: Option<Arc<CommitPage>>,
     pub(crate) page_key: Option<(RepoKey, u64, GraphScope)>,
-    /// Fold the lane gutter down to a single column. Worth about six
-    /// characters of the message, which at this width is the difference
-    /// between reading a subject and reading its first word.
-    pub(crate) lanes_collapsed: bool,
     /// Filter box. Like `commit_input`, created on first render — and with the
     /// subscription that turns typing into a repaint. An `InputState` is its
     /// own entity; without this the box would take text the list never sees.
