@@ -51,6 +51,10 @@ pub struct SearchState {
     pub input: Entity<InputState>,
     pub matches: Vec<Match>,
     pub current_index: Option<usize>,
+    /// Scrollback depth when `matches` was read off the grid. Match points are
+    /// viewport-relative, so this is what turns one back into the absolute row
+    /// it named — see [`TerminalView::refresh_matches_after_output`].
+    scanned_history: usize,
     _subs: Vec<Subscription>,
 }
 
@@ -58,6 +62,32 @@ impl SearchState {
     pub fn current(&self) -> Option<&Match> {
         self.current_index.and_then(|i| self.matches.get(i))
     }
+}
+
+/// One read of the grid: every match in it, whether the pattern compiled, and
+/// how deep the scrollback was at the time.
+struct Scan {
+    matches: Vec<Match>,
+    regex_error: bool,
+    history: usize,
+}
+
+impl Scan {
+    fn empty(regex_error: bool) -> Self {
+        Self {
+            matches: Vec::new(),
+            regex_error,
+            history: 0,
+        }
+    }
+}
+
+/// A match point's row counted from the top of scrollback, which survives the
+/// grid scrolling under it — the same anchor a command mark or a placed image
+/// uses, with the same caveat once the scrollback is full and the discard count
+/// stops being observable.
+fn anchor_row(history: usize, point: &Point) -> i64 {
+    history as i64 + point.line.0 as i64
 }
 
 impl TerminalView {
@@ -77,6 +107,7 @@ impl TerminalView {
                 input,
                 matches: Vec::new(),
                 current_index: None,
+                scanned_history: 0,
                 _subs: subs,
             });
         }
@@ -150,17 +181,18 @@ impl TerminalView {
     /// meaningful against the grid they were read from: the moment output
     /// scrolls the grid, every one of them names a different line. Nothing here
     /// caches, and the two callers below both re-read the grid.
-    fn scan_matches(&self, query: &str) -> (Vec<Match>, bool) {
+    fn scan_matches(&self, query: &str) -> Scan {
         let mut matches: Vec<Match> = Vec::new();
         if query.is_empty() {
-            return (matches, false);
+            return Scan::empty(false);
         }
         let pattern = self.effective_search_pattern(query);
         let Ok(mut regex) = RegexSearch::new(&pattern) else {
-            return (matches, true);
+            return Scan::empty(true);
         };
         let term = self.terminal.term.lock();
         let grid = term.grid();
+        let history = grid.history_size();
         let mut origin = Point::new(grid.topmost_line(), Column(0));
 
         while matches.len() < MAX_MATCHES {
@@ -178,7 +210,11 @@ impl TerminalView {
                 break;
             }
         }
-        (matches, false)
+        Scan {
+            matches,
+            regex_error: false,
+            history,
+        }
     }
 
     /// The match a fresh query starts on: the last one at or above the bottom
@@ -256,21 +292,32 @@ impl TerminalView {
         else {
             return;
         };
-        let (matches, regex_error) = self.scan_matches(&query);
-        // Stay on the match the user stepped to if it survived — it keeps the
-        // same viewport-relative start whenever the grid did not scroll. When
-        // output *did* scroll it away, fall back to where a fresh query would
-        // land rather than to a stale ordinal pointing at some other line.
-        let previous = self.search.as_ref().and_then(|s| s.current().cloned());
+        let scan = self.scan_matches(&query);
+        // Stay on the match the user stepped to if it survived. Its start point
+        // is viewport-relative, so output that scrolled the grid has already
+        // made it name a different line — compare where it *was*, by absolute
+        // row, or the selection silently latches onto whichever occurrence has
+        // taken over that screen position. When it is gone, fall back to where
+        // a fresh query would land rather than to a stale ordinal.
+        let previous = self
+            .search
+            .as_ref()
+            .and_then(|s| Some((*s.current()?.start(), s.scanned_history)))
+            .map(|(p, history)| (anchor_row(history, &p), p.column));
         let current_index = previous
-            .and_then(|p| matches.iter().position(|m| m.start() == p.start()))
-            .or_else(|| self.match_nearest_the_viewport(&matches));
+            .and_then(|(row, column)| {
+                scan.matches.iter().position(|m| {
+                    anchor_row(scan.history, m.start()) == row && m.start().column == column
+                })
+            })
+            .or_else(|| self.match_nearest_the_viewport(&scan.matches));
 
         if let Some(s) = self.search.as_mut() {
-            s.matches = matches;
+            s.matches = scan.matches;
             s.current_index = current_index;
+            s.scanned_history = scan.history;
         }
-        self.search_regex_error = regex_error;
+        self.search_regex_error = scan.regex_error;
         cx.notify();
     }
 
@@ -283,14 +330,15 @@ impl TerminalView {
             return;
         };
 
-        let (matches, regex_error) = self.scan_matches(&query);
-        let current_index = self.match_nearest_the_viewport(&matches);
+        let scan = self.scan_matches(&query);
+        let current_index = self.match_nearest_the_viewport(&scan.matches);
 
         if let Some(s) = self.search.as_mut() {
-            s.matches = matches;
+            s.matches = scan.matches;
             s.current_index = current_index;
+            s.scanned_history = scan.history;
         }
-        self.search_regex_error = regex_error;
+        self.search_regex_error = scan.regex_error;
 
         let current = self.search.as_ref().and_then(|s| s.current().cloned());
         let hidden = self.rows_behind_the_search_bar();
