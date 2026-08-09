@@ -750,6 +750,7 @@ fn parse_combined_header_path(rest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::git::test_support::{PINS, pin_repo_config};
 
     const SAMPLE: &str = "\
 diff --git a/src/main.rs b/src/main.rs
@@ -1379,7 +1380,9 @@ index 1..2 100644
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok()?;
         let run = |args: &[&str]| {
-            git::git_output(&dir, args)
+            let mut full = PINS.to_vec();
+            full.extend_from_slice(args);
+            git::git_output(&dir, &full)
                 .ok()
                 .filter(|out| out.success())
                 .is_some()
@@ -1387,8 +1390,11 @@ index 1..2 100644
         if !run(&["init", "-q", "-b", "mainwork", "."]) {
             return None;
         }
-        run(&["config", "user.email", "t@tty7.test"]);
-        run(&["config", "user.name", "tty7 test"]);
+        // Before the first blob is written, and in the repository rather than
+        // only on this closure's command lines: `probe_diff` runs its own git,
+        // and on Windows that git would otherwise inherit the system-wide
+        // `core.autocrlf=true` and rewrite every checkout of this fixture.
+        assert!(pin_repo_config(&dir));
         std::fs::write(dir.join("base.txt"), "base\n").ok()?;
         run(&["add", "-A"]);
         run(&["commit", "-qm", "initial"]);

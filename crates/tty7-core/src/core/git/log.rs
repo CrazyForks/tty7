@@ -1079,6 +1079,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::git::test_support::{PINS, pin_repo_config};
 
     fn commit(sha: &str, parents: &[&str]) -> (Oid, SmallVec<[Oid; 2]>) {
         (
@@ -1728,29 +1729,25 @@ mod tests {
         Some(Scratch(dir))
     }
 
-    /// Runs git with the identity and signing settings pinned: a CI runner has
-    /// no `user.name` at all and would refuse to commit, and a developer may
-    /// have signing turned on globally.
+    /// Runs git with the identity, signing and line-ending settings pinned: a
+    /// CI runner has no `user.name` at all and would refuse to commit, a
+    /// developer may have signing turned on globally, and Git for Windows has
+    /// `core.autocrlf=true` in its system config.
     fn run(host: &dyn Host, cwd: &Path, args: &[&str]) -> bool {
-        let mut full = vec![
-            "-c",
-            "user.name=tty7 test",
-            "-c",
-            "user.email=test@tty7.invalid",
-            "-c",
-            "commit.gpgsign=false",
-        ];
+        let mut full = PINS.to_vec();
         full.extend_from_slice(args);
         host.git(cwd, &full).map(|o| o.success()).unwrap_or(false)
     }
 
     /// `git init` on a branch named here rather than left to whatever
-    /// `init.defaultBranch` says. `false` means there is no git on this
-    /// machine, which is not a failure.
+    /// `init.defaultBranch` says, with the same pins written into the
+    /// repository so the code under test reads them too. `false` means there is
+    /// no git on this machine, which is not a failure.
     fn init_repo(host: &dyn Host, repo: &Path) -> bool {
         if !run(host, repo, &["init", "--quiet"]) {
             return false;
         }
+        assert!(pin_repo_config(repo));
         // Not `init -b`: that is git 2.28+, and the branch name is asserted on.
         assert!(run(
             host,

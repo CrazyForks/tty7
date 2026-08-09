@@ -930,6 +930,7 @@ fn read_prefilled_message(host: &dyn Host, git_dir: &Path, listing: &[Entry]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::git::test_support::{PINS, one_spelling, pin_repo_config};
 
     /// One NUL-terminated record. Samples are written this way because a string
     /// literal with embedded NULs is unreadable, and because the separator is
@@ -1465,25 +1466,40 @@ mod tests {
     }
 
     fn scratch(name: &str) -> Option<Scratch> {
-        let dir = std::env::temp_dir().join(format!("tty7-scm-status-{name}"));
+        // The pid keeps two concurrent `cargo test` runs off each other's
+        // fixture, since the directory is wiped on the way in — the same
+        // reason `log.rs` carries one.
+        let dir =
+            std::env::temp_dir().join(format!("tty7-scm-status-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok()?;
         Some(Scratch(dir))
     }
 
-    /// Runs git with the identity and signing settings pinned, so the test does
-    /// not depend on whatever is in the developer's `~/.gitconfig`.
+    /// Runs git with the identity, signing and line-ending settings pinned, so
+    /// the test does not depend on whatever is in the developer's
+    /// `~/.gitconfig` or in Git for Windows' system config.
     fn run(host: &dyn Host, cwd: &Path, args: &[&str]) -> bool {
-        let mut full = vec![
-            "-c",
-            "user.name=tty7 test",
-            "-c",
-            "user.email=test@tty7.invalid",
-            "-c",
-            "commit.gpgsign=false",
-        ];
+        let mut full = PINS.to_vec();
         full.extend_from_slice(args);
         host.git(cwd, &full).map(|o| o.success()).unwrap_or(false)
+    }
+
+    /// `git init` on a branch named here, with the pins written into the
+    /// repository so that `probe_status`'s own git reads them too. `false`
+    /// means there is no git on this machine, which is not a failure.
+    fn init_repo(host: &dyn Host, repo: &Path) -> bool {
+        if !run(host, repo, &["init", "--quiet"]) {
+            return false;
+        }
+        assert!(pin_repo_config(repo));
+        // Not `init -b`: that is git 2.28+, and the branch name is asserted on.
+        assert!(run(
+            host,
+            repo,
+            &["symbolic-ref", "HEAD", "refs/heads/main"]
+        ));
+        true
     }
 
     #[test]
@@ -1494,15 +1510,9 @@ mod tests {
         };
         let repo = &scratch.0;
 
-        if !run(&*host, repo, &["init", "--quiet"]) {
+        if !init_repo(&*host, repo) {
             return; // no git on this machine
         }
-        // Not `init -b`: that is git 2.28+, and the branch name is asserted on.
-        assert!(run(
-            &*host,
-            repo,
-            &["symbolic-ref", "HEAD", "refs/heads/main"]
-        ));
         std::fs::write(repo.join("kept.txt"), "one\n").unwrap();
         std::fs::write(repo.join("moved.txt"), "a\nb\nc\nd\ne\nf\ng\nh\n").unwrap();
         assert!(run(&*host, repo, &["add", "-A"]));
@@ -1530,7 +1540,13 @@ mod tests {
         assert_eq!(status.stash_count, 0);
         assert!(!status.truncated);
         assert!(!status.is_clean());
-        assert_eq!(status.root, std::fs::canonicalize(repo).unwrap());
+        // `status.root` is what `git rev-parse` answered, so the two sides have
+        // to be brought into one spelling before they can be compared — see
+        // `one_spelling`. Still an exact equality, just not a literal one.
+        assert_eq!(
+            one_spelling(&status.root),
+            one_spelling(&std::fs::canonicalize(repo).unwrap())
+        );
         assert_eq!(status.home, status.root);
 
         fn names(mut v: Vec<&str>) -> Vec<&str> {
@@ -1575,14 +1591,9 @@ mod tests {
         };
         let repo = &scratch.0;
 
-        if !run(&*host, repo, &["init", "--quiet"]) {
+        if !init_repo(&*host, repo) {
             return;
         }
-        assert!(run(
-            &*host,
-            repo,
-            &["symbolic-ref", "HEAD", "refs/heads/main"]
-        ));
         std::fs::write(repo.join("c.txt"), "base\n").unwrap();
         assert!(run(&*host, repo, &["add", "-A"]));
         assert!(run(&*host, repo, &["commit", "--quiet", "-m", "base"]));
@@ -1629,12 +1640,7 @@ mod tests {
         ) {
             return;
         }
-        assert!(run(&*host, &repo, &["init", "--quiet"]));
-        assert!(run(
-            &*host,
-            &repo,
-            &["symbolic-ref", "HEAD", "refs/heads/main"]
-        ));
+        assert!(init_repo(&*host, &repo));
         std::fs::write(repo.join("f.txt"), "one\n").unwrap();
         assert!(run(&*host, &repo, &["add", "-A"]));
         assert!(run(&*host, &repo, &["commit", "--quiet", "-m", "one"]));

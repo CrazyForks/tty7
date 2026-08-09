@@ -1557,6 +1557,13 @@ mod tests {
 
     // -- against a real repository ----------------------------------------
 
+    /// The same pin list `tty7_core::core::git::test_support` keeps for the
+    /// four modules over there. It cannot be shared with them: those helpers
+    /// are `#[cfg(test)]`, so they do not exist in the `tty7-core` this crate
+    /// links against. Identity and signing because a runner has neither and a
+    /// developer may have signing on; line endings because Git for Windows
+    /// puts `core.autocrlf=true` in its system config, and a fixture whose
+    /// bytes depend on the machine is not a fixture.
     fn run(host: &dyn Host, cwd: &Path, args: &[&str]) -> bool {
         let mut full = vec![
             "-c",
@@ -1565,6 +1572,10 @@ mod tests {
             "user.email=test@tty7.invalid",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.eol=lf",
         ];
         full.extend_from_slice(args);
         host.git(cwd, &full).map(|o| o.success()).unwrap_or(false)

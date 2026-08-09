@@ -683,6 +683,7 @@ fn push_section(buffer: &mut String, section: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::git::test_support::{PINS, pin_repo_config};
 
     fn born() -> HeadState {
         HeadState::Branch {
@@ -1497,8 +1498,13 @@ mod tests {
         }
     }
 
+    /// Runs git with the identity, signing and line-ending settings pinned, so
+    /// the test does not depend on the developer's `~/.gitconfig` or on Git for
+    /// Windows' system config.
     fn run(host: &dyn Host, dir: &Path, args: &[&str]) -> String {
-        let out = host.git(dir, args).expect("git runs");
+        let mut full = PINS.to_vec();
+        full.extend_from_slice(args);
+        let out = host.git(dir, &full).expect("git runs");
         assert!(
             out.success(),
             "git {args:?} failed: {}",
@@ -1524,9 +1530,11 @@ mod tests {
         let dir = repo.dir.clone();
 
         run(host, &dir, &["init", "-q"]);
-        run(host, &dir, &["config", "user.email", "tty7@example.com"]);
-        run(host, &dir, &["config", "user.name", "tty7"]);
-        run(host, &dir, &["config", "commit.gpgsign", "false"]);
+        // In the repository, not just on the test's own command lines: the
+        // discard below is `run_op` running its own `checkout --`, and with
+        // Windows git's system-wide `core.autocrlf=true` that would hand back
+        // `one\r\n` for a file this test wrote as `one\n`.
+        assert!(pin_repo_config(&dir));
 
         repo.write("a.txt", "one\n");
         // A name git would otherwise treat as a character class: proof that the
@@ -1610,6 +1618,8 @@ mod tests {
         )
         .expect("discard the edit");
         assert!(porcelain(host, &dir).is_empty(), "the edit is gone");
+        // Byte for byte, which the repository's pinned line endings make a fact
+        // about the discard rather than about the machine running it.
         assert_eq!(
             std::fs::read_to_string(dir.join("a.txt")).expect("read back"),
             "one\n",
@@ -1624,9 +1634,7 @@ mod tests {
         let dir = repo.dir.clone();
 
         run(host, &dir, &["init", "-q"]);
-        run(host, &dir, &["config", "user.email", "tty7@example.com"]);
-        run(host, &dir, &["config", "user.name", "tty7"]);
-        run(host, &dir, &["config", "commit.gpgsign", "false"]);
+        assert!(pin_repo_config(&dir));
         repo.write("a.txt", "one\n");
         run(host, &dir, &["add", "-A"]);
         run(host, &dir, &["commit", "-q", "-m", "initial"]);

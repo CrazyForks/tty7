@@ -340,12 +340,110 @@ fn trim_cr(line: &[u8]) -> std::borrow::Cow<'_, str> {
     String::from_utf8_lossy(line)
 }
 
+/// What [`status`], [`diff`], [`log`] and [`ops`] all need to drive a scratch
+/// repository the same way. One copy here rather than four that drift.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    /// The `-c` overrides a test's own git invocations carry.
+    ///
+    /// `user.name`/`user.email` because a CI runner has neither and git refuses
+    /// to commit without them, and `commit.gpgsign` because a developer may
+    /// have signing on globally. The two line-ending settings are here for the
+    /// same reason: Git for Windows ships `core.autocrlf=true` in its *system*
+    /// config, so a fixture built with LF and read back is a fixture whose
+    /// bytes depend on which machine ran the test.
+    pub(crate) const PINS: [&str; 10] = [
+        "-c",
+        "user.name=tty7 test",
+        "-c",
+        "user.email=test@tty7.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        "core.eol=lf",
+    ];
+
+    /// The same settings, written into `<repo>/.git/config`.
+    ///
+    /// [`PINS`] only reaches the commands the *test* runs. The code under test
+    /// runs its own git — `run_op`'s `checkout --`, `probe_status`,
+    /// `probe_diff` — with no overrides at all, and rightly so: it must obey
+    /// the repository the user actually has. So the line-ending rules have to
+    /// live in the repository, where every git that opens it will read them,
+    /// and repository config outranks the system config that put
+    /// `core.autocrlf=true` there.
+    ///
+    /// Call this straight after `git init`, before anything is written or
+    /// checked out, so no blob is ever created under the other rules.
+    pub(crate) fn pin_repo_config(repo: &Path) -> bool {
+        PINS.chunks(2).all(|pair| {
+            let Some((key, value)) = pair[1].split_once('=') else {
+                return false;
+            };
+            super::git_output(repo, &["config", key, value]).is_ok_and(|out| out.success())
+        })
+    }
+
+    /// A path in the one spelling two halves of an assertion can agree on.
+    ///
+    /// They do not naturally agree. Anything that came out of `git rev-parse`
+    /// is in git's dialect — forward slashes, no extended-length prefix, even
+    /// on Windows — while the expected side is usually built from
+    /// `fs::canonicalize`, which on Windows answers `\\?\C:\…`. Both name the
+    /// same directory and the Win32 file APIs take either, so the code under
+    /// test is right to pass git's answer straight through; it is only the
+    /// comparison that has to pick a spelling. On unix this is the identity.
+    ///
+    /// Note this normalises the *spelling*, not the path: equality stays exact.
+    pub(crate) fn one_spelling(p: &Path) -> String {
+        let slashed = p.to_string_lossy().replace('\\', "/");
+        match slashed.strip_prefix("//?/") {
+            Some(bare) => bare.to_string(),
+            None => slashed,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::one_spelling;
     use super::*;
 
     fn h() -> crate::host::SharedHost {
         crate::host::local::LocalHost::new()
+    }
+
+    /// The mapping [`test_support::one_spelling`] promises, proven on literals
+    /// rather than on whatever this machine's temp directory happens to be —
+    /// a developer on unix never sees either of the Windows shapes, which is
+    /// exactly how a comparison against `fs::canonicalize` reached Windows CI
+    /// unnoticed in the first place.
+    #[test]
+    fn one_spelling_folds_the_two_ways_windows_writes_a_path() {
+        assert_eq!(
+            one_spelling(Path::new(r"\\?\C:\Users\x\repo\.git")),
+            "C:/Users/x/repo/.git",
+            "the extended-length prefix goes, and the separators match git's"
+        );
+        assert_eq!(
+            one_spelling(Path::new(r"C:\Users\x\repo\.git")),
+            "C:/Users/x/repo/.git",
+            "a plain Windows path lands on the same spelling"
+        );
+        assert_eq!(
+            one_spelling(Path::new("C:/Users/x/repo/.git")),
+            "C:/Users/x/repo/.git",
+            "what git itself answers is already in that spelling"
+        );
+        assert_eq!(
+            one_spelling(Path::new("/private/var/t/repo/.git")),
+            "/private/var/t/repo/.git",
+            "on unix it is the identity, which is why this never fired locally"
+        );
     }
 
     #[test]
