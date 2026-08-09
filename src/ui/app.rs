@@ -3358,24 +3358,15 @@ impl Tty7App {
         cx.notify();
     }
 
-    /// Fills a rename box with the current name and puts the caret after it.
-    ///
-    /// `default_value` leaves the caret at offset 0, which turns typing into
-    /// prepending — renaming "tty7" reached "buildtty7" before it reached
-    /// "build". `set_value` lands the caret at the end of a single-line input,
-    /// which is where it belongs and what the file-tree rename box already
-    /// did. (Selecting the name outright would be better still, and is what
-    /// the platform does, but `InputState::select_all` is not public.)
+    /// Opens a rename box on the current name, selected and focused, so the
+    /// first thing typed replaces it.
     pub(crate) fn rename_box(
         current: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
-        let input = cx.new(|cx| InputState::new(window, cx));
-        input.update(cx, |state, cx| {
-            state.set_value(current, window, cx);
-            state.focus(window, cx);
-        });
+        let input = crate::ui::prefill::filled_box(current, window, cx);
+        input.update(cx, |state, cx| state.focus(window, cx));
         input
     }
 

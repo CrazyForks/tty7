@@ -147,6 +147,7 @@ pub(crate) struct SftpPanelState {
     pub(crate) loading: bool,
     nav_gen: u64,
     pub(crate) editing: Option<SftpEdit>,
+    editing_sub: Vec<Subscription>,
     pub(crate) editing_path: Option<gpui::Entity<InputState>>,
     editing_path_sub: Vec<Subscription>,
     pub(crate) poll_gen: u64,
@@ -181,6 +182,7 @@ impl SftpPanelState {
             loading: false,
             nav_gen: 0,
             editing: None,
+            editing_sub: Vec::new(),
             editing_path: None,
             editing_path_sub: Vec::new(),
             poll_gen: 0,
@@ -324,7 +326,7 @@ impl Tty7App {
         self.sftp_panel.open_pane_id = None;
         self.sftp_panel.entries.clear();
         self.sftp_panel.error = None;
-        self.sftp_panel.editing = None;
+        self.sftp_close_edit();
         self.sftp_panel.editing_path = None;
         self.sftp_panel.editing_path_sub.clear();
         self.sftp_panel.jobs.clear();
@@ -360,7 +362,7 @@ impl Tty7App {
         self.sftp_panel.open_workspace = self.pane_workspace(pane_id, window, cx);
         self.sftp_panel.entries.clear();
         self.sftp_panel.error = None;
-        self.sftp_panel.editing = None;
+        self.sftp_close_edit();
         self.sftp_panel.editing_path = None;
         self.sftp_panel.editing_path_sub.clear();
         self.sftp_panel.show_history = false;
@@ -473,7 +475,7 @@ impl Tty7App {
             return;
         }
         let cwd = self.sftp_panel.cwd.clone();
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(cwd));
+        let input = crate::ui::prefill::filled_box(cwd, window, cx);
         input.update(cx, |s, cx| s.focus(window, cx));
         let sub = cx.subscribe_in(
             &input,
@@ -664,7 +666,7 @@ impl Tty7App {
                         cx.notify();
                     }
                     _ => {
-                        this.sftp_panel.editing = None;
+                        this.sftp_close_edit();
                         this.sftp_refresh(cx);
                     }
                 }
@@ -673,13 +675,39 @@ impl Tty7App {
         .detach();
     }
 
+    /// Puts one of the four edit forms up, ready to type into.
+    ///
+    /// Every other box in the app opens focused and answers Return; these four
+    /// opened cold, so naming a new folder meant clicking into the field
+    /// first, and Return did nothing once you had.
+    fn sftp_open_edit(
+        &mut self,
+        input: gpui::Entity<InputState>,
+        edit: SftpEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        input.update(cx, |s, cx| s.focus(window, cx));
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    this.sftp_commit_edit(cx);
+                }
+            },
+        );
+        self.sftp_panel.editing = Some(edit);
+        self.sftp_panel.editing_sub = vec![sub];
+        cx.notify();
+    }
+
     pub(crate) fn sftp_begin_new_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(crate::ui::i18n::t(crate::ui::i18n::L10nKey::NewFolderName))
         });
-        self.sftp_panel.editing = Some(SftpEdit::NewFolder(input));
-        cx.notify();
+        self.sftp_open_edit(input.clone(), SftpEdit::NewFolder(input), window, cx);
     }
 
     pub(crate) fn sftp_begin_new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -687,8 +715,7 @@ impl Tty7App {
             InputState::new(window, cx)
                 .placeholder(crate::ui::i18n::t(crate::ui::i18n::L10nKey::NewFileName))
         });
-        self.sftp_panel.editing = Some(SftpEdit::NewFile(input));
-        cx.notify();
+        self.sftp_open_edit(input.clone(), SftpEdit::NewFile(input), window, cx);
     }
 
     pub(crate) fn sftp_begin_rename(
@@ -697,12 +724,12 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(name.clone()));
-        self.sftp_panel.editing = Some(SftpEdit::Rename {
+        let input = crate::ui::prefill::filled_box(name.clone(), window, cx);
+        let edit = SftpEdit::Rename {
             original: name,
-            input,
-        });
-        cx.notify();
+            input: input.clone(),
+        };
+        self.sftp_open_edit(input, edit, window, cx);
     }
 
     pub(crate) fn sftp_begin_chmod(
@@ -714,17 +741,25 @@ impl Tty7App {
         let octal = format!("{:o}", entry.permissions & 0o777);
         let readable = mode_string(entry.permissions);
         let path = remote_join(&self.sftp_panel.cwd, &entry.name);
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(octal));
-        self.sftp_panel.editing = Some(SftpEdit::Chmod {
+        let input = crate::ui::prefill::filled_box(octal, window, cx);
+        let edit = SftpEdit::Chmod {
             path,
             readable,
-            input,
-        });
-        cx.notify();
+            input: input.clone(),
+        };
+        self.sftp_open_edit(input, edit, window, cx);
+    }
+
+    /// Takes the form down and drops the subscription that was listening to
+    /// its box. The two travel together — a live subscription on a box nothing
+    /// is showing would answer Return for a form that is gone.
+    fn sftp_close_edit(&mut self) {
+        self.sftp_panel.editing = None;
+        self.sftp_panel.editing_sub.clear();
     }
 
     pub(crate) fn sftp_cancel_edit(&mut self, cx: &mut Context<Self>) {
-        self.sftp_panel.editing = None;
+        self.sftp_close_edit();
         cx.notify();
     }
 
@@ -754,7 +789,7 @@ impl Tty7App {
             Some(SftpEdit::Rename { original, input }) => {
                 let name = input.read(cx).value().trim().to_string();
                 if name.is_empty() || name == *original {
-                    self.sftp_panel.editing = None;
+                    self.sftp_close_edit();
                     cx.notify();
                     return;
                 }
@@ -1160,7 +1195,7 @@ impl Tty7App {
         row.child(div().flex_1().min_w(px(20.)).h(px(16.)))
     }
 
-    fn render_sftp_edit_form(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn render_sftp_edit_form(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let secondary = cx.theme().secondary;
         let border = cx.theme().border;
         let foreground = cx.theme().foreground;
@@ -1177,6 +1212,7 @@ impl Tty7App {
         };
         Some(
             v_flex()
+                .id("panel-sftp-edit")
                 .gap(px(5.))
                 .mx(px(CONTENT_INSET - 4.))
                 .mb(px(4.))
@@ -1185,6 +1221,13 @@ impl Tty7App {
                 .border_1()
                 .border_color(border)
                 .rounded_md()
+                // Escape backs out of the form, the way it backs out of the
+                // path editor above it and every sheet the app puts up.
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
+                    if ev.keystroke.key == "escape" {
+                        this.sftp_cancel_edit(cx);
+                    }
+                }))
                 .child(
                     div()
                         .text_xs()

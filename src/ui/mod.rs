@@ -18,6 +18,7 @@ pub mod palette;
 pub mod pane;
 pub mod pending_pane;
 pub mod perf;
+pub mod prefill;
 pub mod presets;
 pub mod remote_connect;
 pub mod remote_workspace;

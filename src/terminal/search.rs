@@ -60,35 +60,6 @@ impl SearchState {
     }
 }
 
-/// Select everything already in the find box, so ⌘F followed by typing
-/// replaces the last query instead of growing it.
-///
-/// The box keeps the previous query on purpose — stepping back through it is
-/// most of what a find bar is for — but that only works if the caret does not
-/// treat it as a prefix. It did: `default_value` leaves the caret at offset 0,
-/// so reopening and typing "beta" over "alpha" produced "betaalpha", and
-/// re-focusing an open bar appended instead.
-///
-/// `InputState::select_all` is not public, so this goes through the action the
-/// input binds ⌘A to, aimed at the input's own focus handle rather than at
-/// whatever is focused. It waits a frame because the dispatch tree an action is
-/// routed through is the one from the last frame drawn — a box that has just
-/// been created is not in it yet. That frame is also why this has no unit
-/// test: the test harness never paints, so the callback never runs there.
-fn select_whole_query(
-    input: &Entity<InputState>,
-    window: &mut Window,
-    cx: &mut Context<TerminalView>,
-) {
-    if input.read(cx).value().is_empty() {
-        return;
-    }
-    let handle = gpui::Focusable::focus_handle(input.read(cx), cx);
-    window.on_next_frame(move |window, cx| {
-        handle.dispatch_action(&gpui_component::input::SelectAll, window, cx);
-    });
-}
-
 impl TerminalView {
     pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fresh = self.search.is_none();
@@ -111,7 +82,10 @@ impl TerminalView {
         }
         if let Some(input) = self.search.as_ref().map(|s| s.input.clone()) {
             input.update(cx, |state, cx| state.focus(window, cx));
-            select_whole_query(&input, window, cx);
+            // The box keeps the last query on purpose — reopening on the word
+            // you just looked for is most of what a find bar is for — so the
+            // caret must not treat it as text to type around.
+            crate::ui::prefill::select_all_when_drawn(&input, window, cx);
         }
         if fresh {
             self.recompute_matches(cx);
