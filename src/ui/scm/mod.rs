@@ -8,6 +8,10 @@
 // `relative_time` has no row to date yet, and `status_rank` is the file tree's
 // to use. Both allows come off with the step that wires them up.
 pub(crate) mod actions;
+#[allow(dead_code)]
+pub(crate) mod detail;
+#[allow(dead_code)]
+pub(crate) mod graph;
 pub(crate) mod panel;
 #[allow(dead_code)]
 pub(crate) mod path;

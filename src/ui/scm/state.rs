@@ -174,6 +174,7 @@ pub(crate) struct GraphState {
 /// touched. A file-level diff is not shown here — that opens the full-screen
 /// overlay, because 260px cannot render a diff and pretending otherwise would
 /// mean inventing a third kind of container.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct CommitDetailView {
     pub(crate) repo: RepoKey,
     pub(crate) oid: String,

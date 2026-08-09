@@ -169,16 +169,23 @@ impl Tty7App {
         pinned.extend(naming);
         pinned.push(commit);
         pinned.push(buttons);
-        let body = if status.is_clean() {
-            self.panel_empty(
+        // A commit's detail replaces the working tree's, so the two can never
+        // be on screen claiming to be the same thing.
+        let detail = self.scm.detail.clone();
+        let body = match detail
+            .as_ref()
+            .and_then(|d| self.render_commit_detail(d, window, cx))
+        {
+            Some(body) => body,
+            None if status.is_clean() => self.panel_empty(
                 t(L10nKey::PanelNoChanges),
                 Some(t(L10nKey::PanelNoChangesHint)),
                 cx,
-            )
-        } else {
-            self.scm_groups(&repo, &status, cx)
+            ),
+            None => self.scm_groups(&repo, &status, cx),
         };
-        self.scm_shell_with(title, pinned, body)
+        let history = self.render_graph_section(&repo, window, cx);
+        self.scm_shell_full(title, pinned, body, history)
     }
 
     /// The repository line: which branch, how far from its upstream, and one
@@ -763,6 +770,17 @@ impl Tty7App {
         pinned: Vec<AnyElement>,
         body: AnyElement,
     ) -> AnyElement {
+        self.scm_shell_full(title, pinned, body, None)
+    }
+
+    /// …and `footer` is the history section, which scrolls on its own.
+    fn scm_shell_full(
+        &self,
+        title: AnyElement,
+        pinned: Vec<AnyElement>,
+        body: AnyElement,
+        footer: Option<AnyElement>,
+    ) -> AnyElement {
         let scroller = div()
             .id("panel-scm-body")
             .flex_1()
@@ -780,6 +798,7 @@ impl Tty7App {
                 scroller,
                 &self.scm.scroll,
             ))
+            .children(footer)
             .into_any_element()
     }
 
