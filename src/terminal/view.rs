@@ -2117,6 +2117,12 @@ impl TerminalView {
         if !self.accepts_input(cx) {
             return;
         }
+        // Same reason as `commit_text`: what is pasted lands on the prompt, so
+        // the prompt is what has to be on screen. Neither branch below moved
+        // the viewport, and a paste is a bigger change than a keystroke to
+        // make out of sight. This also clears the selection, which the tail of
+        // this function used to do on its own.
+        self.jump_to_prompt();
         if self.input_active() {
             let trimmed = text.strip_suffix('\n').unwrap_or(&text);
             self.cmd.insert_str(trimmed);
@@ -2134,7 +2140,6 @@ impl TerminalView {
             .mode()
             .contains(TermMode::BRACKETED_PASTE);
         self.write_gap_text(&text, paste_bytes(&text, bracketed), cx);
-        self.terminal.term.lock().selection = None;
         cx.notify();
     }
 
@@ -8617,6 +8622,26 @@ mod gpui_tests {
                     "the character went in while the viewport stayed in the scrollback"
                 );
                 assert_eq!(view.cmd.text(), "l", "and it did reach the line");
+            })
+            .unwrap();
+    }
+
+    /// A paste is a larger change than a keystroke to make out of sight, and
+    /// it went the same way.
+    #[gpui::test]
+    fn pasting_brings_the_view_back_to_the_prompt(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        prompt_ready(&window, cx, &mut daemon);
+        window
+            .update(cx, |view, _w, cx| {
+                scroll_into_history(view, 10);
+                view.paste("cargo test\n".to_string(), cx);
+                assert_eq!(display_offset(view), 0, "the paste landed off screen");
+                assert_eq!(
+                    view.cmd.text(),
+                    "cargo test",
+                    "and the trailing newline is still dropped"
+                );
             })
             .unwrap();
     }
