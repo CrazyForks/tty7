@@ -12,9 +12,9 @@
 use gpui::{AppContext as _, Context, Entity, Window};
 use gpui_component::input::{InputState, SelectAll};
 
-/// How many frames to keep trying for. Two is enough everywhere in the app;
-/// the rest is headroom for a surface that takes an extra frame to lay the box
-/// out, and the loop stops the moment the selection lands either way.
+/// How many frames to keep trying for. One is not enough — see below — and
+/// nothing in the app has needed more than two; the rest is headroom, and the
+/// loop stops the moment the selection lands.
 const ATTEMPTS: u8 = 4;
 
 /// Select everything in `input` as soon as it has been drawn.
@@ -29,6 +29,13 @@ const ATTEMPTS: u8 = 4;
 /// always enough. Rather than guess, dispatch and then look at whether it
 /// took. That is also why this cannot be unit-tested: the test harness never
 /// paints.
+///
+/// One box is deliberately left off this: the file tree's inline rename. The
+/// selection lands there like anywhere else — typing does replace the name —
+/// but that input paints no selection band, where the SFTP form's does, so the
+/// name would go in one keystroke with nothing on screen to warn of it. A
+/// selection you cannot see is worse than a caret in the wrong place, so that
+/// box keeps its caret at the end until the painting is understood.
 pub(crate) fn select_all_when_drawn<T: 'static>(
     input: &Entity<InputState>,
     window: &mut Window,
