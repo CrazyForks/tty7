@@ -1591,9 +1591,9 @@ mod tests {
         assert!(run(&*host, &repo, &["add", "-A"]));
         assert!(run(&*host, &repo, &["commit", "--quiet", "-m", "base"]));
 
-        let plain = scm_watch_dirs(&*host, &repo).expect("a repository was just created here");
-        assert_eq!(plain[0], repo.join(".git"));
-        assert!(plain.contains(&repo.join(".git").join("refs").join("heads")));
+        let plain = spelled(&scm_watch_dirs(&*host, &repo).expect("a repository is here"));
+        assert_eq!(plain[0], one_spelling(&repo.join(".git")));
+        assert!(plain.contains(&one_spelling(&repo.join(".git").join("refs").join("heads"))));
 
         let linked = base.join("wt");
         if !run(
@@ -1603,18 +1603,41 @@ mod tests {
         ) {
             return; // git too old for worktrees
         }
-        let dirs = scm_watch_dirs(&*host, &linked).expect("the linked worktree is a repository");
+        let dirs = spelled(&scm_watch_dirs(&*host, &linked).expect("the worktree is a repository"));
         assert!(
-            dirs[0].starts_with(repo.join(".git").join("worktrees")),
+            dirs[0].starts_with(&one_spelling(&repo.join(".git").join("worktrees"))),
             "HEAD and index live in the worktree's own git dir, got {dirs:?}"
         );
         assert!(
-            dirs.contains(&repo.join(".git")),
+            dirs.contains(&one_spelling(&repo.join(".git"))),
             "packed-refs lives in the common dir, and it is a different one, got {dirs:?}"
         );
         assert!(
-            dirs.contains(&repo.join(".git").join("refs").join("heads").join("feat")),
+            dirs.contains(&one_spelling(
+                &repo.join(".git").join("refs").join("heads").join("feat")
+            )),
             "`feat/x` needs its namespace listed: the watch does not recurse, got {dirs:?}"
         );
+    }
+
+    /// A path in the one spelling both halves of that test can agree on.
+    ///
+    /// The two halves do not naturally agree. `scm_watch_dirs` passes on what
+    /// `git rev-parse` answered, and git writes forward slashes and no
+    /// extended-length prefix even on Windows; the expected side is built from
+    /// `fs::canonicalize`, which on Windows returns `\\?\C:\…`. Both name the
+    /// same directory and the Win32 file APIs take either, so the watcher is
+    /// right to hand git's answer straight to `Host::watch` — it is only the
+    /// comparison here that has to pick a spelling.
+    fn one_spelling(p: &Path) -> String {
+        let slashed = p.to_string_lossy().replace('\\', "/");
+        match slashed.strip_prefix("//?/") {
+            Some(bare) => bare.to_string(),
+            None => slashed,
+        }
+    }
+
+    fn spelled(paths: &[std::path::PathBuf]) -> Vec<String> {
+        paths.iter().map(|p| one_spelling(p)).collect()
     }
 }
