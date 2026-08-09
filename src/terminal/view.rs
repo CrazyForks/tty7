@@ -7098,6 +7098,10 @@ mod gpui_tests {
             *out.borrow_mut() = Some(view.clone());
             gpui_component::Root::new(view, window, cx)
         });
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.background_executor.run_until_parked();
         let view = built.borrow_mut().take().expect("the pane was built");
         (window, view, daemon_side)
     }
