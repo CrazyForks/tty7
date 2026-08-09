@@ -1127,6 +1127,25 @@ pub fn t_fmt(key: L10nKey, args: &[(&str, &str)]) -> String {
     apply_template(t(key), args, None)
 }
 
+/// The same key as every *other* locale words it.
+///
+/// Fingers learn a command's name once. Someone running the UI in Chinese who
+/// picked the habit up in English still types `theme`, and until this existed
+/// the palette answered "no matching commands" — the label it was matching
+/// against was the only one that existed. Callers keep these as hidden search
+/// aliases; nothing renders them, so the wording on screen never changes.
+pub fn alias_translations(key: L10nKey) -> Vec<&'static str> {
+    let shown = t(key);
+    let mut out = Vec::with_capacity(SUPPORTED_LANGUAGES.len() - 1);
+    for idx in 0..SUPPORTED_LANGUAGES.len() {
+        let text = translate(idx, key);
+        if text != shown && !out.contains(&text) {
+            out.push(text);
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluralCategory {
     Zero,

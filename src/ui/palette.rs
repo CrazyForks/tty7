@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::core::config::{Config, RightPanelTab, TabBarPosition};
 use crate::core::ssh_profile::parse_quick_connect;
-use crate::ui::i18n::{L10nKey, t, t_fmt};
+use crate::ui::i18n::{L10nKey, alias_translations, t, t_fmt};
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum CommandKind {
@@ -317,6 +317,10 @@ pub struct ChromeState {
 pub struct Command {
     pub title: String,
     pub subtitle: Option<String>,
+    /// Text the query may match but the row never shows: the same label as
+    /// every other locale words it, plus the stable command id. Built once,
+    /// with the entry — the filter runs on every keystroke.
+    pub aliases: Vec<&'static str>,
     pub kind: CommandKind,
     pub group: CommandGroup,
 }
@@ -326,9 +330,20 @@ impl Command {
         Self {
             title: title.into(),
             subtitle: None,
+            // The id is English and hyphenated ("change-theme"), which is close
+            // enough to what someone reaching past a translated label types.
+            aliases: kind.id().into_iter().collect(),
             kind,
             group: CommandGroup::Application,
         }
+    }
+
+    /// A command whose label comes out of the locale table, and which can
+    /// therefore also be found by the wording any other locale would show.
+    pub fn localized(key: L10nKey, kind: CommandKind) -> Self {
+        let mut cmd = Self::new(t(key), kind);
+        cmd.aliases.extend(alias_translations(key));
+        cmd
     }
 
     pub fn with_subtitle(mut self, subtitle: impl Into<String>) -> Self {
@@ -349,129 +364,129 @@ impl Command {
         let right_panel_open = chrome.right_panel_visible;
 
         let tabs = [
-            Command::new(t(L10nKey::CmdNewTab), NewTab),
-            Command::new(t(L10nKey::CmdNewWorktreeTab), NewWorktreeTab)
+            Command::localized(L10nKey::CmdNewTab, NewTab),
+            Command::localized(L10nKey::CmdNewWorktreeTab, NewWorktreeTab)
                 .with_subtitle(t(L10nKey::CmdNewWorktreeTabSubtitle)),
-            Command::new(t(L10nKey::CmdRenameTab), RenameTab),
-            Command::new(t(L10nKey::CmdSplitRight), SplitRight),
-            Command::new(t(L10nKey::CmdSplitDown), SplitDown),
-            Command::new(t(L10nKey::CmdZoomPane), ToggleMaximizePane),
-            Command::new(t(L10nKey::CmdNextPane), NextPane),
-            Command::new(t(L10nKey::CmdPreviousPane), PrevPane),
-            Command::new(t(L10nKey::CmdFocusPaneLeft), FocusPaneLeft),
-            Command::new(t(L10nKey::CmdFocusPaneRight), FocusPaneRight),
-            Command::new(t(L10nKey::CmdFocusPaneUp), FocusPaneUp),
-            Command::new(t(L10nKey::CmdFocusPaneDown), FocusPaneDown),
-            Command::new(t(L10nKey::CmdResizePaneLeft), ResizePaneLeft),
-            Command::new(t(L10nKey::CmdResizePaneRight), ResizePaneRight),
-            Command::new(t(L10nKey::CmdResizePaneUp), ResizePaneUp),
-            Command::new(t(L10nKey::CmdResizePaneDown), ResizePaneDown),
-            Command::new(t(L10nKey::CmdSwapPaneNext), SwapPaneNext),
-            Command::new(t(L10nKey::CmdSwapPanePrevious), SwapPanePrev),
-            Command::new(t(L10nKey::CmdNextTab), NextTab),
-            Command::new(t(L10nKey::CmdPreviousTab), PrevTab),
-            Command::new(t(L10nKey::CmdCopyWorkingDirectory), CopyWorkingDirectory),
-            Command::new(t(L10nKey::CmdCopySessionId), CopyAgentSessionId)
+            Command::localized(L10nKey::CmdRenameTab, RenameTab),
+            Command::localized(L10nKey::CmdSplitRight, SplitRight),
+            Command::localized(L10nKey::CmdSplitDown, SplitDown),
+            Command::localized(L10nKey::CmdZoomPane, ToggleMaximizePane),
+            Command::localized(L10nKey::CmdNextPane, NextPane),
+            Command::localized(L10nKey::CmdPreviousPane, PrevPane),
+            Command::localized(L10nKey::CmdFocusPaneLeft, FocusPaneLeft),
+            Command::localized(L10nKey::CmdFocusPaneRight, FocusPaneRight),
+            Command::localized(L10nKey::CmdFocusPaneUp, FocusPaneUp),
+            Command::localized(L10nKey::CmdFocusPaneDown, FocusPaneDown),
+            Command::localized(L10nKey::CmdResizePaneLeft, ResizePaneLeft),
+            Command::localized(L10nKey::CmdResizePaneRight, ResizePaneRight),
+            Command::localized(L10nKey::CmdResizePaneUp, ResizePaneUp),
+            Command::localized(L10nKey::CmdResizePaneDown, ResizePaneDown),
+            Command::localized(L10nKey::CmdSwapPaneNext, SwapPaneNext),
+            Command::localized(L10nKey::CmdSwapPanePrevious, SwapPanePrev),
+            Command::localized(L10nKey::CmdNextTab, NextTab),
+            Command::localized(L10nKey::CmdPreviousTab, PrevTab),
+            Command::localized(L10nKey::CmdCopyWorkingDirectory, CopyWorkingDirectory),
+            Command::localized(L10nKey::CmdCopySessionId, CopyAgentSessionId)
                 .with_subtitle(t(L10nKey::CmdCopySessionIdSubtitle)),
-            Command::new(t(L10nKey::CmdForkSession), ForkAgentSession)
+            Command::localized(L10nKey::CmdForkSession, ForkAgentSession)
                 .with_subtitle(t(L10nKey::CmdForkSessionSubtitle)),
-            Command::new(t(L10nKey::CmdMarkTabAsUnread), MarkTabUnread),
-            Command::new(t(L10nKey::CmdClosePaneTab), ClosePane),
-            Command::new(t(L10nKey::CmdCloseOtherTabs), CloseOtherTabs),
-            Command::new(t(L10nKey::CmdCloseTabsToTheRight), CloseTabsToTheRight),
-            Command::new(t(L10nKey::CmdReopenClosedTab), ReopenClosedTab),
+            Command::localized(L10nKey::CmdMarkTabAsUnread, MarkTabUnread),
+            Command::localized(L10nKey::CmdClosePaneTab, ClosePane),
+            Command::localized(L10nKey::CmdCloseOtherTabs, CloseOtherTabs),
+            Command::localized(L10nKey::CmdCloseTabsToTheRight, CloseTabsToTheRight),
+            Command::localized(L10nKey::CmdReopenClosedTab, ReopenClosedTab),
         ];
 
         let workspaces = [
-            Command::new(t(L10nKey::CmdNewWorkspace), NewWorkspace),
-            Command::new(t(L10nKey::CmdSwitchWorkspace), OpenWorkspacePicker),
-            Command::new(t(L10nKey::CmdRenameWorkspace), RenameWorkspace),
-            Command::new(t(L10nKey::CmdStopWorkspace), StopWorkspace)
+            Command::localized(L10nKey::CmdNewWorkspace, NewWorkspace),
+            Command::localized(L10nKey::CmdSwitchWorkspace, OpenWorkspacePicker),
+            Command::localized(L10nKey::CmdRenameWorkspace, RenameWorkspace),
+            Command::localized(L10nKey::CmdStopWorkspace, StopWorkspace)
                 .with_subtitle(t(L10nKey::CmdStopWorkspaceSubtitle)),
-            Command::new(t(L10nKey::CmdDeleteWorkspace), DeleteWorkspace)
+            Command::localized(L10nKey::CmdDeleteWorkspace, DeleteWorkspace)
                 .with_subtitle(t(L10nKey::CmdDeleteWorkspaceSubtitle)),
         ];
 
         let view = [
-            Command::new(
+            Command::localized(
                 if sidebar_hidden {
-                    t(L10nKey::CmdShowLeftSidebar)
+                    L10nKey::CmdShowLeftSidebar
                 } else {
-                    t(L10nKey::CmdHideLeftSidebar)
+                    L10nKey::CmdHideLeftSidebar
                 },
                 ToggleLeftPanel,
             ),
-            Command::new(
+            Command::localized(
                 if right_panel_open {
-                    t(L10nKey::CmdHideRightPanel)
+                    L10nKey::CmdHideRightPanel
                 } else {
-                    t(L10nKey::CmdShowRightPanel)
+                    L10nKey::CmdShowRightPanel
                 },
                 ToggleRightPanel,
             ),
-            Command::new(t(L10nKey::CmdShowCodePanel), ToggleCodePanel),
-            Command::new(
+            Command::localized(L10nKey::CmdShowCodePanel, ToggleCodePanel),
+            Command::localized(
                 if tab_bar_left {
-                    t(L10nKey::CmdTabBarMoveToTop)
+                    L10nKey::CmdTabBarMoveToTop
                 } else {
-                    t(L10nKey::CmdTabBarMoveToLeftSidebar)
+                    L10nKey::CmdTabBarMoveToLeftSidebar
                 },
                 ToggleTabSidebar,
             ),
-            Command::new(
-                t(L10nKey::CmdRightPanelInfo),
+            Command::localized(
+                L10nKey::CmdRightPanelInfo,
                 ShowRightPanel(RightPanelTab::Info),
             ),
-            Command::new(
-                t(L10nKey::CmdRightPanelChanges),
+            Command::localized(
+                L10nKey::CmdRightPanelChanges,
                 ShowRightPanel(RightPanelTab::Changes),
             ),
-            Command::new(
-                t(L10nKey::CmdRightPanelFiles),
+            Command::localized(
+                L10nKey::CmdRightPanelFiles,
                 ShowRightPanel(RightPanelTab::Files),
             ),
-            Command::new(t(L10nKey::CmdChangeTheme), OpenThemePicker),
-            Command::new(t(L10nKey::CmdResetFontSize), ResetFontSize),
-            Command::new(t(L10nKey::CmdEnterFullScreen), ToggleFullscreen),
+            Command::localized(L10nKey::CmdChangeTheme, OpenThemePicker),
+            Command::localized(L10nKey::CmdResetFontSize, ResetFontSize),
+            Command::localized(L10nKey::CmdEnterFullScreen, ToggleFullscreen),
         ];
 
         let terminal = [
-            Command::new(t(L10nKey::CmdClearScrollback), ClearTerminal),
-            Command::new(t(L10nKey::CmdFindInTerminal), FindInTerminal),
-            Command::new(t(L10nKey::CmdFindNext), FindNext),
-            Command::new(t(L10nKey::CmdFindPrevious), FindPrevious),
-            Command::new(t(L10nKey::CmdCopy), CopyText),
-            Command::new(t(L10nKey::CmdCut), CutText),
-            Command::new(t(L10nKey::CmdPaste), PasteText),
-            Command::new(t(L10nKey::CmdSelectAll), SelectAllText),
+            Command::localized(L10nKey::CmdClearScrollback, ClearTerminal),
+            Command::localized(L10nKey::CmdFindInTerminal, FindInTerminal),
+            Command::localized(L10nKey::CmdFindNext, FindNext),
+            Command::localized(L10nKey::CmdFindPrevious, FindPrevious),
+            Command::localized(L10nKey::CmdCopy, CopyText),
+            Command::localized(L10nKey::CmdCut, CutText),
+            Command::localized(L10nKey::CmdPaste, PasteText),
+            Command::localized(L10nKey::CmdSelectAll, SelectAllText),
         ];
 
         let ssh = [
-            Command::new(t(L10nKey::CmdSshAddConnection), OpenSshConnectInput),
-            Command::new(t(L10nKey::CmdSshManageProfiles), OpenSshProfiles),
-            Command::new(t(L10nKey::CmdSshReconnect), RestartSshSession),
-            Command::new(t(L10nKey::CmdSshRemoteFiles), ToggleSftp),
-            Command::new(t(L10nKey::CmdSshPortForwarding), ShowSshForwards),
+            Command::localized(L10nKey::CmdSshAddConnection, OpenSshConnectInput),
+            Command::localized(L10nKey::CmdSshManageProfiles, OpenSshProfiles),
+            Command::localized(L10nKey::CmdSshReconnect, RestartSshSession),
+            Command::localized(L10nKey::CmdSshRemoteFiles, ToggleSftp),
+            Command::localized(L10nKey::CmdSshPortForwarding, ShowSshForwards),
         ];
 
         let agents = [
-            Command::new(t(L10nKey::CmdAgentSendSelection), SendSelectionToAgent)
+            Command::localized(L10nKey::CmdAgentSendSelection, SendSelectionToAgent)
                 .with_subtitle(t(L10nKey::CmdAgentSendSelectionSubtitle)),
-            Command::new(t(L10nKey::CmdAgentSendGitDiffForReview), SendGitDiffToAgent)
+            Command::localized(L10nKey::CmdAgentSendGitDiffForReview, SendGitDiffToAgent)
                 .with_subtitle(t(L10nKey::CmdAgentSendGitDiffSubtitle)),
         ];
 
         let application = [
-            Command::new(t(L10nKey::CmdSettings), OpenSettings),
-            Command::new(t(L10nKey::CmdKeyboardShortcuts), ShowKeyboardShortcuts),
-            Command::new(t(L10nKey::CmdAboutTty7), About),
-            Command::new(t(L10nKey::CmdCheckForUpdates), CheckForUpdates),
-            Command::new(t(L10nKey::CmdDocumentation), OpenDocumentation),
-            Command::new(t(L10nKey::CmdJoinDiscord), OpenDiscord),
-            Command::new(t(L10nKey::CmdReportIssue), ReportIssue),
-            Command::new(t(L10nKey::CmdRestartServer), RestartDaemon)
+            Command::localized(L10nKey::CmdSettings, OpenSettings),
+            Command::localized(L10nKey::CmdKeyboardShortcuts, ShowKeyboardShortcuts),
+            Command::localized(L10nKey::CmdAboutTty7, About),
+            Command::localized(L10nKey::CmdCheckForUpdates, CheckForUpdates),
+            Command::localized(L10nKey::CmdDocumentation, OpenDocumentation),
+            Command::localized(L10nKey::CmdJoinDiscord, OpenDiscord),
+            Command::localized(L10nKey::CmdReportIssue, ReportIssue),
+            Command::localized(L10nKey::CmdRestartServer, RestartDaemon)
                 .with_subtitle(t(L10nKey::CmdRestartServerSubtitle)),
-            Command::new(t(L10nKey::CmdQuitTty7), Quit)
+            Command::localized(L10nKey::CmdQuitTty7, Quit)
                 .with_subtitle(t(L10nKey::CmdQuitTty7Subtitle)),
         ];
 
@@ -573,6 +588,11 @@ pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
     Some(score)
 }
 
+/// How far behind the visible label an alias hit lands. An alias *is* the
+/// command's own name, only in another language, so the gap is small — but two
+/// commands that both match must still be ordered by the text on screen.
+const ALIAS_PENALTY: i32 = 10;
+
 fn command_score(query: &str, cmd: &Command) -> Option<i32> {
     let title = fuzzy_score(query, &cmd.title);
     let subtitle = cmd
@@ -580,10 +600,16 @@ fn command_score(query: &str, cmd: &Command) -> Option<i32> {
         .as_deref()
         .and_then(|s| fuzzy_score(query, s))
         .map(|s| s / 2 - 25);
-    match (title, subtitle) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    }
+    // Aliases only ever decide whether a row is in the list and where it sits.
+    // The row keeps rendering `title` untouched, so a hit on wording the user
+    // cannot see can never end up underlined against the wrong characters.
+    let alias = cmd
+        .aliases
+        .iter()
+        .filter_map(|a| fuzzy_score(query, a))
+        .max()
+        .map(|s| s - ALIAS_PENALTY);
+    [title, subtitle, alias].into_iter().flatten().max()
 }
 
 /// A bounded nudge, not a re-ranking. Two commands that match the query about
@@ -1257,6 +1283,35 @@ mod tests {
         let title_hit = command_score("prod", &cmd).expect("title matches");
         let subtitle_hit = command_score("deploy", &cmd).expect("subtitle matches");
         assert!(title_hit > subtitle_hit);
+    }
+
+    #[test]
+    fn a_translated_command_is_still_found_by_its_english_name() {
+        crate::ui::i18n::set_locale("zh-CN");
+        let cmd = Command::localized(L10nKey::CmdChangeTheme, CommandKind::OpenThemePicker);
+        assert!(
+            !cmd.title.to_lowercase().contains("theme"),
+            "the row shows the Chinese label: {:?}",
+            cmd.title
+        );
+        assert!(
+            command_score("theme", &cmd).is_some(),
+            "an English query must find the Chinese-labelled row"
+        );
+        assert!(
+            command_score("テーマ", &cmd).is_some(),
+            "so must the Japanese one"
+        );
+        // The displayed label still works, and still wins: the same query
+        // against the locale that shows it scores higher.
+        let zh = command_score("更改主题", &cmd).expect("the shown label matches");
+        crate::ui::i18n::set_locale("en");
+        let en = Command::localized(L10nKey::CmdChangeTheme, CommandKind::OpenThemePicker);
+        assert!(zh > 0 && en.title.contains("Theme"));
+        assert!(
+            command_score("theme", &en).unwrap() > command_score("theme", &cmd).unwrap(),
+            "a hit on the visible label must outrank the same hit on an alias"
+        );
     }
 
     #[test]
