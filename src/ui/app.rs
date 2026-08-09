@@ -413,6 +413,10 @@ pub struct Tty7App {
     _appearance_watch: Subscription,
     palette: Option<Entity<PaletteView>>,
     palette_sub: Option<Subscription>,
+    /// Preset that was live when the palette's theme picker started previewing.
+    /// `Some` means the theme on screen is a preview that was never written to
+    /// disk, and closing the palette without confirming puts this one back.
+    theme_preview_restore: Option<String>,
     pub(crate) closed: Vec<SessionTab>,
     pub(crate) renaming: Option<Renaming>,
     pub(crate) worktree_prompt: Option<crate::ui::worktree_prompt::WorktreePrompt>,
@@ -936,6 +940,7 @@ impl Tty7App {
             _appearance_watch: appearance_watch,
             palette: None,
             palette_sub: None,
+            theme_preview_restore: None,
             closed: Vec::new(),
             renaming: None,
             worktree_prompt: None,
@@ -1533,6 +1538,14 @@ impl Tty7App {
     }
 
     pub(crate) fn set_preset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A confirmed pick ends any preview: there is nothing left to roll back.
+        self.theme_preview_restore = None;
+        self.write_preset(id, cx);
+        self.after_theme_change(window, cx);
+    }
+
+    /// Points whichever preset slot is live at `id`, in memory only.
+    fn write_preset(&mut self, id: &str, cx: &mut Context<Self>) {
         let dark_now = crate::ui::theme::system_dark(cx);
         let cfg = cx.global_mut::<Config>();
         if !cfg.theme_follow_system {
@@ -1542,7 +1555,27 @@ impl Tty7App {
         } else {
             cfg.theme_preset_light = id.to_string();
         }
-        self.after_theme_change(window, cx);
+    }
+
+    /// Shows a preset for as long as the palette's theme picker is open, so
+    /// arrowing through the list is how you find out what a theme looks like.
+    /// Nothing is written to `config.json` until the pick is confirmed.
+    pub(crate) fn preview_preset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.theme_preview_restore.is_none() {
+            self.theme_preview_restore = Some(crate::ui::theme::effective_preset_id(cx));
+        }
+        self.write_preset(id, cx);
+        self.apply_theme_change(false, window, cx);
+    }
+
+    /// Puts back the preset that was live before the preview started. A no-op
+    /// when nothing is being previewed.
+    pub(crate) fn cancel_preset_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.theme_preview_restore.take() else {
+            return;
+        };
+        self.write_preset(&id, cx);
+        self.apply_theme_change(false, window, cx);
     }
 
     pub(crate) fn set_slot_preset(
@@ -1609,9 +1642,18 @@ impl Tty7App {
     }
 
     fn after_theme_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_theme_change(true, window, cx);
+    }
+
+    /// Repaints everything a theme change touches. `persist` is false for a
+    /// palette preview, which repaints on every arrow key and must not turn
+    /// each of those keystrokes into a `config.json` write.
+    fn apply_theme_change(&mut self, persist: bool, window: &mut Window, cx: &mut Context<Self>) {
         apply_theme(Some(window), cx);
         set_menus(cx);
-        cx.global::<Config>().save();
+        if persist {
+            cx.global::<Config>().save();
+        }
         self.rebuild_theme_editor(window, cx);
         self.sync_window_opacity_slider(window, cx);
         cx.notify();
@@ -3749,16 +3791,30 @@ impl Tty7App {
         match ev {
             PaletteEvent::Confirm(kind) => {
                 let kind = kind.clone();
+                // The picker is already showing this theme; keep it through the
+                // close instead of reverting and re-applying it.
+                if matches!(kind, CommandKind::SetTheme(_)) {
+                    self.theme_preview_restore = None;
+                }
                 self.close_palette(window, cx);
                 self.run_command(kind, window, cx);
             }
             PaletteEvent::Dismiss => self.close_palette(window, cx),
+            PaletteEvent::PreviewTheme(i) => {
+                if let Some(id) = crate::ui::presets::all(cx).get(*i).map(|t| t.id.clone()) {
+                    self.preview_preset(&id, window, cx);
+                }
+            }
+            PaletteEvent::CancelThemePreview => self.cancel_preset_preview(window, cx),
         }
     }
 
     pub(crate) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = None;
         self.palette_sub = None;
+        // A previewed theme was never persisted: closing the palette any way
+        // other than confirming the pick puts the old one back.
+        self.cancel_preset_preview(window, cx);
         self.focus_active(window, cx);
         cx.notify();
     }

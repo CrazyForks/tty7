@@ -520,6 +520,15 @@ impl Command {
             .collect()
     }
 
+    /// Row of the preset already in use, so the theme picker can open on it
+    /// instead of previewing something else the moment it is opened.
+    pub fn active_theme_index(cx: &App) -> Option<usize> {
+        let active = crate::ui::theme::effective_preset_id(cx);
+        crate::ui::presets::all(cx)
+            .iter()
+            .position(|p| p.id == active)
+    }
+
     fn ssh_connect_command(input: &str) -> Command {
         let trimmed = input.trim();
         let title = if trimmed.is_empty() {
@@ -782,7 +791,7 @@ impl ListDelegate for PaletteDelegate {
     fn perform_search(
         &mut self,
         query: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Task<()> {
         if let Some(PaletteInput::SshConnect) = self.input {
@@ -831,7 +840,12 @@ impl ListDelegate for PaletteDelegate {
                 commands,
             }];
         }
-        self.selected = self.first_row();
+        // Through `set_selected_index`, not by hand: the row index may not have
+        // moved, but the command under it has, and the theme picker previews
+        // the command — not the index.
+        self.selected = None;
+        let first = self.first_row();
+        self.set_selected_index(first, window, cx);
         Task::ready(())
     }
 
@@ -949,7 +963,14 @@ impl ListDelegate for PaletteDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) {
+        let moved = self.selected != ix;
         self.selected = ix;
+        // The list only emits `Select` for the arrow keys; a query that re-arms
+        // the first row moves the highlight silently. The theme picker previews
+        // whatever is highlighted, so it has to hear about both.
+        if moved && let Some(ix) = ix {
+            cx.emit(ListEvent::Select(ix));
+        }
         cx.notify();
     }
 }
@@ -957,6 +978,11 @@ impl ListDelegate for PaletteDelegate {
 pub enum PaletteEvent {
     Confirm(CommandKind),
     Dismiss,
+    /// Show the theme at this preset index without persisting it: the theme
+    /// picker previews the highlighted row while it stays open.
+    PreviewTheme(usize),
+    /// Put back the theme that was live before the preview started.
+    CancelThemePreview,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -970,6 +996,9 @@ pub struct PaletteView {
     list: Entity<ListState<PaletteDelegate>>,
     root: Vec<Command>,
     menu: PaletteMenu,
+    /// Preset index the theme picker is currently previewing, so the same
+    /// theme is not re-applied on every redundant selection event.
+    previewing: Option<usize>,
     _sub: Subscription,
 }
 
@@ -981,6 +1010,7 @@ impl PaletteView {
             list,
             root: commands,
             menu: PaletteMenu::Root,
+            previewing: None,
             _sub,
         }
     }
@@ -1021,8 +1051,20 @@ impl PaletteView {
         list
     }
 
-    fn show(&mut self, commands: Vec<Command>, window: &mut Window, cx: &mut Context<Self>) {
+    fn show(
+        &mut self,
+        commands: Vec<Command>,
+        selected: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let list = Self::build_list(commands, window, cx);
+        if let Some(row) = selected {
+            list.update(cx, |state, cx| {
+                state.set_selected_index(Some(IndexPath::new(row)), window, cx);
+                state.scroll_to_selected_item(window, cx);
+            });
+        }
         self._sub = cx.subscribe_in(&list, window, Self::on_list_event);
         self.list = list;
         cx.notify();
@@ -1065,7 +1107,11 @@ impl PaletteView {
                     Some(CommandKind::OpenThemePicker) => {
                         self.menu = PaletteMenu::Theme;
                         let themes = Command::theme_commands(cx);
-                        self.show(themes, window, cx);
+                        // Open on the theme already in use: the picker previews
+                        // the highlighted row, and merely opening it must not
+                        // change what the window looks like.
+                        self.previewing = Command::active_theme_index(cx);
+                        self.show(themes, self.previewing, window, cx);
                     }
                     Some(CommandKind::OpenSshConnectInput) => {
                         self.menu = PaletteMenu::SshConnect;
@@ -1081,6 +1127,12 @@ impl PaletteView {
             }
             ListEvent::Cancel => {
                 if self.menu != PaletteMenu::Root {
+                    if self.menu == PaletteMenu::Theme {
+                        // Backing out of the picker is not a choice: whatever
+                        // was previewed goes back to what it was.
+                        self.previewing = None;
+                        cx.emit(PaletteEvent::CancelThemePreview);
+                    }
                     self.menu = PaletteMenu::Root;
                     let root = self.root.clone();
                     let list = Self::build_root_list(root, window, cx);
@@ -1091,7 +1143,15 @@ impl PaletteView {
                     cx.emit(PaletteEvent::Dismiss);
                 }
             }
-            ListEvent::Select(_) => {}
+            ListEvent::Select(ix) => {
+                if self.menu == PaletteMenu::Theme
+                    && let Some(CommandKind::SetTheme(i)) = list.read(cx).delegate().command_at(*ix)
+                    && self.previewing != Some(i)
+                {
+                    self.previewing = Some(i);
+                    cx.emit(PaletteEvent::PreviewTheme(i));
+                }
+            }
         }
     }
 }
@@ -1338,6 +1398,30 @@ mod tests {
             let id = kind.id().expect("static command has an id");
             assert!(seen.insert(id), "duplicate command id {id:?}");
         }
+    }
+
+    /// The picker previews whatever row is highlighted, so it has to open on
+    /// the row of the theme already in use — the one carrying the check mark.
+    #[gpui::test]
+    fn the_theme_picker_opens_on_the_theme_in_use(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let themes = crate::ui::presets::all(cx);
+            let last = themes.last().expect("built-in themes").id.clone();
+            cx.set_global(Config(crate::core::config::CoreConfig {
+                theme_follow_system: false,
+                theme_preset: last,
+                ..Default::default()
+            }));
+
+            let ix = Command::active_theme_index(cx).expect("the live preset is listed");
+            assert_eq!(ix, themes.len() - 1);
+            let rows = Command::theme_commands(cx);
+            assert!(
+                rows[ix].title.ends_with('✓'),
+                "row {ix} ({:?}) should be the checked one",
+                rows[ix].title
+            );
+        });
     }
 
     #[test]
