@@ -69,11 +69,31 @@ const DIR_ONLY_COMMANDS: &[&str] = &["cd", "pushd", "popd", "rmdir"];
 
 /// Where the pipeline segment holding the cursor begins. `foo | bar baz` is two
 /// segments, and each one starts a fresh command position.
+///
+/// Quoting counts: in `git commit -m "fix bug; retry ` the `;` is part of the
+/// message, not a new command, and treating it as one turned the file
+/// completion the next word wants into a list of every binary on PATH.
 fn segment_start(prefix: &str) -> usize {
-    prefix
-        .rfind(['|', '&', ';', '\n', '('])
-        .map(|i| i + 1)
-        .unwrap_or(0)
+    let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in prefix.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            // A backslash escapes the next character everywhere but inside
+            // single quotes, where the shell takes it literally.
+            (None, '\\') | (Some('"'), '\\') => escaped = true,
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '|' | '&' | ';' | '\n' | '(') => start = i + c.len_utf8(),
+            (None, _) => {}
+        }
+    }
+    start
 }
 
 /// True when the word being completed is the first word of its segment, so it
@@ -768,6 +788,32 @@ mod tests {
         // when the user is typing `grep` is both wrong and slow.
         assert!(remote_path_request("ls | gre", 8, "/home/me").is_none());
         assert!(remote_path_request("ls | grep /et", 13, "/home/me").is_some());
+    }
+
+    #[test]
+    fn a_metacharacter_inside_quotes_does_not_start_a_new_command() {
+        // `;` in a commit message is text. Reading it as a pipeline separator
+        // put the next word in command position, so the menu filled with every
+        // binary on PATH instead of the files the argument wants.
+        let quoted = r#"git commit -m "fix bug; retry" ~/no"#;
+        assert!(!at_command_position(
+            &quoted.chars().collect::<Vec<_>>(),
+            quoted.chars().count() - 4
+        ));
+        let unterminated = r#"git commit -m "fix bug; retry "#;
+        let chars: Vec<char> = unterminated.chars().collect();
+        assert!(!at_command_position(&chars, chars.len()));
+        // An escaped one outside quotes is text too.
+        let escaped = r"echo a\; ";
+        let chars: Vec<char> = escaped.chars().collect();
+        assert!(!at_command_position(&chars, chars.len()));
+        // A real separator still starts a command.
+        let piped = "ls | gre";
+        assert!(at_command_position(&piped.chars().collect::<Vec<_>>(), 5));
+        // …including the remote path request, which returns nothing there.
+        assert!(
+            remote_path_request(unterminated, unterminated.chars().count(), "/home/me").is_some()
+        );
     }
 
     #[test]
