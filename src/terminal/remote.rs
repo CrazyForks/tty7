@@ -553,6 +553,17 @@ impl RemoteTerminal {
         term.set_options(terminal_config_from_user(user_config));
     }
 
+    /// Whether this build puts back the cursor a repaint parked — see
+    /// [`crate::terminal::parked_cursor`].
+    ///
+    /// Only conhost parks one, so like `conpty_resize` the repair is Windows'
+    /// alone. On a raw pty the application owns the cursor and is free to end a
+    /// repaint on the text it just wrote and then echo the next keystroke
+    /// straight after it, with no positioning of its own: vim opens its command
+    /// line that way, and putting the cursor back on the cell the repaint hid it
+    /// on drops the `wq!` typed next onto the row being edited (#430).
+    const REPAIR_PARKED_CURSOR: bool = cfg!(windows);
+
     fn spawn_reader(
         term: Arc<FairMutex<Term<EventProxy>>>,
         proxy: EventProxy,
@@ -637,7 +648,9 @@ impl RemoteTerminal {
                                 // emulator to the cut, act on the state that
                                 // sequence left behind, carry on.
                                 let mut cuts: Vec<(usize, CursorCut)> = Vec::new();
-                                cursor_scan.feed(&out_batch, |off, c| cuts.push((off, c)));
+                                if Self::REPAIR_PARKED_CURSOR {
+                                    cursor_scan.feed(&out_batch, |off, c| cuts.push((off, c)));
+                                }
                                 {
                                     let t0 = trace.then(std::time::Instant::now);
                                     let mut term = term.lock();
@@ -3067,6 +3080,7 @@ mod tests {
     /// Feeds one conhost-shaped repaint and reports the cell the cursor ends on,
     /// waiting for the `X` the frame paints so the reader is known to be done.
     fn cursor_after_conpty_frame(frame: &[u8]) -> (i32, usize) {
+        crate::core::config::pin_test_config_dir();
         let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
         let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
 
@@ -3097,14 +3111,24 @@ mod tests {
 
     #[test]
     fn a_conpty_frame_that_shows_the_cursor_over_an_erase_keeps_the_cell_it_hid_on() {
-        assert_eq!(
-            cursor_after_conpty_frame(
-                b"\x1b[?25l\x1b[20;2HX\x1b[K\x1b[m\x1b[22;42H\x1b[K\x1b[?25h"
-            ),
-            (5, 3),
-            "conhost parked the cursor on the cell it erased last; the cursor \
-             belongs where it was when the repaint hid it"
+        let got = cursor_after_conpty_frame(
+            b"\x1b[?25l\x1b[20;2HX\x1b[K\x1b[m\x1b[22;42H\x1b[K\x1b[?25h",
         );
+        if RemoteTerminal::REPAIR_PARKED_CURSOR {
+            assert_eq!(
+                got,
+                (5, 3),
+                "conhost parked the cursor on the cell it erased last; the cursor \
+                 belongs where it was when the repaint hid it"
+            );
+        } else {
+            assert_eq!(
+                got,
+                (21, 41),
+                "with no conhost in between the stream is the application's own, \
+                 and the cell it left the cursor on is the cell it meant"
+            );
+        }
     }
 
     #[test]
@@ -3115,6 +3139,70 @@ mod tests {
             ),
             (8, 8),
             "the frame painted the cursor somewhere on purpose"
+        );
+    }
+
+    /// Issue #430. Vim opens its command line with exactly the shape the parked
+    /// -cursor scanner calls parked — hide, move around to paint, end on the `:`
+    /// it wrote — and then echoes every following keystroke as a bare byte at
+    /// wherever that left the cursor. Putting the cursor back on a raw pty
+    /// therefore does not straighten out a stray caret, it drops `wq!` onto the
+    /// row vim was editing. Bytes below are a capture of vim 9 on a 20x11 pty.
+    #[test]
+    fn a_raw_pty_repaint_keeps_the_cursor_the_frame_left_so_the_echo_lands_on_it() {
+        crate::core::config::pin_test_config_dir();
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(20, 11)).unwrap();
+
+        let mut stream: Vec<u8> = Vec::new();
+        // `vim test.md`: the alternate screen, the file, cursor home.
+        stream.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[1;1H123456789\x1b[1;1H");
+        // Esc, then `:` — two bracketed repaints, the second ending on the `:`
+        // vim wrote at the head of the command line.
+        stream.extend_from_slice(b"\x1b[?25l\x1b[m\x1b[11;10H^[\x1b[1;1H\x1b[?25h");
+        stream.extend_from_slice(b"\x1b[?25l\x1b[11;10H  \x1b[1;1H\x07\x1b[?25h");
+        stream.extend_from_slice(
+            b"\x1b[?25l\x1b[11;10H:\x1b[1;1H\x1b[11;1H\x1b[K\x1b[11;1H:\x1b[?25h",
+        );
+        // `w`, `q`, `!`: vim echoes them with no positioning of their own.
+        stream.extend_from_slice(b"wq!");
+        DaemonMsg::Output(stream).encode(&mut daemon_side).unwrap();
+        daemon_side.flush().unwrap();
+
+        let row = |t: &Term<EventProxy>, line: i32| -> String {
+            (0..20)
+                .map(|col| {
+                    t.grid()[alacritty_terminal::index::Line(line)]
+                        [alacritty_terminal::index::Column(col)]
+                    .c
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
+        // The whole batch is applied under one lock, so the `:` landing on the
+        // command line means every byte after it landed too.
+        let mut command_line = String::new();
+        let mut edited = String::new();
+        for _ in 0..600 {
+            {
+                let t = term.term.lock();
+                command_line = row(&t, 10);
+                edited = row(&t, 0);
+            }
+            if command_line.starts_with(':') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            command_line, ":wq!",
+            "the keystrokes belong after the `:` the repaint ended on"
+        );
+        assert_eq!(
+            edited, "123456789",
+            "and nothing of them belongs on the row vim was editing"
         );
     }
 

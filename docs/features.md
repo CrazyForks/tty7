@@ -106,6 +106,7 @@ Keys are shown in macOS notation — on Windows and Linux, read <kbd>⌘</kbd> a
 | <kbd>⌘ F</kbd> | search the scrollback |
 | <kbd>⌃ R</kbd> | fuzzy-search shell history |
 | <kbd>⌘ +</kbd> · <kbd>⌘ −</kbd> · <kbd>⌘ 0</kbd> | font size up · down · reset |
+| <kbd>⌘</kbd> + wheel | zoom the font by scrolling over a terminal |
 
 **Settings → Keybindings** (<kbd>⌘ ,</kbd>) lists every shortcut. Click one,
 press the new keys (<kbd>Esc</kbd> cancels, <kbd>Backspace</kbd> resets to

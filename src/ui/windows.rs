@@ -549,7 +549,7 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
     let existing = WindowRegistry::count(cx);
     let bounds = match remembered {
         Some(state) => {
-            let bounds = state.bounds();
+            let bounds = at_least_min_size(state.bounds());
             if cx.displays().iter().any(|d| d.bounds().intersects(&bounds)) {
                 bounds
             } else {
@@ -579,6 +579,23 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
         window_background: crate::ui::theme::background_appearance(cx),
         window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
         ..Default::default()
+    }
+}
+
+/// Grow a remembered bound back up to `MIN_SIZE`.
+///
+/// `window_min_size` only governs what a *drag* may do to a window; the bounds
+/// we open with are taken as given. A window that got under the minimum — an
+/// older build that had no minimum, a hand-edited `views.json`, a display that
+/// went away — was reopened at whatever it had been saved at, and the settings
+/// page it opened onto had never been laid out for that width.
+fn at_least_min_size(bounds: Bounds<gpui::Pixels>) -> Bounds<gpui::Pixels> {
+    Bounds {
+        origin: bounds.origin,
+        size: size(
+            bounds.size.width.max(px(MIN_SIZE.0)),
+            bounds.size.height.max(px(MIN_SIZE.1)),
+        ),
     }
 }
 
@@ -624,6 +641,37 @@ mod tests {
             point(px(100. + 2. * CASCADE_STEP), px(100. + 2. * CASCADE_STEP))
         );
         assert_eq!(cascade(b, 3).size, b.size);
+    }
+
+    #[test]
+    fn a_remembered_bound_under_the_minimum_is_grown_back_to_it() {
+        // The window in the report this was fixed for: 641x830, saved and
+        // reopened at a width no settings page is laid out for.
+        let undersized = Bounds {
+            origin: point(px(700.), px(60.)),
+            size: size(px(641.), px(830.)),
+        };
+        let grown = at_least_min_size(undersized);
+        assert_eq!(grown.size.width, px(MIN_SIZE.0));
+        assert_eq!(grown.size.height, px(830.), "a tall enough height is kept");
+        assert_eq!(grown.origin, undersized.origin, "the corner does not move");
+
+        let short = at_least_min_size(Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(1200.), px(300.)),
+        });
+        assert_eq!(short.size, size(px(1200.), px(MIN_SIZE.1)));
+    }
+
+    #[test]
+    fn a_remembered_bound_at_or_over_the_minimum_is_left_alone() {
+        let b = bounds_at(100., 100.);
+        assert_eq!(at_least_min_size(b).size, b.size);
+        let exact = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(MIN_SIZE.0), px(MIN_SIZE.1)),
+        };
+        assert_eq!(at_least_min_size(exact).size, exact.size);
     }
 
     #[test]

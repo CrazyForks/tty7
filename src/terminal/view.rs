@@ -23,8 +23,9 @@ use super::reverse_search::{self, ReverseSearch};
 use super::search::{LinkTarget, SearchState};
 use super::typeahead::{RawInput, Typeahead};
 use crate::core::actions::{
-    CloseActiveTab, ForkAgentSessionDown, ForkAgentSessionLeft, ForkAgentSessionRight,
-    ForkAgentSessionUp, NewTab, SendBackTab, SendTab, SplitDown, SplitRight, ToggleMaximizePane,
+    CloseActiveTab, DecreaseFontSize, ForkAgentSessionDown, ForkAgentSessionLeft,
+    ForkAgentSessionRight, ForkAgentSessionUp, IncreaseFontSize, NewTab, SendBackTab, SendTab,
+    SplitDown, SplitRight, ToggleMaximizePane,
 };
 use crate::core::config::{BellMode, Config, NotifyMode};
 use crate::daemon::protocol::{RemoteContext, ShellSpec};
@@ -113,6 +114,10 @@ const SCROLL_ANIM_MIN_JUMP: f32 = 1.0;
 /// to bridge the gaps in a momentum tail, short enough that reaching for the
 /// wheel right after a swipe is not mistaken for more of the swipe.
 const SCROLL_GESTURE_IDLE: std::time::Duration = std::time::Duration::from_millis(150);
+/// How far a trackpad has to travel, in lines, to earn one font-size step while
+/// the platform modifier is held. A wheel detent is one step on its own, so
+/// this only ever applies to the continuous stream a gesture produces.
+const ZOOM_SCROLL_LINES: f32 = 3.0;
 
 fn cwd_is_on_host(pane_runs_remotely: bool, host_is_local: bool) -> bool {
     match pane_runs_remotely {
@@ -160,6 +165,11 @@ pub struct TerminalView {
     /// modifiers the user actually held.
     context_menu_allowed: bool,
     scroll_debt: f32,
+    /// Lines travelled under the zoom modifier that have not yet added up to a
+    /// font-size step. Kept apart from [`scroll_debt`](Self::scroll_debt) so
+    /// letting go of the modifier mid-gesture cannot hand the leftovers of one
+    /// to the other.
+    zoom_debt: f32,
     pub(super) scroll_frac: f32,
     pub search: Option<SearchState>,
     pub cursor_visible: bool,
@@ -1095,6 +1105,7 @@ impl TerminalView {
             link_modifier_down: false,
             context_menu_allowed: true,
             scroll_debt: 0.,
+            zoom_debt: 0.,
             scroll_frac: 0.,
             search: None,
             cursor_visible: true,
@@ -4259,6 +4270,14 @@ impl TerminalView {
     }
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The platform modifier alone turns the wheel into a zoom, the way it
+        // does in a browser. Any other modifier alongside it is somebody else's
+        // gesture — shift in particular is the escape hatch that scrolls the
+        // scrollback out from under a mouse-reporting program.
+        if ev.modifiers.secondary() && ev.modifiers.number_of_modifiers() == 1 {
+            self.zoom_scroll(ev, window, cx);
+            return;
+        }
         let mult = cx.global::<Config>().mouse_scroll_multiplier;
         let raw = match ev.delta {
             ScrollDelta::Lines(p) => p.y,
@@ -4290,6 +4309,34 @@ impl TerminalView {
         } else {
             self.cancel_scroll_anim();
             self.smooth_scroll(delta, cx);
+        }
+    }
+
+    /// Resize the terminal font by whole steps under the platform modifier.
+    ///
+    /// The event never reaches the buffer, and never reaches the program
+    /// running in it either: zooming is chrome, and showing a pane to someone
+    /// standing behind you has to work the same whether or not what is running
+    /// asked for the wheel. Steps go out as the same actions the keyboard and
+    /// the View menu send, so the min/max clamp and the saved setting live in
+    /// one place — [`Tty7App::change_font_size`](crate::ui::app::Tty7App).
+    fn zoom_scroll(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Whatever the scrollback still had in flight is dropped: it was
+        // travelling in lines of a font that is about to change size.
+        self.cancel_scroll_anim();
+        let lines = match ev.delta {
+            ScrollDelta::Lines(p) => p.y,
+            ScrollDelta::Pixels(p) => p.y.as_f32() / self.line_height.as_f32(),
+        };
+        let gesturing = self.track_scroll_gesture(ev.touch_phase);
+        let (steps, debt) = zoom_scroll_steps(lines, self.zoom_debt, gesturing);
+        self.zoom_debt = debt;
+        for _ in 0..steps.unsigned_abs() {
+            if steps > 0 {
+                window.dispatch_action(Box::new(IncreaseFontSize), cx);
+            } else {
+                window.dispatch_action(Box::new(DecreaseFontSize), cx);
+            }
         }
     }
 
@@ -5869,6 +5916,30 @@ fn wrapped_click_index(
         Some(ni) => Some(ni),
         None => Some(len),
     }
+}
+
+/// How many font-size steps a zoom event is worth, and what is left over for
+/// the next one.
+///
+/// A wheel detent is a discrete click of intent, so it is one step whatever the
+/// platform says it covers — macOS calls a single notch five lines, and five
+/// points of font per notch would be unusable. A trackpad has no detents and
+/// spends a flick over dozens of events, so those accumulate and only pay out
+/// once the fingers have travelled [`ZOOM_SCROLL_LINES`].
+fn zoom_scroll_steps(lines: f32, debt: f32, gesturing: bool) -> (i32, f32) {
+    if !gesturing {
+        let step = if lines > 0. {
+            1
+        } else if lines < 0. {
+            -1
+        } else {
+            0
+        };
+        return (step, 0.);
+    }
+    let total = debt + lines;
+    let steps = (total / ZOOM_SCROLL_LINES).trunc();
+    (steps as i32, total - steps * ZOOM_SCROLL_LINES)
 }
 
 fn smooth_scroll_step(offset: usize, frac: f32, delta: f32, max: usize) -> (i32, f32) {
@@ -9001,6 +9072,46 @@ mod gpui_tests {
                 assert!(view.scroll_anim.is_some(), "nothing was left to animate");
             })
             .unwrap();
+    }
+
+    /// Zooming has to take the wheel away from the buffer entirely, or the
+    /// grid would slide under the pointer while the font changed size.
+    #[gpui::test]
+    fn the_zoom_modifier_takes_the_wheel_off_the_scrollback(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, w, cx| {
+                scroll_into_history(view, 10);
+                let mut ev = notch(view, -4.9);
+                ev.modifiers = Modifiers::secondary_key();
+                view.on_scroll(&ev, w, cx);
+                assert_eq!(display_offset(view), 10, "the wheel reached the grid");
+                assert!(view.scroll_anim.is_none(), "and queued more of it");
+            })
+            .unwrap();
+    }
+
+    /// A detent is one step however many lines the platform bills it as —
+    /// macOS calls a single notch five.
+    #[test]
+    fn a_wheel_detent_zooms_by_exactly_one_step() {
+        assert_eq!(zoom_scroll_steps(4.9, 0., false), (1, 0.));
+        assert_eq!(zoom_scroll_steps(-4.9, 0., false), (-1, 0.));
+        assert_eq!(zoom_scroll_steps(0., 0., false), (0, 0.));
+    }
+
+    /// A trackpad has no detents, so a flick arrives as a stream of slivers.
+    /// Paying out a step per sliver would run the font from end to end.
+    #[test]
+    fn a_trackpad_flick_adds_up_to_whole_steps() {
+        let (mut debt, mut steps) = (0., 0);
+        for _ in 0..20 {
+            let (s, d) = zoom_scroll_steps(1. / 3., debt, true);
+            steps += s;
+            debt = d;
+        }
+        assert_eq!(steps, 2, "twenty thirds of a line is two steps, not twenty");
+        assert!(debt > 0., "and the remainder was dropped instead of kept");
     }
 
     /// The one thing typing at a prompt must never do is land where the

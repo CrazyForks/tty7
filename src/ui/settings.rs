@@ -22,8 +22,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::core::config::{
-    BellMode, Config, CursorStyle, NewTabPosition, NotifyMode, TabBarPosition, UpdateChannel,
-    WindowBackdrop,
+    BellMode, Config, CursorStyle, NewTabPosition, NotifyMode, TabBarPosition,
+    UI_FONT_SIZE_DEFAULT, UpdateChannel, WindowBackdrop,
 };
 use crate::core::keychain::CredentialRef;
 use crate::core::ssh_profile::{
@@ -39,28 +39,191 @@ use crate::ui::presets;
 use crate::ui::rounding;
 use crate::ui::rounding::RoundedCorners as _;
 
-/// The settings nav, the SSH host list, and the padding each page sets — the
-/// chrome a row has to share the window with.
+/// The settings nav, the SSH host list, the theme panel, and the padding each
+/// page sets — the chrome a row has to share the window with.
 const NAV_W: f32 = 220.;
 const SSH_LIST_W: f32 = 280.;
+const THEME_PANEL_W: f32 = 300.;
 const SSH_DETAIL_PAD: f32 = 64.;
 const PAGE_PAD: f32 = 80.;
+
+/// The narrowest window these numbers have to hold for.
+///
+/// `ui::windows::MIN_SIZE` declares 720, but the settings window in the report
+/// this file was fixed for measured 641pt: `window_min_size` governs dragging,
+/// not the bounds a window opens with, so a remembered bound walked straight
+/// under it. `ui::windows::at_least_min_size` now closes that path, and this
+/// stays below it deliberately — a declared minimum is a claim about the code,
+/// and this file would rather be laid out for the window that turns up.
+const NARROWEST_WINDOW: f32 = 640.;
+
+/// The narrowest each list is still itself: a nav item that still shows a label
+/// beside its icon (40 of icon, gap and padding, then the longest label), a
+/// host row that still shows a name, a theme card that is still a recognisable
+/// picture of a theme.
+///
+/// The nav floor is sized for the longest nav label in *any* locale, not the
+/// one the developer happens to be reading. `SidebarMenuItem` clips its label
+/// rather than eliding it, so a floor that fits English cuts a glyph in half in
+/// Chinese and Japanese: at 140 the zh-CN "窗口与标签页" lost the right half of
+/// its last character. The widest is ja-JP "ウィンドウとタブ" — 8 full-width
+/// kana beside the icon, which is 36 more than the 6-glyph Chinese label needs.
+const NAV_W_MIN: f32 = 176.;
+const SSH_LIST_W_MIN: f32 = 180.;
+const THEME_PANEL_W_MIN: f32 = 240.;
+
+/// The reading column every scrolled page caps itself at. Wider than this and
+/// a description stops being a paragraph and becomes a line to scan across.
+const READING_COLUMN: f32 = 640.;
+
+/// What the page gets before any list does, and the floor it may be pushed to
+/// when even that cannot be had — the numbers this file did not have.
+///
+/// Every list beside the page was a fixed width that never gave anything back,
+/// so the page absorbed the entire shortfall. On a half-width window with the
+/// theme panel open that ran all the way down: a Chinese description came out
+/// one character per line, twenty-five lines tall, and the theme cards under it
+/// were slivers clipped by the window edge.
+///
+/// `CONTENT_W` holds a stacked row's widest control — the 260px text fields —
+/// with a description beside it that still reads as a paragraph. `CONTENT_MIN_W`
+/// is not chosen at all: it is what the narrowest window in the wild leaves the
+/// SSH page, the one that spends a second list, once both lists are standing on
+/// their own floors. A control wider than it has to be able to shrink, which is
+/// what `max_w_full` on the wrappers below is for.
+const CONTENT_W: f32 = 420.;
+const CONTENT_MIN_W: f32 = NARROWEST_WINDOW - NAV_W_MIN - SSH_LIST_W_MIN - SSH_DETAIL_PAD;
+
+/// What the settings page is made of at a given window width.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct SettingsColumns {
+    nav: f32,
+    /// Zero off the SSH page.
+    ssh_list: f32,
+    /// The width to *draw* the theme panel at, whether it is taking a column or
+    /// covering one — zero only when it is closed.
+    theme_panel: f32,
+    /// The panel no longer fits beside the page, so it lays itself over the
+    /// page instead of taking width from it. The panel is a temporary layer
+    /// over one choice; the page underneath is what the window is for.
+    panel_overlays: bool,
+}
+
+/// Hand every list its full width, then take the shortfall back from all of
+/// them at once — each in proportion to what it has to spare — until the page
+/// between them reaches `CONTENT_W`. Once every list is standing on its own
+/// floor the page takes whatever is left, which from `NARROWEST_WINDOW` up is
+/// never less than `CONTENT_MIN_W`. The theme panel leaves the row altogether
+/// rather than let it come to that.
+///
+/// Every width here is one this row can actually have, so the columns always
+/// add up to the window. That is deliberate: the fix for a page squeezed to
+/// nothing is not a `min_w` the row cannot honour — a floor a flex row cannot
+/// meet does not push back, it overflows, and overflow here means content
+/// painted off the edge of the window, which is the other half of this bug.
+fn settings_columns(
+    section: SettingsSection,
+    theme_panel_open: bool,
+    viewport: f32,
+) -> SettingsColumns {
+    let ssh = matches!(section, SettingsSection::Ssh);
+    // The panel belongs to Appearance; a stale open flag on any other page is
+    // not a column, the same way `render_settings` does not draw one.
+    let theme_panel_open = theme_panel_open && matches!(section, SettingsSection::Appearance);
+    let pad = if ssh { SSH_DETAIL_PAD } else { PAGE_PAD };
+    let page = CONTENT_W + pad;
+
+    // Even with the nav and the panel both at their floors there has to be a
+    // readable page left between them. Below that width the panel stops being a
+    // column — this is the one place the *floor* is the test, because the panel
+    // leaving the row is what buys the page its preferred width back.
+    let panel_overlays =
+        theme_panel_open && viewport - NAV_W_MIN - THEME_PANEL_W_MIN - PAGE_PAD < CONTENT_MIN_W;
+    let beside = theme_panel_open && !panel_overlays;
+
+    let mut nav = NAV_W;
+    let mut ssh_list = only_when(ssh, SSH_LIST_W);
+    let mut theme_panel = only_when(beside, THEME_PANEL_W);
+    let (nav_slack, list_slack, panel_slack) = (
+        NAV_W - NAV_W_MIN,
+        only_when(ssh, SSH_LIST_W - SSH_LIST_W_MIN),
+        only_when(beside, THEME_PANEL_W - THEME_PANEL_W_MIN),
+    );
+    let slack = nav_slack + list_slack + panel_slack;
+    let short = (nav + ssh_list + theme_panel + page - viewport).max(0.);
+    if short > 0. && slack > 0. {
+        let give = (short / slack).min(1.);
+        nav -= nav_slack * give;
+        ssh_list -= list_slack * give;
+        theme_panel -= panel_slack * give;
+    }
+    if panel_overlays {
+        // Covering the page, not replacing it: leave a strip of the page in
+        // view so the panel reads as something laid on top and dismissible.
+        theme_panel = THEME_PANEL_W
+            .min(viewport - nav - CONTENT_MIN_W / 2.)
+            .max(THEME_PANEL_W_MIN);
+    }
+    SettingsColumns {
+        nav: nav.round(),
+        ssh_list: ssh_list.round(),
+        theme_panel: theme_panel.round(),
+        panel_overlays,
+    }
+}
 
 /// What a row on this page really has to lay out in.
 ///
 /// The nav is always in front of it; the SSH page puts its host list there too,
-/// and only the scrolled pages cap the reading column at 640.
-fn settings_row_width(section: SettingsSection, viewport: f32) -> f32 {
+/// the theme panel takes another slice of Appearance for as long as it is open
+/// *and* still fits beside it, and only the scrolled pages cap the reading
+/// column.
+fn settings_row_width(
+    section: SettingsSection,
+    theme_panel_open: bool,
+    viewport: f32,
+    ui_scale: f32,
+) -> f32 {
+    let cols = settings_columns(section, theme_panel_open, viewport);
+    let panel = only_when(!cols.panel_overlays, cols.theme_panel);
     match section {
-        SettingsSection::Ssh => (viewport - NAV_W - SSH_LIST_W - SSH_DETAIL_PAD).max(0.),
-        _ => (viewport - NAV_W - PAGE_PAD).clamp(0., 640.),
+        SettingsSection::Ssh => (viewport - cols.nav - cols.ssh_list - SSH_DETAIL_PAD).max(0.),
+        _ => (viewport - cols.nav - panel - PAGE_PAD).clamp(0., READING_COLUMN * ui_scale),
     }
+}
+
+fn only_when(on: bool, w: f32) -> f32 {
+    if on { w } else { 0. }
+}
+
+/// How much wider every piece of text on this page is than the px thresholds
+/// below assume.
+///
+/// Those thresholds are widths a *label* needs, measured at the default
+/// interface font. The interface has a font size of its own and it goes up to
+/// 24 — half as wide again — while a slider or a text field beside that label
+/// stays the px width it was built at. Without this the row that has to stack
+/// first is the one that never does.
+fn ui_scale(cx: &App) -> f32 {
+    cx.global::<Config>().ui_font_size / UI_FONT_SIZE_DEFAULT
 }
 
 /// Width a settings row needs before its label and its control fit side by
 /// side: a 260px control, the `gap_8` between them, and enough left for a
 /// description to read as prose rather than as a column of words.
 const STACK_ROW_BELOW: f32 = 500.;
+
+/// Width a port-forwarding rule needs before its kind switch, its two host:port
+/// pairs, its description and its remove button all fit on one line: about 580
+/// with every field at its floor, rounded up. Past this the rule takes two
+/// lines instead of running off the page.
+const SPLIT_FORWARD_ROW_BELOW: f32 = 620.;
+
+/// And the width below which even `bind → target` is more than one line holds:
+/// two host fields at their narrow floor, two ports and the arrow come to about
+/// 310, which is more than `CONTENT_MIN_W`. The SSH page reaches this on the
+/// window the report came from, so the two ends take a line each.
+const STACK_FORWARD_ENDS_BELOW: f32 = 340.;
 
 fn settings_row_id(label: &str, _desc: &str) -> SharedString {
     SharedString::from(format!("settings-row-{label}"))
@@ -873,9 +1036,15 @@ impl Tty7App {
         let query = search.read(cx).value().trim().to_lowercase();
         let show_theme_panel = theme_panel_open && section == SettingsSection::Appearance;
 
+        let viewport_w = window.viewport_size().width.as_f32();
+        let ui_scale = ui_scale(cx);
+        self.settings_viewport_w.set(viewport_w);
+        let cols = settings_columns(section, show_theme_panel, viewport_w);
         self.settings_row_width.set(settings_row_width(
             section,
-            window.viewport_size().width.as_f32(),
+            show_theme_panel,
+            viewport_w,
+            ui_scale,
         ));
         self.settings_hit_anchored.set(false);
 
@@ -971,7 +1140,7 @@ impl Tty7App {
 
         let sidebar = Sidebar::new("settings-sidebar")
             .collapsible(SidebarCollapsible::None)
-            .w(px(220.))
+            .w(px(cols.nav))
             .header(
                 v_flex()
                     .w_full()
@@ -1040,6 +1209,12 @@ impl Tty7App {
         // No fill of its own: the root already paints the opaque surface and
         // the background image behind it, and repainting here would hide the
         // image again in the one pane that fills most of the panel.
+        //
+        // `min_w_0` and not a `CONTENT_MIN_W` floor: `settings_columns` sized
+        // the chrome so this pane clears it, and a floor a flex row cannot
+        // honour does not push the nav back — it overflows, and overflow here
+        // means content painted off the edge of the window, which is the other
+        // half of the bug this file is fixing.
         let content_pane = if section == SettingsSection::Ssh {
             v_flex()
                 .id("settings-content")
@@ -1067,7 +1242,7 @@ impl Tty7App {
                     div().w_full().px_10().py_8().child(
                         div()
                             .w_full()
-                            .max_w(px(640.))
+                            .max_w(px(READING_COLUMN * ui_scale))
                             .children(no_match_note)
                             .child(content),
                     ),
@@ -1129,7 +1304,25 @@ impl Tty7App {
                 )
                 .on_double_click(|_, window, _| window.titlebar_double_click()),
             )
-            .when(show_theme_panel, |r| r.child(self.render_theme_panel(cx)))
+            // Beside the page while there is room for both, over it when there
+            // is not. As a column it was taking its 300px from the page and
+            // from nothing else, which is how a half-width window ended up
+            // rendering a description one character wide.
+            .when(show_theme_panel && !cols.panel_overlays, |r| {
+                r.child(self.render_theme_panel(cx))
+            })
+            .when(show_theme_panel && cols.panel_overlays, |r| {
+                r.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .occlude()
+                        .shadow_lg()
+                        .child(self.render_theme_panel(cx)),
+                )
+            })
             .when(!show_theme_panel, |r| {
                 r.child(
                     div()
@@ -1159,6 +1352,27 @@ impl Tty7App {
             crate::ui::perf::record(label, start.elapsed());
         }
         root
+    }
+
+    /// The column widths this render settled on. `settings_columns` is pure and
+    /// cheap, so the two pages that draw chrome of their own work them out
+    /// again rather than have the answer threaded through every builder.
+    fn settings_columns_now(&self) -> SettingsColumns {
+        let (section, panel_open) = match self.active_settings() {
+            Some(s) => (
+                s.section,
+                s.theme_panel_open && s.section == SettingsSection::Appearance,
+            ),
+            None => (SettingsSection::Appearance, false),
+        };
+        settings_columns(section, panel_open, self.settings_viewport_w.get())
+    }
+
+    /// Whether the row measured this render came out narrower than a threshold
+    /// quoted at the default interface font — the only way those px thresholds
+    /// mean anything to a reader who scaled the interface up.
+    fn settings_row_under(&self, at_default_font: f32, cx: &App) -> bool {
+        self.settings_row_width.get() < at_default_font * ui_scale(cx)
     }
 
     fn header_text(&self, title: &str, cx: &Context<Self>) -> Div {
@@ -1270,7 +1484,7 @@ impl Tty7App {
         // where both still fit, put the control on its own line instead.
         // Measured, not `flex_wrap`: wrapping made the label column size to its
         // description, which then ran out past the row on every wide page.
-        let stacked = self.settings_row_width.get() < STACK_ROW_BELOW;
+        let stacked = self.settings_row_under(STACK_ROW_BELOW, cx);
         let labels = v_flex()
             .gap_0p5()
             .min_w_0()
@@ -1309,7 +1523,16 @@ impl Tty7App {
             .hover(|h| h.bg(gpui::rgb(cx.global::<presets::Surfaces>().window.hover)))
             .on_hover(cx.listener(|_this, _hovered, _window, cx| cx.notify()))
             .child(labels)
-            .child(h_flex().flex_shrink_0().child(control))
+            // Stacked, the control column takes the row: that is what gives a
+            // `max_w_full` control a definite width to shrink against, and on
+            // the SSH page the widest of them is 260 in a column that can be
+            // `CONTENT_MIN_W`.
+            .child(
+                h_flex()
+                    .when(stacked, |c| c.w_full())
+                    .when(!stacked, |c| c.flex_shrink_0())
+                    .child(control),
+            )
     }
 
     pub(crate) fn segmented(
@@ -1643,6 +1866,7 @@ impl Tty7App {
             .items_center()
             .gap_3()
             .w(px(240.))
+            .max_w_full()
             .child(div().flex_1().child(Slider::new(&slider)))
             .child(
                 div()
@@ -1951,7 +2175,7 @@ impl Tty7App {
             .child(
                 v_flex()
                     .flex_shrink_0()
-                    .w(px(280.))
+                    .w(px(self.settings_columns_now().ssh_list))
                     .h_full()
                     .border_r_1()
                     .border_color(border)
@@ -2455,7 +2679,12 @@ impl Tty7App {
                 h_flex()
                     .mt_3()
                     .gap_2()
-                    .child(div().w(px(320.)).child(Input::new(&input).small()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .max_w(px(320.))
+                            .child(Input::new(&input).small()),
+                    )
                     .child(
                         Button::new("ssh-quick-connect")
                             .label(t(L10nKey::Connect))
@@ -3172,6 +3401,7 @@ impl Tty7App {
                     t(L10nKey::SettingsNameDesc),
                     div()
                         .w(px(260.))
+                        .max_w_full()
                         .child(Input::new(&form.name).small())
                         .into_any_element(),
                     cx,
@@ -3183,8 +3413,19 @@ impl Tty7App {
                     t(L10nKey::SettingsHostDesc),
                     h_flex()
                         .gap_2()
-                        .child(div().w(px(172.)).child(Input::new(&form.host).small()))
-                        .child(div().w(px(80.)).child(Input::new(&form.port).small()))
+                        .max_w_full()
+                        .child(
+                            div()
+                                .w(px(172.))
+                                .min_w_0()
+                                .child(Input::new(&form.host).small()),
+                        )
+                        .child(
+                            div()
+                                .w(px(80.))
+                                .flex_shrink_0()
+                                .child(Input::new(&form.port).small()),
+                        )
                         .into_any_element(),
                     cx,
                 ),
@@ -3195,6 +3436,7 @@ impl Tty7App {
                     t(L10nKey::SettingsUserDesc),
                     div()
                         .w(px(260.))
+                        .max_w_full()
                         .child(Input::new(&form.user).small())
                         .into_any_element(),
                     cx,
@@ -3314,6 +3556,7 @@ impl Tty7App {
                     t(L10nKey::SettingsJumpHostDesc),
                     div()
                         .w(px(260.))
+                        .max_w_full()
                         .child(Input::new(&form.jump).small())
                         .into_any_element(),
                     cx,
@@ -3373,6 +3616,7 @@ impl Tty7App {
             )
             .child(
                 h_flex()
+                    .flex_wrap()
                     .gap_3()
                     .pt_1()
                     .text_xs()
@@ -3400,6 +3644,14 @@ impl Tty7App {
         };
         let incomplete = row.collect(cx).is_none() && !row.is_blank(cx);
 
+        // Below `SPLIT_FORWARD_ROW_BELOW` the five controls stop fitting on one
+        // line. The kind switch, the description and the remove button keep the
+        // first line; the mapping the rule is actually about takes the second,
+        // where two host fields, two ports and an arrow are what has to fit
+        // inside `CONTENT_MIN_W` — hence the lower floor on the host field.
+        let split = self.settings_row_under(SPLIT_FORWARD_ROW_BELOW, cx);
+        let stack_ends = self.settings_row_under(STACK_FORWARD_ENDS_BELOW, cx);
+        let host_min = if split { 80. } else { 104. };
         let endpoint = |host: &Entity<InputState>, port: &Entity<InputState>| {
             h_flex()
                 .gap_1()
@@ -3411,74 +3663,89 @@ impl Tty7App {
                 .child(
                     div()
                         .flex_1()
-                        .min_w(px(104.))
+                        .min_w(px(host_min))
                         .child(Input::new(host).xsmall()),
                 )
                 .child(div().text_xs().text_color(muted).child(":"))
                 .child(div().w(px(58.)).child(Input::new(port).xsmall()))
         };
+        let mapping = |line: Div| {
+            line.child(
+                div()
+                    .flex_1()
+                    .when(stack_ends, |end| end.w_full())
+                    .child(endpoint(&row.bind_host, &row.bind_port)),
+            )
+            .child(div().flex_shrink_0().text_xs().text_color(muted).child("→"))
+            .child(
+                div()
+                    .flex_1()
+                    .opacity(if needs_target {
+                        1.0
+                    } else {
+                        crate::ui::forwards::NO_TARGET_FADE
+                    })
+                    .when(stack_ends, |end| end.w_full())
+                    .child(endpoint(&row.target_host, &row.target_port)),
+            )
+        };
+
+        let kind_switch = div().flex_shrink_0().child(self.segmented(
+            format!("ssh-fwd-kind-{idx}"),
+            &["L", "R", "D"],
+            kind_idx,
+            cx,
+            move |this, ix, _w, cx| {
+                let kind = match ix {
+                    1 => ForwardKind::Remote,
+                    2 => ForwardKind::Dynamic,
+                    _ => ForwardKind::Local,
+                };
+                if let Some(f) = this.ssh_form_mut()
+                    && let Some(r) = f.forwards.get_mut(idx)
+                {
+                    r.kind = kind;
+                    cx.notify();
+                }
+            },
+        ));
+        let description = div()
+            .flex_1()
+            .min_w(px(80.))
+            .child(Input::new(&row.description).xsmall());
+        let remove = crate::ui::tab_strip::hit_target(
+            Button::new(("ssh-fwd-remove", idx))
+                .icon(Icon::new(IconName::Close))
+                .ghost()
+                .xsmall(),
+        )
+        .tooltip(t(L10nKey::SettingsRemoveRule))
+        .on_click(cx.listener(move |this, _, _w, cx| this.remove_forward_rule(idx, cx)));
+
+        let rule = match split {
+            true => v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(kind_switch)
+                        .child(description)
+                        .child(remove),
+                )
+                .child(match stack_ends {
+                    true => mapping(v_flex().gap_1().items_start()),
+                    false => mapping(h_flex().gap_2().items_center()),
+                }),
+            false => mapping(h_flex().gap_2().items_center().child(kind_switch))
+                .child(description)
+                .child(remove),
+        };
 
         v_flex()
             .gap_0p5()
             .py_1()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(self.segmented(
-                        format!("ssh-fwd-kind-{idx}"),
-                        &["L", "R", "D"],
-                        kind_idx,
-                        cx,
-                        move |this, ix, _w, cx| {
-                            let kind = match ix {
-                                1 => ForwardKind::Remote,
-                                2 => ForwardKind::Dynamic,
-                                _ => ForwardKind::Local,
-                            };
-                            if let Some(f) = this.ssh_form_mut()
-                                && let Some(r) = f.forwards.get_mut(idx)
-                            {
-                                r.kind = kind;
-                                cx.notify();
-                            }
-                        },
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(endpoint(&row.bind_host, &row.bind_port)),
-                    )
-                    .child(div().flex_shrink_0().text_xs().text_color(muted).child("→"))
-                    .child(
-                        div()
-                            .flex_1()
-                            .opacity(if needs_target {
-                                1.0
-                            } else {
-                                crate::ui::forwards::NO_TARGET_FADE
-                            })
-                            .child(endpoint(&row.target_host, &row.target_port)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(80.))
-                            .child(Input::new(&row.description).xsmall()),
-                    )
-                    .child(
-                        crate::ui::tab_strip::hit_target(
-                            Button::new(("ssh-fwd-remove", idx))
-                                .icon(Icon::new(IconName::Close))
-                                .ghost()
-                                .xsmall(),
-                        )
-                        .tooltip(t(L10nKey::SettingsRemoveRule))
-                        .on_click(
-                            cx.listener(move |this, _, _w, cx| this.remove_forward_rule(idx, cx)),
-                        ),
-                    ),
-            )
+            .child(rule)
             .when(incomplete, |col| {
                 col.child(div().text_xs().text_color(danger).child(if needs_target {
                     t(L10nKey::SettingsFwdNeedsBoth)
@@ -3550,6 +3817,7 @@ impl Tty7App {
                 desc.to_string(),
                 div()
                     .w(px(260.))
+                    .max_w_full()
                     .child(Input::new(input).small())
                     .into_any_element(),
                 cx,
@@ -3874,10 +4142,12 @@ impl Tty7App {
         });
         let program_control = div()
             .w(px(260.))
+            .max_w_full()
             .child(Input::new(&program_input).small().suffix(program_picker))
             .into_any_element();
         let args_control = div()
             .w(px(260.))
+            .max_w_full()
             .child(Input::new(&args_input).small())
             .into_any_element();
 
@@ -3908,6 +4178,7 @@ impl Tty7App {
         let wd_path_control = if wd_strategy == WdStrategy::Custom {
             div()
                 .w(px(260.))
+                .max_w_full()
                 .child(Input::new(&wd_path_input).small())
                 .into_any_element()
         } else {
@@ -3997,6 +4268,7 @@ impl Tty7App {
             .into_any_element();
         let link_file_command_control = div()
             .w(px(300.))
+            .max_w_full()
             .child(Input::new(&link_file_command_input).small())
             .into_any_element();
         let scrollback_radio = self.segmented(
@@ -4059,6 +4331,7 @@ impl Tty7App {
             .items_center()
             .gap_3()
             .w(px(240.))
+            .max_w_full()
             .child(div().flex_1().child(Slider::new(&scroll_slider)))
             .child(
                 div()
@@ -4264,6 +4537,7 @@ impl Tty7App {
             ),
             None => (AgentHooksView::Loading, None, HostId::LOCAL),
         };
+        let stacked = self.settings_row_under(STACK_ROW_BELOW, cx);
         let mut page = v_flex().child(self.section_intro(
             t(L10nKey::SettingsAgentsIntro),
             t(L10nKey::SettingsAgentsIntroDesc),
@@ -4308,9 +4582,13 @@ impl Tty7App {
                         .filter(|(for_agent, _)| *for_agent == agent)
                         .map(|(_, text)| text.clone());
 
+                    // Right-aligned beside its label, left-aligned under it —
+                    // `settings_row` gives the control column the whole row
+                    // once it stacks, and buttons flush to the far edge of a
+                    // row whose label starts at the near one read as unrelated.
                     let control = v_flex()
                         .gap_2()
-                        .items_end()
+                        .when(!stacked, |c| c.items_end())
                         .child(
                             h_flex()
                                 .gap_2()
@@ -4344,8 +4622,9 @@ impl Tty7App {
                             col.child(
                                 div()
                                     .max_w_80()
+                                    .max_w_full()
                                     .text_xs()
-                                    .text_right()
+                                    .when(!stacked, |note| note.text_right())
                                     .text_color(muted_fg)
                                     .child(text),
                             )
@@ -4797,6 +5076,9 @@ impl Tty7App {
         let open = self
             .active_settings()
             .is_some_and(|s| s.theme_panel_open && s.theme_panel_slot == slot);
+        // The same width a row stacks at: the card is a row too, just one whose
+        // control happens to be a whole preview.
+        let narrow = self.settings_row_under(STACK_ROW_BELOW, cx);
 
         div()
             .id(card_id)
@@ -4822,9 +5104,17 @@ impl Tty7App {
                     })
                     .bg(surface)
                     .hover(|h| h.bg(hover_bg))
-                    .child(div().w(px(150.)).flex_shrink_0().child(preview))
+                    // The preview is the first thing to go: it is a picture of a
+                    // choice the two lines beside it already name, and at the
+                    // width where it stops fitting it was pushing the "change
+                    // theme" affordance off the card.
+                    .when(!narrow, |card| {
+                        card.child(div().w(px(150.)).flex_shrink_0().child(preview))
+                    })
                     .child(
                         v_flex()
+                            .flex_1()
+                            .min_w_0()
                             .gap_0p5()
                             .child(div().text_xs().text_color(muted_fg).child(caption))
                             .child(
@@ -4836,9 +5126,9 @@ impl Tty7App {
                             )
                             .child(swatches),
                     )
-                    .child(div().flex_1())
                     .child(
                         h_flex()
+                            .flex_shrink_0()
                             .items_center()
                             .gap_1()
                             .text_sm()
@@ -4922,7 +5212,7 @@ impl Tty7App {
             });
 
         let search_box = div().px_4().pb_3().child(
-            div().w(px(268.)).child(
+            div().w_full().child(
                 Input::new(&search).small().prefix(
                     Icon::empty()
                         .path("stock/icons/search.svg")
@@ -4986,7 +5276,7 @@ impl Tty7App {
                     .cursor_pointer()
                     .child(
                         div()
-                            .w(px(268.))
+                            .w_full()
                             .rounded(rounding::TRACK_RADIUS)
                             .overflow_hidden()
                             .border_1()
@@ -5005,8 +5295,10 @@ impl Tty7App {
                         h_flex()
                             .items_center()
                             .gap_1p5()
+                            .w_full()
                             .child(
                                 div()
+                                    .truncate()
                                     .text_sm()
                                     .font_weight(if is_active {
                                         FontWeight::SEMIBOLD
@@ -5017,7 +5309,12 @@ impl Tty7App {
                                     .child(p.name.clone()),
                             )
                             .when(is_active, |s| {
-                                s.child(Icon::new(IconName::Check).small().text_color(foreground))
+                                s.child(
+                                    Icon::new(IconName::Check)
+                                        .small()
+                                        .flex_shrink_0()
+                                        .text_color(foreground),
+                                )
                             }),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| match slot {
@@ -5036,7 +5333,7 @@ impl Tty7App {
         }
 
         v_flex()
-            .w(px(300.))
+            .w(px(self.settings_columns_now().theme_panel))
             .h_full()
             .flex_shrink_0()
             .bg(bg)
@@ -5134,13 +5431,18 @@ impl Tty7App {
         // The label column has to be allowed to shrink, or its description sets
         // the row's width and the control it belongs to is pushed off the page.
         // `settings_row` does this for every other row in Settings; these two
-        // are hand-rolled and were missing it.
-        let preset_row = h_flex()
-            .w_full()
-            .items_center()
-            .justify_between()
-            .gap_8()
-            .py_2()
+        // are hand-rolled and were missing it. They take its breakpoint too:
+        // the segmented controls beside them are the widest on the page.
+        let stacked = self.settings_row_under(STACK_ROW_BELOW, cx);
+        let hand_rolled_row = |row: Div| {
+            row.w_full()
+                .flex()
+                .when(stacked, |r| r.flex_col().items_start().gap_2())
+                .when(!stacked, |r| {
+                    r.flex_row().items_center().justify_between().gap_8()
+                })
+        };
+        let preset_row = hand_rolled_row(div().py_2())
             .child(
                 v_flex()
                     .min_w_0()
@@ -5161,12 +5463,7 @@ impl Tty7App {
             )
             .child(h_flex().flex_shrink_0().child(preset_control));
 
-        let prefix_row = h_flex()
-            .w_full()
-            .items_center()
-            .justify_between()
-            .gap_8()
-            .py_2()
+        let prefix_row = hand_rolled_row(div().py_2())
             .child(
                 div()
                     .min_w_0()
@@ -5221,8 +5518,11 @@ impl Tty7App {
             let is_recording = recording.as_ref().is_some_and(|(a, _)| a == &action);
             let is_overridden = overridden.contains(&action);
 
+            // Wrapping, because a four-chord binding is wider than the column a
+            // narrow window leaves for it, and the alternative to a second line
+            // is a first one that runs off the page.
             let keycaps = |spec: &str| {
-                h_flex().gap_2().children(
+                h_flex().flex_wrap().gap_2().children(
                     crate::ui::keymap::key_chords(spec)
                         .into_iter()
                         .map(|chord| h_flex().gap_1().children(chord.into_iter().map(&keycap))),
@@ -5332,13 +5632,16 @@ impl Tty7App {
             }
             let last_in_group = heading_at.contains_key(&(i + 1)) || i + 1 == count;
             list = list.child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .py_1p5()
+                hand_rolled_row(div().py_1p5())
                     .when(!last_in_group, |s| s.border_b_1().border_color(border))
-                    .child(div().text_sm().text_color(foreground).child(label))
-                    .child(right),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(foreground)
+                            .child(label),
+                    )
+                    .child(right.flex_shrink_0()),
             );
         }
 
@@ -5454,6 +5757,7 @@ impl Tty7App {
         let http_proxy_control = v_flex()
             .gap_1()
             .w(px(260.))
+            .max_w_full()
             .child(Input::new(&http_proxy_input).small())
             .when(http_proxy_invalid, |this| {
                 this.child(
@@ -5809,21 +6113,177 @@ mod tests {
     use super::*;
 
     /// The row keeps its side-by-side shape while both halves fit, and stacks
-    /// once they do not. The SSH page reaches that point first — it spends 500px
-    /// on two lists before the row gets any.
+    /// once they do not. The SSH page reaches that point first — it spends its
+    /// host list before the row gets anything.
     #[test]
     fn a_row_stacks_once_its_label_and_control_stop_fitting() {
         use SettingsSection::*;
-        assert!(settings_row_width(Terminal, 1440.) >= STACK_ROW_BELOW);
-        assert!(settings_row_width(Terminal, 900.) >= STACK_ROW_BELOW);
-        assert!(settings_row_width(Terminal, 700.) < STACK_ROW_BELOW);
+        assert!(settings_row_width(Terminal, false, 1440., 1.) >= STACK_ROW_BELOW);
+        assert!(settings_row_width(Terminal, false, 900., 1.) >= STACK_ROW_BELOW);
+        // At the narrowest window that turns up the page is 420 wide, which is
+        // under the width where a label and a control still share a line.
+        assert!(settings_row_width(Terminal, false, NARROWEST_WINDOW, 1.) < STACK_ROW_BELOW);
         // Capped at the reading column, so a wider window never widens the row.
-        assert_eq!(settings_row_width(Terminal, 4000.), 640.);
-        // SSH crosses over while the window is still wide.
-        assert!(settings_row_width(Ssh, 1440.) >= STACK_ROW_BELOW);
-        assert!(settings_row_width(Ssh, 1000.) < STACK_ROW_BELOW);
+        assert_eq!(
+            settings_row_width(Terminal, false, 4000., 1.),
+            READING_COLUMN
+        );
+        // SSH crosses over while the window is still wide — it is the page that
+        // spends a host list before its rows get anything.
+        assert!(settings_row_width(Ssh, false, 1440., 1.) >= STACK_ROW_BELOW);
+        assert!(settings_row_width(Ssh, false, 900., 1.) < STACK_ROW_BELOW);
         // And never goes negative on a window narrower than its own chrome.
-        assert_eq!(settings_row_width(Ssh, 100.), 0.);
+        assert_eq!(settings_row_width(Ssh, false, 100., 1.), 0.);
+    }
+
+    /// Every list gives width back before the page does, and no combination of
+    /// page and panel leaves the page below the width it is derived to keep.
+    /// 641pt is the window the report came from — under the declared 720 —- so
+    /// that is the case that has to hold, not the one the manifest promises.
+    #[test]
+    fn the_page_keeps_a_readable_width_at_every_window_that_turns_up() {
+        use SettingsSection::*;
+        for section in SettingsSection::ALL {
+            for panel_open in [false, true] {
+                for viewport in [NARROWEST_WINDOW, 641., 720., 900., 1100., 1440., 2560.] {
+                    let cols = settings_columns(section, panel_open, viewport);
+                    let pad = match section {
+                        Ssh => SSH_DETAIL_PAD,
+                        _ => PAGE_PAD,
+                    };
+                    let panel = only_when(!cols.panel_overlays, cols.theme_panel);
+                    let page = viewport - cols.nav - cols.ssh_list - panel - pad;
+                    assert!(
+                        page >= CONTENT_MIN_W,
+                        "{viewport}px, {panel_open}: page got {page}, floor is {CONTENT_MIN_W}"
+                    );
+                    // And the columns add up to the window rather than past it,
+                    // which is what keeps the rightmost one on screen.
+                    assert!(cols.nav + cols.ssh_list + panel + pad + page <= viewport + 1.);
+                    assert!(cols.nav >= NAV_W_MIN && cols.nav <= NAV_W);
+                }
+            }
+        }
+    }
+
+    /// The three screenshots in the report, by the numbers measured off them.
+    /// Every one of them is the same 641pt window.
+    #[test]
+    fn the_reported_window_lays_out_without_running_off_the_screen() {
+        use SettingsSection::*;
+        const REPORTED: f32 = 641.;
+
+        // Shot 1 — SSH. Nav 220 and host list 280 left the detail 141pt and its
+        // empty state painted ~270 past the window edge. Both lists now stand
+        // on their floors and the detail keeps the rest.
+        let ssh = settings_columns(Ssh, false, REPORTED);
+        assert_eq!((ssh.nav, ssh.ssh_list), (NAV_W_MIN, SSH_LIST_W_MIN));
+        let detail = settings_row_width(Ssh, false, REPORTED, 1.);
+        assert!(detail >= CONTENT_MIN_W, "SSH detail got {detail}");
+
+        // Shot 2 — Appearance, panel closed. The opacity row measured a 78pt
+        // label beside a 240pt slider; at this width the row has to stack.
+        // The page does not reach its preferred `CONTENT_W` here: the nav floor
+        // is sized to show a Japanese nav label whole, and at 641 that costs the
+        // page the difference. Readable and stacked is the property that matters.
+        let page = settings_row_width(Appearance, false, REPORTED, 1.);
+        assert_eq!(page, REPORTED - NAV_W_MIN - PAGE_PAD);
+        assert!(page >= CONTENT_MIN_W, "the page got {page}");
+        assert!(
+            page < STACK_ROW_BELOW,
+            "the opacity row has to stack at 641"
+        );
+
+        // Shot 3 — Appearance with the theme panel. 220 + 300 of chrome left
+        // the page ~125pt, one Chinese character per line. The panel now lifts
+        // off the row entirely and the page is back to shot 2's width.
+        assert!(settings_columns(Appearance, true, REPORTED).panel_overlays);
+        assert_eq!(settings_row_width(Appearance, true, REPORTED, 1.), page);
+    }
+
+    /// The list that has to give the most is the one the window has the least
+    /// room for, and no list is ever asked for more than it has to spare.
+    #[test]
+    fn the_lists_shrink_together_and_stop_at_their_floors() {
+        use SettingsSection::*;
+        // Wide enough for everyone: nothing moves.
+        let wide = settings_columns(Ssh, false, 1440.);
+        assert_eq!((wide.nav, wide.ssh_list), (NAV_W, SSH_LIST_W));
+        // The reported window — half of a 1440pt screen, three columns on SSH.
+        // Both lists give, neither past its floor, and the detail comes out at
+        // its preferred width instead of the 336 it used to be left with.
+        let half = settings_columns(Ssh, false, 900.);
+        assert!(half.nav < NAV_W && half.ssh_list < SSH_LIST_W);
+        assert!(half.nav >= NAV_W_MIN && half.ssh_list >= SSH_LIST_W_MIN);
+        assert_eq!(
+            settings_row_width(Ssh, false, 900., 1.).round(),
+            CONTENT_W,
+            "the SSH detail should get its preferred width at 900pt"
+        );
+        // The narrowest window that turns up: both at the floor, page readable.
+        let tiny = settings_columns(Ssh, false, NARROWEST_WINDOW);
+        assert_eq!((tiny.nav, tiny.ssh_list), (NAV_W_MIN, SSH_LIST_W_MIN));
+        assert_eq!(
+            settings_row_width(Ssh, false, NARROWEST_WINDOW, 1.),
+            CONTENT_MIN_W
+        );
+    }
+
+    /// The thresholds are widths a *label* needs, and a reader who scaled the
+    /// interface up scaled every label with it while the slider beside it kept
+    /// the px width it was built at. A window that reads fine at the default
+    /// font is a starved label column at the largest one.
+    #[test]
+    fn the_stacking_width_follows_the_interface_font() {
+        use crate::core::config::UI_FONT_SIZE_MAX;
+        use SettingsSection::*;
+        let large = UI_FONT_SIZE_MAX / UI_FONT_SIZE_DEFAULT;
+        // Side by side at the default font...
+        assert!(settings_row_width(Appearance, false, 900., 1.) >= STACK_ROW_BELOW);
+        // ...and stacked at the largest, where the same row holds half as much.
+        assert!(
+            settings_row_width(Appearance, false, 900., large) < STACK_ROW_BELOW * large,
+            "a 900pt window at the largest interface font has to stack"
+        );
+        // The reading column grows with the font, so a wide window does not.
+        assert!(settings_row_width(Appearance, false, 1600., large) >= STACK_ROW_BELOW * large);
+    }
+
+    /// The theme panel took its 300px from the page and from nothing else, so
+    /// a half-width window with it open rendered a description one character
+    /// wide. It now shrinks with everything else, and stops being a column at
+    /// all once even that is not enough.
+    #[test]
+    fn the_theme_panel_yields_before_the_page_does() {
+        use SettingsSection::*;
+        assert!(settings_row_width(Appearance, true, 900., 1.) < STACK_ROW_BELOW);
+        assert!(
+            settings_row_width(Appearance, true, 900., 1.)
+                < settings_row_width(Appearance, false, 900., 1.)
+        );
+        // Beside the page while both fit — which, with the panel and the nav
+        // both allowed down to their floors, still holds at 720.
+        assert!(!settings_columns(Appearance, true, 900.).panel_overlays);
+        assert!(!settings_columns(Appearance, true, 720.).panel_overlays);
+        // ...and over it once they do not, at which point the page is back to
+        // the width it has with the panel closed.
+        assert!(settings_columns(Appearance, true, 641.).panel_overlays);
+        assert_eq!(
+            settings_row_width(Appearance, true, 641., 1.),
+            settings_row_width(Appearance, false, 641., 1.)
+        );
+        // The panel is the only chrome that can leave, so it has to leave in
+        // time: at 641 there is no arrangement in which it and a readable page
+        // both fit in a row.
+        assert!(
+            NARROWEST_WINDOW - NAV_W_MIN - THEME_PANEL_W_MIN - PAGE_PAD < CONTENT_MIN_W,
+            "the overlay threshold has to fire at the narrowest window"
+        );
+        // Wide enough and the cap is the reading column either way.
+        assert_eq!(
+            settings_row_width(Appearance, true, 1600., 1.),
+            READING_COLUMN
+        );
     }
 
     #[test]
