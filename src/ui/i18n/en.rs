@@ -1297,6 +1297,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsShellDetected => "Shells tty7 found",
         L10nKey::SftpErrorUnexpectedReply => "unexpected reply: {reply}",
         L10nKey::SftpErrorUnsafeRemoteName => "refusing unsafe remote name {name}",
+        L10nKey::SftpErrorNoFreeLocalName => {
+            "no free name left in Downloads for {name} — move or delete the older copies"
+        }
         L10nKey::SftpReplaceTitle => "Replace what is already there?",
         L10nKey::SftpReplaceBody => {
             "{names} already exist in this folder. Uploading overwrites them."

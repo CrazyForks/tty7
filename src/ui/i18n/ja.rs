@@ -1343,6 +1343,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsShellDetected => "tty7 が見つけたシェル",
         L10nKey::SftpErrorUnexpectedReply => "予期しない応答: {reply}",
         L10nKey::SftpErrorUnsafeRemoteName => "安全でないリモート名 {name} を拒否しました",
+        L10nKey::SftpErrorNoFreeLocalName => {
+            "ダウンロードフォルダに {name} の空き名がありません。古いコピーを移動または削除してください"
+        }
         L10nKey::SftpReplaceTitle => "既にあるファイルを置き換えますか？",
         L10nKey::SftpReplaceBody => {
             "{names} はこのフォルダに既に存在します。アップロードすると上書きされます。"

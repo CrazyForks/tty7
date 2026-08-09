@@ -1083,6 +1083,7 @@ l10n_keys! {
     SettingsShellDetected,
     SftpErrorUnexpectedReply,
     SftpErrorUnsafeRemoteName,
+    SftpErrorNoFreeLocalName,
     SftpReplaceTitle,
     SftpReplaceBody,
     Replace,

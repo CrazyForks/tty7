@@ -142,6 +142,10 @@ pub(crate) struct SftpPanelState {
     pub(crate) filter_input: gpui::Entity<InputState>,
     pub(crate) error: Option<String>,
     pub(crate) jobs: Vec<SftpJobProgress>,
+    /// Local names handed to a download that has not created its file yet.
+    /// Two quick downloads of the same remote file would otherwise both find
+    /// the name free and the second would write over the first.
+    claimed_downloads: HashSet<PathBuf>,
     dismissed_jobs: HashSet<u64>,
     show_history: bool,
     tray_expanded: bool,
@@ -177,6 +181,7 @@ impl SftpPanelState {
             filter_input,
             error: None,
             jobs: Vec::new(),
+            claimed_downloads: HashSet::new(),
             dismissed_jobs: HashSet::new(),
             show_history: false,
             tray_expanded: false,
@@ -272,10 +277,16 @@ fn local_download_dir() -> PathBuf {
 
 /// `dir/name`, or the first `dir/name (n)` that is not taken. A dotfile keeps
 /// its leading dot and gets the number on the end, the way the OS numbers one.
-fn free_local_path(dir: &Path, name: &str) -> PathBuf {
+///
+/// `claimed` names the downloads already in flight: their files do not exist
+/// yet, so the filesystem alone would hand the same name out twice. `None`
+/// means every name in range is spoken for — better to say so than to return
+/// one of them and quietly overwrite it.
+fn free_local_path(dir: &Path, name: &str, claimed: &HashSet<PathBuf>) -> Option<PathBuf> {
+    let taken = |p: &PathBuf| p.exists() || claimed.contains(p);
     let first = dir.join(name);
-    if !first.exists() {
-        return first;
+    if !taken(&first) {
+        return Some(first);
     }
     let path = Path::new(name);
     let ext = path.extension().map(|e| e.to_string_lossy().to_string());
@@ -283,16 +294,12 @@ fn free_local_path(dir: &Path, name: &str) -> PathBuf {
         .file_stem()
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_else(|| name.to_string());
-    for n in 2..1000u32 {
-        let candidate = match &ext {
+    (2..1000u32)
+        .map(|n| match &ext {
             Some(ext) => dir.join(format!("{stem} ({n}).{ext}")),
             None => dir.join(format!("{stem} ({n})")),
-        };
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    first
+        })
+        .find(|candidate| !taken(candidate))
 }
 
 impl Tty7App {
@@ -549,7 +556,24 @@ impl Tty7App {
         // Downloading twice used to write over the first copy without a word.
         // Browsers answer this by numbering the second one; that keeps the
         // gesture one click and still cannot lose a file.
-        let local = free_local_path(&local_download_dir(), &entry.name);
+        //
+        // A claim outlives its transfer only until the file lands, at which
+        // point `exists()` speaks for it and re-downloading something the user
+        // has since deleted starts again from the plain name.
+        self.sftp_panel.claimed_downloads.retain(|p| !p.exists());
+        let Some(local) = free_local_path(
+            &local_download_dir(),
+            &entry.name,
+            &self.sftp_panel.claimed_downloads,
+        ) else {
+            self.sftp_panel.error = Some(t_fmt(
+                L10nKey::SftpErrorNoFreeLocalName,
+                &[("name", &entry.name)],
+            ));
+            cx.notify();
+            return;
+        };
+        self.sftp_panel.claimed_downloads.insert(local.clone());
         let recursive = matches!(entry.kind, SftpEntryKind::Dir);
         let spec = SftpTransferSpec {
             pane_id,
@@ -1751,26 +1775,65 @@ mod tests {
     fn a_second_download_is_numbered_rather_than_written_over_the_first() {
         let dir = tempfile::tempdir().expect("tempdir");
         let d = dir.path();
+        let free = HashSet::new();
 
         // Nothing there: the plain name.
-        assert_eq!(free_local_path(d, "notes.txt"), d.join("notes.txt"));
+        assert_eq!(
+            free_local_path(d, "notes.txt", &free),
+            Some(d.join("notes.txt"))
+        );
 
         std::fs::write(d.join("notes.txt"), b"first").expect("write");
-        assert_eq!(free_local_path(d, "notes.txt"), d.join("notes (2).txt"));
+        assert_eq!(
+            free_local_path(d, "notes.txt", &free),
+            Some(d.join("notes (2).txt"))
+        );
         std::fs::write(d.join("notes (2).txt"), b"second").expect("write");
-        assert_eq!(free_local_path(d, "notes.txt"), d.join("notes (3).txt"));
+        assert_eq!(
+            free_local_path(d, "notes.txt", &free),
+            Some(d.join("notes (3).txt"))
+        );
 
         // Extensionless and dotfiles keep their shape.
         std::fs::write(d.join("Makefile"), b"x").expect("write");
-        assert_eq!(free_local_path(d, "Makefile"), d.join("Makefile (2)"));
+        assert_eq!(
+            free_local_path(d, "Makefile", &free),
+            Some(d.join("Makefile (2)"))
+        );
         std::fs::write(d.join(".env"), b"x").expect("write");
-        assert_eq!(free_local_path(d, ".env"), d.join(".env (2)"));
+        assert_eq!(free_local_path(d, ".env", &free), Some(d.join(".env (2)")));
 
         // And the first file is still the first file.
         assert_eq!(
             std::fs::read(d.join("notes.txt")).expect("read"),
             b"first".to_vec()
         );
+    }
+
+    #[test]
+    fn a_download_still_in_flight_holds_its_name_before_the_file_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+
+        // The first download has been handed a name but has written nothing
+        // yet, so `exists()` cannot see it. A second one must not take it.
+        let claimed: HashSet<PathBuf> = [d.join("notes.txt")].into_iter().collect();
+        assert_eq!(
+            free_local_path(d, "notes.txt", &claimed),
+            Some(d.join("notes (2).txt"))
+        );
+    }
+
+    #[test]
+    fn every_name_taken_reports_rather_than_overwriting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let mut claimed: HashSet<PathBuf> = HashSet::new();
+        claimed.insert(d.join("notes.txt"));
+        for n in 2..1000u32 {
+            claimed.insert(d.join(format!("notes ({n}).txt")));
+        }
+        assert_eq!(free_local_path(d, "notes.txt", &claimed), None);
     }
 
     #[test]

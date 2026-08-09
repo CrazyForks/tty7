@@ -1233,6 +1233,9 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsShellDetected => "tty7 检测到的 shell",
         L10nKey::SftpErrorUnexpectedReply => "意外回复：{reply}",
         L10nKey::SftpErrorUnsafeRemoteName => "拒绝不安全的远程名称 {name}",
+        L10nKey::SftpErrorNoFreeLocalName => {
+            "下载目录里 {name} 已无可用名称——请先移走或删除旧的副本"
+        }
         L10nKey::SftpReplaceTitle => "覆盖已有的文件？",
         L10nKey::SftpReplaceBody => "{names} 在这个文件夹里已经存在，上传会覆盖它们。",
         L10nKey::Replace => "覆盖",
