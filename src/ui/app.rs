@@ -7524,7 +7524,9 @@ mod shell_menu_gpui_tests {
     }
 }
 
-#[cfg(test)]
+// `harness_with_tabs` hands back the panes' `UnixStream`s, so it exists only
+// on unix — same as `ssh_rebuild_gpui_tests` below it.
+#[cfg(all(test, unix))]
 mod rename_gpui_tests {
     use gpui::TestAppContext;
 
