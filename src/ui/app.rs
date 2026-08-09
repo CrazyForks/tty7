@@ -440,9 +440,13 @@ pub struct Tty7App {
     pub(crate) sidebar_dragging: Rc<Cell<bool>>,
     /// How much width a settings row will actually get, measured once per
     /// render. `settings_row` is called from page builders that never see the
-    /// window, and the answer differs per page — the SSH page spends 500px on
-    /// its two lists first.
+    /// window, and the answer differs per page — the SSH page spends a host
+    /// list on top of the nav before the row gets anything.
     pub(crate) settings_row_width: Cell<f32>,
+    /// The window width the settings chrome sized itself against, measured in
+    /// the same pass. The pages that render their own chrome — the SSH host
+    /// list, the theme panel — are as blind to the window as `settings_row` is.
+    pub(crate) settings_viewport_w: Cell<f32>,
     /// Cleared at the top of every settings render, then set by the first row
     /// the live search matched, so exactly one row per page carries the anchor
     /// the page scrolls to.
@@ -971,6 +975,7 @@ impl Tty7App {
             sidebar_width: Rc::new(Cell::new(sidebar_width)),
             sidebar_dragging: Rc::new(Cell::new(false)),
             settings_row_width: Cell::new(f32::MAX),
+            settings_viewport_w: Cell::new(f32::MAX),
             settings_hit_anchored: Cell::new(false),
             right_panel_width: Rc::new(Cell::new(right_panel_width)),
             right_panel_dragging: Rc::new(Cell::new(false)),
