@@ -103,6 +103,7 @@ Aider、Amp、OpenCode 等共 18 个）并在其外围加功能 —— 绝不包
 | <kbd>⌘ F</kbd> | 搜索 scrollback |
 | <kbd>⌃ R</kbd> | 模糊搜索 shell 历史 |
 | <kbd>⌘ +</kbd> · <kbd>⌘ −</kbd> · <kbd>⌘ 0</kbd> | 字号增大 · 减小 · 重置 |
+| <kbd>⌘</kbd> + 滚轮 | 在终端上滚动缩放字号，演示时随手放大 |
 
 **设置 → 按键绑定**（<kbd>⌘ ,</kbd>）列出全部快捷键。点一行、按下新键即可
 （<kbd>Esc</kbd> 取消，<kbd>Backspace</kbd> 恢复默认），改完立即生效。窗格缩放与
