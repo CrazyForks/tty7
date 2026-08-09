@@ -49,17 +49,26 @@ const PAGE_PAD: f32 = 80.;
 
 /// The narrowest window these numbers have to hold for.
 ///
-/// `ui::windows::MIN_SIZE` declares 720 and there is only one `window_min_size`
-/// in the app, but the settings window in the report this file was fixed for
-/// measured 641pt — a restored window bound gets under the declared minimum.
-/// Derive from what turns up, not from what is declared.
+/// `ui::windows::MIN_SIZE` declares 720, but the settings window in the report
+/// this file was fixed for measured 641pt: `window_min_size` governs dragging,
+/// not the bounds a window opens with, so a remembered bound walked straight
+/// under it. `ui::windows::at_least_min_size` now closes that path, and this
+/// stays below it deliberately — a declared minimum is a claim about the code,
+/// and this file would rather be laid out for the window that turns up.
 const NARROWEST_WINDOW: f32 = 640.;
 
 /// The narrowest each list is still itself: a nav item that still shows a label
 /// beside its icon (40 of icon, gap and padding, then the longest label), a
 /// host row that still shows a name, a theme card that is still a recognisable
 /// picture of a theme.
-const NAV_W_MIN: f32 = 140.;
+///
+/// The nav floor is sized for the longest nav label in *any* locale, not the
+/// one the developer happens to be reading. `SidebarMenuItem` clips its label
+/// rather than eliding it, so a floor that fits English cuts a glyph in half in
+/// Chinese and Japanese: at 140 the zh-CN "窗口与标签页" lost the right half of
+/// its last character. The widest is ja-JP "ウィンドウとタブ" — 8 full-width
+/// kana beside the icon, which is 36 more than the 6-glyph Chinese label needs.
+const NAV_W_MIN: f32 = 176.;
 const SSH_LIST_W_MIN: f32 = 180.;
 const THEME_PANEL_W_MIN: f32 = 240.;
 
@@ -6174,8 +6183,12 @@ mod tests {
 
         // Shot 2 — Appearance, panel closed. The opacity row measured a 78pt
         // label beside a 240pt slider; at this width the row has to stack.
+        // The page does not reach its preferred `CONTENT_W` here: the nav floor
+        // is sized to show a Japanese nav label whole, and at 641 that costs the
+        // page the difference. Readable and stacked is the property that matters.
         let page = settings_row_width(Appearance, false, REPORTED, 1.);
-        assert_eq!(page, CONTENT_W);
+        assert_eq!(page, REPORTED - NAV_W_MIN - PAGE_PAD);
+        assert!(page >= CONTENT_MIN_W, "the page got {page}");
         assert!(
             page < STACK_ROW_BELOW,
             "the opacity row has to stack at 641"
