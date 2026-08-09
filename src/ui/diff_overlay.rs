@@ -12,8 +12,8 @@ use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_f
 use crate::core::config::{Config, DiffViewMode};
 use crate::core::git::status::DecoStatus;
 use crate::terminal::git_diff::{
-    self, AUTO_COLLAPSE_LINES, DiffSnapshot, DiffSource, DiffStats, FileDiff, FileStatus, LineKind,
-    MAX_RENDERED_FILES, Truncation,
+    self, AUTO_COLLAPSE_LINES, CommitLabel, DiffSnapshot, DiffSource, DiffStats, FileDiff,
+    FileStatus, LineKind, MAX_RENDERED_FILES, Truncation,
 };
 use crate::ui::app::Tty7App;
 use crate::ui::diff_rows::{Side, SplitCell, SplitRow, UnifiedRow, split_hunk, unified_rows};
@@ -21,6 +21,7 @@ use crate::ui::i18n::{L10nKey, t, t_fmt, t_plural};
 use crate::ui::right_panel::info_chip;
 use crate::ui::rounding;
 use crate::ui::rounding::RoundedCorners as _;
+use crate::ui::scm::path::relative_time;
 use crate::ui::scm::status::{status_color, status_glyph};
 
 pub(crate) enum DiffLoad {
@@ -444,6 +445,27 @@ impl Tty7App {
                     &mono,
                 ))
             })
+            // The subject takes the slack the spacer below would otherwise
+            // have, which is why that one is skipped when a label is present:
+            // two `flex_1` siblings split the line in half and the subject
+            // would truncate with empty space beside it.
+            .when_some(subject.label.as_ref(), |bar, label| {
+                bar.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .child(SharedString::from(label.subject.clone())),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label_byline(label, now_unix())),
+                )
+            })
             .when_some(focused_name(overlay), |bar, name| {
                 bar.child(
                     div().occlude().flex_shrink_0().child(
@@ -523,7 +545,7 @@ impl Tty7App {
                     )
                 },
             )
-            .child(div().flex_1())
+            .when(subject.label.is_none(), |bar| bar.child(div().flex_1()))
             .child(div().occlude().flex_shrink_0().child({
                 let sf = cx.global::<crate::ui::presets::Surfaces>().window;
                 let selected = usize::from(view_mode(cx) == DiffViewMode::Unified);
@@ -1062,7 +1084,7 @@ fn unified_marker(kind: LineKind) -> &'static str {
 /// `Copied` and `TypeChanged` have no decoration of their own — porcelain v2's
 /// index folds them the same way — so they take the nearest one rather than
 /// inventing a `C` and a `T` that appear in the overlay and nowhere else.
-fn deco_status(status: FileStatus) -> DecoStatus {
+pub(crate) fn deco_status(status: FileStatus) -> DecoStatus {
     match status {
         FileStatus::Added => DecoStatus::Added,
         FileStatus::Modified => DecoStatus::Modified,
@@ -1089,6 +1111,10 @@ struct SourceSubject {
     /// Set only where the branch name alone would be ambiguous.
     chip: Option<&'static str>,
     is_rev: bool,
+    /// What the commit is *about*, where whoever opened it knew. An object id
+    /// is an address, not a name, and a header with nothing but eight hex
+    /// digits leaves the reader to remember which commit that was.
+    label: Option<CommitLabel>,
 }
 
 fn source_subject(source: &DiffSource, branch: String) -> SourceSubject {
@@ -1097,6 +1123,7 @@ fn source_subject(source: &DiffSource, branch: String) -> SourceSubject {
         text: branch.clone(),
         chip,
         is_rev: false,
+        label: None,
     };
     match source {
         // Worktree and Head are both "the branch, right now"; the header for
@@ -1105,19 +1132,43 @@ fn source_subject(source: &DiffSource, branch: String) -> SourceSubject {
         // Staged is the branch too, but a patch that does not match the files
         // on disk — without the chip it is indistinguishable from the above.
         DiffSource::Staged => branch_of(Some("STAGED")),
-        DiffSource::Commit { rev } => SourceSubject {
+        DiffSource::Commit { rev, label } => SourceSubject {
             icon: "icons/git-commit.svg",
             text: short_rev(rev),
             chip: None,
             is_rev: true,
+            // An empty subject is no more use than no label at all, and a
+            // `Default::default()` that leaked through would render as one.
+            label: label.clone().filter(|l| !l.subject.is_empty()),
         },
         DiffSource::Range { base, head } => SourceSubject {
             icon: "icons/git-commit.svg",
             text: format!("{}…{}", short_rev(base), short_rev(head)),
             chip: None,
             is_rev: true,
+            label: None,
         },
     }
+}
+
+/// `Ada · 2h`, the byline under a commit's subject.
+///
+/// One string rather than two elements: the separator has to disappear along
+/// with whichever half is missing, and a `when_some` chain around a middle dot
+/// says less than this does.
+fn label_byline(label: &CommitLabel, now: i64) -> String {
+    let when = (label.at > 0).then(|| relative_time(now, label.at));
+    match (label.author.trim(), when) {
+        ("", Some(when)) => when,
+        (author, Some(when)) => format!("{author} · {when}"),
+        (author, None) => author.to_string(),
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Object ids get cut to eight characters; anything else is already a name a
@@ -1191,15 +1242,19 @@ fn oversized_summary(snap: &DiffSnapshot, stats: &DiffStats) -> String {
 
 /// The de-duplication sets on `Tty7App` are keyed by `(HostId, PathBuf)`, so
 /// the source rides along inside the path: two sources over one directory are
-/// two independent probes and must not cancel one another. `Debug` is what
-/// makes the tag unique — it carries the rev of a `Commit` and both ends of a
-/// `Range` — and the separator is a byte no path contains.
+/// two independent probes and must not cancel one another.
+///
+/// `DiffSource::tag` rather than `Debug`, which is what this used to be built
+/// from. `Debug` prints a commit's label too, so the same commit opened with a
+/// subject in hand and without one would have been two keys and two probes for
+/// one patch — the same split `DiffSource`'s own `PartialEq` is written to
+/// avoid. The separator is a byte no path contains.
 fn probe_key(
     host: crate::ui::host_ops::HostId,
     cwd: &Path,
     source: &DiffSource,
 ) -> (crate::ui::host_ops::HostId, PathBuf) {
-    let mut tagged = std::ffi::OsString::from(format!("{source:?}\u{1}"));
+    let mut tagged = std::ffi::OsString::from(format!("{}\u{1}", source.tag()));
     tagged.push(cwd.as_os_str());
     (host, PathBuf::from(tagged))
 }
@@ -1227,14 +1282,32 @@ mod tests {
         assert_ne!(worktree, probe_key(host, cwd, &DiffSource::Staged));
         assert_ne!(worktree, probe_key(host, cwd, &DiffSource::Head));
         assert_ne!(
-            probe_key(host, cwd, &DiffSource::Commit { rev: "a".into() }),
-            probe_key(host, cwd, &DiffSource::Commit { rev: "b".into() }),
+            probe_key(host, cwd, &DiffSource::commit("a")),
+            probe_key(host, cwd, &DiffSource::commit("b")),
             "two commits are two probes"
         );
         assert_eq!(worktree, probe_key(host, cwd, &DiffSource::Worktree));
         assert_ne!(
             worktree,
             probe_key(host, Path::new("/other"), &DiffSource::Worktree)
+        );
+        // …and one commit is one probe however much is known about it. Built
+        // from `Debug`, as this key once was, the labelled one would have been
+        // a second in-flight probe for a patch already being read.
+        assert_eq!(
+            probe_key(host, cwd, &DiffSource::commit("a")),
+            probe_key(
+                host,
+                cwd,
+                &DiffSource::Commit {
+                    rev: "a".into(),
+                    label: Some(CommitLabel {
+                        subject: "s".into(),
+                        author: "Ada".into(),
+                        at: 1,
+                    }),
+                }
+            )
         );
     }
 
@@ -1307,9 +1380,7 @@ mod tests {
         );
 
         let commit = source_subject(
-            &DiffSource::Commit {
-                rev: "3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a".into(),
-            },
+            &DiffSource::commit("3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a"),
             branch(),
         );
         assert_eq!(commit.icon, COMMIT_ICON);
@@ -1325,6 +1396,83 @@ mod tests {
         );
         assert_eq!(range.icon, COMMIT_ICON);
         assert_eq!(range.text, "main…feature");
+    }
+
+    #[test]
+    fn a_labelled_commit_says_what_it_was_about() {
+        let label = CommitLabel {
+            subject: "fix(scm): stop the panel asking twice".into(),
+            author: "Ada".into(),
+            at: 1_786_255_391,
+        };
+        let with = source_subject(
+            &DiffSource::Commit {
+                rev: "3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a".into(),
+                label: Some(label.clone()),
+            },
+            "main".to_string(),
+        );
+        assert_eq!(with.text, "3f2a1b9c", "the sha is still the identifier");
+        assert_eq!(
+            with.label.as_ref().map(|l| l.subject.as_str()),
+            Some(label.subject.as_str())
+        );
+
+        // Nothing else grows a subject line, least of all a working-tree
+        // patch, whose "subject" would be a branch name repeated.
+        assert!(
+            source_subject(&DiffSource::Worktree, "main".into())
+                .label
+                .is_none()
+        );
+        assert!(
+            source_subject(&DiffSource::Head, "main".into())
+                .label
+                .is_none()
+        );
+        assert!(
+            source_subject(&DiffSource::commit("deadbeef"), "main".into())
+                .label
+                .is_none(),
+            "a commit nobody has read yet has nothing to say"
+        );
+        // A default-constructed label is indistinguishable from none, and must
+        // not paint an empty row where the subject would go.
+        let empty = source_subject(
+            &DiffSource::Commit {
+                rev: "deadbeef".into(),
+                label: Some(CommitLabel::default()),
+            },
+            "main".into(),
+        );
+        assert!(empty.label.is_none());
+    }
+
+    #[test]
+    fn the_byline_drops_the_separator_along_with_the_half_it_joined() {
+        let now = 1_786_255_391 + 7200;
+        let full = CommitLabel {
+            subject: "s".into(),
+            author: "Ada".into(),
+            at: 1_786_255_391,
+        };
+        assert_eq!(label_byline(&full, now), "Ada · 2h");
+        assert_eq!(
+            label_byline(
+                &CommitLabel {
+                    author: String::new(),
+                    ..full.clone()
+                },
+                now
+            ),
+            "2h",
+            "a commit with no author is not `· 2h`"
+        );
+        assert_eq!(
+            label_byline(&CommitLabel { at: 0, ..full }, now),
+            "Ada",
+            "and a timestamp that would not parse is not `Ada · 56y`"
+        );
     }
 
     const BRANCH_ICON: &str = "icons/git-branch.svg";
@@ -1868,8 +2016,14 @@ mod overlay_gpui_tests {
                 DiffSource::Worktree,
                 DiffSource::Staged,
                 DiffSource::Head,
+                DiffSource::commit("3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a"),
                 DiffSource::Commit {
                     rev: "3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a".into(),
+                    label: Some(CommitLabel {
+                        subject: "fix(scm): read a commit's own header".into(),
+                        author: "Ada".into(),
+                        at: 1_786_255_391,
+                    }),
                 },
                 DiffSource::Range {
                     base: "main".into(),

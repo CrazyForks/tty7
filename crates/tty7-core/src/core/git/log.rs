@@ -13,6 +13,7 @@ use std::path::Path;
 use smallvec::SmallVec;
 
 use super::RecordSplitter;
+use super::diff::FileStatus;
 use crate::host::Host;
 
 /// Full hex object id. Kept as `String` rather than `[u8; 20]` because sha256
@@ -33,6 +34,10 @@ pub const GRAPH_PAGE: usize = 200;
 pub const MAX_GRAPH_COMMITS: usize = 5_000;
 pub const MAX_LANES: Lane = 32;
 pub const MAX_REFS: usize = 2_000;
+/// How many changed files one commit's detail view will hold. A vendored
+/// dependency landing in a single commit is tens of thousands of paths, and
+/// every one of them would become a row.
+pub const MAX_COMMIT_FILES: usize = 1_000;
 pub const MAX_SUBJECT_BYTES: usize = 512;
 pub const MAX_BODY_BYTES: usize = 8 * 1024;
 pub const MAX_LOG_BYTES: usize = 16 * 1024 * 1024;
@@ -79,6 +84,10 @@ pub struct RefDeco {
     pub short: String,
     /// Carried the `HEAD -> ` prefix in `%D`.
     pub is_head: bool,
+    /// The full refname this branch tracks, where it tracks one. Only
+    /// [`for_each_ref`] can fill it in — `%D` says nothing about upstreams —
+    /// so a decoration parsed out of a `log` record always leaves it `None`.
+    pub upstream: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -496,6 +505,7 @@ fn parse_deco(text: &str) -> Vec<RefDeco> {
                 full: "HEAD".to_string(),
                 short: "HEAD".to_string(),
                 is_head: true,
+                upstream: None,
             });
             continue;
         }
@@ -524,6 +534,7 @@ fn ref_deco(full: &str, is_head: bool) -> Option<RefDeco> {
         full: full.to_string(),
         short: short.to_string(),
         is_head,
+        upstream: None,
     })
 }
 
@@ -538,11 +549,10 @@ pub fn parse_refs(stdout: &[u8]) -> HashMap<Oid, Vec<RefDeco>> {
         let full = fields.next().unwrap_or_default().trim();
         // `%(refname:short)` is skipped in favour of stripping the prefix here,
         // so a ref named the same way from `%D` and from here reads identically
-        // in the UI. `%(upstream)` and `%(objecttype)` are asked for because
-        // the branch switcher will want them off the same call; neither has a
-        // home on `RefDeco` yet.
+        // in the UI. `%(objecttype)` is asked for to keep the format one line
+        // rather than two; only `%(*objectname)` below acts on it.
         let _short = fields.next();
-        let _upstream = fields.next();
+        let upstream = fields.next().unwrap_or_default().trim();
         let head = fields.next().unwrap_or_default().trim();
         let _kind = fields.next();
         let peeled = fields.next().unwrap_or_default().trim();
@@ -553,7 +563,8 @@ pub fn parse_refs(stdout: &[u8]) -> HashMap<Oid, Vec<RefDeco>> {
         if full.is_empty() || !is_hex_oid(target) {
             continue;
         }
-        if let Some(deco) = ref_deco(full, head == "*") {
+        if let Some(mut deco) = ref_deco(full, head == "*") {
+            deco.upstream = (!upstream.is_empty()).then(|| upstream.to_string());
             out.entry(target.to_string()).or_default().push(deco);
         }
     }
@@ -575,6 +586,264 @@ pub fn for_each_ref(host: &dyn Host, root: &Path) -> HashMap<Oid, Vec<RefDeco>> 
         Ok(out) if out.success() => parse_refs(&out.stdout),
         _ => HashMap::new(),
     }
+}
+
+/// The local branch names, one per line, in git's own refname order.
+///
+/// `for-each-ref` rather than `branch`: no porcelain warnings, no column
+/// layout, and one name per line whatever the user's config says. It is a
+/// separate call from [`for_each_ref`] because that one groups by the commit a
+/// ref points at, which is the wrong shape for a list of branches — the
+/// switcher wants every branch, including the ones sharing a tip.
+pub fn local_branches(host: &dyn Host, root: &Path) -> Vec<String> {
+    let count = format!("--count={MAX_REFS}");
+    let args = [
+        "for-each-ref",
+        &count,
+        "--format=%(refname:short)",
+        "refs/heads",
+    ];
+    match host.git(root, &args) {
+        Ok(out) if out.success() => parse_branch_names(&out.stdout),
+        _ => Vec::new(),
+    }
+}
+
+pub fn parse_branch_names(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .take(MAX_REFS)
+        .map(str::to_string)
+        .collect()
+}
+
+/// One commit's metadata, for a detail view that does not already have it.
+///
+/// A commit that is on screen in the graph is already a [`Commit`] in
+/// [`CommitPage::commits`], and the caller is expected to hand that over
+/// instead of paying for this. What is left is the case the page cannot
+/// answer: a commit reached from a parent link, or from anywhere outside the
+/// window the graph happens to be holding.
+pub fn load_commit(host: &dyn Host, root: &Path, rev: &str) -> Option<Commit> {
+    if !is_rev(rev) {
+        return None;
+    }
+    let args = [
+        "-c",
+        "log.showSignature=false",
+        "show",
+        "--no-patch",
+        // Without it `%D` prints short names, and `parse_deco` reads full
+        // ones — every chip would come back as `RefKind::Other`.
+        "--decorate=full",
+        "--no-color",
+        LOG_PRETTY,
+        rev,
+    ];
+    let out = host.git(root, &args).ok()?;
+    if !out.success() {
+        return None;
+    }
+    parse_log(&out.stdout).into_iter().next()
+}
+
+/// One path a commit touched, with the line counts beside it.
+///
+/// The counts are `Option` rather than `0` because "git did not say" and
+/// "nothing changed" are different answers: a binary file reports neither, and
+/// a pure rename reports `0 0`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CommitFile {
+    /// Repository-relative, and for a rename the *new* name.
+    pub path: String,
+    /// Where a rename or a copy came from.
+    pub orig_path: Option<String>,
+    pub status: FileStatus,
+    pub added: Option<u32>,
+    pub removed: Option<u32>,
+    pub binary: bool,
+}
+
+/// The paths one commit touched, against its first parent.
+///
+/// Two commands rather than one, because git will take `--numstat` and
+/// `--name-status` together and then quietly drop the numstat half — measured
+/// on 2.50.1, where the combined `-z` stream comes back as pure name-status.
+/// So they are run separately and joined on the path.
+///
+/// `log -1 --first-parent`, *not* `diff-tree -m --first-parent`: `diff-tree`
+/// does not honour `--first-parent` as a narrowing of a merge. On the same git
+/// it emits one diff per parent and concatenates them, so a two-parent merge
+/// comes back with a file list twice as long as the merge really is. `log` is
+/// also exactly how [`DiffSource::Commit`](super::diff::DiffSource) walks the
+/// patch, which is what makes this list and the overlay's cards agree file for
+/// file — and it needs no `--root`, because `log` shows a root commit's
+/// contents as additions without being asked.
+pub fn commit_files(host: &dyn Host, root: &Path, rev: &str) -> Option<Vec<CommitFile>> {
+    let numstat = commit_diff(host, root, rev, "--numstat")?;
+    let name_status = commit_diff(host, root, rev, "--name-status")?;
+    Some(join_commit_files(&numstat, &name_status))
+}
+
+fn commit_diff(host: &dyn Host, root: &Path, rev: &str, what: &str) -> Option<Vec<u8>> {
+    if !is_rev(rev) {
+        return None;
+    }
+    let args = [
+        "-c",
+        "log.showSignature=false",
+        // Without it a non-ASCII path comes back wrapped in quotes with its
+        // bytes spelled as C octal escapes, and nothing here decodes those.
+        "-c",
+        "core.quotePath=false",
+        "log",
+        "-1",
+        "--format=",
+        "--first-parent",
+        "--no-color",
+        "-z",
+        what,
+        "--find-renames",
+        rev,
+    ];
+    let out = host.git(root, &args).ok()?;
+    out.success().then_some(out.stdout)
+}
+
+/// A rev the caller made up is still a rev git will be handed, so anything
+/// that could be read as an option is refused before it gets there.
+fn is_rev(rev: &str) -> bool {
+    !rev.is_empty() && !rev.starts_with('-') && !rev.contains(|c: char| c.is_control())
+}
+
+fn records(stdout: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut on_record = |record: &[u8]| out.push(String::from_utf8_lossy(record).into_owned());
+    let mut split = RecordSplitter::new(0);
+    split.push(stdout, &mut on_record);
+    split.finish(&mut on_record);
+    out
+}
+
+/// `-z --numstat`: `<added>\t<removed>\t<path>\0` per file — except for a
+/// rename or a copy, where the third field is *empty* and the old and the new
+/// path follow as two records of their own. A binary file reports `-\t-`.
+fn parse_numstat(stdout: &[u8]) -> HashMap<String, (Option<u32>, Option<u32>, bool)> {
+    let mut out = HashMap::new();
+    let records = records(stdout);
+    let mut at = 0usize;
+    while at < records.len() && out.len() < MAX_COMMIT_FILES {
+        let record = &records[at];
+        at += 1;
+        let mut fields = record.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let binary = added == "-" && removed == "-";
+        let counts = (added.parse::<u32>().ok(), removed.parse::<u32>().ok());
+        let path = if path.is_empty() {
+            let new = records.get(at + 1).cloned();
+            at += 2;
+            match new {
+                Some(new) => new,
+                // Truncated mid-rename. Nothing else can be read from here.
+                None => break,
+            }
+        } else {
+            path.to_string()
+        };
+        out.insert(path, (counts.0, counts.1, binary));
+    }
+    out
+}
+
+/// `-z --name-status`: `<status>\0<path>\0`, and `R<score>\0<old>\0<new>\0`
+/// for the two statuses that name two paths.
+fn parse_name_status(stdout: &[u8]) -> Vec<(String, Option<String>, FileStatus)> {
+    let mut out = Vec::new();
+    let records = records(stdout);
+    let mut at = 0usize;
+    while at < records.len() && out.len() < MAX_COMMIT_FILES {
+        let code = records[at].trim().to_string();
+        at += 1;
+        let two_paths = matches!(code.as_bytes().first(), Some(b'R' | b'C'));
+        let taken = 1 + usize::from(two_paths);
+        let Some(paths) = records.get(at..at + taken) else {
+            break;
+        };
+        at += taken;
+        let Some(status) = file_status(&code) else {
+            continue;
+        };
+        match paths {
+            [path] => out.push((path.clone(), None, status)),
+            [old, new] => out.push((new.clone(), Some(old.clone()), status)),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn file_status(code: &str) -> Option<FileStatus> {
+    match code.as_bytes().first()? {
+        b'A' => Some(FileStatus::Added),
+        b'M' => Some(FileStatus::Modified),
+        b'D' => Some(FileStatus::Deleted),
+        b'R' => Some(FileStatus::Renamed),
+        b'C' => Some(FileStatus::Copied),
+        b'T' => Some(FileStatus::TypeChanged),
+        // `X` is git's own "unknown"; `B` only appears under
+        // `--break-rewrites`, which nothing here passes.
+        b'U' => Some(FileStatus::Unmerged),
+        _ => None,
+    }
+}
+
+/// Joins the two streams on the path.
+///
+/// `--name-status` is the spine: it carries the letter every row is drawn
+/// from, and it is in git's own order. `--numstat` only contributes counts, so
+/// losing it costs the numbers and nothing else. Losing the other way round is
+/// worse — a path with counts and no letter would vanish — so anything left
+/// over is appended rather than dropped.
+pub fn join_commit_files(numstat: &[u8], name_status: &[u8]) -> Vec<CommitFile> {
+    let mut counts = parse_numstat(numstat);
+    let named = parse_name_status(name_status);
+    let mut out: Vec<CommitFile> = Vec::with_capacity(named.len());
+    for (path, orig_path, status) in named {
+        let (added, removed, binary) = counts.remove(&path).unwrap_or((None, None, false));
+        out.push(CommitFile {
+            path,
+            orig_path,
+            status,
+            added,
+            removed,
+            binary,
+        });
+    }
+    let mut leftover: Vec<_> = counts.into_iter().collect();
+    // A `HashMap` has no order to preserve, and a file list that reshuffles
+    // itself between two reads of the same commit would be worse than a
+    // list that is merely not in git's order.
+    leftover.sort_by(|a, b| a.0.cmp(&b.0));
+    for (path, (added, removed, binary)) in leftover {
+        if out.len() >= MAX_COMMIT_FILES {
+            break;
+        }
+        out.push(CommitFile {
+            path,
+            orig_path: None,
+            status: FileStatus::Modified,
+            added,
+            removed,
+            binary,
+        });
+    }
+    out
 }
 
 /// Loads the newest `count` commits of `scope` and lays them out.
@@ -1280,6 +1549,195 @@ mod tests {
         assert_eq!(by_oid[SHA_B][0].kind, RefKind::Tag);
         assert_eq!(by_oid[SHA_B][0].short, "v9");
         assert_eq!(by_oid[SHA_C][0].short, "origin/dev");
+    }
+
+    #[test]
+    fn a_branch_keeps_the_upstream_it_tracks() {
+        let lines = [
+            format!(
+                "{SHA_A}\x1frefs/heads/main\x1fmain\x1frefs/remotes/origin/main\x1f*\x1fcommit\x1f"
+            ),
+            // A branch nobody has published tracks nothing, and an empty
+            // `%(upstream)` has to stay `None` rather than become `Some("")`.
+            format!("{SHA_B}\x1frefs/heads/local-only\x1flocal-only\x1f\x1f \x1fcommit\x1f"),
+            format!("{SHA_C}\x1frefs/tags/v9\x1fv9\x1f\x1f \x1fcommit\x1f"),
+        ];
+        let by_oid = parse_refs(lines.join("\n").as_bytes());
+
+        assert_eq!(
+            by_oid[SHA_A][0].upstream.as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+        assert_eq!(by_oid[SHA_B][0].upstream, None);
+        assert_eq!(by_oid[SHA_C][0].upstream, None);
+        // `%D` cannot carry an upstream at all, so a decoration parsed out of
+        // a log record must not claim one.
+        let logged = parse_log(one(SHA_A, "", "refs/heads/main", "s", "").as_bytes());
+        assert_eq!(logged[0].refs[0].upstream, None);
+    }
+
+    #[test]
+    fn branch_names_come_back_one_per_line() {
+        let out = b"main\nfeature/a\n\n  spaced  \n";
+        assert_eq!(
+            parse_branch_names(out),
+            ["main", "feature/a", "spaced"],
+            "blank lines are not branches, and git pads nothing"
+        );
+        assert!(parse_branch_names(b"").is_empty());
+        let many: String = (0..MAX_REFS + 50)
+            .map(|i| format!("b{i}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(parse_branch_names(many.as_bytes()).len(), MAX_REFS);
+    }
+
+    /// Every shape `-z` can produce, from the streams git actually emits —
+    /// each of these was captured from git 2.50.1 rather than guessed.
+    #[test]
+    fn a_commits_file_list_joins_the_two_z_streams() {
+        // A rename, a path with a space, a path outside ASCII, and a binary.
+        let numstat = b"1\t0\tbin.dat\x000\t0\t\x00a.txt\x00renamed.txt\x001\t0\twith space.txt\x002\t3\t\xe4\xb8\xad\xe6\x96\x87\xe5\x90\x8d.txt\x00";
+        let name_status = b"A\x00bin.dat\x00R100\x00a.txt\x00renamed.txt\x00A\x00with space.txt\x00M\x00\xe4\xb8\xad\xe6\x96\x87\xe5\x90\x8d.txt\x00";
+        let files = join_commit_files(numstat, name_status);
+
+        assert_eq!(files.len(), 4, "{files:?}");
+        assert_eq!(files[0].path, "bin.dat");
+        assert_eq!(files[0].status, FileStatus::Added);
+        assert_eq!((files[0].added, files[0].removed), (Some(1), Some(0)));
+
+        // The rename: `--numstat` spells it as an empty third field followed
+        // by two records of its own, and the counts belong to the new name.
+        assert_eq!(files[1].path, "renamed.txt");
+        assert_eq!(files[1].orig_path.as_deref(), Some("a.txt"));
+        assert_eq!(files[1].status, FileStatus::Renamed);
+        assert_eq!((files[1].added, files[1].removed), (Some(0), Some(0)));
+
+        assert_eq!(
+            files[2].path, "with space.txt",
+            "a space is not a separator"
+        );
+        assert_eq!(files[3].path, "中文名.txt");
+        assert_eq!((files[3].added, files[3].removed), (Some(2), Some(3)));
+        assert!(files.iter().all(|f| !f.binary));
+    }
+
+    #[test]
+    fn a_binary_file_reports_no_counts_rather_than_zero() {
+        let files = join_commit_files(b"-\t-\tbin2.dat\x00", b"A\x00bin2.dat\x00");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].binary);
+        assert_eq!(
+            (files[0].added, files[0].removed),
+            (None, None),
+            "`0 0` is a real answer and `-\t-` is not, so they must not read alike"
+        );
+        // A pure rename really does change nothing, and says so.
+        let renamed = join_commit_files(b"0\t0\t\x00a\x00b\x00", b"R100\x00a\x00b\x00");
+        assert!(!renamed[0].binary);
+        assert_eq!((renamed[0].added, renamed[0].removed), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn one_stream_going_missing_degrades_instead_of_emptying_the_list() {
+        // No counts: every row still knows what happened to it.
+        let no_numstat = join_commit_files(b"", b"M\x00a.txt\x00D\x00b.txt\x00");
+        assert_eq!(no_numstat.len(), 2);
+        assert_eq!(no_numstat[1].status, FileStatus::Deleted);
+        assert!(no_numstat.iter().all(|f| f.added.is_none()));
+
+        // No letters: the paths are the more important half, so they are kept
+        // and given the one status that claims the least.
+        let no_names = join_commit_files(b"1\t2\tb.txt\x003\t4\ta.txt\x00", b"");
+        assert_eq!(
+            no_names.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            ["a.txt", "b.txt"],
+            "with no order to inherit the leftovers are sorted, not shuffled"
+        );
+        assert!(no_names.iter().all(|f| f.status == FileStatus::Modified));
+        assert_eq!((no_names[0].added, no_names[0].removed), (Some(3), Some(4)));
+
+        assert!(join_commit_files(b"", b"").is_empty());
+    }
+
+    #[test]
+    fn a_truncated_or_unknown_record_is_dropped_rather_than_shifting_the_parse() {
+        // A status letter with no path behind it ends the read; anything
+        // already parsed still stands.
+        let cut = join_commit_files(b"", b"M\x00a.txt\x00D\x00");
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0].path, "a.txt");
+
+        // `X` is git's own "something went wrong". Its path is consumed so the
+        // records after it stay aligned.
+        let unknown = join_commit_files(b"", b"X\x00weird\x00A\x00good.txt\x00");
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].path, "good.txt");
+
+        // A rename cut off after its old name leaves nothing to attach to.
+        assert!(join_commit_files(b"0\t0\t\x00a\x00", b"R100\x00a\x00").is_empty());
+    }
+
+    #[test]
+    fn a_file_list_is_capped_without_losing_its_first_rows() {
+        let mut numstat = Vec::new();
+        let mut name_status = Vec::new();
+        for i in 0..MAX_COMMIT_FILES + 20 {
+            numstat.extend_from_slice(format!("1\t0\tf{i:05}.rs\0").as_bytes());
+            name_status.extend_from_slice(format!("A\0f{i:05}.rs\0").as_bytes());
+        }
+        let files = join_commit_files(&numstat, &name_status);
+        assert_eq!(files.len(), MAX_COMMIT_FILES);
+        assert_eq!(files[0].path, "f00000.rs");
+    }
+
+    #[test]
+    fn a_rev_that_could_be_read_as_an_option_never_reaches_git() {
+        assert!(is_rev("HEAD"));
+        assert!(is_rev(SHA_A));
+        assert!(is_rev("v1.0^{commit}"));
+        assert!(!is_rev(""));
+        assert!(!is_rev("--upload-pack=touch /tmp/pwned"));
+        assert!(!is_rev("-n"));
+        assert!(!is_rev("HEAD\nrm -rf"));
+    }
+
+    #[test]
+    fn this_repo_answers_for_one_commit_and_its_files() {
+        let host = crate::host::local::LocalHost::new();
+        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // A source tarball is a legitimate place to run the tests from.
+        let Some(page) = load_page(&*host, here, &GraphScope::Head, 2) else {
+            return;
+        };
+        let Some(head) = page.commits.first() else {
+            return;
+        };
+
+        let shown = load_commit(&*host, here, &head.oid).expect("HEAD is a commit");
+        assert_eq!(shown.oid, head.oid);
+        assert_eq!(shown.summary, head.summary, "the two formats are the same");
+        assert_eq!(shown.parents.as_slice(), head.parents.as_slice());
+        assert_eq!(shown.author.at, head.author.at);
+        assert_eq!(load_commit(&*host, here, "-n"), None);
+
+        let files = commit_files(&*host, here, &head.oid).expect("HEAD touched something");
+        assert!(!files.is_empty(), "no commit in this repo is empty");
+        assert!(
+            files.iter().all(|f| !f.path.is_empty()),
+            "an empty path means the join lost a record: {files:?}"
+        );
+        // The whole reason the two commands are run separately.
+        assert!(
+            files
+                .iter()
+                .any(|f| f.added.is_some() || f.removed.is_some() || f.binary),
+            "not one row got its counts: {files:?}"
+        );
+
+        let branches = local_branches(&*host, here);
+        assert!(!branches.is_empty(), "this checkout is on a branch");
+        assert!(branches.iter().all(|b| !b.starts_with("refs/heads/")));
     }
 
     #[test]

@@ -4,11 +4,10 @@
 //! `file_tree.rs` use. The directory only keeps the surface from piling into
 //! `right_panel.rs`.
 
-// What is left unused is what the graph and the commit detail view will call:
-// `relative_time` has no row to date yet, and `status_rank` is the file tree's
-// to use. Both allows come off with the step that wires them up.
+// What is left unused is what the graph will call, plus `status_rank`, which
+// is the file tree's to use. Both allows come off with the step that wires
+// them up.
 pub(crate) mod actions;
-#[allow(dead_code)]
 pub(crate) mod detail;
 #[allow(dead_code)]
 pub(crate) mod graph;
