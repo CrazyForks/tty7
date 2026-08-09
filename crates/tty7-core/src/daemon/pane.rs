@@ -2375,8 +2375,12 @@ mod tests {
         // than saying nothing.
         assert_eq!(shell_program_problem("zsh"), None);
 
-        // Something real passes.
-        assert_eq!(shell_program_problem("/bin/sh"), None);
+        // Something real passes. The test binary is the one path guaranteed
+        // to exist and carry the execute bit on every platform this runs on —
+        // `/bin/sh` named a file that is simply absent on Windows, so the
+        // check meant to prove a good shell passes proved the opposite there.
+        let real = std::env::current_exe().expect("the running test binary");
+        assert_eq!(shell_program_problem(&real.to_string_lossy()), None);
     }
 
     #[cfg(unix)]
