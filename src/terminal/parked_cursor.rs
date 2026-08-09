@@ -10,13 +10,19 @@
 //! on every batch of pty output) draws that stray cursor for a frame, and a
 //! TUI that repaints on a spinner — Codex while it works — produces one every
 //! spinner tick, which reads as a second cursor blinking in the wrong place.
-//! macOS never shows it: no ConPTY sits in between, and the TUI itself always
-//! moves the cursor before it shows it.
 //!
 //! [`ParkedCursorScanner`] finds those hide/show pairs in the byte stream and
 //! [`ParkedCursorRepair`] restores the cell the cursor stood on when it went
 //! invisible, which is the cell the correcting frame would have moved it back
 //! to anyway.
+//!
+//! Only conhost parks a cursor, so the reader runs this on Windows alone
+//! (`RemoteTerminal::REPAIR_PARKED_CURSOR`). Off it the pty is raw and the
+//! application's cursor is the real one: a TUI is free to end a repaint on the
+//! text it just wrote and then echo the next keystroke straight after it, with
+//! no positioning of its own — vim opens its `:` command line exactly that way,
+//! which a repair on a raw pty turns into `wq!` landing on the row being edited
+//! (#430).
 
 use std::time::{Duration, Instant};
 
