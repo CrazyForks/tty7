@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::core::actions::*;
 use crate::core::config::{
     Config, CursorStyle as ConfigCursorStyle, NewTabPosition, RightPanelTab, ShellConfig,
-    TabBarPosition,
+    TabBarPosition, WindowBackdrop,
 };
 use crate::core::session::{
     Session, SessionAxis, SessionPane, SessionTab, WorkspaceId, WorkspaceStore,
@@ -37,7 +37,7 @@ use crate::ui::presets::Fill;
 use crate::ui::settings::{
     Recording, SettingsSection, SettingsState, ThemeEditor, humanize_action,
 };
-use crate::ui::theme::{apply_theme, set_menus, window_background};
+use crate::ui::theme::{apply_theme, set_menus};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThemeEdit {
@@ -445,6 +445,103 @@ pub(crate) struct TabAgentSession {
 impl TabAgentSession {
     pub(crate) fn forkable(&self) -> bool {
         self.fork_label.is_some() && self.session_id.is_some() && !self.remote
+    }
+}
+
+/// Maps a backdrop onto the settings dropdown. The dropdown lists the
+/// presets the current Windows build supports, plus the stored value even
+/// when unsupported here (see `theme::backdrop_options`), so the label
+/// always matches what the window actually resolves to.
+#[cfg(target_os = "windows")]
+fn window_backdrop_index(backdrop: WindowBackdrop) -> usize {
+    crate::ui::theme::backdrop_options(backdrop)
+        .iter()
+        .position(|candidate| *candidate == backdrop)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "windows")]
+fn window_backdrop_from_index(idx: usize, current: WindowBackdrop) -> WindowBackdrop {
+    crate::ui::theme::backdrop_options(current)
+        .get(idx)
+        .copied()
+        .unwrap_or(WindowBackdrop::Auto)
+}
+
+#[cfg(target_os = "windows")]
+fn window_backdrop_label_key(backdrop: WindowBackdrop) -> L10nKey {
+    match backdrop {
+        WindowBackdrop::Auto => L10nKey::SettingsBackdropAuto,
+        WindowBackdrop::Blur => L10nKey::SettingsBackdropBlur,
+        WindowBackdrop::Mica => L10nKey::SettingsBackdropMica,
+        WindowBackdrop::MicaAlt => L10nKey::SettingsBackdropMicaAlt,
+        WindowBackdrop::Acrylic => L10nKey::SettingsBackdropAcrylic,
+        WindowBackdrop::Off => L10nKey::SettingsBackdropOff,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn window_backdrop_labels(backdrop: WindowBackdrop) -> Vec<String> {
+    crate::ui::theme::backdrop_options(backdrop)
+        .iter()
+        .map(|backdrop| t(window_backdrop_label_key(*backdrop)).to_string())
+        .collect()
+}
+
+/// What a full-window overlay (settings, the opened file, the diff view)
+/// paints between its own fill and its content.
+///
+/// Those overlays fill opaquely on purpose, so the OS backdrop cannot show
+/// through their text — but that fill also sits on top of the background
+/// image the workspace root paints, and would erase it for as long as an
+/// overlay is open. So each one repaints the image, then the workspace's own
+/// translucent fill over it. That second layer is what keeps the overlay
+/// readable: it dims the image to exactly the strength it had when these
+/// overlays were themselves translucent, before they were made opaque.
+///
+/// Empty when the theme has no image — then the opaque fill alone is already
+/// what the overlay wants, and a second pass of the same paint buys nothing.
+pub(crate) fn overlay_surface_layers(cx: &App) -> Vec<gpui::Div> {
+    match window_background_image_layer(cx) {
+        Some(image) => vec![
+            image,
+            div()
+                .absolute()
+                .inset_0()
+                .bg(crate::ui::theme::workspace_background(cx)),
+        ],
+        None => Vec::new(),
+    }
+}
+
+/// The theme's background image as a full-bleed layer.
+pub(crate) fn window_background_image_layer(cx: &App) -> Option<gpui::Div> {
+    let image = cx
+        .try_global::<crate::ui::presets::ActiveBackground>()?
+        .image
+        .clone()?;
+    Some(
+        div()
+            .absolute()
+            .inset_0()
+            .overflow_hidden()
+            .opacity(image.opacity)
+            .child(
+                img(image.path)
+                    .size_full()
+                    .object_fit(gpui::ObjectFit::Cover),
+            ),
+    )
+}
+
+/// Clears the window overrides that are effective on the current platform.
+/// `backdrop_is_local` models whether the Windows-only backdrop participates
+/// in this platform's rendering and therefore belongs to its reset operation.
+fn clear_window_override_values(config: &mut Config, backdrop_is_local: bool) {
+    config.window_opacity = None;
+    config.window_blur = None;
+    if backdrop_is_local {
+        config.window_backdrop = WindowBackdrop::Auto;
     }
 }
 
@@ -1454,7 +1551,10 @@ impl Tty7App {
     pub(crate) fn effective_window_opacity(cx: &App) -> f32 {
         let config = cx.global::<Config>();
         let theme = crate::ui::presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
-        config.window_opacity.or(theme.opacity).unwrap_or(1.0)
+        let blur = config.window_blur.unwrap_or(theme.blur);
+        config.window_opacity.or(theme.opacity).unwrap_or_else(|| {
+            crate::ui::theme::default_window_opacity(config.window_backdrop, blur)
+        })
     }
 
     pub(crate) fn set_window_opacity(
@@ -1481,15 +1581,37 @@ impl Tty7App {
         cx.notify();
     }
 
+    #[cfg(target_os = "windows")]
+    pub(crate) fn set_window_backdrop(
+        &mut self,
+        backdrop: WindowBackdrop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.global_mut::<Config>().window_backdrop = backdrop;
+        apply_theme(Some(window), cx);
+        cx.global::<Config>().save();
+        // A material changes the default opacity (SYSTEM_MATERIAL_OPACITY
+        // vs 1.0), so the slider must track the new effective value.
+        self.sync_window_opacity_slider(window, cx);
+        // Rebuild the rows as well as the selected index. The previous value
+        // may have been an unsupported preset retained only for cross-machine
+        // config sync, and must disappear after the user selects a supported
+        // preset on this machine.
+        self.sync_window_backdrop_select(window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn reset_window_overrides(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         {
             let config = cx.global_mut::<Config>();
-            config.window_opacity = None;
-            config.window_blur = None;
+            clear_window_override_values(config, cfg!(target_os = "windows"));
         }
         apply_theme(Some(window), cx);
         cx.global::<Config>().save();
         self.sync_window_opacity_slider(window, cx);
+        #[cfg(target_os = "windows")]
+        self.sync_window_backdrop_select(window, cx);
         cx.notify();
     }
 
@@ -1504,6 +1626,28 @@ impl Tty7App {
             .map(|s| s.window_opacity_slider.clone())
         {
             slider.update(cx, |s, cx| s.set_value(eff, window, cx));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn sync_window_backdrop_select(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(select) = self
+            .active_settings()
+            .map(|s| s.window_backdrop_select.clone())
+        {
+            let current = cx.global::<Config>().window_backdrop;
+            let rows = window_backdrop_labels(current);
+            let selected = window_backdrop_index(current);
+            select.update(cx, |state, cx| {
+                state.set_items(SearchableVec::new(rows), window, cx);
+                // Replacing the delegate clears its selection snapshot, so
+                // restore the stored value after installing the new rows.
+                state.set_selected_index(Some(IndexPath::default().row(selected)), window, cx);
+            });
         }
     }
 
@@ -3635,6 +3779,8 @@ impl Tty7App {
         let (font_select, font_bold_select, font_italic_select) =
             self.build_font_selects(&mut subs, window, cx);
         let language_select = self.build_language_select(&mut subs, window, cx);
+        #[cfg(target_os = "windows")]
+        let window_backdrop_select = self.build_window_backdrop_select(&mut subs, window, cx);
         let (shell_program_input, shell_args_input, wd_path_input) =
             self.build_shell_inputs(&mut subs, window, cx);
         let link_file_command_input = self.build_link_file_command_input(&mut subs, window, cx);
@@ -3693,6 +3839,8 @@ impl Tty7App {
             font_bold_select,
             font_italic_select,
             language_select,
+            #[cfg(target_os = "windows")]
+            window_backdrop_select,
             shell_program_input,
             shell_args_input,
             wd_path_input,
@@ -3865,6 +4013,46 @@ impl Tty7App {
             .unwrap_or_else(crate::ui::i18n::default_language_code)
     }
 
+    /// The backdrop dropdown only lists the presets this Windows build
+    /// supports, in the order of `theme::supported_backdrops`; the select
+    /// resolves the picked label back through that same list.
+    #[cfg(target_os = "windows")]
+    fn build_window_backdrop_select(
+        &mut self,
+        subs: &mut Vec<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<SelectState<SearchableVec<String>>> {
+        let rows = window_backdrop_labels(cx.global::<Config>().window_backdrop);
+        let selected = window_backdrop_index(cx.global::<Config>().window_backdrop);
+        let select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(rows),
+                Some(IndexPath::default().row(selected)),
+                window,
+                cx,
+            )
+        });
+        subs.push(cx.subscribe_in(
+            &select,
+            window,
+            move |this, _select, ev: &SelectEvent<SearchableVec<String>>, window, cx| {
+                if let SelectEvent::Confirm(Some(label)) = ev {
+                    let current = cx.global::<Config>().window_backdrop;
+                    let rows = window_backdrop_labels(current);
+                    if let Some(idx) = rows.iter().position(|row| row == label) {
+                        this.set_window_backdrop(
+                            window_backdrop_from_index(idx, current),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            },
+        ));
+        select
+    }
+
     pub(crate) fn set_gui_language(
         &mut self,
         code: &'static str,
@@ -3903,6 +4091,21 @@ impl Tty7App {
                     .position(|lang| lang.code == code)
                     .unwrap_or(0);
                 state.set_selected_index(Some(IndexPath::default().row(selected)), window, cx);
+            });
+            #[cfg(target_os = "windows")]
+            s.window_backdrop_select.update(cx, |state, cx| {
+                let current = cx.global::<Config>().window_backdrop;
+                let rows = window_backdrop_labels(current);
+                state.set_items(SearchableVec::new(rows), window, cx);
+                // `set_items` does not preserve the selection; restore the
+                // index of the stored value so a locale refresh (which
+                // re-translates the labels) cannot leave the dropdown
+                // showing no — or the wrong — selection.
+                state.set_selected_index(
+                    Some(IndexPath::default().row(window_backdrop_index(current))),
+                    window,
+                    cx,
+                );
             });
             s.search.update(cx, |state, cx| {
                 state.set_placeholder(t(L10nKey::SearchSettings), window, cx)
@@ -4240,6 +4443,13 @@ impl Tty7App {
     fn reload_from_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         apply_theme(Some(window), cx);
         self.sync_window_opacity_slider(window, cx);
+        // Another window — or a hand edit / config sync picked up by the
+        // `Config` watcher — can change the backdrop while this window's
+        // settings panel is open. The window itself already switched
+        // material above, so the dropdown has to follow or it contradicts
+        // what it describes.
+        #[cfg(target_os = "windows")]
+        self.sync_window_backdrop_select(window, cx);
         let config = cx.global::<Config>().clone();
         if config.cursor_style != self.terminal_cursor_style
             || config.scrollback_limit != self.terminal_scrollback_limit
@@ -5310,7 +5520,7 @@ impl Render for Tty7App {
                                     .bottom_0()
                                     .right_0()
                                     .w(px(self.right_panel_px(window, cx)))
-                                    .bg(cx.theme().sidebar)
+                                    .bg(crate::ui::theme::workspace_surface_color(cx))
                                     .border_l_1()
                                     .border_color(cx.theme().sidebar_border),
                             )
@@ -5331,17 +5541,21 @@ impl Render for Tty7App {
             })
             .into_any_element();
 
-        let (window_bg, bg_image) = match cx.try_global::<crate::ui::presets::ActiveBackground>() {
-            Some(bg) => (window_background(bg), bg.image.clone()),
-            None => (cx.theme().background.into(), None),
-        };
+        let window_bg = crate::ui::theme::workspace_background(cx);
+        let bg_image = window_background_image_layer(cx);
+        let settings_bg = crate::ui::theme::overlay_background(cx);
 
         let settings_overlay = self.settings.is_some().then(|| {
             div()
                 .absolute()
                 .inset_0()
                 .occlude()
-                .bg(window_bg)
+                // Opaque on purpose: the settings panel must never let the
+                // workspace translucency (window opacity / backdrop material)
+                // show through, even at window edges during a resize. The
+                // preset's gradient fill is preserved, just with alpha 1;
+                // `render_settings` repaints the theme image over it.
+                .bg(settings_bg)
                 .child(self.render_settings(window, cx))
         });
 
@@ -5606,20 +5820,7 @@ impl Render for Tty7App {
                 )
                 .on_action(cx.listener(|_, _: &OpenDiscord, _window, cx| cx.open_url(DISCORD_URL)))
                 .on_action(cx.listener(|_, _: &ReportIssue, _window, cx| cx.open_url(ISSUES_URL)))
-                .when_some(bg_image, |this, image| {
-                    this.child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .overflow_hidden()
-                            .opacity(image.opacity)
-                            .child(
-                                img(image.path)
-                                    .size_full()
-                                    .object_fit(gpui::ObjectFit::Cover),
-                            ),
-                    )
-                })
+                .children(bg_image)
                 .child(main_layout)
                 .when_some(settings_overlay, |this, overlay| this.child(overlay))
                 .children(self.render_switcher(cx))
@@ -6466,9 +6667,40 @@ mod window_drag_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        TabAgentSession, leaf_shares_the_window_daemon, mru_order, pane_attachable,
-        parse_ssh_connect_input, parse_ssh_option_words,
+        TabAgentSession, clear_window_override_values, leaf_shares_the_window_daemon, mru_order,
+        pane_attachable, parse_ssh_connect_input, parse_ssh_option_words,
     };
+
+    #[test]
+    fn non_windows_reset_preserves_the_synced_windows_backdrop() {
+        let mut config = crate::core::config::Config::default();
+        config.window_opacity = Some(0.8);
+        config.window_blur = Some(true);
+        config.window_backdrop = crate::core::config::WindowBackdrop::Mica;
+
+        clear_window_override_values(&mut config, false);
+
+        assert_eq!(config.window_opacity, None);
+        assert_eq!(config.window_blur, None);
+        assert_eq!(
+            config.window_backdrop,
+            crate::core::config::WindowBackdrop::Mica,
+            "an inert synchronized backdrop is not a local override to reset"
+        );
+    }
+
+    #[test]
+    fn windows_reset_clears_the_local_backdrop_override() {
+        let mut config = crate::core::config::Config::default();
+        config.window_backdrop = crate::core::config::WindowBackdrop::Acrylic;
+
+        clear_window_override_values(&mut config, true);
+
+        assert_eq!(
+            config.window_backdrop,
+            crate::core::config::WindowBackdrop::Auto
+        );
+    }
 
     #[test]
     fn mru_puts_the_active_tab_first_and_the_last_one_used_behind_it() {
