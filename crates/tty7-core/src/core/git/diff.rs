@@ -28,12 +28,29 @@ pub enum Truncation {
     Budget,
 }
 
+/// What a commit is called, for a header that would otherwise have eight hex
+/// digits and nothing else to say.
+///
+/// Rides along on [`DiffSource::Commit`] and takes no part in its identity —
+/// see [`DiffSource::tag`]. Defined here rather than in [`log`](super::log) so
+/// the dependency between the two modules stays one-way: `log` reaches into
+/// `diff` for [`FileStatus`], and nothing goes back. That is also why the
+/// timestamp is a bare unix second rather than an
+/// [`OffsetTs`](super::log::OffsetTs) — relative time is all the header shows.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct CommitLabel {
+    pub subject: String,
+    pub author: String,
+    /// Author time, unix seconds. Zero where it is not known.
+    pub at: i64,
+}
+
 /// Which patch to ask git for.
 ///
 /// The three working-tree variants are the same three questions the SCM panel
 /// asks — `Worktree` is what is not staged, `Staged` is what is, and `Head` is
 /// both at once, which is what the overlay has always shown.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub enum DiffSource {
     /// `git diff` — unstaged changes.
     Worktree,
@@ -42,13 +59,59 @@ pub enum DiffSource {
     /// `git diff HEAD` — staged and unstaged together.
     #[default]
     Head,
-    /// One commit against its first parent.
-    Commit { rev: String },
+    /// One commit against its first parent, and optionally what to call it.
+    Commit {
+        rev: String,
+        label: Option<CommitLabel>,
+    },
     /// `base...head`: what `head` added since the two diverged.
     Range { base: String, head: String },
 }
 
+impl PartialEq for DiffSource {
+    fn eq(&self, other: &DiffSource) -> bool {
+        self.tag() == other.tag()
+    }
+}
+
+impl Eq for DiffSource {}
+
+impl std::hash::Hash for DiffSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.tag().hash(state);
+    }
+}
+
 impl DiffSource {
+    /// A commit with nothing known about it yet beyond which one it is.
+    pub fn commit(rev: impl Into<String>) -> DiffSource {
+        DiffSource::Commit {
+            rev: rev.into(),
+            label: None,
+        }
+    }
+
+    /// The identity of the patch, with nothing on it that only affects how the
+    /// patch is *labelled*.
+    ///
+    /// `PartialEq`, `Hash` and the overlay's string cache key are all defined
+    /// from this one function, so the three cannot drift apart. The rule it
+    /// exists to enforce: the same commit opened from the graph (with a
+    /// subject in hand) and from a keybinding (without one) is one patch, one
+    /// in-flight probe and one overlay. A derived `PartialEq` would make them
+    /// two, and the derived `Debug` the overlay's key used to be built from
+    /// would have split the probe cache the same way.
+    pub fn tag(&self) -> String {
+        match self {
+            DiffSource::Worktree => "worktree".to_string(),
+            DiffSource::Staged => "staged".to_string(),
+            DiffSource::Head => "head".to_string(),
+            // US, which can occur in neither a refname nor an object id.
+            DiffSource::Commit { rev, .. } => format!("commit\u{1f}{rev}"),
+            DiffSource::Range { base, head } => format!("range\u{1f}{base}\u{1f}{head}"),
+        }
+    }
+
     /// The whole argv, minus pathspecs. Every diff tty7 runs is built here so
     /// there is one place to read, and one place to test, what git is asked.
     pub fn args(&self, context: u32, ignore_whitespace: bool) -> Vec<String> {
@@ -70,7 +133,7 @@ impl DiffSource {
             // is no special case and no need for `--root`. `--format=` empties
             // the commit header, at the cost of one blank line the parser
             // ignores.
-            DiffSource::Commit { rev } => {
+            DiffSource::Commit { rev, .. } => {
                 argv.extend(strings(&["log", "-p", "-1", "--format=", "--first-parent"]));
                 argv.push(rev.clone());
             }
@@ -767,9 +830,7 @@ Binary files a/img.png and b/img.png differ
             (DiffSource::Staged, vec!["diff", "--cached"]),
             (DiffSource::Head, vec!["diff", "HEAD"]),
             (
-                DiffSource::Commit {
-                    rev: "deadbeef".into(),
-                },
+                DiffSource::commit("deadbeef"),
                 vec!["log", "-p", "-1", "--format=", "--first-parent", "deadbeef"],
             ),
             (
@@ -791,6 +852,73 @@ Binary files a/img.png and b/img.png differ
         }
     }
 
+    /// The one property the whole label mechanism rests on. Break it and the
+    /// same commit becomes two probes, two overlays and two cache entries the
+    /// moment one of them learns its own subject.
+    #[test]
+    fn a_commits_label_is_not_part_of_which_commit_it_is() {
+        let bare = DiffSource::commit("deadbeef");
+        let labelled = DiffSource::Commit {
+            rev: "deadbeef".into(),
+            label: Some(CommitLabel {
+                subject: "fix(scm): the thing".into(),
+                author: "Ada".into(),
+                at: 1_786_255_391,
+            }),
+        };
+        let other = DiffSource::Commit {
+            rev: "deadbeef".into(),
+            label: Some(CommitLabel {
+                subject: "something else entirely".into(),
+                ..Default::default()
+            }),
+        };
+
+        assert_eq!(bare, labelled);
+        assert_eq!(labelled, other);
+        assert_eq!(bare.tag(), labelled.tag());
+        assert_eq!(hash_of(&bare), hash_of(&labelled));
+        assert_eq!(hash_of(&labelled), hash_of(&other));
+        // …and the argv, which is the other thing a split cache would show up
+        // in: two "different" sources running the identical command.
+        assert_eq!(argv(bare.clone()), argv(labelled));
+
+        // Which commit it is still separates them, of course.
+        let elsewhere = DiffSource::commit("cafebabe");
+        assert_ne!(bare, elsewhere);
+        assert_ne!(hash_of(&bare), hash_of(&elsewhere));
+        assert_ne!(bare, DiffSource::Head);
+        assert_ne!(
+            DiffSource::Range {
+                base: "a".into(),
+                head: "b".into()
+            },
+            DiffSource::Range {
+                base: "b".into(),
+                head: "a".into()
+            }
+        );
+        // Every variant is still equal to itself, which `Eq` promises and a
+        // hand-written `PartialEq` is exactly where it could stop being true.
+        for source in [
+            DiffSource::Worktree,
+            DiffSource::Staged,
+            DiffSource::Head,
+            bare,
+            elsewhere,
+        ] {
+            assert_eq!(source, source.clone(), "{source:?}");
+            assert_eq!(hash_of(&source), hash_of(&source.clone()));
+        }
+    }
+
+    fn hash_of(source: &DiffSource) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        hasher.finish()
+    }
+
     #[test]
     fn quote_path_is_off_on_every_source() {
         // Left on, a non-ASCII path arrives as C octal escapes that nothing
@@ -802,7 +930,7 @@ Binary files a/img.png and b/img.png differ
             DiffSource::Worktree,
             DiffSource::Staged,
             DiffSource::Head,
-            DiffSource::Commit { rev: "HEAD".into() },
+            DiffSource::commit("HEAD"),
             DiffSource::Range {
                 base: "a".into(),
                 head: "b".into(),
@@ -915,7 +1043,7 @@ Binary files a/img.png and b/img.png differ
         assert!(DiffSource::Worktree.lists_untracked());
         assert!(DiffSource::Head.lists_untracked());
         assert!(!DiffSource::Staged.lists_untracked());
-        assert!(!DiffSource::Commit { rev: "x".into() }.lists_untracked());
+        assert!(!DiffSource::commit("x").lists_untracked());
         assert!(
             !DiffSource::Range {
                 base: "a".into(),
@@ -1284,9 +1412,7 @@ index 1..2 100644
 
     fn commit_files(host: &dyn Host, dir: &Path, spec: &str) -> Vec<String> {
         let req = DiffRequest {
-            source: DiffSource::Commit {
-                rev: rev(dir, spec),
-            },
+            source: DiffSource::commit(rev(dir, spec)),
             ..Default::default()
         };
         probe_diff(host, dir, &req)

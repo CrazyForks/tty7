@@ -857,6 +857,10 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::ScmResetToCommit => "Reset to Commit",
         L10nKey::ScmRefresh => "Refresh",
         L10nKey::ScmBackToChanges => "Back",
+        L10nKey::ScmCommitParents => "Parents",
+        L10nKey::ScmShowMore => "Show more",
+        L10nKey::ScmShowLess => "Show less",
+        L10nKey::ScmCommitNotFound => "This commit is not in this repository.",
         L10nKey::ScmTooManyChanges => "Showing the first {shown} of {total} changes.",
         L10nKey::ScmOpenChanges => "Open Changes",
         L10nKey::ScmDiscardAllConfirm => {

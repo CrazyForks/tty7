@@ -907,6 +907,10 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::ScmResetToCommit => "このコミットにリセット",
         L10nKey::ScmRefresh => "更新",
         L10nKey::ScmBackToChanges => "戻る",
+        L10nKey::ScmCommitParents => "親コミット",
+        L10nKey::ScmShowMore => "続きを表示",
+        L10nKey::ScmShowLess => "折りたたむ",
+        L10nKey::ScmCommitNotFound => "このリポジトリにそのコミットはありません。",
         L10nKey::ScmTooManyChanges => {
             "変更が多いため、{total} 件のうち先頭 {shown} 件のみ表示しています。"
         }

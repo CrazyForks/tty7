@@ -12,9 +12,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::Entity;
 use gpui_component::input::InputState;
+use tty7_core::core::git::log::{Commit, CommitFile};
 use tty7_core::core::git::status::HeadState;
 
 use crate::ui::host_ops::HostId;
@@ -174,11 +176,49 @@ pub(crate) struct GraphState {
 /// touched. A file-level diff is not shown here — that opens the full-screen
 /// overlay, because 260px cannot render a diff and pretending otherwise would
 /// mean inventing a third kind of container.
+///
+/// The two loaded halves are behind `Arc` because the panel clones this whole
+/// struct once per frame — `render_panel_scm` cannot hand `render_commit_
+/// detail` a borrow of `self.scm` and a `&mut self` at once — and a commit
+/// that touched a thousand files would otherwise deep-copy a thousand paths
+/// every time anything on the panel redrew.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct CommitDetailView {
     pub(crate) repo: RepoKey,
     pub(crate) oid: String,
+    /// A read is out. Set before it is dispatched, so the render that runs in
+    /// between does not ask for a second one.
     pub(crate) loading: bool,
+    /// Whether a read has ever come back. With `loading` it is what stops the
+    /// view asking again forever after a commit git could not resolve: the
+    /// pair says "nothing is in flight and nothing is coming".
+    pub(crate) loaded: bool,
+    /// `None` until a read lands, and still `None` afterwards for a commit
+    /// that is not in this repository.
+    pub(crate) commit: Option<Arc<Commit>>,
+    pub(crate) files: Option<Arc<Vec<CommitFile>>>,
+    /// A long body starts folded — a merge from a bot can run to fifty lines,
+    /// and the file list is what the reader came for.
+    pub(crate) body_expanded: bool,
+}
+
+impl CommitDetailView {
+    /// A commit the panel is about to show. `seed` is the row the graph
+    /// already has in hand, where the caller came from the graph: the page
+    /// carries every field a detail view needs, so handing it over is what
+    /// keeps the common path from running `git show` for a commit that is
+    /// literally on screen.
+    pub(crate) fn new(repo: RepoKey, oid: String, seed: Option<Commit>) -> CommitDetailView {
+        CommitDetailView {
+            repo,
+            oid,
+            loading: false,
+            loaded: false,
+            commit: seed.map(Arc::new),
+            files: None,
+            body_expanded: false,
+        }
+    }
 }
 
 #[cfg(test)]

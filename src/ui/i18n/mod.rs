@@ -683,6 +683,13 @@ pub enum L10nKey {
     ScmResetToCommit,
     ScmRefresh,
     ScmBackToChanges,
+    /// Header over the parent links in the commit detail view.
+    ScmCommitParents,
+    /// The fold toggle under a long commit body.
+    ScmShowMore,
+    ScmShowLess,
+    /// The detail view asked git for a commit and git did not have one.
+    ScmCommitNotFound,
     /// Shown when the working tree has more changes than the status parser
     /// keeps. The list is still useful; the count at the top would otherwise
     /// be a lie.
@@ -1135,12 +1142,10 @@ const SCM_KEYS_AWAITING_A_CALLER: &[L10nKey] = &[
     L10nKey::ScmGraphAllBranches,
     L10nKey::ScmGraphEmpty,
     L10nKey::ScmCommitDetailTitle,
-    L10nKey::ScmCopyCommitSha,
     L10nKey::ScmCherryPick,
     L10nKey::ScmRevertCommit,
     L10nKey::ScmResetToCommit,
     L10nKey::ScmRefresh,
-    L10nKey::ScmBackToChanges,
     L10nKey::ScmTooManyChanges,
     L10nKey::ScmOpenChanges,
     L10nKey::ScmDiscardAllConfirm,
@@ -1152,7 +1157,6 @@ const SCM_KEYS_AWAITING_A_CALLER: &[L10nKey] = &[
     L10nKey::ScmOpBisect,
     L10nKey::ScmOpAm,
     L10nKey::ScmSwitchRepository,
-    L10nKey::ScmFilesChanged,
     L10nKey::DiffViewSplit,
     L10nKey::DiffViewUnified,
 ];
