@@ -167,6 +167,12 @@ pub struct TerminalView {
     pub(super) search_regex: bool,
     pub(super) search_regex_error: bool,
     pub(super) search_last_query: String,
+    /// Bumped by every wakeup that reaches an open search bar, so the pending
+    /// rescan can tell "the pane went quiet" from "more output landed".
+    pub(super) search_scan_epoch: u64,
+    /// Whether a rescan is already waiting out the debounce. One task at a
+    /// time, however fast the pane is printing.
+    pub(super) search_scan_armed: bool,
     pub bell_flash: bool,
     pub report_mouse: bool,
     last_at_prompt: bool,
@@ -1049,6 +1055,8 @@ impl TerminalView {
             search_regex: false,
             search_regex_error: false,
             search_last_query: String::new(),
+            search_scan_epoch: 0,
+            search_scan_armed: false,
             bell_flash: false,
             last_at_prompt: false,
             last_typeahead_blocked: false,
@@ -1333,7 +1341,11 @@ impl TerminalView {
             cx.emit(AuthPromptReady);
         }
         match ev {
-            AlacEvent::Wakeup => cx.notify(),
+            AlacEvent::Wakeup => {
+                // The grid moved under whatever the search bar last measured.
+                self.note_output_under_search(cx);
+                cx.notify();
+            }
             AlacEvent::Title(title) => {
                 self.title = title;
                 cx.notify();
@@ -7033,7 +7045,7 @@ pub(crate) fn quiet_test_ssh_pane(
 mod gpui_tests {
     use super::*;
     use crate::daemon::protocol::{ClientMsg, DaemonMsg};
-    use gpui::{TestAppContext, point};
+    use gpui::{Entity, TestAppContext, point};
     use std::os::unix::net::UnixStream;
 
     fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, UnixStream) {
@@ -7053,6 +7065,41 @@ mod gpui_tests {
             TerminalView::with_terminal(terminal, 1, window, cx)
         });
         (window, daemon_side)
+    }
+
+    /// The same pane, but hung under a `gpui_component::Root` the way the real
+    /// window hangs it.
+    ///
+    /// `harness` makes the view its own root, which is enough for anything
+    /// that never paints — but gpui-component's text input reaches for `Root`
+    /// while painting, so any test that lets a frame draw with the search bar
+    /// (or any other input) on screen needs this one instead.
+    fn rooted_harness(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<gpui_component::Root>,
+        Entity<TerminalView>,
+        UnixStream,
+    ) {
+        crate::core::config::pin_test_config_dir();
+        cx.executor().allow_parking();
+        let (client_side, daemon_side) = UnixStream::pair().unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(Config::default());
+        });
+        let built: std::rc::Rc<std::cell::RefCell<Option<Entity<TerminalView>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let out = built.clone();
+        let window = cx.add_window(move |window, cx| {
+            let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
+                .expect("socketpair-backed terminal");
+            let view = cx.new(|cx| TerminalView::with_terminal(terminal, 1, window, cx));
+            *out.borrow_mut() = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = built.borrow_mut().take().expect("the pane was built");
+        (window, view, daemon_side)
     }
 
     fn prompt_ready(
@@ -9411,6 +9458,78 @@ mod gpui_tests {
                 assert!(view.search.is_none());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn output_under_an_open_search_bar_is_searched_too(cx: &mut TestAppContext) {
+        let (window, view, mut daemon) = rooted_harness(cx);
+
+        fn wait_for(cx: &mut TestAppContext, view: &Entity<TerminalView>, needle: char) {
+            for _ in 0..200 {
+                let seen = cx.update(|cx| {
+                    let v = view.read(cx);
+                    let term = v.terminal.term.lock();
+                    let grid = term.grid();
+                    (0..grid.screen_lines() as i32)
+                        .any(|l| (0..grid.columns()).any(|c| grid[Line(l)][Column(c)].c == needle))
+                });
+                if seen {
+                    return;
+                }
+                cx.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("the pane never printed {needle:?}");
+        }
+
+        DaemonMsg::Output(b"world 1\r\n".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        wait_for(cx, &view, '1');
+
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| {
+                    v.open_search(window, cx);
+                    let input = v.search.as_ref().unwrap().input.clone();
+                    input.update(cx, |s, cx| s.set_value("world", window, cx));
+                    v.recompute_matches(cx);
+                    assert_eq!(v.search.as_ref().unwrap().matches.len(), 1);
+                });
+            })
+            .unwrap();
+
+        // A second line arrives while the bar is up. Until it is rescanned the
+        // count still says 1, and the one highlight it does draw has slid onto
+        // whatever line took the old one's place.
+        DaemonMsg::Output(b"world 2\r\n".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        wait_for(cx, &view, '2');
+        for _ in 0..8 {
+            cx.executor()
+                .advance_clock(super::super::search::SCAN_DEBOUNCE * 2);
+            cx.run_until_parked();
+        }
+
+        cx.update(|cx| {
+            let v = view.read(cx);
+            let search = v.search.as_ref().expect("the bar is still open");
+            assert_eq!(
+                search.matches.len(),
+                2,
+                "the line printed under the open bar has to be counted too"
+            );
+            assert_eq!(
+                search.current_index,
+                Some(0),
+                "and the match the user was standing on is still the one they are on"
+            );
+            assert!(
+                !v.search_scan_armed,
+                "the debounce has to settle, not rescan forever"
+            );
+        });
     }
 
     #[gpui::test]

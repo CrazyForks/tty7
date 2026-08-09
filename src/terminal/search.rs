@@ -17,6 +17,12 @@ use crate::ui::i18n::{L10nKey, t};
 
 const MAX_MATCHES: usize = 10_000;
 
+/// How long a printing pane has to stay quiet before an open search bar
+/// rescans it. Short enough that a command's output is re-counted by the time
+/// the eye gets back to the bar, long enough that a flood costs one scan per
+/// pause rather than one per frame.
+pub(super) const SCAN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
 /// The search bar floats over the top of the grid rather than pushing it down,
 /// so these two decide how many rows it hides. Keep them next to the `.top()`
 /// and `.h()` that use them — a match parked under the bar is on screen and
@@ -133,6 +139,137 @@ impl TerminalView {
         }
     }
 
+    /// Every match of the current query in the whole grid, and whether the
+    /// pattern failed to compile.
+    ///
+    /// Match points are lines *relative to the viewport*, so they are only
+    /// meaningful against the grid they were read from: the moment output
+    /// scrolls the grid, every one of them names a different line. Nothing here
+    /// caches, and the two callers below both re-read the grid.
+    fn scan_matches(&self, query: &str) -> (Vec<Match>, bool) {
+        let mut matches: Vec<Match> = Vec::new();
+        if query.is_empty() {
+            return (matches, false);
+        }
+        let pattern = self.effective_search_pattern(query);
+        let Ok(mut regex) = RegexSearch::new(&pattern) else {
+            return (matches, true);
+        };
+        let term = self.terminal.term.lock();
+        let grid = term.grid();
+        let mut origin = Point::new(grid.topmost_line(), Column(0));
+
+        while matches.len() < MAX_MATCHES {
+            let Some(m) = term.search_next(&mut regex, origin, Direction::Right, Side::Left, None)
+            else {
+                break;
+            };
+            if matches.last().is_some_and(|last| m.start() <= last.start()) {
+                break;
+            }
+            origin = m.end().add(grid, Boundary::None, 1);
+            let wrapped = origin <= *m.end();
+            matches.push(m);
+            if wrapped {
+                break;
+            }
+        }
+        (matches, false)
+    }
+
+    /// The match a fresh query starts on: the last one at or above the bottom
+    /// of what is on screen, so Enter walks forward from where the eye is.
+    fn match_nearest_the_viewport(&self, matches: &[Match]) -> Option<usize> {
+        if matches.is_empty() {
+            return None;
+        }
+        let term = self.terminal.term.lock();
+        let grid = term.grid();
+        let display_offset = grid.display_offset() as i32;
+        let bottom = Point::new(
+            Line(grid.screen_lines() as i32 - 1 - display_offset),
+            grid.last_column(),
+        );
+        Some(
+            matches
+                .iter()
+                .rposition(|m| *m.start() <= bottom)
+                .unwrap_or(0),
+        )
+    }
+
+    /// Note that output changed the grid an open search bar is describing.
+    ///
+    /// The rescan is debounced rather than run per wakeup: it reads the whole
+    /// grid, which is up to `MAX_SCROLLBACK` lines, and a pane mid-flood is
+    /// repainting far faster than anyone can read a match count off it. One
+    /// task waits for the printing to pause and then rescans once; further
+    /// output while it waits only pushes the deadline out.
+    pub(super) fn note_output_under_search(&mut self, cx: &mut Context<Self>) {
+        if self.search.is_none() {
+            return;
+        }
+        self.search_scan_epoch = self.search_scan_epoch.wrapping_add(1);
+        if self.search_scan_armed {
+            return;
+        }
+        self.search_scan_armed = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(epoch) = this.update(cx, |view, _| view.search_scan_epoch) else {
+                    break;
+                };
+                cx.background_executor().timer(SCAN_DEBOUNCE).await;
+                let settled = this.update(cx, |view, cx| {
+                    if view.search_scan_epoch != epoch {
+                        return false;
+                    }
+                    view.search_scan_armed = false;
+                    view.refresh_matches_after_output(cx);
+                    true
+                });
+                match settled {
+                    Ok(true) | Err(_) => break,
+                    Ok(false) => continue,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Re-run the query against the grid as it now stands, keeping the count
+    /// and the highlights honest while the pane is still printing.
+    ///
+    /// This is the same scan as `recompute_matches`, minus the two things that
+    /// only a *user* action has the right to do: it does not drop the
+    /// selection, and it does not scroll. Output arriving under an open search
+    /// bar must not yank the viewport or erase what the user was selecting.
+    pub(super) fn refresh_matches_after_output(&mut self, cx: &mut Context<Self>) {
+        let Some(query) = self
+            .search
+            .as_ref()
+            .map(|s| s.input.read(cx).value().to_string())
+        else {
+            return;
+        };
+        let (matches, regex_error) = self.scan_matches(&query);
+        // Stay on the match the user stepped to if it survived — it keeps the
+        // same viewport-relative start whenever the grid did not scroll. When
+        // output *did* scroll it away, fall back to where a fresh query would
+        // land rather than to a stale ordinal pointing at some other line.
+        let previous = self.search.as_ref().and_then(|s| s.current().cloned());
+        let current_index = previous
+            .and_then(|p| matches.iter().position(|m| m.start() == p.start()))
+            .or_else(|| self.match_nearest_the_viewport(&matches));
+
+        if let Some(s) = self.search.as_mut() {
+            s.matches = matches;
+            s.current_index = current_index;
+        }
+        self.search_regex_error = regex_error;
+        cx.notify();
+    }
+
     pub(super) fn recompute_matches(&mut self, cx: &mut Context<Self>) {
         let Some(query) = self
             .search
@@ -142,50 +279,8 @@ impl TerminalView {
             return;
         };
 
-        let mut matches: Vec<Match> = Vec::new();
-        let mut current_index: Option<usize> = None;
-        let mut regex_error = false;
-
-        if !query.is_empty() {
-            let pattern = self.effective_search_pattern(&query);
-            let compiled = RegexSearch::new(&pattern);
-            regex_error = compiled.is_err();
-            if let Ok(mut regex) = compiled {
-                let term = self.terminal.term.lock();
-                let grid = term.grid();
-                let mut origin = Point::new(grid.topmost_line(), Column(0));
-
-                while matches.len() < MAX_MATCHES {
-                    let Some(m) =
-                        term.search_next(&mut regex, origin, Direction::Right, Side::Left, None)
-                    else {
-                        break;
-                    };
-                    if matches.last().is_some_and(|last| m.start() <= last.start()) {
-                        break;
-                    }
-                    origin = m.end().add(grid, Boundary::None, 1);
-                    let wrapped = origin <= *m.end();
-                    matches.push(m);
-                    if wrapped {
-                        break;
-                    }
-                }
-
-                if !matches.is_empty() {
-                    let display_offset = grid.display_offset() as i32;
-                    let bottom = Point::new(
-                        Line(grid.screen_lines() as i32 - 1 - display_offset),
-                        grid.last_column(),
-                    );
-                    let idx = matches
-                        .iter()
-                        .rposition(|m| *m.start() <= bottom)
-                        .unwrap_or(0);
-                    current_index = Some(idx);
-                }
-            }
-        }
+        let (matches, regex_error) = self.scan_matches(&query);
+        let current_index = self.match_nearest_the_viewport(&matches);
 
         if let Some(s) = self.search.as_mut() {
             s.matches = matches;
