@@ -7390,8 +7390,7 @@ mod tests {
     use super::{
         CloseReason, TabAgentSession, clear_window_override_values, close_prompt,
         leaf_shares_the_window_daemon, mru_order, pane_attachable, pane_free_for,
-        parse_ssh_connect_input,
-        parse_ssh_option_words,
+        parse_ssh_connect_input, parse_ssh_option_words,
     };
 
     #[test]

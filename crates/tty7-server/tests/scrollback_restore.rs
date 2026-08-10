@@ -364,7 +364,8 @@ fn the_tree_records_the_shell_a_pane_is_running() {
     let wanted = interactive_shell().program;
     let deadline = Instant::now() + STREAM_WITHIN;
     loop {
-        let tree = std::fs::read_to_string(instance.path().join("machine.json")).unwrap_or_default();
+        let tree =
+            std::fs::read_to_string(instance.path().join("machine.json")).unwrap_or_default();
         // The record is keyed by pane id and the program is a plain string in
         // it; matching on both together is enough to say this pane's shell —
         // not some other pane's — reached the tree.
