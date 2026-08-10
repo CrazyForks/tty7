@@ -311,11 +311,25 @@ impl RemoteTerminal {
         // predates the field would silently drop it. Sending it anyway would
         // cost nothing but would make the log claim a restore that never
         // happened, so the local case is the only one that asks.
-        let restore = restore.filter(|_| {
-            route.is_local()
-                && crate::daemon::spawn::local_daemon_supports(
-                    crate::daemon::protocol::FEATURE_RESTORE_SCROLLBACK,
-                )
+        let restore = restore.and_then(|want| {
+            let local = route.is_local();
+            let supported = crate::daemon::spawn::local_daemon_supports(
+                crate::daemon::protocol::FEATURE_RESTORE_SCROLLBACK,
+            );
+            if local && supported {
+                return Some(want);
+            }
+            // Said out loud, because the symptom of dropping it here is a pane
+            // that opens blank — which is also what a pane with nothing stored
+            // looks like, and what a daemon that refused would produce. Three
+            // causes, one appearance; without this line the only way to tell
+            // them apart is to read the source.
+            log::info!(
+                "not asking to restore pane {}'s screen: local={local} \
+                 daemon-supports-restore={supported}",
+                want.pane_id
+            );
+            None
         });
 
         ClientMsg::Spawn {
