@@ -26,6 +26,15 @@ impl Registry {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Resume naming panes where the previous image left off.
+    ///
+    /// Reusing a number would be worse than skipping one: a client that
+    /// reconnects after a handoff is still holding the old ids, and an `Attach`
+    /// for one of them has to find the pane it means or nothing at all.
+    fn claim_ids_past(&self, next: u64) {
+        self.next_id.fetch_max(next, Ordering::Relaxed);
+    }
+
     fn seed_ids_past(&self, machine: &crate::core::machine::Machine) {
         let max = machine
             .panes
@@ -67,6 +76,10 @@ impl Registry {
         for pane in panes {
             pane.kill();
         }
+    }
+
+    fn all(&self) -> Vec<Arc<DaemonPane>> {
+        self.panes.lock().unwrap().values().cloned().collect()
     }
 
     fn list(&self) -> Vec<crate::daemon::protocol::PaneInfo> {
@@ -135,6 +148,128 @@ fn spawn_orphan_sweep(registry: Arc<Registry>) {
     }
 }
 
+/// Pane ids that something can still ask to see again: every pane a workspace
+/// tree names, plus every pane this daemon is running.
+///
+/// The registry half matters for a pane spawned since the tree was last
+/// written — without it a sweep landing in that window would delete the
+/// snapshot of a pane that is very much alive, and the writer would put it
+/// back seconds later.
+fn restorable_pane_ids(registry: &Registry) -> std::collections::HashSet<u64> {
+    let mut ids: std::collections::HashSet<u64> =
+        registry.list().into_iter().map(|p| p.pane_id).collect();
+    if let Some(store) = crate::core::machine::observed_store() {
+        ids.extend(
+            store
+                .machine()
+                .workspaces
+                .iter()
+                .flat_map(|w| w.tabs.iter())
+                .flat_map(|t| t.root.pane_ids()),
+        );
+    }
+    ids
+}
+
+/// Keep each pane's stored screen roughly current.
+///
+/// Only panes whose ring has moved are written, so an idle machine does no IO
+/// at all, and the busy pane that most needs a fresh copy is the one that gets
+/// it. Turning the setting off mid-run is honoured here too: the next tick
+/// clears the directory rather than leaving terminal output on disk that the
+/// user has just said they do not want stored.
+fn spawn_scrollback_writer(registry: Arc<Registry>) {
+    let spawned = std::thread::Builder::new()
+        .name("tty7-scrollback".into())
+        .spawn(move || {
+            let mut marks: HashMap<u64, u64> = HashMap::new();
+            let mut storing = crate::daemon::scrollback::enabled();
+            loop {
+                std::thread::sleep(crate::daemon::scrollback::SNAPSHOT_INTERVAL);
+                let enabled = crate::daemon::scrollback::enabled();
+                if !enabled {
+                    if storing {
+                        log::info!("scrollback persistence turned off; dropping what was stored");
+                        crate::daemon::scrollback::sweep(&std::collections::HashSet::new());
+                        marks.clear();
+                        storing = false;
+                    }
+                    continue;
+                }
+                storing = true;
+                for pane in registry.all() {
+                    if marks.get(&pane.id) == Some(&pane.scrollback_mark()) {
+                        continue;
+                    }
+                    let (segments, mark) = pane.scrollback_snapshot();
+                    crate::daemon::scrollback::save(pane.id, &segments);
+                    marks.insert(pane.id, mark);
+                }
+                crate::daemon::scrollback::sweep(&restorable_pane_ids(&registry));
+                marks.retain(|id, _| registry.get(*id).is_some());
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("could not start the scrollback writer: {e}");
+    }
+}
+
+/// Write every pane's screen one last time, on the way out of a shutdown this
+/// process was told about.
+///
+/// The periodic writer covers the deaths nobody gets to prepare for; this
+/// covers the ones we do, and makes the copy exact rather than up to
+/// [`SNAPSHOT_INTERVAL`](crate::daemon::scrollback::SNAPSHOT_INTERVAL) stale.
+fn store_scrollback_now(registry: &Registry) {
+    if !crate::daemon::scrollback::enabled() {
+        return;
+    }
+    for pane in registry.all() {
+        let (segments, _) = pane.scrollback_snapshot();
+        crate::daemon::scrollback::save(pane.id, &segments);
+    }
+}
+
+/// Turn a client's restore request into the screen its new pane opens with.
+///
+/// The snapshot is dropped as it is handed out. It has been folded into a live
+/// pane's ring, which is where it will be persisted from now on — under that
+/// pane's own id — and a copy left behind could only ever be used to restore
+/// the same screen into a second pane.
+fn restored_screen(
+    request: crate::daemon::protocol::RestoreFrom,
+) -> Option<crate::daemon::pane::Restore> {
+    if !crate::daemon::scrollback::enabled() {
+        return None;
+    }
+    let segments = crate::daemon::scrollback::load(request.pane_id)?;
+    crate::daemon::scrollback::forget(request.pane_id);
+    if segments.is_empty() {
+        return None;
+    }
+    log::info!(
+        "pane {} is gone; its last screen is restored into a fresh pane",
+        request.pane_id
+    );
+    Some(crate::daemon::pane::Restore {
+        segments,
+        banner: request.banner,
+    })
+}
+
+/// Close a pane for good: stop it, drop it from the registry, and drop the copy
+/// of its screen.
+///
+/// A stored screen exists so a pane can survive a death nobody chose. A pane
+/// the user closed is not that; keeping its output on disk afterwards would
+/// only be a way for it to turn up in some later restore.
+fn kill_pane(registry: &Registry, pane_id: u64) {
+    if let Some(pane) = registry.remove(pane_id) {
+        pane.kill();
+    }
+    crate::daemon::scrollback::forget(pane_id);
+}
+
 fn ssh_connection_for(
     registry: &Registry,
     pane_id: u64,
@@ -165,6 +300,11 @@ macro_rules! startup_note {
 }
 
 pub fn run_daemon() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if let Some(inheritance) = crate::daemon::handoff::requested() {
+        return run_adopting(inheritance);
+    }
+
     // Before either endpoint, and before the machine tree is opened. Whoever
     // holds this is the server; everyone else stands down while it lives.
     //
@@ -204,6 +344,145 @@ pub fn run_daemon() -> anyhow::Result<()> {
     log::info!("no control listener on this platform; serving panes only");
 
     run_with(registry)
+}
+
+/// Come up as the far side of a handoff: the panes are already running, and
+/// this image only has to recognise them.
+///
+/// The seat is adopted rather than claimed — the lock is held by this process,
+/// which is the process that held it before the exec. Claiming would ask the
+/// kernel for a lock our own descriptor already has, be refused, and take the
+/// "another server is already serving" exit, which would leave the machine with
+/// no daemon and a set of orphaned shells nobody can reach.
+#[cfg(unix)]
+fn run_adopting(inheritance: crate::daemon::handoff::Inheritance) -> anyhow::Result<()> {
+    let _seat = inheritance
+        .seat_fd
+        .map(|fd| unsafe { crate::daemon::singleton::adopt(fd) });
+    if _seat.is_none() {
+        startup_note!("tty7-server: handed over without a seat descriptor; serving unprotected");
+    }
+
+    let registry = Arc::new(Registry::new());
+
+    match crate::daemon::handoff::adopt(inheritance.blob_fd) {
+        Some(adopted) => {
+            registry.claim_ids_past(adopted.next_pane_id);
+            let mut kept = 0usize;
+            for carried in adopted.panes {
+                let id = carried.id;
+                let on_dead = reaper(registry.clone(), id);
+                match crate::daemon::pane::DaemonPane::adopt(carried, on_dead) {
+                    Ok(pane) => {
+                        registry.insert(pane);
+                        kept += 1;
+                    }
+                    // The shell is alive and this image cannot speak to its pty.
+                    // Saying so is all that can be done: the descriptor closes
+                    // when this process eventually exits, and the shell gets the
+                    // hangup it would have got from an ordinary restart.
+                    Err(e) => log::error!("pane {id} could not be adopted: {e}"),
+                }
+            }
+            startup_note!("tty7-server: adopted {kept} pane(s) from the previous build");
+        }
+        // The blob is a file this process wrote and unlinked moments ago, so
+        // this is a bug rather than an accident. The shells are the cost: their
+        // ptys are still open here, held by descriptors nothing can now name,
+        // which leaves them running with no reader — #42's stranded sessions,
+        // arrived at from the other direction. They are released when this
+        // daemon exits, so a restart clears it; there is nothing safe to close
+        // in the meantime, because which descriptors they were is exactly what
+        // was lost.
+        None => startup_note!(
+            "tty7-server: the handoff blob was unreadable; the previous build's panes are lost"
+        ),
+    }
+
+    {
+        let mut services = control_services();
+        services.panes = Some(registry.clone());
+        match crate::host::server::spawn_control_listener_with(
+            crate::host::local::LocalHost::shared(),
+            services,
+        ) {
+            Ok(path) => startup_note!("tty7-server: control socket at {}", path.display()),
+            Err(e) => startup_note!("tty7-server: control listener unavailable: {e}"),
+        }
+    }
+
+    run_with(registry)
+}
+
+/// Become `exe` in place, keeping every pane that can survive the crossing.
+///
+/// Returns the reason it did not happen; on success there is no return, because
+/// by then this program has been replaced by the one it was asked to become.
+#[cfg(unix)]
+fn hand_over(registry: &Registry, exe: &std::path::Path) -> anyhow::Error {
+    // Before anything is given up: the native-SSH panes below are hung up on
+    // the promise that this process is about to stop existing, and an exec
+    // that was never going to work must not collect on it. `execve` can still
+    // fail after this — a wrong architecture, a permission the metadata does
+    // not show — but the everyday failures, a path that is not there or not a
+    // program, are caught while everything is still intact.
+    match std::fs::metadata(exe) {
+        Err(e) => return anyhow::anyhow!("cannot become {}: {e}", exe.display()),
+        Ok(meta) => {
+            use std::os::unix::fs::PermissionsExt as _;
+            if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+                return anyhow::anyhow!("cannot become {}: not an executable file", exe.display());
+            }
+        }
+    }
+
+    let mut carried = Vec::new();
+    for pane in registry.all() {
+        match pane.carry() {
+            Some(c) => carried.push(c),
+            None => {
+                // A native-SSH pane's session is cipher state in this process's
+                // memory; the socket would cross and nothing able to speak on
+                // it would. Hanging it up here means the far end sees a close
+                // rather than a connection that has stopped answering.
+                log::info!("pane {} cannot cross a handoff; closing it", pane.id);
+                kill_pane(registry, pane.id);
+            }
+        }
+    }
+
+    // The tree is what the window rebuilds itself from when it reconnects, and
+    // the reconnect happens milliseconds from now.
+    if let Some(store) = crate::core::machine::observed_store() {
+        store.flush();
+    }
+
+    crate::daemon::handoff::take_over(
+        exe,
+        carried,
+        registry.alloc_id(),
+        crate::daemon::singleton::held_fd(),
+    )
+}
+
+#[cfg(not(unix))]
+fn hand_over(_registry: &Registry, _exe: &std::path::Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "this platform has no way to replace a running program while keeping its \
+         open consoles, so the daemon has to be stopped and started"
+    )
+}
+
+/// What a pane does to the registry when its shell dies.
+fn reaper(registry: Arc<Registry>, id: u64) -> impl FnOnce() + Send + 'static {
+    move || {
+        std::thread::Builder::new()
+            .name("tty7-daemon-pane-reap".to_string())
+            .spawn(move || {
+                registry.remove(id);
+            })
+            .ok();
+    }
 }
 
 pub fn control_services() -> crate::host::server::Services {
@@ -280,6 +559,22 @@ fn run_with(registry: Arc<Registry>) -> anyhow::Result<()> {
     }
 
     spawn_orphan_sweep(registry.clone());
+    // Before the writer starts: a daemon that has just come up owns no panes,
+    // so everything on disk belongs to panes the machine tree either still
+    // names — those are the ones a window is about to ask to restore — or has
+    // forgotten, and the latter are nobody's to restore any more.
+    let restorable = restorable_pane_ids(&registry);
+    if crate::daemon::scrollback::enabled() {
+        crate::daemon::scrollback::sweep(&restorable);
+    } else {
+        crate::daemon::scrollback::sweep(&std::collections::HashSet::new());
+    }
+    // A daemon that was killed outright never retired anything, so the files of
+    // panes that died with it are still here. Their commands cannot be
+    // recovered — the mark saying which were new belongs to a shell that is
+    // gone — so what is left is not to hoard them.
+    crate::daemon::history::sweep(&restorable);
+    spawn_scrollback_writer(registry.clone());
 
     for stream in listener.incoming() {
         match stream {
@@ -321,6 +616,10 @@ fn serve_sigterm(registry: Arc<Registry>) {
             let mut sig: libc::c_int = 0;
             if unsafe { libc::sigwait(&set, &mut sig) } == 0 {
                 log::info!("daemon shutting down on SIGTERM");
+                // Ahead of the kill: `drain_and_kill` hangs up every pty, and a
+                // pane whose shell has already been reaped has nothing left to
+                // photograph.
+                store_scrollback_now(&registry);
                 registry.drain_and_kill();
                 on_shutdown();
                 std::process::exit(0);
@@ -364,8 +663,16 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             shell,
             owner,
             workspace,
+            restore,
         } => {
             let id = registry.alloc_id();
+            if let Some(dead) = restore.as_ref().map(|r| r.pane_id) {
+                // Before the spawn, because the spawn is what hands the shell
+                // the name of its history file — and this is what puts the
+                // predecessor's commands behind that name.
+                crate::daemon::history::carry(dead, id);
+            }
+            let restore = restore.and_then(restored_screen);
             let on_dead = {
                 let registry = registry.clone();
                 move || {
@@ -377,17 +684,18 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
                         .ok();
                 }
             };
-            let pane = match DaemonPane::spawn(id, cwd, size, shell, owner, workspace, on_dead) {
-                Ok(p) => p,
-                Err(e) => {
-                    let mut w = write_stream;
-                    // The daemon's own error is already a sentence; a second
-                    // "spawn failed:" in front of it only pads the one the
-                    // window ends up showing.
-                    let _ = DaemonMsg::Error(format!("{e}")).encode(&mut w);
-                    return Err(e);
-                }
-            };
+            let pane =
+                match DaemonPane::spawn(id, cwd, size, shell, owner, workspace, restore, on_dead) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let mut w = write_stream;
+                        // The daemon's own error is already a sentence; a second
+                        // "spawn failed:" in front of it only pads the one the
+                        // window ends up showing.
+                        let _ = DaemonMsg::Error(format!("{e}")).encode(&mut w);
+                        return Err(e);
+                    }
+                };
             registry.insert(pane.clone());
 
             {
@@ -466,6 +774,11 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
 
         ClientMsg::Shutdown => {
             log::info!("daemon shutting down on client request");
+            // This is the path a restart takes, so it is the one that decides
+            // whether panes come back showing anything. Ahead of the kill:
+            // `drain_and_kill` hangs up every pty, and a pane whose shell has
+            // been reaped has nothing left to photograph.
+            store_scrollback_now(&registry);
             registry.drain_and_kill();
             // The ConPTY hosts (OpenConsole.exe) are this process's children,
             // not the shells', so the per-pane kill never reaches them — and
@@ -484,9 +797,17 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
         }
 
         ClientMsg::Kill { pane_id } => {
-            if let Some(pane) = registry.remove(pane_id) {
-                pane.kill();
-            }
+            kill_pane(&registry, pane_id);
+            Ok(())
+        }
+
+        ClientMsg::Handoff { exe } => {
+            let mut w = write_stream;
+            // Only ever returns having failed: a handoff that works replaces
+            // this program mid-call, and there is nobody left to write a reply.
+            let failure = hand_over(&registry, &exe);
+            log::error!("handoff to {} did not happen: {failure}", exe.display());
+            DaemonMsg::Error(failure.to_string()).encode(&mut w)?;
             Ok(())
         }
 
@@ -797,9 +1118,8 @@ fn run_stream(
                     if pane_id == id {
                         killed = true;
                         break 'conn;
-                    } else if let Some(other) = registry.remove(pane_id) {
-                        other.kill();
                     }
+                    kill_pane(&registry, pane_id);
                 }
                 _ => {}
             }
@@ -822,9 +1142,7 @@ fn run_stream(
     let _ = writer.join();
 
     if killed {
-        if let Some(p) = registry.remove(id) {
-            p.kill();
-        }
+        kill_pane(&registry, id);
     } else if reclaimable {
         registry.remove(id);
     }

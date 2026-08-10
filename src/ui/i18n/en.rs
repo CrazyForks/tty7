@@ -1340,6 +1340,36 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::Replace => "Replace",
         L10nKey::SftpErrorInvalidOctalMode => "invalid octal mode",
+        L10nKey::SettingsDaemonStaleDescInPlace => {
+            "tty7 was updated in place, so the app is new but your panes are still served by the \
+             previous build. The server can replace itself with the new one without stopping: \
+             your shells and whatever is running in them carry straight over. Panes on tty7's \
+             built-in SSH client are the exception — those connections close and need reopening."
+        }
+        L10nKey::AppRestartServerBodyInPlace => {
+            "The background server replaces itself with this build without stopping. Your shells \
+             keep running — commands, agents and `ssh` sessions in a pane are not interrupted — \
+             and the window reconnects to them a moment later. Panes on tty7's built-in SSH \
+             client are the exception: those connections close and need reopening."
+        }
+        L10nKey::PaneRestoredScreenBanner => {
+            "restored screen — this shell is new, nothing above it is still running"
+        }
+        L10nKey::SettingsPerPaneHistory => "Give each pane its own shell history",
+        L10nKey::SettingsPerPaneHistoryDescription => {
+            "Up walks through what you ran in this pane, instead of an interleaving of every \
+             pane. A new pane starts from your existing history rather than blank, and what it \
+             adds is written back when it closes, so nothing is lost. Applies to bash and zsh \
+             panes that tty7 can set up; a shell started with your own arguments is left alone."
+        }
+        L10nKey::SettingsPersistScrollback => "Keep pane output on disk",
+        L10nKey::SettingsPersistScrollbackDescription => {
+            "If the background service dies without warning — a crash, or a reboot — panes come \
+             back showing what was on them instead of blank. The processes are gone either way; \
+             this restores the picture. It writes a capped tail of every pane's output to disk, \
+             including anything printed there: tokens, the output of `env`, an agent's \
+             transcript. Off means that output only ever lives in memory."
+        }
         L10nKey::PanelMoreChangedFiles => {
             "… and {count} more changed files — run git diff to see them."
         }

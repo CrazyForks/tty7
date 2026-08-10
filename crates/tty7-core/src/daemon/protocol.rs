@@ -16,6 +16,20 @@ pub const FEATURE_PANE_OWNER: &str = "pane-owner";
 /// older daemon it must keep reflowing locally at request time.
 pub const FEATURE_RESIZE_ECHO: &str = "resize-echo";
 
+/// The daemon can seed a new pane with the screen a dead one left behind, named
+/// by `ClientMsg::Spawn`'s `restore` field. A client that does not see this
+/// feature leaves the field out: an older daemon would ignore it and spawn a
+/// blank pane, which is the same outcome, but sending it would make the wire
+/// claim a restore that never happened.
+pub const FEATURE_RESTORE_SCROLLBACK: &str = "restore-scrollback";
+
+/// The daemon can replace its own binary without stopping, keeping every pty
+/// and everything running on one — `ClientMsg::Handoff`. Advertised only where
+/// it can actually be done, which is where `execve` exists, so a client can use
+/// it to choose between offering an upgrade that costs the user nothing and one
+/// that costs them every running command.
+pub const FEATURE_HANDOFF: &str = "handoff";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonVersion {
     pub protocol: u32,
@@ -29,13 +43,18 @@ pub struct DaemonVersion {
 
 impl DaemonVersion {
     pub fn current() -> DaemonVersion {
+        let mut features = vec![
+            FEATURE_PANE_OWNER.to_string(),
+            FEATURE_RESIZE_ECHO.to_string(),
+            FEATURE_RESTORE_SCROLLBACK.to_string(),
+        ];
+        if cfg!(unix) {
+            features.push(FEATURE_HANDOFF.to_string());
+        }
         DaemonVersion {
             protocol: PROTOCOL_VERSION,
             build: env!("CARGO_PKG_VERSION").to_string(),
-            features: vec![
-                FEATURE_PANE_OWNER.to_string(),
-                FEATURE_RESIZE_ECHO.to_string(),
-            ],
+            features,
             instance: process_instance().to_string(),
         }
     }
@@ -584,6 +603,7 @@ pub enum ClientMsg {
         shell: Option<ShellSpec>,
         owner: Option<String>,
         workspace: Option<String>,
+        restore: Option<RestoreFrom>,
     },
     Attach {
         pane_id: u64,
@@ -605,6 +625,16 @@ pub enum ClientMsg {
     },
     List,
     Shutdown,
+    /// Become `exe` without stopping: the daemon rewrites itself in place and
+    /// keeps every pty, shell and pane id it is holding. The connection dies in
+    /// the process — the new image has never heard of it — so this is the last
+    /// thing a client can say on it, and the reply is the socket closing.
+    ///
+    /// Unix only. Elsewhere the daemon answers with an error and the caller
+    /// falls back to stopping and starting it.
+    Handoff {
+        exe: PathBuf,
+    },
     EnsureLoopbackForward(LoopbackForwardRequest),
     ListLoopbackForwards,
     CloseLoopbackForward(LoopbackForwardId),
@@ -741,6 +771,7 @@ mod kind {
     pub const SPAWN_OWNED: u8 = 53;
     pub const OBSERVE: u8 = 54;
     pub const SEND_INPUT: u8 = 55;
+    pub const HANDOFF: u8 = 56;
 
     pub const SPAWNED: u8 = 1;
     pub const SNAPSHOT: u8 = 2;
@@ -855,6 +886,29 @@ struct OwnedSpawn {
     owner: Option<String>,
     #[serde(default)]
     workspace: Option<String>,
+    #[serde(default)]
+    restore: Option<RestoreFrom>,
+}
+
+/// "This pane replaces one that died with the daemon."
+///
+/// Carried on a spawn rather than an attach because there is nothing to attach
+/// to: the process is gone. The daemon looks up what pane `pane_id` last had on
+/// its screen and seeds the new pane's ring with it, so the window shows the
+/// output it lost under a shell that is plainly new.
+///
+/// `banner` is the line drawn between the two, and it comes from the client
+/// because the daemon has no locale — it serves a GUI that might be running in
+/// any language, and a CLI whose output is always English. A client that has
+/// nothing to say can leave it out; the reset sequence is emitted either way.
+///
+/// Old daemons decode this frame without the field and simply spawn a blank
+/// pane, which is what they did before it existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreFrom {
+    pub pane_id: u64,
+    #[serde(default)]
+    pub banner: Option<String>,
 }
 
 impl ClientMsg {
@@ -866,6 +920,7 @@ impl ClientMsg {
                 shell: None,
                 owner: None,
                 workspace: None,
+                restore: None,
             } => write_frame(w, kind::SPAWN, &to_json(&(cwd, size))?),
             ClientMsg::Spawn {
                 cwd,
@@ -873,6 +928,7 @@ impl ClientMsg {
                 shell: shell @ Some(_),
                 owner: None,
                 workspace: None,
+                restore: None,
             } => write_frame(w, kind::SPAWN_SHELL, &to_json(&(cwd, size, shell))?),
             ClientMsg::Spawn {
                 cwd,
@@ -880,6 +936,7 @@ impl ClientMsg {
                 shell,
                 owner,
                 workspace,
+                restore,
             } => write_frame(
                 w,
                 kind::SPAWN_OWNED,
@@ -889,6 +946,7 @@ impl ClientMsg {
                     shell: shell.clone(),
                     owner: owner.clone(),
                     workspace: workspace.clone(),
+                    restore: restore.clone(),
                 })?,
             ),
             ClientMsg::Attach { pane_id, size } => {
@@ -906,6 +964,7 @@ impl ClientMsg {
             ClientMsg::Kill { pane_id } => write_frame(w, kind::KILL, &to_json(pane_id)?),
             ClientMsg::List => write_frame(w, kind::LIST, &[]),
             ClientMsg::Shutdown => write_frame(w, kind::SHUTDOWN, &[]),
+            ClientMsg::Handoff { exe } => write_frame(w, kind::HANDOFF, &to_json(exe)?),
             ClientMsg::EnsureLoopbackForward(req) => {
                 write_frame(w, kind::ENSURE_LOOPBACK_FORWARD, &to_json(req)?)
             }
@@ -967,6 +1026,7 @@ impl ClientMsg {
                     shell: None,
                     owner: None,
                     workspace: None,
+                    restore: None,
                 }
             }
             kind::SPAWN_SHELL => {
@@ -977,6 +1037,7 @@ impl ClientMsg {
                     shell,
                     owner: None,
                     workspace: None,
+                    restore: None,
                 }
             }
             kind::SPAWN_OWNED => {
@@ -986,6 +1047,7 @@ impl ClientMsg {
                     shell,
                     owner,
                     workspace,
+                    restore,
                 } = from_json(&payload)?;
                 ClientMsg::Spawn {
                     cwd,
@@ -993,6 +1055,7 @@ impl ClientMsg {
                     shell,
                     owner,
                     workspace,
+                    restore,
                 }
             }
             kind::ATTACH => {
@@ -1015,6 +1078,9 @@ impl ClientMsg {
             },
             kind::LIST => ClientMsg::List,
             kind::SHUTDOWN => ClientMsg::Shutdown,
+            kind::HANDOFF => ClientMsg::Handoff {
+                exe: from_json(&payload)?,
+            },
             kind::ENSURE_LOOPBACK_FORWARD => ClientMsg::EnsureLoopbackForward(from_json(&payload)?),
             kind::LIST_LOOPBACK_FORWARDS => ClientMsg::ListLoopbackForwards,
             kind::CLOSE_LOOPBACK_FORWARD => ClientMsg::CloseLoopbackForward(from_json(&payload)?),
@@ -1226,6 +1292,7 @@ mod tests {
                 shell: None,
                 owner: None,
                 workspace: None,
+                restore: None,
             },
             ClientMsg::Resize(SIZE),
             ClientMsg::Input(vec![b'l', b's', b'\r']),
@@ -1280,6 +1347,7 @@ mod tests {
                 shell: None,
                 owner: None,
                 workspace: None,
+                restore: None,
             },
             ClientMsg::Spawn {
                 cwd: None,
@@ -1287,6 +1355,7 @@ mod tests {
                 shell: None,
                 owner: None,
                 workspace: None,
+                restore: None,
             },
             ClientMsg::Spawn {
                 cwd: Some(PathBuf::from("/tmp/x")),
@@ -1298,6 +1367,7 @@ mod tests {
                 }),
                 owner: None,
                 workspace: None,
+                restore: None,
             },
             ClientMsg::Spawn {
                 cwd: Some(PathBuf::from("/tmp/x")),
@@ -1305,6 +1375,7 @@ mod tests {
                 shell: None,
                 owner: Some("bda10e44-02de-44a0-8412-ec1cda2b5f5b".into()),
                 workspace: None,
+                restore: None,
             },
             ClientMsg::Spawn {
                 cwd: Some(PathBuf::from("/tmp/x")),
@@ -1312,6 +1383,7 @@ mod tests {
                 shell: None,
                 owner: None,
                 workspace: Some("ws-main".into()),
+                restore: None,
             },
             ClientMsg::Observe {
                 pane_id: 42,
@@ -1615,6 +1687,7 @@ mod tests {
             shell: None,
             owner: None,
             workspace: None,
+            restore: None,
         };
         let mut buf = Vec::new();
         msg.encode(&mut buf).unwrap();
@@ -1634,6 +1707,7 @@ mod tests {
                 shell: None,
                 owner: None,
                 workspace: None,
+                restore: None,
             }
         );
     }
@@ -1651,6 +1725,7 @@ mod tests {
             shell: Some(shell.clone()),
             owner: None,
             workspace: None,
+            restore: None,
         };
         let mut buf = Vec::new();
         msg.encode(&mut buf).unwrap();
@@ -1665,6 +1740,7 @@ mod tests {
                 shell: Some(shell),
                 owner: None,
                 workspace: None,
+                restore: None,
             }
         );
     }
@@ -1681,6 +1757,7 @@ mod tests {
             }),
             owner: Some("bda10e44-02de-44a0-8412-ec1cda2b5f5b".into()),
             workspace: Some("ws-7".into()),
+            restore: None,
         };
         let mut buf = Vec::new();
         msg.encode(&mut buf).unwrap();
@@ -1710,6 +1787,7 @@ mod tests {
                 shell: None,
                 owner: None,
                 workspace: None,
+                restore: None,
             }
         );
     }
@@ -1722,6 +1800,7 @@ mod tests {
             shell: None,
             owner: None,
             workspace: Some("ws-main".into()),
+            restore: None,
         };
         let mut buf = Vec::new();
         msg.encode(&mut buf).unwrap();

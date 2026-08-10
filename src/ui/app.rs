@@ -1409,10 +1409,21 @@ impl Tty7App {
     }
 
     pub(crate) fn restart_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Two different actions wearing one name. Where the service can rewrite
+        // itself in place, nothing in a pane is interrupted and promising the
+        // user a bloodbath would be a lie that costs them the feature; where it
+        // cannot, every running command really does end, and that is the one
+        // thing they need to be told before they agree.
+        let in_place =
+            crate::daemon::spawn::local_daemon_supports(crate::daemon::protocol::FEATURE_HANDOFF);
         let answer = window.prompt(
             PromptLevel::Warning,
             t(L10nKey::AppRestartServerTitle),
-            Some(t(L10nKey::AppRestartServerBody)),
+            Some(t(if in_place {
+                L10nKey::AppRestartServerBodyInPlace
+            } else {
+                L10nKey::AppRestartServerBody
+            })),
             &crate::ui::confirm_answers(
                 t(L10nKey::AppRestart),
                 t(crate::ui::i18n::L10nKey::Cancel),
@@ -1443,7 +1454,23 @@ impl Tty7App {
                 return;
             }
             let restarted = cx
-                .background_spawn(async move { crate::daemon::spawn::restart() })
+                .background_spawn(async move {
+                    // The same test that chose the dialog's copy chooses the
+                    // action, because the copy is a promise. A daemon that
+                    // advertises the handoff was described as replacing itself
+                    // with nothing interrupted — if that fails, the failure is
+                    // shown, not silently traded for the restart that kills
+                    // every pane the user was just told would live. The
+                    // stop-and-start path is only taken where its bloodbath is
+                    // what the dialog actually said.
+                    if crate::daemon::spawn::local_daemon_supports(
+                        crate::daemon::protocol::FEATURE_HANDOFF,
+                    ) {
+                        crate::daemon::spawn::hand_off()
+                    } else {
+                        crate::daemon::spawn::restart()
+                    }
+                })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match &restarted {
@@ -2489,6 +2516,20 @@ impl Tty7App {
 
     pub(crate) fn set_restore_session(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.restore_session = on);
+    }
+
+    /// The daemon reads this from the config file on its own — it is the one
+    /// holding the output — so there is nothing to tell it here. Turning it off
+    /// also removes what was already stored, which the daemon does on its next
+    /// pass rather than leaving the bytes behind.
+    pub(crate) fn set_persist_scrollback(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.persist_scrollback = on);
+    }
+
+    /// Takes effect on the next pane: a shell is told where its history lives
+    /// when it starts, and nothing can move it afterwards.
+    pub(crate) fn set_per_pane_history(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.per_pane_history = on);
     }
 
     pub(crate) fn set_show_tray_icon(&mut self, on: bool, cx: &mut Context<Self>) {

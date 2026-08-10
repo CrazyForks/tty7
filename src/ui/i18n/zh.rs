@@ -1273,6 +1273,31 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SftpReplaceBody => "{names} 在这个文件夹里已经存在，上传会覆盖它们。",
         L10nKey::Replace => "覆盖",
         L10nKey::SftpErrorInvalidOctalMode => "无效的八进制模式",
+        L10nKey::SettingsDaemonStaleDescInPlace => {
+            "tty7 是原地更新的，所以应用是新的，但你的面板仍由上一个版本在服务。\
+             server 可以在不停止的情况下把自己换成新版本：你的 shell 和里面正在跑的东西会直接延续下来。\
+             用 tty7 内置 SSH 客户端的面板除外——那些连接会断开，需要重新打开。"
+        }
+        L10nKey::AppRestartServerBodyInPlace => {
+            "后台 server 会在不停止的情况下把自己换成当前这个版本。\
+             你的 shell 会继续运行——面板里的命令、agent、`ssh` 会话都不会被打断——窗口稍后会重新连上它们。\
+             用 tty7 内置 SSH 客户端的面板除外：那些连接会断开，需要重新打开。"
+        }
+        L10nKey::PaneRestoredScreenBanner => {
+            "已恢复的画面 —— 下面是新的 shell，上面的内容都已不在运行"
+        }
+        L10nKey::SettingsPerPaneHistory => "每个面板用自己的 shell 历史",
+        L10nKey::SettingsPerPaneHistoryDescription => {
+            "上方向键翻的是这个面板里跑过的命令，而不是所有面板混在一起的结果。\
+             新面板会从你已有的历史开始，而不是一片空白；面板关闭时，它新增的部分会写回原来的历史文件，不会丢。\
+             只对 tty7 能接管的 bash 和 zsh 面板生效；用你自己参数启动的 shell 不受影响。"
+        }
+        L10nKey::SettingsPersistScrollback => "把面板输出留在磁盘上",
+        L10nKey::SettingsPersistScrollbackDescription => {
+            "后台服务如果没来得及交接就没了（崩溃、重启机器），面板回来时会显示原先的内容，而不是一片空白。\
+             进程无论如何都救不回来，这里恢复的只是画面。它会把每个面板输出的末尾（有上限）写到磁盘上，\
+             包括那里打印过的一切：token、`env` 的输出、agent 的对话记录。关掉则这些输出只存在于内存里。"
+        }
         L10nKey::PanelMoreChangedFiles => "…还有 {count} 个变更文件——运行 git diff 查看。",
         L10nKey::PanelUntracked => "{count} 个未跟踪文件",
         L10nKey::AppMenuAbout => "关于 tty7",

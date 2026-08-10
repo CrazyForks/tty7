@@ -1,5 +1,13 @@
 pub mod control;
 pub mod duplex;
+/// Upgrading the daemon in place, keeping the ptys and the shells on them.
+///
+/// Unix only, and not for want of trying: `execve` is what makes it possible,
+/// and Windows has neither that nor a way to hand a ConPTY to another process.
+/// There the daemon still stops and starts, and `scrollback` softens it.
+#[cfg(unix)]
+pub mod handoff;
+pub mod history;
 pub mod install;
 pub mod pane;
 pub mod pidfile;
@@ -8,6 +16,7 @@ pub mod protocol;
 pub(crate) mod remote;
 pub mod remote_link;
 pub mod router;
+pub mod scrollback;
 pub mod server;
 pub mod singleton;
 pub mod spawn;
