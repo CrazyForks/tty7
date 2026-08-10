@@ -23,6 +23,14 @@ pub const MAX_PATHSPECS_PER_CALL: usize = 200;
 /// — the local path has no deadline at all.
 pub const GIT_NETWORK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How long a non-network write may take before the client stops waiting.
+///
+/// Sized for a pre-commit hook that runs a linter or a test suite, not for an
+/// interactive query: a remote server never times a job out — it runs it to
+/// completion — so a deadline shorter than the job only *misreports* failure
+/// while the commit lands anyway, and the offered re-run doubles it.
+pub const GIT_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// What the user stands to lose. Purely advisory data for the UI's gate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Destructive {
@@ -114,6 +122,11 @@ pub enum GitOp {
     },
     Push {
         remote: String,
+        /// The branch to update *on the remote*. The refspec sent is
+        /// `HEAD:<branch>`, never the bare name: a bare name means a *local*
+        /// branch, and a branch tracking a differently-named upstream — `feat`
+        /// created from `origin/main` — would push stale local `main` instead
+        /// of the branch the user is on.
         branch: String,
         /// First push of a new branch: `-u`.
         set_upstream: bool,
@@ -384,7 +397,9 @@ impl GitOp {
                     out.push("--force-with-lease".into());
                 }
                 out.push(remote.clone());
-                out.push(branch.clone());
+                // `HEAD:` pins the source to the current branch. See the
+                // field's doc — a bare branch name names a local branch.
+                out.push(format!("HEAD:{branch}"));
                 vec![out]
             }
         }
@@ -422,7 +437,10 @@ impl GitOp {
             | GitOp::Reset { rev, .. } => self.check_rev("revision", rev)?,
             GitOp::Push { remote, branch, .. } => {
                 self.check_rev("remote", remote)?;
-                self.check_rev("branch", branch)?;
+                // The full branch check, not just the rev one: the name lands
+                // in a `HEAD:<branch>` refspec, where a `:` would smuggle in a
+                // second refspec — and `:foo` alone *deletes* remote `foo`.
+                self.check_branch(branch)?;
             }
             GitOp::Fetch {
                 remote: Some(remote),
@@ -619,15 +637,19 @@ pub fn run_op(
                 .collect::<Vec<_>>()
         };
 
-        // A push over a slow link outlives the deadline a `Git` request gets
-        // by default, which is sized for interactive queries. The no-prompt
-        // environment is not this layer's business: `LocalHost` puts it on
-        // every call, on both sides of the wire.
-        let spawned = if op.is_network() {
-            host.git_with_deadline(root, &borrowed, GIT_NETWORK_DEADLINE)
+        // Every write gets an explicit deadline: the default `Git` request
+        // deadline is sized for interactive queries, and a remote server runs
+        // every job to completion regardless — so a commit whose hook outlives
+        // the client's patience would be reported failed and then land anyway.
+        // Network verbs get the long allowance, everything else the write one.
+        // The no-prompt environment is not this layer's business: `LocalHost`
+        // puts it on every call, on both sides of the wire.
+        let deadline = if op.is_network() {
+            GIT_NETWORK_DEADLINE
         } else {
-            host.git(root, &borrowed)
+            GIT_WRITE_DEADLINE
         };
+        let spawned = host.git_with_deadline(root, &borrowed, deadline);
         let out = spawned.map_err(|err| GitOpError {
             op: label,
             kind: GitOpErrorKind::Spawn,
@@ -1160,7 +1182,10 @@ mod tests {
                 force_with_lease: false,
             }
             .commands(&born()),
-            vec![vec!["push", "origin", "main"]],
+            // `HEAD:main`, not `main`: a bare name is a *local* branch, and a
+            // branch tracking a differently-named upstream would push the
+            // wrong one.
+            vec![vec!["push", "origin", "HEAD:main"]],
         );
         assert_eq!(
             GitOp::Push {
@@ -1170,7 +1195,13 @@ mod tests {
                 force_with_lease: true,
             }
             .commands(&born()),
-            vec![vec!["push", "-u", "--force-with-lease", "origin", "main"]],
+            vec![vec![
+                "push",
+                "-u",
+                "--force-with-lease",
+                "origin",
+                "HEAD:main"
+            ]],
         );
     }
 
@@ -1262,6 +1293,24 @@ mod tests {
             .validate()
             .is_ok()
         );
+
+        // Push's branch lands in a `HEAD:<branch>` refspec, where a `:` would
+        // start a second refspec — and `:foo` alone deletes remote `foo`.
+        for branch in [":main", "a:b", ""] {
+            assert_eq!(
+                GitOp::Push {
+                    remote: "origin".into(),
+                    branch: branch.into(),
+                    set_upstream: false,
+                    force_with_lease: false,
+                }
+                .validate()
+                .expect_err("a refspec-shaped branch has to be rejected")
+                .kind,
+                GitOpErrorKind::InvalidArgument,
+                "{branch:?}",
+            );
+        }
     }
 
     #[test]

@@ -54,7 +54,8 @@ use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, Po
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
 use tty7_core::core::git::log::{
-    Commit, CommitPage, Edge, GRAPH_PAGE, GraphRow, GraphScope, Lane, RefDeco, RefKind,
+    Commit, CommitPage, Edge, GRAPH_PAGE, GraphRow, GraphScope, Lane, MAX_GRAPH_COMMITS, RefDeco,
+    RefKind,
 };
 use tty7_core::core::git::ops::{GitOp, ResetMode};
 
@@ -559,6 +560,23 @@ impl Tty7App {
     /// same prefix row for row — nothing already on screen moves — where
     /// `--skip` is O(skip) to walk and slides under you the moment a ref moves.
     fn scm_load_graph(&mut self, repo: &RepoKey, cx: &mut Context<Self>) {
+        // A page that belongs to another repository must neither be drawn nor
+        // grown from: this runs before the frame reads `page`, so the switch
+        // shows the loading state, never seconds of the previous repository's
+        // history — where a row click would build an op for the new repo with
+        // the old repo's rev. The page size resets with it; how deep someone
+        // read one history says nothing about the next.
+        if self
+            .scm
+            .graph
+            .page_key
+            .as_ref()
+            .is_some_and(|(r, _, _)| r != repo)
+        {
+            self.scm.graph.page = None;
+            self.scm.graph.page_key = None;
+            self.scm.graph.requested = 0;
+        }
         // `try_global`, never `default_global`: this runs from `render`, and
         // taking the global mutably there queues a global-observer effect on
         // every frame, which is a panel that asks for a frame from inside one.
@@ -566,7 +584,14 @@ impl Tty7App {
             .try_global::<crate::terminal::git_data::ScmData>()
             .map_or(0, |data| data.epoch(repo.host, &repo.root));
         let scope = self.graph_scope();
-        let want = self.scm.graph.requested.max(GRAPH_PAGE);
+        // Clamped like `load_page` clamps it: `requested` above the cap with a
+        // page that answers *at* the cap would read as never-fresh, and the
+        // panel would refetch the same full page from every frame's render.
+        let want = self
+            .scm
+            .graph
+            .requested
+            .clamp(GRAPH_PAGE, MAX_GRAPH_COMMITS);
         let key = (repo.clone(), epoch, scope.clone());
         let fresh = self.scm.graph.page_key.as_ref() == Some(&key)
             && self
@@ -575,7 +600,10 @@ impl Tty7App {
                 .page
                 .as_ref()
                 .is_some_and(|p| p.requested >= want);
-        if fresh || self.scm.graph.loading {
+        // A load that failed is not retried until its key changes — an epoch
+        // bump, a new scope, a new repository. Retrying from render would
+        // spawn git processes in a tight loop for as long as the cause holds.
+        if fresh || self.scm.graph.loading || self.scm.graph.failed_key.as_ref() == Some(&key) {
             return;
         }
         let Some(host) = crate::ui::host_registry::HostRegistry::get(cx, repo.host) else {
@@ -590,11 +618,13 @@ impl Tty7App {
             move |h| tty7_core::core::git::log::load_page(h, &root, &query, want),
             move |this, page, cx| {
                 this.scm.graph.loading = false;
-                // A page that came back for a scope nobody is looking at any
-                // more is dropped rather than shown for one frame.
-                if let Some(page) = page {
-                    this.scm.graph.page = Some(Arc::new(page));
-                    this.scm.graph.page_key = Some(key);
+                match page {
+                    Some(page) => {
+                        this.scm.graph.failed_key = None;
+                        this.scm.graph.page = Some(Arc::new(page));
+                        this.scm.graph.page_key = Some(key);
+                    }
+                    None => this.scm.graph.failed_key = Some(key),
                 }
                 cx.notify();
             },
@@ -686,7 +716,9 @@ impl Tty7App {
                 .filter(|i| matches_query(&page.commits[*i], q))
                 .collect(),
         };
-        let more = query.is_none() && !page.complete;
+        // No row at the cap either: `load_page` clamps there, so "load more"
+        // past it could only refetch what is already on screen.
+        let more = query.is_none() && !page.complete && page.commits.len() < MAX_GRAPH_COMMITS;
         let bands = rows.len() + usize::from(more);
 
         // With the gutter gone the text takes the panel's own inset, so a
@@ -873,6 +905,19 @@ impl Tty7App {
     }
 }
 
+/// One "load more" click's worth of growth, stopped at what `load_page` will
+/// actually answer.
+///
+/// Growing past [`MAX_GRAPH_COMMITS`] would ask for a page the loader clamps:
+/// the answer would never satisfy `requested >= want`, and the panel would
+/// refetch the same full page from every frame's render, forever.
+fn next_page_request(requested: usize) -> usize {
+    requested
+        .max(GRAPH_PAGE)
+        .saturating_add(GRAPH_PAGE)
+        .min(MAX_GRAPH_COMMITS)
+}
+
 /// Whether a commit answers the filter box.
 ///
 /// Subject, author and sha, all case-folded. Not the body: a search that
@@ -1030,8 +1075,7 @@ impl Tty7App {
                 false => t(L10nKey::ScmGraphLoadMore),
             }))
             .on_click(cx.listener(|this, _, _, cx| {
-                let now = this.scm.graph.requested.max(GRAPH_PAGE);
-                this.scm.graph.requested = now.saturating_add(GRAPH_PAGE);
+                this.scm.graph.requested = next_page_request(this.scm.graph.requested);
                 cx.notify();
             }))
             .into_any_element()
@@ -1867,6 +1911,62 @@ mod tests {
         app.update(&mut vcx, |app, cx| {
             app.scm.graph.page = Some(Arc::new(empty_page()));
             app.graph_set_scope(GraphScope::All, cx);
+        });
+        assert!(app.read_with(&vcx, |app, _| app.scm.graph.page.is_some()));
+    }
+
+    /// One click at the cap used to loop: `requested` grew past what
+    /// `load_page` clamps to, the answer never satisfied `requested >= want`,
+    /// and the panel refetched the full page from every frame's render.
+    #[test]
+    fn load_more_growth_stops_at_the_cap() {
+        assert_eq!(next_page_request(0), GRAPH_PAGE * 2);
+        assert_eq!(next_page_request(GRAPH_PAGE), GRAPH_PAGE * 2);
+        assert_eq!(
+            next_page_request(MAX_GRAPH_COMMITS - 1),
+            MAX_GRAPH_COMMITS,
+            "the last step lands on the cap, not past it"
+        );
+        assert_eq!(
+            next_page_request(MAX_GRAPH_COMMITS),
+            MAX_GRAPH_COMMITS,
+            "at the cap the click is a no-op, not a bigger ask"
+        );
+    }
+
+    /// A repository switch drops the old page before anything can draw it or
+    /// grow from it: a stale row's context menu would otherwise build an op
+    /// for the new repository with the old repository's rev.
+    #[gpui::test]
+    fn switching_repositories_drops_the_previous_page(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (app, mut vcx) = harness(cx);
+
+        let other = RepoKey {
+            host: HostId::LOCAL,
+            root: PathBuf::from("/tmp/tty7-graph-test-other"),
+        };
+        app.update(&mut vcx, |app, cx| {
+            app.scm.graph.requested = GRAPH_PAGE * 3;
+            app.scm.graph.page = Some(Arc::new(empty_page()));
+            app.scm.graph.page_key = Some((repo(), 7, GraphScope::HeadAndUpstream));
+            app.scm_load_graph(&other, cx);
+        });
+        app.read_with(&vcx, |app, _| {
+            assert!(app.scm.graph.page.is_none(), "the old history is gone");
+            assert!(app.scm.graph.page_key.is_none());
+            assert_eq!(
+                app.scm.graph.requested, 0,
+                "page depth does not carry across repositories"
+            );
+        });
+
+        // The same repository keeps its page — this must not turn every
+        // render into a reload.
+        app.update(&mut vcx, |app, cx| {
+            app.scm.graph.page = Some(Arc::new(empty_page()));
+            app.scm.graph.page_key = Some((repo(), 7, GraphScope::HeadAndUpstream));
+            app.scm_load_graph(&repo(), cx);
         });
         assert!(app.read_with(&vcx, |app, _| app.scm.graph.page.is_some()));
     }

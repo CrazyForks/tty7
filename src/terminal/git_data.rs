@@ -32,13 +32,26 @@ use crate::core::git::status::{StatusIndex, WorkingTreeStatus, probe_status};
 use crate::ui::app::Tty7App;
 use crate::ui::host_ops::{ByHost, Host, HostId, HostOps, InFlight, SharedHost, WatchSub};
 
-/// How many network operations one host may have in flight.
+/// How many network operations one (host, repository) pair may have in flight.
 ///
 /// The far side serves every request from one worker pool, and keepalive's
 /// `Ping` queues behind the rest of it. Enough concurrent pushes and the ping
 /// misses its own deadline for long enough that the link is declared dead —
-/// so the client, not the server, keeps the number small.
+/// so the client, not the server, keeps the number small. Counted per
+/// repository rather than per host, so a long fetch in one repository cannot
+/// lock the sync tile of another; the price is that N busy repositories on
+/// one host can hold N × this many operations, which the panel's own layout
+/// (one repository on screen) keeps theoretical.
 pub const MAX_CONCURRENT_NETWORK_OPS: usize = 2;
+
+/// How long a failed watch open rests before it is tried again.
+///
+/// Without this the retry runs at frame rate: a failed open leaves the
+/// repository in `unwatched()`, which `scm_sync_watchers` reads at the top of
+/// every render — and a host that cannot watch (inotify limit, a server
+/// without the capability) would pay a `rev-parse` + `read_dir` + `watch`
+/// round trip per frame, forever.
+pub const WATCH_RETRY: Duration = Duration::from_secs(10);
 
 /// How quiet a burst of invalidations has to go before we believe it is over.
 pub const GIT_WATCH_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -301,6 +314,10 @@ struct RepoWatch {
     /// A watch is two round trips to open (`rev-parse`, then `watch`), so the
     /// frame after the one that asked must not ask again.
     opening: bool,
+    /// Set when an open came back empty-handed; `unwatched` sits out until it
+    /// passes, so a host that cannot watch is asked once per [`WATCH_RETRY`],
+    /// not once per frame.
+    retry_at: Option<Instant>,
     debounce: Debounce,
 }
 
@@ -446,13 +463,18 @@ impl ScmData {
         self.subs.is_empty() && self.watches.is_empty()
     }
 
-    /// Repositories that have a holder but no watch, and nothing on the way.
-    fn unwatched(&self) -> Vec<(HostId, PathBuf)> {
+    /// Repositories that have a holder but no watch, nothing on the way, and
+    /// no failed attempt still resting.
+    fn unwatched(&self, now: Instant) -> Vec<(HostId, PathBuf)> {
         self.subs
             .subscribed()
             .into_iter()
             .filter(|key| match self.watches.get(key) {
-                Some(watch) => watch.sub.is_none() && !watch.opening,
+                Some(watch) => {
+                    watch.sub.is_none()
+                        && !watch.opening
+                        && watch.retry_at.is_none_or(|at| at <= now)
+                }
                 None => true,
             })
             .collect()
@@ -472,9 +494,18 @@ impl ScmData {
         true
     }
 
-    fn finish_watch_open(&mut self, host: HostId, root: &Path, sub: Option<Arc<WatchSub>>) {
+    fn finish_watch_open(
+        &mut self,
+        host: HostId,
+        root: &Path,
+        sub: Option<Arc<WatchSub>>,
+        now: Instant,
+    ) {
         let watch = self.watch_mut(host, root);
         watch.opening = false;
+        // A failed open rests before the next try; a successful one clears
+        // any rest a previous failure left behind.
+        watch.retry_at = sub.is_none().then(|| now + WATCH_RETRY);
         watch.sub = sub;
     }
 
@@ -713,7 +744,7 @@ impl Tty7App {
             }
         }
 
-        for (host, root) in cx.default_global::<ScmData>().unwatched() {
+        for (host, root) in cx.default_global::<ScmData>().unwatched(Instant::now()) {
             let Some(shared) = crate::ui::host_registry::HostRegistry::get(cx, host) else {
                 continue;
             };
@@ -847,11 +878,11 @@ impl Tty7App {
         // Letting go while the watch was opening leaves the only `Arc` here,
         // so returning closes it.
         if data.generation(host, &root) != sub_gen || !data.is_subscribed(host, &root) {
-            data.finish_watch_open(host, &root, None);
+            data.finish_watch_open(host, &root, None, Instant::now());
             return;
         }
         let events = sub.as_ref().map(|sub| sub.events().clone());
-        data.finish_watch_open(host, &root, sub);
+        data.finish_watch_open(host, &root, sub, Instant::now());
         let Some(events) = events else {
             return;
         };
@@ -882,6 +913,7 @@ impl Tty7App {
         host: SharedHost,
         root: PathBuf,
         op: GitOp,
+        then: Option<crate::ui::scm::actions::ScmFollowUp>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -903,6 +935,22 @@ impl Tty7App {
             None
         };
 
+        // Armed at dispatch, not when the button was pressed: a confirmation
+        // the user cancels must leave nothing armed, or the next unrelated
+        // HEAD move would clear a message that was never committed. See
+        // `scm_commit_landed`.
+        let was_commit = matches!(op, GitOp::Commit { .. });
+        if let GitOp::Commit { message, .. } = &op {
+            self.scm.committing = Some((
+                crate::ui::scm::state::RepoKey {
+                    host: id,
+                    root: root.clone(),
+                },
+                head.clone(),
+                message.clone(),
+            ));
+        }
+
         let op_root = root.clone();
         HostOps::run_in(
             host,
@@ -918,7 +966,18 @@ impl Tty7App {
                 // write is about to cause arrives inside the debounce window
                 // and the two of them cost one probe.
                 app.scm_invalidate(id, &root, cx);
+                let ok = result.is_ok();
+                if was_commit && !ok {
+                    app.scm_commit_failed(id, &root);
+                }
                 app.on_git_op_done(result, window, cx);
+                // The second half of a compound verb starts only now, against
+                // the repository this operation produced — never alongside it.
+                if ok {
+                    if let Some(follow) = then {
+                        app.scm_follow_up(id, root, follow, window, cx);
+                    }
+                }
             },
         );
     }
@@ -1355,21 +1414,30 @@ mod tests {
 
     #[test]
     fn only_repositories_without_a_watch_are_asked_for_one() {
+        let now = Instant::now();
         let mut data = ScmData::default();
         data.subscriptions().acquire(HostId::LOCAL, &root());
-        assert_eq!(data.unwatched(), vec![(HostId::LOCAL, root())]);
+        assert_eq!(data.unwatched(now), vec![(HostId::LOCAL, root())]);
 
         assert!(data.begin_watch_open(HostId::LOCAL, &root()));
         assert!(
             !data.begin_watch_open(HostId::LOCAL, &root()),
             "the frame after the one that asked must not ask again"
         );
-        assert!(data.unwatched().is_empty());
+        assert!(data.unwatched(now).is_empty());
 
-        // A watch that failed to open leaves nothing behind, so the next
-        // frame is free to try again.
-        data.finish_watch_open(HostId::LOCAL, &root(), None);
-        assert_eq!(data.unwatched(), vec![(HostId::LOCAL, root())]);
+        // A watch that failed to open rests before the next try — the retry
+        // used to run at frame rate, one host round trip per render, forever.
+        data.finish_watch_open(HostId::LOCAL, &root(), None, now);
+        assert!(
+            data.unwatched(now).is_empty(),
+            "the frame after a failure must not retry it"
+        );
+        assert_eq!(
+            data.unwatched(now + WATCH_RETRY),
+            vec![(HostId::LOCAL, root())],
+            "…but once the rest has passed, it is asked for again"
+        );
     }
 
     #[test]

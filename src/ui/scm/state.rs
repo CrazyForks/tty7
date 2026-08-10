@@ -164,6 +164,12 @@ pub(crate) struct GraphState {
     /// empty graph rather than the previous repository's history.
     pub(crate) page: Option<Arc<CommitPage>>,
     pub(crate) page_key: Option<(RepoKey, u64, GraphScope)>,
+    /// The key of a load that came back empty-handed. Without it a failing
+    /// `git log` — a scope pinned to a since-deleted branch, a vanished
+    /// repository — would be retried from every frame's render, one git
+    /// process per notify, forever. The failure clears itself the moment the
+    /// key changes: an epoch bump (any refresh), a new scope, a new repo.
+    pub(crate) failed_key: Option<(RepoKey, u64, GraphScope)>,
     /// Filter box. Like `commit_input`, created on first render — and with the
     /// subscription that turns typing into a repaint. An `InputState` is its
     /// own entity; without this the box would take text the list never sees.

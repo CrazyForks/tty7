@@ -874,6 +874,7 @@ impl Tty7App {
                                 this.scm_commit(
                                     repo_for_button.clone(),
                                     this.scm.amend,
+                                    None,
                                     window,
                                     cx,
                                 );
