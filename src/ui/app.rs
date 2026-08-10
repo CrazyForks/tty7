@@ -2539,14 +2539,6 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.restore_session = on);
     }
 
-    /// The daemon reads this from the config file on its own — it is the one
-    /// holding the output — so there is nothing to tell it here. Turning it off
-    /// also removes what was already stored, which the daemon does on its next
-    /// pass rather than leaving the bytes behind.
-    pub(crate) fn set_persist_scrollback(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.update_config(cx, |cfg| cfg.persist_scrollback = on);
-    }
-
     /// Takes effect on the next pane: a shell is told where its history lives
     /// when it starts, and nothing can move it afterwards.
     pub(crate) fn set_per_pane_history(&mut self, on: bool, cx: &mut Context<Self>) {

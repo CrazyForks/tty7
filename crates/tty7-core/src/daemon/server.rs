@@ -182,28 +182,14 @@ fn restorable_pane_ids(registry: &Registry) -> std::collections::HashSet<u64> {
 ///
 /// Only panes whose ring has moved are written, so an idle machine does no IO
 /// at all, and the busy pane that most needs a fresh copy is the one that gets
-/// it. Turning the setting off mid-run is honoured here too: the next tick
-/// clears the directory rather than leaving terminal output on disk that the
-/// user has just said they do not want stored.
+/// it.
 fn spawn_scrollback_writer(registry: Arc<Registry>) {
     let spawned = std::thread::Builder::new()
         .name("tty7-scrollback".into())
         .spawn(move || {
             let mut marks: HashMap<u64, u64> = HashMap::new();
-            let mut storing = crate::daemon::scrollback::enabled();
             loop {
                 std::thread::sleep(crate::daemon::scrollback::SNAPSHOT_INTERVAL);
-                let enabled = crate::daemon::scrollback::enabled();
-                if !enabled {
-                    if storing {
-                        log::info!("scrollback persistence turned off; dropping what was stored");
-                        crate::daemon::scrollback::sweep(&std::collections::HashSet::new());
-                        marks.clear();
-                        storing = false;
-                    }
-                    continue;
-                }
-                storing = true;
                 for pane in registry.all() {
                     if marks.get(&pane.id) == Some(&pane.scrollback_mark()) {
                         continue;
@@ -228,9 +214,6 @@ fn spawn_scrollback_writer(registry: Arc<Registry>) {
 /// covers the ones we do, and makes the copy exact rather than up to
 /// [`SNAPSHOT_INTERVAL`](crate::daemon::scrollback::SNAPSHOT_INTERVAL) stale.
 fn store_scrollback_now(registry: &Registry) {
-    if !crate::daemon::scrollback::enabled() {
-        return;
-    }
     for pane in registry.all() {
         let (segments, _) = pane.scrollback_snapshot();
         crate::daemon::scrollback::save(pane.id, &segments);
@@ -246,9 +229,6 @@ fn store_scrollback_now(registry: &Registry) {
 fn restored_screen(
     request: crate::daemon::protocol::RestoreFrom,
 ) -> Option<crate::daemon::pane::Restore> {
-    if !crate::daemon::scrollback::enabled() {
-        return None;
-    }
     let segments = crate::daemon::scrollback::load(request.pane_id)?;
     if segments.is_empty() {
         return None;
@@ -570,25 +550,18 @@ fn run_with(registry: Arc<Registry>) -> anyhow::Result<()> {
 
     spawn_orphan_sweep(registry.clone());
     let restorable = restorable_pane_ids(&registry);
-    // Deliberately not swept here while the setting is on. Startup is the one
-    // moment this process knows least: it owns no panes yet, and the windows
-    // that know which screens are still wanted cannot say so until the
-    // endpoint below is listening. Answering "is anyone going to ask for
-    // this?" here answers it when nobody can — and the answer deletes. A tree
-    // that failed to parse makes it worse, because `read_machine` quarantines
-    // it and hands back an empty `Machine`, so one bad file would take every
-    // pane's screen with it.
+    // No scrollback sweep here, deliberately. Startup is the one moment this
+    // process knows least: it owns no panes yet, and the windows that know
+    // which screens are still wanted cannot say so until the endpoint below is
+    // listening. Answering "is anyone going to ask for this?" here answers it
+    // when nobody can — and the answer deletes. A tree that failed to parse
+    // makes it worse, because `read_machine` quarantines it and hands back an
+    // empty `Machine`, so one bad file would take every pane's screen with it.
     //
-    // The periodic sweep asks the same question a tick later, with the
-    // registry filled in and the tree caught up, and that is soon enough:
-    // nothing here is serving a request in the meantime.
+    // The periodic sweep asks the same question a tick later, with the registry
+    // filled in and the tree caught up, and that is soon enough: nothing here
+    // is serving a request in the meantime.
     //
-    // Off is not the same question. Then nothing on disk is worth keeping and
-    // deleting it promptly is the setting's whole promise, so that one still
-    // happens before anything else runs.
-    if !crate::daemon::scrollback::enabled() {
-        crate::daemon::scrollback::sweep(&std::collections::HashSet::new());
-    }
     // A daemon that was killed outright never retired anything, so the files of
     // panes that died with it are still here. Their commands cannot be
     // recovered — the mark saying which were new belongs to a shell that is

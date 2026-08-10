@@ -143,11 +143,6 @@ fn take<'a>(cur: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
     Some(head)
 }
 
-/// Whether the user has asked for scrollback to outlive the daemon.
-pub fn enabled() -> bool {
-    crate::core::config::Config::load().persist_scrollback
-}
-
 fn dir() -> Option<PathBuf> {
     crate::core::config::config_path("scrollback")
 }

@@ -38,13 +38,11 @@ struct Instance {
 
 impl Instance {
     fn new() -> Instance {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join("config.json"),
-            r#"{"persist_scrollback": true}"#,
-        )
-        .unwrap();
-        Instance { dir }
+        // No config: keeping each pane's screen is what the daemon does, not
+        // something it is asked to do.
+        Instance {
+            dir: tempfile::TempDir::new().unwrap(),
+        }
     }
 
     fn path(&self) -> &std::path::Path {
