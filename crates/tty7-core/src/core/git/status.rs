@@ -2,7 +2,8 @@
 //! control panel, the file tree's decorations, and every button that is only
 //! enabled for some file states.
 //!
-//! One `git status --porcelain=v2 --branch -z` answers all of it. That format
+//! One `git status --porcelain=v2 --branch --show-stash -uall -z` answers all
+//! of it. That format
 //! is the only one that carries the staged and unstaged halves *separately*
 //! (the `XY` pair), a rename's old path, unmerged stages, submodule sub-state,
 //! and the branch header — getting the same picture out of `git diff` takes
@@ -222,6 +223,12 @@ impl StatusEntry {
         if self.is_untracked() {
             return DecoStatus::Untracked;
         }
+        // Explicit, not via the code match below: an ignored record carries no
+        // change codes, so it would otherwise fall through to `Modified` the
+        // day `--ignored` is passed — and light the whole ignored tree up.
+        if matches!(self.kind, EntryKind::Ignored) {
+            return DecoStatus::Ignored;
+        }
         let worse = if code_rank(self.worktree) >= code_rank(self.index) {
             self.worktree
         } else {
@@ -407,11 +414,13 @@ impl StatusIndex {
         for entry in &status.entries {
             let deco = entry.deco();
             index.insert(entry.path.as_str(), deco);
-            // A rename's old path is no longer on disk, so no tree row will ask
-            // for it — but the directory it left did lose a file, and the
-            // rollup is the only place that can say so.
+            // A rename's old path goes into the directory rollup only — the
+            // directory it left did lose a file. Not into `files`: the path
+            // can be occupied again (`git mv a b && echo x > a` emits an
+            // untracked record for `a`), and that row belongs to whatever
+            // occupies it now, not to the rename it outranks.
             if let Some(orig) = &entry.orig_path {
-                index.insert(orig.as_str(), deco);
+                index.rollup(orig.as_str(), deco);
             }
         }
         if index.files.len() > MAX_DECORATED_FILES {
@@ -439,6 +448,12 @@ impl StatusIndex {
             .entry(repo_rel.to_string())
             .and_modify(|slot| *slot = (*slot).max(status))
             .or_insert(status);
+        self.rollup(repo_rel, status);
+    }
+
+    /// Only the ancestor walk — for a path that must not claim a file row of
+    /// its own, like the old half of a rename.
+    fn rollup(&mut self, repo_rel: &str, status: DecoStatus) {
         let mut cut = repo_rel;
         while let Some((parent, _)) = cut.rsplit_once('/') {
             self.dirs
@@ -531,8 +546,12 @@ pub fn parse_porcelain_v2(stdout: &[u8]) -> ParsedStatus {
     let mut parser = Parser::default();
     let mut split = RecordSplitter::new(0);
     split.push(stdout, |record| parser.record(record));
-    split.finish(|record| parser.record(record));
-    parser.finish()
+    let dropped = split.finish(|record| parser.record(record));
+    let mut parsed = parser.finish();
+    // A record past `MAX_RECORD` (a pathological pathname) is dropped whole;
+    // the status must say it is not the full picture, same as the entry cap.
+    parsed.truncated |= dropped > 0;
+    parsed
 }
 
 #[derive(Default)]
@@ -793,15 +812,28 @@ fn head_state(oid: Option<String>, head_name: Option<String>) -> HeadState {
     }
 }
 
-/// The whole working tree state for the repository containing `cwd`, or `None`
-/// if there is no repository there.
+/// What a status probe learned. The middle answer is the load-bearing one:
+/// `Unreachable` is not an answer *about the repository* — the question could
+/// not be asked — and treating it as "no repository here" made a dropped link
+/// erase a panel that was showing perfectly good (if stale) data.
+#[derive(Clone, PartialEq, Debug)]
+pub enum StatusProbe {
+    Status(Box<WorkingTreeStatus>),
+    /// git ran and said so — an ordinary directory.
+    NotARepo,
+    /// git could not run, or ran and failed for a reason that is not "no
+    /// repository": a dead link, a timeout, an `index.lock` held by someone
+    /// else. Keep what is cached and ask again later.
+    Unreachable,
+}
+
+/// The whole working tree state for the repository containing `cwd`.
 ///
 /// Three round trips in the common case — `rev-parse`, `status`, `read_dir` —
 /// and each one is an RPC on a remote workspace, which is why none of them is
 /// split into the several calls that would read more naturally.
-pub fn probe_status(host: &dyn Host, cwd: &Path) -> Option<WorkingTreeStatus> {
-    let paths = super::git(
-        host,
+pub fn probe_status(host: &dyn Host, cwd: &Path) -> StatusProbe {
+    let Ok(out) = host.git(
         cwd,
         &[
             "rev-parse",
@@ -810,16 +842,36 @@ pub fn probe_status(host: &dyn Host, cwd: &Path) -> Option<WorkingTreeStatus> {
             "--git-dir",
             "--git-common-dir",
         ],
-    )?;
+    ) else {
+        return StatusProbe::Unreachable;
+    };
+    if !out.success() {
+        // Exit 128 with this phrase is the ordinary answer for an ordinary
+        // directory; the phrase has been stable (modulo case) since git 1.x.
+        // Anything else is a repository that could not be read.
+        let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+        return if stderr.contains("not a git repository") {
+            StatusProbe::NotARepo
+        } else {
+            StatusProbe::Unreachable
+        };
+    }
+    let paths = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut lines = paths.lines().map(|l| l.trim_end_matches(['\n', '\r']));
-    let root = PathBuf::from(lines.next()?);
+    let Some(root) = lines.next().map(PathBuf::from) else {
+        return StatusProbe::Unreachable;
+    };
     let git_dir = lines.next();
     let home = super::repo_home(&root, git_dir, lines.next());
-    let git_dir = PathBuf::from(git_dir?);
+    let Some(git_dir) = git_dir.map(PathBuf::from) else {
+        return StatusProbe::Unreachable;
+    };
 
-    let out = host.git(cwd, STATUS_ARGS).ok()?;
+    let Ok(out) = host.git(cwd, STATUS_ARGS) else {
+        return StatusProbe::Unreachable;
+    };
     if !out.success() {
-        return None;
+        return StatusProbe::Unreachable;
     }
     let mut parsed = parse_porcelain_v2(&out.stdout);
     if parsed.ahead_behind.is_none()
@@ -832,7 +884,12 @@ pub fn probe_status(host: &dyn Host, cwd: &Path) -> Option<WorkingTreeStatus> {
     let operation = detect_operation(host, &git_dir, &listing);
     let prefilled_message =
         operation.and_then(|_| read_prefilled_message(host, &git_dir, &listing));
-    Some(parsed.into_status(root, home, operation, prefilled_message))
+    StatusProbe::Status(Box::new(parsed.into_status(
+        root,
+        home,
+        operation,
+        prefilled_message,
+    )))
 }
 
 /// Ask for ahead/behind again when the header could not say.
@@ -1436,6 +1493,48 @@ mod tests {
             index.dir("old").unwrap().changed,
             "the directory it left lost a file"
         );
+        assert_eq!(
+            index.file("old/home.rs"),
+            None,
+            "the old path holds no file row of its own"
+        );
+    }
+
+    /// `git mv a b && echo x > a`: the rename record's old path and a fresh
+    /// untracked file share a spelling. The row on disk is the untracked file;
+    /// the rename must not outrank it just because `Renamed > Untracked`.
+    #[test]
+    fn a_file_recreated_at_a_renames_old_path_decorates_as_itself() {
+        let status = status_of(
+            &[
+                head_records(),
+                rec(&[
+                    "2 R. N... 100644 100644 100644 ",
+                    SHA,
+                    " ",
+                    SHA,
+                    " R090 b.rs",
+                ]),
+                rec(&["a.rs"]),
+                rec(&["? a.rs"]),
+            ]
+            .concat(),
+        );
+        let index = StatusIndex::build(&status);
+
+        assert_eq!(index.file("a.rs"), Some(DecoStatus::Untracked));
+        assert_eq!(index.file("b.rs"), Some(DecoStatus::Renamed));
+    }
+
+    /// `--ignored` is not passed today; the parser is future-proofed for it,
+    /// and the decoration must be too — an ignored record carries no change
+    /// codes and used to fall through to `Modified`.
+    #[test]
+    fn an_ignored_record_decorates_as_ignored_not_modified() {
+        let parsed = parse_porcelain_v2(&[head_records(), rec(&["! target"])].concat());
+        let entry = &parsed.entries[0];
+        assert_eq!(entry.kind, EntryKind::Ignored);
+        assert_eq!(entry.deco(), DecoStatus::Ignored);
     }
 
     #[test]
@@ -1462,6 +1561,14 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A probe that must have found a repository, unwrapped with a reason.
+    fn probed(probe: StatusProbe, why: &str) -> WorkingTreeStatus {
+        match probe {
+            StatusProbe::Status(status) => *status,
+            other => panic!("{why}: {other:?}"),
         }
     }
 
@@ -1524,7 +1631,10 @@ mod tests {
         assert!(run(&*host, repo, &["mv", "moved.txt", "renamed.txt"]));
         std::fs::write(repo.join("untracked.txt"), "loose\n").unwrap();
 
-        let status = probe_status(&*host, repo).expect("a repository was just created here");
+        let status = probed(
+            probe_status(&*host, repo),
+            "a repository was just created here",
+        );
 
         match &status.head {
             HeadState::Branch { name, oid } => {
@@ -1606,7 +1716,7 @@ mod tests {
         // Expected to fail — that is the point.
         run(&*host, repo, &["merge", "other"]);
 
-        let status = probe_status(&*host, repo).expect("still a repository mid-merge");
+        let status = probed(probe_status(&*host, repo), "still a repository mid-merge");
         assert_eq!(status.operation, Some(RepoOperation::Merge));
         assert!(
             status
@@ -1657,7 +1767,7 @@ mod tests {
         std::fs::write(repo.join("f.txt"), "two\n").unwrap();
         assert!(run(&*host, &repo, &["commit", "--quiet", "-am", "two"]));
 
-        let status = probe_status(&*host, &repo).expect("a repository with a remote");
+        let status = probed(probe_status(&*host, &repo), "a repository with a remote");
         assert_eq!(status.upstream.as_deref(), Some("origin/main"));
         // Straight from `# branch.ab`; the `rev-list` fallback never runs here.
         assert_eq!(
@@ -1668,13 +1778,20 @@ mod tests {
         assert!(status.is_clean());
     }
 
+    /// The two negative answers stay distinct: an ordinary directory is
+    /// `NotARepo` (record it, stop asking), a directory git could not even be
+    /// run in is `Unreachable` (keep what is cached, ask again later).
     #[test]
     fn outside_a_repository_there_is_no_status() {
         let host = crate::host::local::LocalHost::new();
         let Some(scratch) = scratch("not-a-repo") else {
             return;
         };
-        assert_eq!(probe_status(&*host, &scratch.0), None);
-        assert_eq!(probe_status(&*host, Path::new("/no/such/tty7/path")), None);
+        assert_eq!(probe_status(&*host, &scratch.0), StatusProbe::NotARepo);
+        assert_eq!(
+            probe_status(&*host, Path::new("/no/such/tty7/path")),
+            StatusProbe::Unreachable,
+            "a cwd that cannot be entered is not an answer about a repository"
+        );
     }
 }

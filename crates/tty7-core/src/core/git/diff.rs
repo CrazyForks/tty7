@@ -163,6 +163,23 @@ impl DiffSource {
     pub fn lists_untracked(&self) -> bool {
         matches!(self, DiffSource::Worktree | DiffSource::Head)
     }
+
+    /// Whether every rev this source carries can be handed to git as an
+    /// argument. The same rule log's `is_rev` applies: a rev the caller made
+    /// up is still a rev git will be handed, and anything that could be read
+    /// as an option — `--output=…` most damningly — is refused before it
+    /// reaches an argv. Checked by [`probe_diff`], so no in-tree caller can
+    /// forget it.
+    fn revs_are_arguments(&self) -> bool {
+        let ok = |rev: &str| {
+            !rev.is_empty() && !rev.starts_with('-') && !rev.contains(|c: char| c.is_control())
+        };
+        match self {
+            DiffSource::Worktree | DiffSource::Staged | DiffSource::Head => true,
+            DiffSource::Commit { rev, .. } => ok(rev),
+            DiffSource::Range { base, head } => ok(base) && ok(head),
+        }
+    }
 }
 
 fn strings(args: &[&str]) -> Vec<String> {
@@ -358,6 +375,9 @@ pub fn probe(host: &dyn Host, cwd: &Path) -> Option<DiffSnapshot> {
 }
 
 pub fn probe_diff(host: &dyn Host, root: &Path, req: &DiffRequest<'_>) -> Option<DiffSnapshot> {
+    if !req.source.revs_are_arguments() {
+        return None;
+    }
     let toplevel = git::git(host, root, &["rev-parse", "--show-toplevel"])?;
     let toplevel = PathBuf::from(toplevel.trim_end_matches(['\n', '\r']));
     let branch = git::branch_name(host, root)?;
@@ -483,12 +503,25 @@ impl DiffParser {
             file.status = FileStatus::Deleted;
             return;
         }
-        if line.starts_with("rename from ") {
+        // These four carry one unambiguous path each — unlike the `diff --git`
+        // header, where two unquoted paths containing ` b/` cannot be split
+        // reliably (git does not quote a path for a mere space). They land
+        // after the header, so what they say overrides what it guessed.
+        if let Some(old) = line.strip_prefix("rename from ") {
             file.status = FileStatus::Renamed;
+            file.old_path = Some(unquote_path(old));
             return;
         }
-        if line.starts_with("copy from ") {
+        if let Some(old) = line.strip_prefix("copy from ") {
             file.status = FileStatus::Copied;
+            file.old_path = Some(unquote_path(old));
+            return;
+        }
+        if let Some(new) = line
+            .strip_prefix("rename to ")
+            .or_else(|| line.strip_prefix("copy to "))
+        {
+            file.path = unquote_path(new);
             return;
         }
         if let Some(mode) = line.strip_prefix("old mode ") {
@@ -542,7 +575,7 @@ impl DiffParser {
         if !self.in_hunk {
             return;
         }
-        let Some((kind, text)) = split_body_line(line, self.markers) else {
+        let Some((kind, sides, text)) = split_body_line(line, self.markers) else {
             return;
         };
         match kind {
@@ -565,24 +598,19 @@ impl DiffParser {
         let Some(hunk) = file.hunks.last_mut() else {
             return;
         };
-        let (o, n) = match kind {
-            LineKind::Added => {
-                let n = self.new_no;
-                self.new_no += 1;
-                (None, Some(n))
-            }
-            LineKind::Removed => {
-                let o = self.old_no;
-                self.old_no += 1;
-                (Some(o), None)
-            }
-            LineKind::Context => {
-                let (o, n) = (self.old_no, self.new_no);
-                self.old_no += 1;
-                self.new_no += 1;
-                (Some(o), Some(n))
-            }
-        };
+        // Numbered by side, not by colour: in a combined diff a ` +` line is
+        // painted as an addition but *exists* in the first parent, and the
+        // old-side counter has to walk past it or every number below drifts.
+        let o = sides.in_old.then(|| {
+            let o = self.old_no;
+            self.old_no += 1;
+            o
+        });
+        let n = sides.in_new.then(|| {
+            let n = self.new_no;
+            self.new_no += 1;
+            n
+        });
         hunk.lines.push(DiffLine {
             kind,
             old_no: o,
@@ -648,10 +676,19 @@ fn object_type(mode: &str) -> &str {
     &mode[..mode.len().min(3)]
 }
 
-/// Splits a hunk body line into its kind and its text, given how many marker
-/// columns the hunk carries. A combined diff marks a line per parent; one `+`
-/// or `-` anywhere in those columns settles what happened to the line.
-fn split_body_line(line: &str, markers: usize) -> Option<(LineKind, &str)> {
+/// Splits a hunk body line into its kind, which sides it exists on, and its
+/// text, given how many marker columns the hunk carries. A combined diff marks
+/// a line per parent; one `+` or `-` anywhere in those columns settles the
+/// *colour*, but the line numbers come from the sides:
+///
+/// - the line is in the result iff no column says `-`;
+/// - the line is in the first parent — the side tty7 numbers — iff its own
+///   column says `-`, or says ` ` on a line that is in the result. (` ` on a
+///   line outside the result is the other parent's removal; the first parent
+///   never had it.)
+///
+/// For an ordinary one-column diff this reduces to exactly `+`/`-`/context.
+fn split_body_line(line: &str, markers: usize) -> Option<(LineKind, LineSides, &str)> {
     let head = line.get(..markers)?;
     let kind = if head.contains('+') {
         LineKind::Added
@@ -662,7 +699,17 @@ fn split_body_line(line: &str, markers: usize) -> Option<(LineKind, &str)> {
     } else {
         return None;
     };
-    Some((kind, &line[markers..]))
+    let in_new = !head.contains('-');
+    let first = head.as_bytes().first().copied();
+    let in_old = first == Some(b'-') || (first == Some(b' ') && in_new);
+    Some((kind, LineSides { in_old, in_new }, &line[markers..]))
+}
+
+/// Which sides of the diff a body line exists on. See [`split_body_line`].
+#[derive(Clone, Copy)]
+struct LineSides {
+    in_old: bool,
+    in_new: bool,
 }
 
 fn is_hunk_line(line: &str) -> bool {
@@ -696,10 +743,15 @@ fn parse_quoted_pair(s: &str) -> Vec<String> {
             continue;
         }
         match ch {
-            '\\' if in_quote => escaped = true,
+            // The backslash stays in `cur`: the scanner only needs to know the
+            // next `"` does not close the quote; `c_unescape` does the decode.
+            '\\' if in_quote => {
+                cur.push('\\');
+                escaped = true;
+            }
             '"' => {
                 if in_quote {
-                    parts.push(std::mem::take(&mut cur));
+                    parts.push(c_unescape(&std::mem::take(&mut cur)));
                 }
                 in_quote = !in_quote;
             }
@@ -708,6 +760,67 @@ fn parse_quoted_pair(s: &str) -> Vec<String> {
         }
     }
     parts
+}
+
+/// A single path as written after `rename from ` and friends: C-quoted when it
+/// carries a character git always quotes (a control character or a `"` —
+/// `core.quotePath=false` stops the quoting of non-ASCII only), bare
+/// otherwise.
+fn unquote_path(s: &str) -> String {
+    let s = s.trim_end_matches(['\n', '\r']);
+    match s
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+    {
+        Some(inner) => c_unescape(inner),
+        None => s.to_string(),
+    }
+}
+
+/// Decodes the C escapes git writes inside a quoted path — the full set, not
+/// just `\"` and `\\`: a path with a real tab arrives as `\t`, and decoding it
+/// to a literal `t` breaks the `:(literal)` re-probe for that row. Octal
+/// escapes are *bytes* — a multi-byte character arrives as several — so the
+/// value is assembled as bytes and read back as UTF-8 at the end.
+fn c_unescape(s: &str) -> String {
+    let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
+    let mut push_char = |bytes: &mut Vec<u8>, ch: char| {
+        let mut buf = [0u8; 4];
+        bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    };
+    let mut it = s.chars().peekable();
+    while let Some(ch) = it.next() {
+        if ch != '\\' {
+            push_char(&mut bytes, ch);
+            continue;
+        }
+        match it.next() {
+            Some(digit @ '0'..='7') => {
+                let mut value = digit as u32 - '0' as u32;
+                for _ in 0..2 {
+                    match it.peek() {
+                        Some(&next @ '0'..='7') => {
+                            value = value * 8 + (next as u32 - '0' as u32);
+                            it.next();
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(value as u8);
+            }
+            Some('n') => bytes.push(b'\n'),
+            Some('t') => bytes.push(b'\t'),
+            Some('r') => bytes.push(b'\r'),
+            Some('a') => bytes.push(0x07),
+            Some('b') => bytes.push(0x08),
+            Some('f') => bytes.push(0x0c),
+            Some('v') => bytes.push(0x0b),
+            // `\"`, `\\`, and anything git never writes: the character itself.
+            Some(other) => push_char(&mut bytes, other),
+            None => {}
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn strip_prefix_ab(p: &str) -> String {
@@ -922,9 +1035,9 @@ Binary files a/img.png and b/img.png differ
 
     #[test]
     fn quote_path_is_off_on_every_source() {
-        // Left on, a non-ASCII path arrives as C octal escapes that nothing
-        // downstream decodes — `parse_quoted_pair` would hand back the literal
-        // digits. Verified against git 2.50.1: `diff --git
+        // Left on, every non-ASCII path arrives as C octal escapes — decodable
+        // (see below), but the raw spelling needs no decode at all. Verified
+        // against git 2.50.1: `diff --git
         // "a/\344\270\255\346\226\207\345\220\215.txt" …` becomes
         // `diff --git a/中文名.txt b/中文名.txt` once this is off.
         for source in [
@@ -941,19 +1054,72 @@ Binary files a/img.png and b/img.png differ
         }
     }
 
+    /// `core.quotePath=false` stops the quoting of non-ASCII only. A path
+    /// with a control character or a `"` is *always* C-quoted, so the decoder
+    /// has to speak the whole escape set — a tab decoded to a literal `t`
+    /// names a path that does not exist, and the `:(literal)` re-probe for
+    /// that row comes back empty.
     #[test]
-    fn octal_escaped_paths_are_what_the_flag_prevents() {
+    fn c_quoted_paths_decode_the_full_escape_set() {
         let escaped = parse_unified(
             "diff --git \"a/\\344\\270\\255\\346\\226\\207\\345\\220\\215.txt\" \
              \"b/\\344\\270\\255\\346\\226\\207\\345\\220\\215.txt\"\n",
         );
-        assert_ne!(
-            escaped[0].path, "中文名.txt",
-            "the escapes are not decoded here, which is why they must not be produced"
-        );
+        assert_eq!(escaped[0].path, "中文名.txt");
+
+        let control = parse_unified("diff --git \"a/x\\ty.rs\" \"b/x\\ty.rs\"\n");
+        assert_eq!(control[0].path, "x\ty.rs");
+
+        let quote =
+            parse_unified("diff --git \"a/he said \\\"hi\\\".md\" \"b/he said \\\"hi\\\".md\"\n");
+        assert_eq!(quote[0].path, "he said \"hi\".md");
 
         let raw = parse_unified("diff --git a/中文名.txt b/中文名.txt\n");
         assert_eq!(raw[0].path, "中文名.txt");
+    }
+
+    /// git never quotes a path for a mere space, so a `diff --git` header
+    /// whose paths contain ` b/` cannot be split reliably — but the `rename
+    /// from`/`rename to` lines that follow name one path each, and they win.
+    #[test]
+    fn rename_lines_override_an_ambiguous_header() {
+        let files = parse_unified(
+            "diff --git a/my b/old.rs b/my b/new.rs\n\
+             similarity index 90%\n\
+             rename from my b/old.rs\n\
+             rename to my b/new.rs\n",
+        );
+        assert_eq!(files[0].path, "my b/new.rs");
+        assert_eq!(files[0].old_path.as_deref(), Some("my b/old.rs"));
+        assert_eq!(files[0].status, FileStatus::Renamed);
+    }
+
+    /// A rev that could be read as an option never reaches git — same guard
+    /// log's `is_rev` applies, on the module that calls itself the one place
+    /// to read what git is asked.
+    #[test]
+    fn a_rev_shaped_like_an_option_never_reaches_git() {
+        let host = crate::host::local::LocalHost::new();
+        for source in [
+            DiffSource::commit("--output=/tmp/pwned"),
+            DiffSource::Range {
+                base: "--output=/tmp/pwned".into(),
+                head: "main".into(),
+            },
+            DiffSource::Range {
+                base: "main".into(),
+                head: "".into(),
+            },
+        ] {
+            let req = DiffRequest {
+                source,
+                ..DiffRequest::default()
+            };
+            assert!(
+                probe_diff(&*host, Path::new("/"), &req).is_none(),
+                "refused before any git runs"
+            );
+        }
     }
 
     #[test]
@@ -1168,6 +1334,20 @@ index af70335,f794161..0000000
         assert_eq!(lines[4].text, "SIDE", "added on one side is still added");
         assert_eq!(lines[6].text, "c");
         assert_eq!((files[0].added, files[0].removed), (5, 0));
+
+        // Numbers follow the *sides*, not the colour: ` +MAIN` is painted as
+        // an addition but exists in the first parent (it is HEAD's own line),
+        // so the old counter walks past it — and `c` lands on old line 3,
+        // exactly the `-1,3` the hunk header promises. `+ SIDE` is the other
+        // parent's line: no old number.
+        assert_eq!(
+            (lines[2].old_no, lines[2].new_no),
+            (Some(2), Some(3)),
+            "MAIN: {:?}",
+            lines[2]
+        );
+        assert_eq!((lines[4].old_no, lines[4].new_no), (None, Some(5)));
+        assert_eq!((lines[6].old_no, lines[6].new_no), (Some(3), Some(7)));
     }
 
     #[test]

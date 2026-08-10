@@ -218,6 +218,19 @@ impl Tty7App {
             host: host.id(),
             root,
         });
+        // An override whose host has left the registry is dropped, not worked
+        // around: falling back to the *pane's* host while keeping the
+        // override's root would probe the wrong machine for that path and
+        // cache the answer under a mismatched key.
+        if self
+            .scm
+            .repo_override
+            .as_ref()
+            .is_some_and(|k| crate::ui::host_registry::HostRegistry::get(cx, k.host).is_none())
+        {
+            self.scm.repo_override = None;
+            self.scm.override_tab = None;
+        }
         // An explicit pick from the switcher wins over the pane's own
         // repository, so everything below reads through `active_repo`.
         let repo = self
@@ -869,7 +882,7 @@ impl Tty7App {
                             // does.
                             .text_color(if live { fg } else { muted })
                             .disabled(!live)
-                            .when(!live, |b| b.tooltip(t(L10nKey::ScmNothingToCommit)))
+                            .when(!live, |b| b.tooltip(t(plan.reason)))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.scm_commit(
                                     repo_for_button.clone(),
@@ -1292,8 +1305,9 @@ impl Tty7App {
         let path = entry.path.as_str().to_string();
         let (name, dir) = split_display_path(&path);
         let (letter, deco) = row_status(entry, group);
-        let selected = self.diff_overlay_focus(repo.host, &repo.root) == Some(path.as_str());
         let source = group_diff_source(group);
+        let selected =
+            self.diff_overlay_focus(repo.host, &repo.root, &source) == Some(path.as_str());
         let id = SharedString::from(format!("scm-row-{group:?}-{path}"));
         let actions = self.scm_row_actions(
             &id,
@@ -1875,6 +1889,10 @@ pub(crate) fn operation_label(op: RepoOperation) -> L10nKey {
 pub(crate) struct CommitPlan {
     pub(crate) label: L10nKey,
     pub(crate) enabled: bool,
+    /// Why the button is disabled, when it is. "Nothing to commit" and "write
+    /// a message" call for opposite actions, and one tooltip for both sends
+    /// the user staging files they already staged.
+    pub(crate) reason: L10nKey,
 }
 
 /// Decide both from the state of the index.
@@ -1894,9 +1912,19 @@ pub(crate) fn commit_plan(status: &WorkingTreeStatus, amend: bool, message: &str
         L10nKey::ScmCommitAllButton
     };
     let has_message = !message.trim().is_empty();
+    // Mid-merge, an empty message is still committable: `ops` sends
+    // `--allow-empty-message` for exactly this, because refusing would strand
+    // the merge behind a message the user deliberately cleared.
+    let merging = matches!(status.operation, Some(RepoOperation::Merge));
+    let something = staged || tracked_edits || amend;
     CommitPlan {
         label,
-        enabled: (staged || tracked_edits || amend) && (has_message || amend),
+        enabled: something && (has_message || amend || merging),
+        reason: if something {
+            L10nKey::ScmCommitNeedsMessage
+        } else {
+            L10nKey::ScmNothingToCommit
+        },
     }
 }
 

@@ -50,7 +50,10 @@ const NO_PROMPT_ENV: &[(&str, Option<&str>)] = &[
 /// call, and this is the read path too.
 fn no_prompt_env() -> Vec<(&'static str, Option<&'static str>)> {
     let mut env = NO_PROMPT_ENV.to_vec();
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+    // `GIT_SSH` too: it is the older spelling of the same choice (plink on
+    // Windows, most commonly), and `GIT_SSH_COMMAND` outranks it — forcing
+    // ours would silently swap their transport out.
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
         env.push(("GIT_SSH_COMMAND", Some("ssh -o BatchMode=yes")));
     }
     env

@@ -124,7 +124,7 @@ impl Tty7App {
             PromptLevel::Warning,
             &confirm_question(&op, loss),
             None,
-            &[t(L10nKey::Cancel), confirm_verb(loss)],
+            &[t(L10nKey::Cancel), confirm_verb(&op, loss)],
             cx,
         );
         cx.spawn_in(window, async move |app, cx| {
@@ -465,6 +465,12 @@ pub(crate) fn split_upstream(upstream: &str) -> Option<(&str, &str)> {
 
 /// The question a destructive operation has to answer before it runs.
 fn confirm_question(op: &GitOp, loss: Destructive) -> String {
+    // Its own question, not the discard one: a hard reset to an older commit
+    // drops commits off the branch, and a dialog that says "Discard every
+    // change in this repository?" never mentions the part that hurts.
+    if matches!(op, GitOp::Reset { .. }) {
+        return t(L10nKey::ScmResetHardConfirm).to_string();
+    }
     match loss {
         Destructive::RewritesHistory => t(L10nKey::ScmAmendConfirm).to_string(),
         // One file gets named; a whole group does not, because a list of two
@@ -476,7 +482,10 @@ fn confirm_question(op: &GitOp, loss: Destructive) -> String {
     }
 }
 
-fn confirm_verb(loss: Destructive) -> &'static str {
+fn confirm_verb(op: &GitOp, loss: Destructive) -> &'static str {
+    if matches!(op, GitOp::Reset { .. }) {
+        return t(L10nKey::ScmReset);
+    }
     match loss {
         Destructive::RewritesHistory => t(L10nKey::ScmAmendLastCommit),
         _ => t(L10nKey::ScmDiscard),

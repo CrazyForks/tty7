@@ -146,11 +146,6 @@ impl Tty7App {
             }
             None => {}
         }
-        let seed = DiffLoad::Loading;
-        let epoch = match &seed {
-            DiffLoad::Ready(snap) => Some(scm_epoch(cx, host, &snap.root)),
-            _ => None,
-        };
         self.remember_active_pane(window, cx);
         let Some(tab) = self.tabs.get_mut(active) else {
             return;
@@ -161,25 +156,34 @@ impl Tty7App {
             cwd,
             source,
             focus_handle: focus_handle.clone(),
-            load: seed,
+            // Every open starts at Loading until its own probe lands. The old
+            // panel-snapshot seeding died with the panel that held a snapshot
+            // per source; re-seeding would need the caller to carry one.
+            load: DiffLoad::Loading,
             loading: false,
             expanded: HashMap::new(),
             focus,
             scroll: gpui::ScrollHandle::new(),
-            epoch,
+            epoch: None,
         });
         window.focus(&focus_handle, cx);
         self.spawn_diff_probe(cx);
         cx.notify();
     }
 
+    /// Which file the open overlay is focused on — for the row that asked,
+    /// which means the *source* has to match too: a file staged and edited
+    /// again sits in two panel groups, and only the row whose patch is
+    /// actually on screen may draw itself selected.
     pub(crate) fn diff_overlay_focus(
         &self,
         host: crate::ui::host_ops::HostId,
         cwd: &std::path::Path,
+        source: &crate::terminal::git_diff::DiffSource,
     ) -> Option<&str> {
         let overlay = self.tabs.get(self.active)?.diff_overlay.as_ref()?;
-        (overlay.cwd == cwd && overlay.host_id == host).then_some(overlay.focus.as_deref())?
+        (overlay.cwd == cwd && overlay.host_id == host && overlay.source == *source)
+            .then_some(overlay.focus.as_deref())?
     }
 
     pub(crate) fn close_diff_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1149,7 +1153,7 @@ fn source_subject(source: &DiffSource, branch: String) -> SourceSubject {
         DiffSource::Worktree | DiffSource::Head => branch_of(None),
         // Staged is the branch too, but a patch that does not match the files
         // on disk — without the chip it is indistinguishable from the above.
-        DiffSource::Staged => branch_of(Some("STAGED")),
+        DiffSource::Staged => branch_of(Some(t(L10nKey::ScmChipStaged))),
         DiffSource::Commit { rev, label } => SourceSubject {
             icon: "icons/git-commit.svg",
             text: short_rev(rev),

@@ -19,6 +19,13 @@ use crate::host::Host;
 /// macOS), so a big stage is split into several calls.
 pub const MAX_PATHSPECS_PER_CALL: usize = 200;
 
+/// …and only so many *bytes*. The binding limit is not macOS's 256 KiB but
+/// Windows' `CreateProcess`, which caps the whole command line at 32,767
+/// UTF-16 units — 200 deep-tree paths at 200+ characters each sail past it.
+/// Sized with room for the prefix and the per-argument quoting the Windows
+/// join adds.
+pub const MAX_PATHSPEC_BYTES_PER_CALL: usize = 24 * 1024;
+
 /// Long enough for a push over a slow link. Only applied to network operations
 /// — the local path has no deadline at all.
 pub const GIT_NETWORK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
@@ -202,10 +209,13 @@ impl GitOp {
             GitOp::DiscardWorktree { .. } => Destructive::LosesWorktreeEdits,
             GitOp::DiscardUntracked { .. } => Destructive::LosesUntrackedFiles,
             GitOp::DeleteBranch { .. } => Destructive::LosesCommits,
+            // The stronger of the two truths: a hard reset clobbers worktree
+            // edits *and* — pointed at an older commit — drops commits off
+            // the branch. The dialog has to warn about the worse one.
             GitOp::Reset {
                 mode: ResetMode::Hard,
                 ..
-            } => Destructive::LosesWorktreeEdits,
+            } => Destructive::LosesCommits,
             GitOp::Commit { amend: true, .. } => Destructive::RewritesHistory,
             GitOp::Push {
                 force_with_lease: true,
@@ -243,8 +253,12 @@ impl GitOp {
     /// 2.23 (2019), is still documented as EXPERIMENTAL, and has had its
     /// behaviour adjusted across releases; the two older forms have not moved
     /// in over a decade. tty7's whole point is that a remote host behaves like
-    /// the local one, and a dev box on CentOS 7 (git 1.8) is a real thing —
-    /// a version fork here would have to be tested twice forever.
+    /// the local one, and ancient dev boxes are real. (The honest floor is
+    /// git 1.8.5, not older: every path-carrying op spells its pathspecs
+    /// `:(literal)`, which is where that magic arrived — CentOS 7's 1.8.3
+    /// fails those with a clean "Invalid pathspec magic" rather than doing
+    /// anything wrong.) A version fork here would have to be tested twice
+    /// forever.
     ///
     /// So there is no version probing at all. The one case that genuinely
     /// needs a different command is an unborn HEAD, and that needs no probe
@@ -296,7 +310,12 @@ impl GitOp {
                 }
                 vec![out]
             }
-            GitOp::CheckoutBranch { name } => vec![argv(&["checkout", name])],
+            // The trailing `--` forces ref interpretation: without it a name
+            // that no longer resolves (deleted out from under a stale branch
+            // list) but matches a tracked *file* falls back to a path
+            // checkout — which silently discards worktree edits to that file,
+            // under an op whose `destructive()` says nothing is at risk.
+            GitOp::CheckoutBranch { name } => vec![argv(&["checkout", name, "--"])],
             GitOp::CheckoutDetached { rev } => vec![argv(&["checkout", "--detach", rev])],
             GitOp::CreateBranch {
                 name,
@@ -511,25 +530,46 @@ fn unstage_prefix(head: &HeadState) -> &'static [&'static str] {
         &["reset", "-q", "HEAD"]
     } else {
         // There is no HEAD to reset against before the first commit — git
-        // fails outright — so the index entry is dropped instead.
-        &["rm", "--cached", "-r", "-q"]
+        // fails outright — so the index entry is dropped instead. `-f`,
+        // because without it git refuses a file whose staged content differs
+        // from the file on disk (staged, then edited again) — and with
+        // `--cached` the worktree is never touched, so nothing is at risk.
+        &["rm", "--cached", "-r", "-q", "-f"]
     }
 }
 
-/// `prefix -- <specs…>`, split so no single argv can hit `E2BIG`.
+/// `prefix -- <specs…>`, split so no single argv can hit `E2BIG` on unix or
+/// the 32,767-unit command-line cap on Windows — by count *and* by bytes,
+/// whichever fills first.
 ///
 /// The `--` is not optional: without it a file named `HEAD` reads as a rev and
 /// one named `-f` reads as an option.
 fn batched(prefix: &[&str], specs: &[String]) -> Vec<Vec<String>> {
-    specs
-        .chunks(MAX_PATHSPECS_PER_CALL)
-        .map(|chunk| {
-            let mut out = argv(prefix);
-            out.push("--".into());
-            out.extend(chunk.iter().cloned());
-            out
-        })
-        .collect()
+    let mut out = Vec::new();
+    let mut chunk: Vec<String> = Vec::new();
+    let mut bytes = 0usize;
+    let flush = |chunk: Vec<String>, out: &mut Vec<Vec<String>>| {
+        let mut call = argv(prefix);
+        call.push("--".into());
+        call.extend(chunk);
+        out.push(call);
+    };
+    for spec in specs {
+        // Room for the quotes and the space the Windows argv join adds.
+        let cost = spec.len() + 3;
+        if !chunk.is_empty()
+            && (chunk.len() >= MAX_PATHSPECS_PER_CALL || bytes + cost > MAX_PATHSPEC_BYTES_PER_CALL)
+        {
+            flush(std::mem::take(&mut chunk), &mut out);
+            bytes = 0;
+        }
+        bytes += cost;
+        chunk.push(spec.clone());
+    }
+    if !chunk.is_empty() {
+        flush(chunk, &mut out);
+    }
+    out
 }
 
 /// What a failure means, from git's own words.
@@ -652,7 +692,13 @@ pub fn run_op(
         let spawned = host.git_with_deadline(root, &borrowed, deadline);
         let out = spawned.map_err(|err| GitOpError {
             op: label,
-            kind: GitOpErrorKind::Spawn,
+            // A deadline expiry is its own kind: "git could not be run" tells
+            // the user to check their install, when the truth is the job was
+            // running — and on a remote host may still be.
+            kind: match err.kind() {
+                std::io::ErrorKind::TimedOut => GitOpErrorKind::Timeout,
+                _ => GitOpErrorKind::Spawn,
+            },
             message: err.to_string(),
             detail: err.to_string(),
             rerun_argv: rerun(),
@@ -679,7 +725,13 @@ pub fn run_op(
                 op: label,
                 kind,
                 message,
-                detail: if stderr.is_empty() { stdout } else { stderr },
+                // Both streams: a pull explains itself across the two, and
+                // showing only one buries half the reason.
+                detail: match (stderr.is_empty(), stdout.is_empty()) {
+                    (false, false) => format!("{stderr}\n{stdout}"),
+                    (false, true) => stderr,
+                    _ => stdout,
+                },
                 rerun_argv: rerun(),
                 cwd: root.to_path_buf(),
             });
@@ -865,11 +917,21 @@ mod tests {
                 paths: vec![p("x")],
             }
             .commands(&unborn()),
-            vec![vec!["rm", "--cached", "-r", "-q", "--", ":(literal)x"]],
+            // `-f` because a staged-then-edited file otherwise refuses to
+            // unstage before the first commit; `--cached` keeps it worktree-safe.
+            vec![vec![
+                "rm",
+                "--cached",
+                "-r",
+                "-q",
+                "-f",
+                "--",
+                ":(literal)x"
+            ]],
         );
         assert_eq!(
             GitOp::UnstageAll.commands(&unborn()),
-            vec![vec!["rm", "--cached", "-r", "-q", "--", "."]],
+            vec![vec!["rm", "--cached", "-r", "-q", "-f", "--", "."]],
         );
     }
 
@@ -916,6 +978,28 @@ mod tests {
             assert!(batch[2..].iter().all(|s| s.starts_with(":(literal)")));
         }
         assert_eq!(batches[1][2], ":(literal)f200.txt");
+    }
+
+    /// The count cap alone is not enough: 200 deep-tree paths at 200+
+    /// characters each sail past Windows' 32,767-unit command line. Bytes
+    /// split a batch before the count does.
+    #[test]
+    fn long_paths_split_a_batch_by_bytes_before_the_count_cap() {
+        let long = "d/".repeat(150) + "file.rs"; // ~300 bytes each
+        let paths: Vec<RepoPath> = (0..MAX_PATHSPECS_PER_CALL).map(|_| p(&long)).collect();
+        let batches = GitOp::Stage { paths }.commands(&born());
+
+        assert!(batches.len() > 1, "200 × ~300B has to split");
+        for batch in &batches {
+            let bytes: usize = batch[2..].iter().map(|s| s.len() + 3).sum();
+            assert!(
+                bytes <= MAX_PATHSPEC_BYTES_PER_CALL,
+                "batch of {bytes} bytes would overflow a Windows command line"
+            );
+            assert!(batch.len() >= 3, "no batch goes out empty");
+        }
+        let total: usize = batches.iter().map(|b| b.len() - 2).sum();
+        assert_eq!(total, MAX_PATHSPECS_PER_CALL, "every path is still sent");
     }
 
     #[test]
@@ -1029,7 +1113,9 @@ mod tests {
                 name: "feature".into(),
             }
             .commands(&born()),
-            vec![vec!["checkout", "feature"]],
+            // The trailing `--` keeps a stale branch name from falling back
+            // to a worktree-clobbering *path* checkout.
+            vec![vec!["checkout", "feature", "--"]],
         );
         assert_eq!(
             GitOp::CheckoutDetached {
@@ -1210,10 +1296,13 @@ mod tests {
         for op in every_op() {
             for head in [born(), unborn()] {
                 for batch in op.commands(&head) {
+                    // The two sanctioned `-f`s: `clean` (that is the verb's
+                    // whole meaning, and it is gated as destructive) and
+                    // `rm --cached` (never touches the worktree).
+                    let exempt = batch[0] == "clean"
+                        || (batch[0] == "rm" && batch.iter().any(|a| a == "--cached"));
                     assert!(
-                        !batch
-                            .iter()
-                            .any(|a| a == "--force" || a == "-f" && batch[0] != "clean"),
+                        !batch.iter().any(|a| a == "--force" || a == "-f" && !exempt),
                         "{:?} would force: {batch:?}",
                         op.label(),
                     );

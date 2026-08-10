@@ -12,13 +12,6 @@
 //! entries a `git add` touched is a losing game; bumping a counter for the
 //! repository and letting readers notice they are behind is not.
 
-// The watcher and the subscription gate now use this module, but the panel and
-// the file tree — the things that read the status and run the writes — are
-// still landing alongside it, so `status_of`, `index_of`, `run_git_op`,
-// `shell_quote` and the `FileTree`/`Editor` subscribers have no callers yet.
-// Take the allow off with the last of them; anything still unused then is.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,7 +21,7 @@ use std::time::{Duration, Instant};
 use gpui::{Context, Window};
 
 use crate::core::git::ops::{GitOp, GitOpError, GitOpErrorKind, GitOpOutcome, run_op};
-use crate::core::git::status::{StatusIndex, WorkingTreeStatus, probe_status};
+use crate::core::git::status::{StatusIndex, StatusProbe, WorkingTreeStatus, probe_status};
 use crate::ui::app::Tty7App;
 use crate::ui::host_ops::{ByHost, Host, HostId, HostOps, InFlight, SharedHost, WatchSub};
 
@@ -43,6 +36,12 @@ use crate::ui::host_ops::{ByHost, Host, HostId, HostOps, InFlight, SharedHost, W
 /// one host can hold N × this many operations, which the panel's own layout
 /// (one repository on screen) keeps theoretical.
 pub const MAX_CONCURRENT_NETWORK_OPS: usize = 2;
+
+/// How long a probe that could not reach its host rests before it is asked
+/// again. Only the render-driven retry waits this out — any real invalidation
+/// (a watcher event, a write, the Refresh button) bumps the epoch, which
+/// clears the rest and retries at once.
+pub const PROBE_FAILURE_RETRY: Duration = Duration::from_secs(10);
 
 /// How long a failed watch open rests before it is tried again.
 ///
@@ -307,6 +306,14 @@ impl GitSubscriptions {
     }
 }
 
+/// What a probe hands back to the UI thread: [`StatusProbe`], with the
+/// decoration index pre-built off-thread and the panic case folded in.
+enum ProbeLanding {
+    Status(Arc<WorkingTreeStatus>, Arc<StatusIndex>),
+    NotARepo,
+    Unreachable,
+}
+
 /// One repository's `.git` watch and the burst it is feeding.
 #[derive(Default)]
 struct RepoWatch {
@@ -331,6 +338,11 @@ pub struct ScmData {
     epoch: ByHost<PathBuf, u64>,
     /// repo root → the epoch the cached status was read at.
     read_at: ByHost<PathBuf, u64>,
+    /// repo root → when a probe last came back *unreachable* — not "not a
+    /// repository", but "the question could not be asked". The held status
+    /// stays (stale beats blank), and `is_stale` sits out
+    /// [`PROBE_FAILURE_RETRY`] so a dead link is not probed at frame rate.
+    failed_at: ByHost<PathBuf, Instant>,
     probes: InFlight<(HostId, PathBuf)>,
     network: ByHost<PathBuf, Arc<AtomicUsize>>,
     /// repo root → its `.git` watch, once someone is looking. A plain map
@@ -380,19 +392,28 @@ impl ScmData {
     }
 
     /// Whether what we hold was read before the last thing that changed it.
-    /// A repository we have never probed counts as stale.
+    /// A repository we have never probed counts as stale — unless the last
+    /// attempt could not reach the host and its rest has not passed yet.
     pub fn is_stale(&self, host: HostId, root: &Path) -> bool {
-        match self.read_at.get(host, root) {
+        let stale = match self.read_at.get(host, root) {
             Some(read) => *read < self.epoch(host, root),
             None => true,
-        }
+        };
+        stale
+            && !self
+                .failed_at
+                .get(host, root)
+                .is_some_and(|at| at.elapsed() < PROBE_FAILURE_RETRY)
     }
 
     /// Mark a repository changed. Every write, every `.git` watcher event and
     /// every command boundary lands here; readers reprobe on their next look.
+    /// A real change also ends a failure's rest: whatever made the epoch move
+    /// is evidence the host is alive again.
     pub fn bump(&mut self, host: HostId, root: &Path) {
         let next = self.epoch(host, root) + 1;
         self.epoch.insert(host, root.to_path_buf(), next);
+        self.failed_at.remove(host, root);
         self.probes.invalidate(&(host, root.to_path_buf()));
     }
 
@@ -403,9 +424,14 @@ impl ScmData {
         self.index.clear_host(host);
         self.epoch.clear_host(host);
         self.read_at.clear_host(host);
+        self.failed_at.clear_host(host);
         self.network.clear_host(host);
         self.watches.retain(|(held, _), _| *held != host);
         self.subs.clear_host(host);
+        // In-flight probe bookkeeping too: a probe whose landing never runs
+        // (its work panicked, say) would otherwise hold `begin` false for
+        // this key for the life of the process.
+        self.probes.retain(|(held, _)| *held != host);
         self.wipe += 1;
     }
 
@@ -571,14 +597,24 @@ impl Tty7App {
 
         let probe_root = root.clone();
         let this = cx.weak_entity();
-        let again = host.clone();
         HostOps::run_detached(
             host,
             cx,
             move |h| {
-                let status = probe_status(h, &probe_root)?;
-                let index = StatusIndex::build(&status);
-                Some((Arc::new(status), Arc::new(index)))
+                // `catch_unwind` because a panic on the pool thread would skip
+                // the landing entirely — and with it `probes.finish`, wedging
+                // this repository's refresh for the life of the process.
+                let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    probe_status(h, &probe_root)
+                }));
+                match probe {
+                    Ok(StatusProbe::Status(status)) => {
+                        let index = StatusIndex::build(&status);
+                        ProbeLanding::Status(Arc::new(*status), Arc::new(index))
+                    }
+                    Ok(StatusProbe::NotARepo) => ProbeLanding::NotARepo,
+                    Ok(StatusProbe::Unreachable) | Err(_) => ProbeLanding::Unreachable,
+                }
             },
             move |cx, result| {
                 let data = cx.default_global::<ScmData>();
@@ -591,8 +627,13 @@ impl Tty7App {
                 if data.wipe != wipe || data.generation(id, &root) != sub_gen {
                     return;
                 }
+                // Only a definitive answer counts as a read; an unreachable
+                // host leaves what is cached (stale beats blank) and rests
+                // before the next try — see `is_stale`.
+                let definitive = !matches!(result, ProbeLanding::Unreachable);
+                let mut not_a_repo = false;
                 let changed = match result {
-                    Some((status, index)) => {
+                    ProbeLanding::Status(status, index) => {
                         let same = data
                             .status
                             .get(id, root.as_path())
@@ -606,13 +647,27 @@ impl Tty7App {
                     // is what stops the next frame asking again: a pane whose
                     // cwd is an ordinary directory would otherwise spawn a
                     // `rev-parse` per frame, forever.
-                    None => {
+                    ProbeLanding::NotARepo => {
+                        not_a_repo = true;
                         let held = data.status.remove(id, root.as_path()).is_some();
                         data.index.remove(id, root.as_path());
                         held
                     }
+                    ProbeLanding::Unreachable => {
+                        data.failed_at.insert(id, root.clone(), Instant::now());
+                        false
+                    }
                 };
-                data.read_at.insert(id, root.clone(), at);
+                if definitive {
+                    data.failed_at.remove(id, root.as_path());
+                    data.read_at.insert(id, root.clone(), at);
+                }
+                if not_a_repo {
+                    // Every cwd that resolved to this root must re-ask, or the
+                    // panel keeps drawing the Loading state of a repository
+                    // that is gone (`rm -rf .git` being the honest test).
+                    let _ = this.update(cx, |app, _| app.scm.forget_root(id, &root));
+                }
                 // `run_detached` lands with an `App` and no view, and writing
                 // a global marks nothing dirty, so without this the panel and
                 // the decorations wait for the next unrelated repaint.
@@ -627,7 +682,13 @@ impl Tty7App {
                     cx.refresh_windows();
                 }
                 if superseded {
-                    let _ = this.update(cx, |app, cx| app.scm_refresh(again, root, cx));
+                    // Through the debounce, not straight back into a probe:
+                    // during sustained churn on a repository whose status read
+                    // outlives the event interval, a direct relaunch runs
+                    // probes back to back for the whole of it. The bump-and-
+                    // wait path coalesces the retry with whatever is still
+                    // landing.
+                    let _ = this.update(cx, |app, cx| app.scm_invalidate(id, &root, cx));
                 }
             },
         );
@@ -832,6 +893,9 @@ impl Tty7App {
             cx.default_global::<ScmData>().clear_host(host);
             cx.default_global::<crate::terminal::git_status::GitStatusCache>()
                 .clear_host(host);
+            // The panel's own per-cwd caches too — `roots` grows one entry
+            // per directory ever visited on the dead link otherwise.
+            self.scm.forget_host(host);
         }
     }
 
@@ -846,22 +910,29 @@ impl Tty7App {
             return;
         }
         let sub_gen = cx.default_global::<ScmData>().generation(id, &root);
+        let wipe = cx.default_global::<ScmData>().wipe;
         let probe_root = root.clone();
         HostOps::run(
             host,
             cx,
             move |h| {
-                let dirs = scm_watch_dirs(h, &probe_root)?;
-                match h.watch(&dirs) {
-                    Ok(sub) => Some(Arc::new(sub)),
-                    Err(e) => {
-                        log::warn!("source control: no watch for {probe_root:?}: {e}");
-                        None
+                // `catch_unwind` for the same reason the status probe carries
+                // it: a panic here would skip the landing, and with it
+                // `finish_watch_open` — `opening` would stay true forever.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let dirs = scm_watch_dirs(h, &probe_root)?;
+                    match h.watch(&dirs) {
+                        Ok(sub) => Some(Arc::new(sub)),
+                        Err(e) => {
+                            log::warn!("source control: no watch for {probe_root:?}: {e}");
+                            None
+                        }
                     }
-                }
+                }))
+                .unwrap_or(None)
             },
             move |app, sub: Option<Arc<WatchSub>>, cx| {
-                app.scm_watch_opened(id, root, sub_gen, sub, cx)
+                app.scm_watch_opened(id, root, sub_gen, wipe, sub, cx)
             },
         );
     }
@@ -871,13 +942,20 @@ impl Tty7App {
         host: HostId,
         root: PathBuf,
         sub_gen: u64,
+        wipe: u64,
         sub: Option<Arc<WatchSub>>,
         cx: &mut Context<Self>,
     ) {
         let data = cx.default_global::<ScmData>();
         // Letting go while the watch was opening leaves the only `Arc` here,
-        // so returning closes it.
-        if data.generation(host, &root) != sub_gen || !data.is_subscribed(host, &root) {
+        // so returning closes it. `wipe` closes the one gap `generation`
+        // cannot: a disconnect resets generations to their default, so a
+        // watch opened against the *previous* connection could otherwise be
+        // installed for the re-subscribed repository.
+        if data.wipe != wipe
+            || data.generation(host, &root) != sub_gen
+            || !data.is_subscribed(host, &root)
+        {
             data.finish_watch_open(host, &root, None, Instant::now());
             return;
         }
@@ -914,7 +992,7 @@ impl Tty7App {
         root: PathBuf,
         op: GitOp,
         then: Option<crate::ui::scm::actions::ScmFollowUp>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(status) = status_of(cx, host.id(), &root) else {
@@ -929,7 +1007,16 @@ impl Tty7App {
         let slot = if op.is_network() {
             match cx.default_global::<ScmData>().take_network_slot(id, &root) {
                 Some(slot) => Some(slot),
-                None => return,
+                None => {
+                    // Said out loud: a swallowed click on Push looks exactly
+                    // like a push that finished instantly.
+                    gpui_component::WindowExt::push_notification(
+                        window,
+                        crate::ui::i18n::t(crate::ui::i18n::L10nKey::ScmNetworkBusy).to_string(),
+                        cx,
+                    );
+                    return;
+                }
             }
         } else {
             None

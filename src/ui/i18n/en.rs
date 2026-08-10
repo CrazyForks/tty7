@@ -845,6 +845,21 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::ScmCommitStaged => "Commit Staged",
         L10nKey::ScmStashAll => "Stash All",
         L10nKey::ScmNothingToCommit => "Nothing to commit",
+        L10nKey::ScmNetworkBusy => "Another network operation is still running for this repository",
+        L10nKey::ScmCommitNeedsMessage => "Write a commit message first",
+        L10nKey::ScmDetailFilesFailed => "The file list could not be read",
+        L10nKey::ScmTimeNow => "now",
+        L10nKey::ScmTimeMinutes => "{n}m",
+        L10nKey::ScmTimeHours => "{n}h",
+        L10nKey::ScmTimeDays => "{n}d",
+        L10nKey::ScmTimeMonths => "{n}mo",
+        L10nKey::ScmTimeYears => "{n}y",
+        L10nKey::ScmResetHardConfirm => {
+            "Reset the branch to this commit? Commits after it fall off the branch, \
+             and uncommitted changes are discarded."
+        }
+        L10nKey::ScmReset => "Reset",
+        L10nKey::ScmChipStaged => "STAGED",
         L10nKey::ScmStage => "Stage Changes",
         L10nKey::ScmStageAll => "Stage All Changes",
         L10nKey::ScmUnstage => "Unstage Changes",
@@ -1314,7 +1329,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::PanelMoreChangedFiles => {
             "… and {count} more changed files — run `git diff` to see them."
         }
-        L10nKey::PanelUntracked => "{count} untracked",
         L10nKey::ScmFilesChanged => "{count} files changed",
         L10nKey::ScmStagedFileCount => "{count} files staged",
         L10nKey::AppMenuAbout => "About tty7",
@@ -1425,9 +1439,6 @@ pub fn translate_variant_en(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::ScmStagedFileCount, "zero") => "No staged changes",
         (L10nKey::ScmStagedFileCount, "one") => "1 file staged",
         (L10nKey::ScmStagedFileCount, "other") => "{count} files staged",
-        (L10nKey::PanelUntracked, "zero") => "0 untracked",
-        (L10nKey::PanelUntracked, "one") => "1 untracked",
-        (L10nKey::PanelUntracked, "other") => "{count} untracked",
         (L10nKey::PanelMoreChangedFiles, "zero") => {
             "… and 0 more changed files — run `git diff` to see them."
         }

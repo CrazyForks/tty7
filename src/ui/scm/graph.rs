@@ -74,6 +74,10 @@ use crate::ui::scm::state::RepoKey;
 /// phi, so 12px occupies `round(12 × 1.618) = 19px`, and 20 is the first even
 /// pitch above it.
 const GRAPH_ROW_H: f32 = 20.;
+/// Rows materialized above and below the visible band, so a fast scroll never
+/// outruns the window into blank space, and the "load more" band — laid out
+/// one row past the window's end — stays below the fold until it is real.
+const GRAPH_WINDOW_MARGIN: usize = 4;
 
 /// Header of the section itself: fold, title, count, filter tile, scope picker.
 ///
@@ -314,6 +318,14 @@ struct GraphPaint {
     /// transparency when one is configured, which would let the lane line show
     /// straight down the middle of the node.
     surface: Hsla,
+    /// The selected row and the fill its band paints under the node, so a
+    /// hollow node's hole matches the selection band it sits on instead of
+    /// punching through to the resting surface. Hover is not covered — it
+    /// lives in gpui's element state, which a paint closure cannot read — so
+    /// a hovered ring keeps the resting hole; one step of fill under a 3px
+    /// hole, against a whole selected band showing the wrong colour.
+    selected: Option<usize>,
+    selected_surface: Hsla,
     /// Whether a "load more" band follows the last row.
     more: bool,
 }
@@ -419,6 +431,11 @@ fn paint_graph(p: &GraphPaint, bounds: Bounds<Pixels>, window: &mut Window) {
         // because the border is part of that same SDF — stacking would blend the
         // inner edge over the outer one's already-blended edge, and a 3px hole
         // is where that shows.
+        let hole = if p.selected == Some(i) {
+            p.selected_surface
+        } else {
+            p.surface
+        };
         if row.parents > 1 {
             // A merge is a ring. It is the one row shape a reader scans for,
             // and an outline reads at 8px where a second fill colour does not.
@@ -426,7 +443,7 @@ fn paint_graph(p: &GraphPaint, bounds: Bounds<Pixels>, window: &mut Window) {
             window.paint_quad(quad(
                 dot(r),
                 Corners::all(px(r)),
-                p.surface,
+                hole,
                 Edges::all(px(GRAPH_LINE_W)),
                 ink,
                 BorderStyle::Solid,
@@ -437,7 +454,7 @@ fn paint_graph(p: &GraphPaint, bounds: Bounds<Pixels>, window: &mut Window) {
             window.paint_quad(quad(
                 dot(GRAPH_DOT_R),
                 Corners::all(px(GRAPH_DOT_R)),
-                p.surface,
+                hole,
                 Edges::all(px(GRAPH_LINE_W)),
                 ink,
                 BorderStyle::Solid,
@@ -527,7 +544,7 @@ impl Tty7App {
             Some(page) if page.commits.is_empty() => {
                 self.panel_empty(t(L10nKey::ScmGraphEmpty), None, cx)
             }
-            Some(page) => self.graph_body(repo, &page, query.as_deref(), cx),
+            Some(page) => self.graph_body(repo, &page, query.as_deref(), height, cx),
         };
         let (backing, handle) = self.graph_resize(ceiling, cx);
 
@@ -631,6 +648,29 @@ impl Tty7App {
         );
     }
 
+    /// Which commit indices the list shows for this page and query, resolved
+    /// through the cache on `GraphState` — see its doc for why it exists.
+    fn graph_visible_rows(
+        &mut self,
+        page: &Arc<CommitPage>,
+        query: Option<&str>,
+    ) -> Arc<Vec<usize>> {
+        let key = Arc::as_ptr(page) as usize;
+        if let Some((held_query, held_page, rows)) = &self.scm.graph.filter_cache {
+            if *held_page == key && held_query.as_deref() == query {
+                return rows.clone();
+            }
+        }
+        let rows: Arc<Vec<usize>> = Arc::new(match query {
+            None => (0..page.commits.len()).collect(),
+            Some(q) => (0..page.commits.len())
+                .filter(|i| matches_query(&page.commits[*i], q))
+                .collect(),
+        });
+        self.scm.graph.filter_cache = Some((query.map(str::to_string), key, rows.clone()));
+        rows
+    }
+
     /// The filter box's text, if it has any.
     fn graph_query(&self, cx: &Context<Self>) -> Option<String> {
         let input = self.scm.graph.search.as_ref()?;
@@ -693,11 +733,15 @@ impl Tty7App {
 
 impl Tty7App {
     /// The scrolling list: rows underneath, one canvas over the gutter.
+    ///
+    /// `height` is the section's height — the ceiling on how much of the list
+    /// can be on screen, and so on how many rows become elements.
     fn graph_body(
         &mut self,
         repo: &RepoKey,
         page: &Arc<CommitPage>,
         query: Option<&str>,
+        height: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let panel_w = cx.global::<crate::core::config::Config>().right_panel_width;
@@ -710,22 +754,31 @@ impl Tty7App {
         // So the filter hides the gutter entirely and the list becomes a flat
         // search result — which is what it actually is.
         let filtering = query.is_some();
-        let rows: Vec<usize> = match query {
-            None => (0..page.commits.len()).collect(),
-            Some(q) => (0..page.commits.len())
-                .filter(|i| matches_query(&page.commits[*i], q))
-                .collect(),
-        };
+        let rows = self.graph_visible_rows(page, query);
         // No row at the cap either: `load_page` clamps there, so "load more"
         // past it could only refetch what is already on screen.
         let more = query.is_none() && !page.complete && page.commits.len() < MAX_GRAPH_COMMITS;
         let bands = rows.len() + usize::from(more);
 
+        // Only the rows that can be on screen become elements — the row count
+        // is bounded by the cap at 5000, and a taffy pass over 5000 flex
+        // children per frame is most of a frame. The stack below keeps its
+        // full fixed height so the scroll range is unchanged; a top padding
+        // stands in for everything scrolled past. The canvas needs no such
+        // treatment: its paint is already clipped to the content mask.
+        let scrolled = (-self.scm.graph.scroll.offset().y.as_f32()).max(0.);
+        let first = ((scrolled / GRAPH_ROW_H) as usize)
+            .saturating_sub(GRAPH_WINDOW_MARGIN)
+            .min(rows.len());
+        let visible = (height / GRAPH_ROW_H).ceil() as usize + GRAPH_WINDOW_MARGIN * 2;
+        let last = first.saturating_add(visible).min(rows.len());
+
         // With the gutter gone the text takes the panel's own inset, so a
         // search result does not sit in a column of empty space.
         let indent = if filtering { CONTENT_INSET } else { gutter };
-        let list = v_flex().children(
-            rows.iter()
+        let list = v_flex().pt(px(first as f32 * GRAPH_ROW_H)).children(
+            rows[first..last]
+                .iter()
                 .map(|i| self.graph_row(repo, page, *i, indent, now, cx)),
         );
         let mut stack = div()
@@ -736,6 +789,7 @@ impl Tty7App {
             .children(more.then(|| self.graph_load_more(gutter, cx)));
 
         if !filtering {
+            let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
             let paint = GraphPaint {
                 page: page.clone(),
                 max_lanes: cap,
@@ -744,7 +798,14 @@ impl Tty7App {
                 // The hole in a hollow node has to be the exact fill behind it,
                 // or the lane line running underneath shows through. The
                 // section is flush on the panel, so that fill is the sidebar's.
-                surface: gpui::rgb(cx.global::<crate::ui::presets::Surfaces>().sidebar.base).into(),
+                surface: gpui::rgb(sf.base).into(),
+                selected: self
+                    .scm
+                    .graph
+                    .selected
+                    .as_deref()
+                    .and_then(|oid| page.commits.iter().position(|c| c.oid == oid)),
+                selected_surface: gpui::rgb(sf.selected).into(),
                 more,
             };
             stack = stack.child(
@@ -866,12 +927,15 @@ impl Tty7App {
             })
             .on_click(cx.listener({
                 let repo = repo.clone();
-                let oid = oid.clone();
                 // The row already holds everything the detail view renders, so
-                // it hands its own commit over and no `git show` is run.
-                let seed = commit.clone();
+                // it hands its own commit over and no `git show` is run. The
+                // listener carries the page `Arc` and an index, not a clone of
+                // the commit: with up to 5000 rows a frame, one deep `Commit`
+                // clone per row (an 8KB body, refs) was most of the frame.
+                let page = page.clone();
                 move |this, _, _, cx| {
-                    this.graph_open_commit(repo.clone(), oid.clone(), Some(seed.clone()), cx)
+                    let seed = page.commits[i].clone();
+                    this.graph_open_commit(repo.clone(), seed.oid.clone(), Some(seed), cx)
                 }
             }))
             .context_menu({

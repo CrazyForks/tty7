@@ -241,7 +241,12 @@ impl Tty7App {
                 if let Some(commit) = commit {
                     open.commit = Some(Arc::new(commit));
                 }
-                open.files = Some(Arc::new(files.unwrap_or_default()));
+                match files {
+                    Some(files) => open.files = Some(Arc::new(files)),
+                    // A failed read is not an empty commit — see
+                    // `CommitDetailView::files_failed`.
+                    None => open.files_failed = true,
+                }
                 cx.notify();
             },
         );
@@ -531,7 +536,12 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(files) = detail.files.clone() else {
-            return self.detail_note(t(L10nKey::PanelLoading).to_string(), cx);
+            let note = if detail.files_failed {
+                L10nKey::ScmDetailFilesFailed
+            } else {
+                L10nKey::PanelLoading
+            };
+            return self.detail_note(t(note).to_string(), cx);
         };
         let list = v_flex().child(self.detail_summary(&files, mono, cx));
         // The label rides along on the source so the overlay's header can say
@@ -649,7 +659,7 @@ impl Tty7App {
         let sf = panel_surface(cx);
         let deco = crate::ui::diff_overlay::deco_status(file.status);
         let (name, dir) = split_display_path(&file.path);
-        let selected = self.diff_overlay_focus(detail.repo.host, &detail.repo.root)
+        let selected = self.diff_overlay_focus(detail.repo.host, &detail.repo.root, source)
             == Some(file.path.as_str());
 
         h_flex()

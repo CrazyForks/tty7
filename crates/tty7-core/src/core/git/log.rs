@@ -47,6 +47,14 @@ pub const MAX_LOG_BYTES: usize = 16 * 1024 * 1024;
 /// told apart by counting fields — and one NUL inside a commit message (git
 /// objects allow it) would desynchronise the whole stream. RS and US cannot
 /// occur in a sha, a refname, an ISO date or an address.
+///
+/// A commit *message* can still carry RS or US — nothing git accepts is out of
+/// bounds there. The failure is contained, not eliminated: the body truncates
+/// at the stray separator, `is_hex_oid` throws the tail away unless it is
+/// deliberately shaped like a full record, and a deliberately shaped one can
+/// fabricate at worst a bogus row in the graph — whose `git show` then fails.
+/// Sealing that needs length-prefixed reads (`cat-file --batch`), a different
+/// data path entirely.
 pub const REC_SEP: u8 = 0x1e;
 pub const FIELD_SEP: u8 = 0x1f;
 
@@ -326,7 +334,9 @@ impl LaneAlloc {
         // No parents: a root. `slots[node]` was released above and nothing
         // claimed it, so the lane simply ends here.
 
-        edges.sort_unstable_by_key(Edge::paint_rank);
+        // Stable: two edges of one rank (a merge's several `Out`s) keep their
+        // insertion order — first parent first — which the golden tests pin.
+        edges.sort_by_key(Edge::paint_rank);
         GraphRow {
             node,
             // Colour is the lane number, fixed when the lane is created and
@@ -394,17 +404,28 @@ const LOG_FIELDS: usize = 11;
 
 pub const REF_FORMAT: &str = "--format=%(objectname)%x1f%(refname)%x1f%(refname:short)%x1f%(upstream)%x1f%(HEAD)%x1f%(objecttype)%x1f%(*objectname)";
 
+/// What [`parse_log`] read, and whether it read all of it.
+pub struct ParsedLog {
+    pub commits: Vec<Commit>,
+    /// The stream was cut short — by [`MAX_LOG_BYTES`], or by a record past
+    /// `MAX_RECORD` being dropped whole. The caller must not present the
+    /// commits as "all of history": git returned more than was parsed.
+    pub truncated: bool,
+}
+
 /// Parses the output of the `log` invocation [`LOG_PRETTY`] belongs to.
 ///
 /// Records are split on RS and fields on US. Fields are taken with `splitn`, so
 /// the body — the only field that can contain anything at all — absorbs every
 /// separator past the tenth instead of shifting the parse.
-pub fn parse_log(stdout: &[u8]) -> Vec<Commit> {
+pub fn parse_log(stdout: &[u8]) -> ParsedLog {
     let mut commits = Vec::new();
     let mut used = 0usize;
+    let mut clipped = false;
     let mut on_record = |record: &[u8]| {
         used = used.saturating_add(record.len());
         if used > MAX_LOG_BYTES {
+            clipped = true;
             return;
         }
         if let Some(commit) = parse_record(record) {
@@ -413,8 +434,11 @@ pub fn parse_log(stdout: &[u8]) -> Vec<Commit> {
     };
     let mut split = RecordSplitter::new(REC_SEP);
     split.push(stdout, &mut on_record);
-    split.finish(&mut on_record);
-    commits
+    let dropped = split.finish(&mut on_record);
+    ParsedLog {
+        commits,
+        truncated: clipped || dropped > 0,
+    }
 }
 
 fn parse_record(record: &[u8]) -> Option<Commit> {
@@ -646,7 +670,7 @@ pub fn load_commit(host: &dyn Host, root: &Path, rev: &str) -> Option<Commit> {
     if !out.success() {
         return None;
     }
-    parse_log(&out.stdout).into_iter().next()
+    parse_log(&out.stdout).commits.into_iter().next()
 }
 
 /// One path a commit touched, with the line counts beside it.
@@ -723,7 +747,10 @@ fn records(stdout: &[u8]) -> Vec<String> {
     let mut on_record = |record: &[u8]| out.push(String::from_utf8_lossy(record).into_owned());
     let mut split = RecordSplitter::new(0);
     split.push(stdout, &mut on_record);
-    split.finish(&mut on_record);
+    // A dropped record here is a >1 MiB *pathname* — losing that one row from
+    // a commit's file list is the same answer `MAX_COMMIT_FILES` already gives
+    // for lists that are merely long.
+    let _ = split.finish(&mut on_record);
     out
 }
 
@@ -886,7 +913,6 @@ pub fn load_page(
         // of its children, and dates do not guarantee that. A rebase or a
         // cherry-pick across timezones is enough to invert a pair.
         "--topo-order",
-        "--parents",
         "--decorate=full",
         "--no-color",
         LOG_PRETTY,
@@ -905,8 +931,13 @@ pub fn load_page(
     if !out.success() {
         return None;
     }
-    let mut commits = parse_log(&out.stdout);
-    let complete = commits.len() < count;
+    let parsed = parse_log(&out.stdout);
+    let mut commits = parsed.commits;
+    // "End of history" needs both halves: git answered with fewer than asked
+    // for, *and* the parse read everything git answered with. A stream cut at
+    // `MAX_LOG_BYTES` also has fewer commits than `count` — calling that
+    // complete would freeze paging on a truncated graph.
+    let complete = !parsed.truncated && commits.len() < count;
 
     let page: Vec<(Oid, SmallVec<[Oid; 2]>)> = commits
         .iter()
@@ -950,27 +981,24 @@ pub fn load_page(
 
 /// The revs to walk for a scope.
 ///
-/// `HeadAndUpstream` resolves to shas first. Paging re-runs the walk with a
-/// larger `-n`, and a symbolic `HEAD` would let a commit pushed between the two
-/// runs change where page two starts — the second page would no longer be a
-/// superset of the first, which is the one thing paging here relies on.
+/// Every symbolic name resolves to a sha first. Paging re-runs the walk with a
+/// larger `-n`, and a symbolic `HEAD` or branch name would let a commit pushed
+/// between the two runs change where page two starts — the second page would
+/// no longer be a superset of the first, which is the one thing paging here
+/// relies on. (`--all` cannot be pinned; that scope accepts the reflow.)
+/// A name that no longer resolves — a deleted branch, an unborn HEAD — simply
+/// contributes nothing, which reads as "no history" rather than as a failure.
 fn scope_revs(host: &dyn Host, root: &Path, scope: &GraphScope) -> Vec<String> {
     match scope {
-        GraphScope::Head => vec!["HEAD".to_string()],
+        GraphScope::Head => rev(host, root, "HEAD^{commit}").into_iter().collect(),
         GraphScope::All => vec!["--all".to_string()],
-        GraphScope::Refs(refs) => {
-            let mut revs: Vec<String> = refs
-                .iter()
-                // A refname cannot begin with `-`, so anything that does is
-                // either a mistake or an option smuggled in through a scope.
-                .filter(|r| !r.is_empty() && !r.starts_with('-'))
-                .cloned()
-                .collect();
-            if revs.is_empty() {
-                revs.push("HEAD".to_string());
-            }
-            revs
-        }
+        GraphScope::Refs(refs) => refs
+            .iter()
+            // A refname cannot begin with `-`, so anything that does is
+            // either a mistake or an option smuggled in through a scope.
+            .filter(|r| !r.is_empty() && !r.starts_with('-'))
+            .filter_map(|r| rev(host, root, &format!("{r}^{{commit}}")))
+            .collect(),
         GraphScope::HeadAndUpstream => {
             let mut revs = Vec::new();
             if let Some(head) = rev(host, root, "HEAD^{commit}") {
@@ -1127,7 +1155,14 @@ mod tests {
         lanes
     }
 
-    /// Lanes crossing the row's bottom edge, sorted.
+    /// Lanes crossing the row's bottom edge, sorted and folded.
+    ///
+    /// Folded, because one lane can legally carry a `Pass` *and* an `Out`: a
+    /// merge whose second parent already has a lane reserved by another child
+    /// sends its `Out` onto that lane, joining the line rather than opening a
+    /// second one. Below the row that is a single line in a single colour (an
+    /// `Out`'s colour is its lane), so the cut sees one line — which the
+    /// assertions below verify before folding.
     fn bottom(row: &GraphRow) -> Vec<Lane> {
         let mut lanes: Vec<Lane> = row
             .edges
@@ -1139,20 +1174,45 @@ mod tests {
             })
             .collect();
         lanes.sort_unstable();
+        lanes.dedup();
         lanes
     }
 
     /// The property the whole layout rests on: at any horizontal cut through
-    /// the graph a lane carries at most one line, and what leaves a row's
-    /// bottom is exactly what enters the next row's top. Together those two
-    /// mean colour-by-lane can never put two visible lines in one colour.
+    /// the graph a lane carries at most one visible line, and what leaves a
+    /// row's bottom is exactly what enters the next row's top. Together those
+    /// two mean colour-by-lane can never put two visible lines in one colour.
+    ///
+    /// "Visible" carries the one nuance: an `Out` may land on a lane a `Pass`
+    /// already crosses — a join, see [`bottom`] — and that pair is one line.
+    /// Two `Pass`es or two `Out`s on one lane are still bugs.
     fn assert_lanes_line_up(rows: &[GraphRow]) {
         for (i, row) in rows.iter().enumerate() {
-            for edges in [top(row), bottom(row)] {
-                let mut once = edges.clone();
-                once.dedup();
-                assert_eq!(once, edges, "row {i} has two lines on one lane: {row:?}");
-            }
+            let once = |mut lanes: Vec<Lane>| {
+                lanes.sort_unstable();
+                let len = lanes.len();
+                lanes.dedup();
+                assert_eq!(lanes.len(), len, "row {i} doubles up a lane: {row:?}");
+            };
+            once(top(row));
+            once(
+                row.edges
+                    .iter()
+                    .filter_map(|e| match *e {
+                        Edge::Pass { lane, .. } => Some(lane),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            once(
+                row.edges
+                    .iter()
+                    .filter_map(|e| match *e {
+                        Edge::Out { to, .. } => Some(to),
+                        _ => None,
+                    })
+                    .collect(),
+            );
         }
         for (i, pair) in rows.windows(2).enumerate() {
             assert_eq!(
@@ -1330,6 +1390,37 @@ mod tests {
         assert_lanes_line_up(&rows);
     }
 
+    /// The commonest merge topology of all: "merge main into topic after main
+    /// advanced". The merge's second parent (`c`) already has a lane reserved
+    /// by another child (`x`), so the merge's `Out` *joins* that lane instead
+    /// of opening a second one to the same commit — the row legally carries a
+    /// `Pass` and an `Out` on lane 0, one line below the cut, not two.
+    #[test]
+    fn a_second_parent_joins_a_line_another_child_opened() {
+        let page = [
+            commit("x", &["c"]),
+            commit("m", &["a", "c"]),
+            commit("a", &["c"]),
+            commit("c", &[]),
+        ];
+        let rows = lay_out(&page);
+
+        assert_eq!(rows[0].edges.as_slice(), [out_at(0)]);
+        let merge = &rows[1];
+        assert_eq!(merge.node, 1, "the merge tips a lane of its own");
+        assert_eq!(
+            merge.edges.as_slice(),
+            [pass_at(0), out_at(1), out_at(0)],
+            "first parent inherits the node's lane; the second joins lane 0"
+        );
+        assert_eq!(
+            rows[3].edges.as_slice(),
+            [in_at(0), in_at(1)],
+            "both lines still converge on the shared parent"
+        );
+        assert_lanes_line_up(&rows);
+    }
+
     #[test]
     fn more_parents_than_lanes_truncates_instead_of_panicking() {
         let parents: Vec<String> = (0..40).map(|i| format!("p{i}")).collect();
@@ -1374,6 +1465,35 @@ mod tests {
         ])
     }
 
+    /// A parse that could not read everything must say so — `load_page` turns
+    /// `truncated` into `complete: false`, and a truncated graph that claimed
+    /// to be the end of history would freeze paging on it forever.
+    #[test]
+    fn a_stream_the_parse_cannot_finish_is_never_called_complete() {
+        // One record past MAX_RECORD: dropped whole by the splitter.
+        let huge_body = "x".repeat(super::super::MAX_RECORD + 1);
+        let stream = [
+            one(SHA_A, SHA_B, "", "kept", ""),
+            one(SHA_B, "", "", "monster", &huge_body),
+        ]
+        .concat();
+        let parsed = parse_log(stream.as_bytes());
+        assert_eq!(parsed.commits.len(), 1, "the readable record survives");
+        assert!(parsed.truncated);
+
+        // Cumulative bytes past MAX_LOG_BYTES: the tail is clipped.
+        let body = "y".repeat(512 * 1024);
+        let stream: String = (0..40)
+            .map(|i| one(&format!("{i:040}"), "", "", "big", &body))
+            .collect();
+        let parsed = parse_log(stream.as_bytes());
+        assert!(parsed.commits.len() < 40);
+        assert!(parsed.truncated);
+
+        let parsed = parse_log(one(SHA_A, "", "", "small", "fine").as_bytes());
+        assert!(!parsed.truncated, "an ordinary stream is read in full");
+    }
+
     #[test]
     fn a_multi_line_body_survives_the_record_split() {
         let stream = [
@@ -1387,7 +1507,7 @@ mod tests {
             one(SHA_B, "", "", "second", ""),
         ]
         .join("\n");
-        let commits = parse_log(stream.as_bytes());
+        let commits = parse_log(stream.as_bytes()).commits;
 
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].summary, "first");
@@ -1402,7 +1522,7 @@ mod tests {
     #[test]
     fn a_merge_records_both_parents() {
         let stream = one(SHA_A, &format!("{SHA_B} {SHA_C}"), "", "merge", "");
-        let commits = parse_log(stream.as_bytes());
+        let commits = parse_log(stream.as_bytes()).commits;
 
         assert_eq!(commits[0].parents.as_slice(), [SHA_B, SHA_C]);
         assert!(commits[0].is_merge());
@@ -1413,7 +1533,7 @@ mod tests {
     fn decorations_map_to_their_ref_kinds() {
         let deco = "HEAD -> refs/heads/main, refs/remotes/origin/main, tag: refs/tags/v1.0";
         let stream = one(SHA_A, "", deco, "subject", "");
-        let refs = parse_log(stream.as_bytes()).remove(0).refs;
+        let refs = parse_log(stream.as_bytes()).commits.remove(0).refs;
 
         assert_eq!(refs.len(), 3);
         assert_eq!(refs[0].kind, RefKind::LocalBranch);
@@ -1427,7 +1547,7 @@ mod tests {
         assert_eq!(refs[2].short, "v1.0");
 
         let detached = one(SHA_A, "", "HEAD, refs/tags/v2", "subject", "");
-        let refs = parse_log(detached.as_bytes()).remove(0).refs;
+        let refs = parse_log(detached.as_bytes()).commits.remove(0).refs;
         assert_eq!(refs[0].kind, RefKind::Head);
         assert!(refs[0].is_head);
     }
@@ -1436,7 +1556,7 @@ mod tests {
     fn a_unit_separator_inside_a_body_does_not_shift_fields() {
         let body = "before\x1fafter\x1fand\x1fmore";
         let stream = one(SHA_A, "", "", "subject", body);
-        let commits = parse_log(stream.as_bytes());
+        let commits = parse_log(stream.as_bytes()).commits;
 
         assert_eq!(
             commits[0].summary, "subject",
@@ -1453,7 +1573,7 @@ mod tests {
             record(&[SHA_B, "only two fields"]),
         ]
         .join("\n");
-        let commits = parse_log(stream.as_bytes());
+        let commits = parse_log(stream.as_bytes()).commits;
 
         assert_eq!(commits.len(), 1, "{commits:?}");
         assert_eq!(commits[0].summary, "real");
@@ -1517,7 +1637,7 @@ mod tests {
         let subject = "提".repeat(400);
         let body = "交".repeat(4000);
         let stream = one(SHA_A, "", "", &subject, &body);
-        let commit = parse_log(stream.as_bytes()).remove(0);
+        let commit = parse_log(stream.as_bytes()).commits.remove(0);
 
         assert_eq!(
             commit.summary.len(),
@@ -1573,7 +1693,7 @@ mod tests {
         assert_eq!(by_oid[SHA_C][0].upstream, None);
         // `%D` cannot carry an upstream at all, so a decoration parsed out of
         // a log record must not claim one.
-        let logged = parse_log(one(SHA_A, "", "refs/heads/main", "s", "").as_bytes());
+        let logged = parse_log(one(SHA_A, "", "refs/heads/main", "s", "").as_bytes()).commits;
         assert_eq!(logged[0].refs[0].upstream, None);
     }
 

@@ -265,6 +265,9 @@ impl LineSplitter {
 pub struct RecordSplitter {
     sep: u8,
     tail: Vec<u8>,
+    /// The record being assembled overran [`MAX_RECORD`] and is now being
+    /// discarded up to its separator.
+    discarding: bool,
     dropped: usize,
 }
 
@@ -275,6 +278,7 @@ impl RecordSplitter {
         RecordSplitter {
             sep,
             tail: Vec::new(),
+            discarding: false,
             dropped: 0,
         }
     }
@@ -283,40 +287,63 @@ impl RecordSplitter {
         let mut rest = chunk;
         while let Some(at) = rest.iter().position(|b| *b == self.sep) {
             let (record, after) = rest.split_at(at);
-            if self.tail.is_empty() && self.dropped == 0 && record.len() <= MAX_RECORD {
-                on_record(record);
+            // An overlong record is dropped whole, never delivered cut short:
+            // a truncated record still parses — a commit body cut mid-way
+            // reads as the real message — and a wrong record is worse than a
+            // missing one the caller is told about.
+            if self.discarding {
+                self.discarding = false;
+                self.dropped += 1;
+            } else if self.tail.is_empty() {
+                // The common case — a whole record inside one chunk — is
+                // borrowed straight from the input, no copy.
+                if record.len() <= MAX_RECORD {
+                    on_record(record);
+                } else {
+                    self.dropped += 1;
+                }
             } else {
                 self.keep(record);
-                let joined = std::mem::take(&mut self.tail);
-                self.dropped = 0;
-                on_record(&joined);
+                if self.discarding {
+                    self.discarding = false;
+                    self.dropped += 1;
+                } else {
+                    let joined = std::mem::take(&mut self.tail);
+                    on_record(&joined);
+                }
             }
             rest = &after[1..];
         }
         self.keep(rest);
     }
 
-    /// Emits a trailing record only if one was actually started. Unlike lines,
-    /// well-formed `-z` output ends *with* a separator, so the common case here
-    /// is emitting nothing.
-    pub fn finish(mut self, mut on_record: impl FnMut(&[u8])) {
-        if !self.tail.is_empty() {
+    /// Emits a trailing record only if one was actually started — unlike
+    /// lines, well-formed `-z` output ends *with* a separator, so the common
+    /// case here is emitting nothing. Returns how many records were dropped
+    /// whole for overrunning [`MAX_RECORD`]; non-zero means the parse is
+    /// incomplete and the caller must not present it as the full answer.
+    #[must_use]
+    pub fn finish(mut self, mut on_record: impl FnMut(&[u8])) -> usize {
+        if self.discarding {
+            self.dropped += 1;
+        } else if !self.tail.is_empty() {
             let joined = std::mem::take(&mut self.tail);
             on_record(&joined);
         }
-    }
-
-    /// How many bytes were discarded for overrunning [`MAX_RECORD`]. Non-zero
-    /// means the parse is incomplete and the caller should say so.
-    pub fn dropped(&self) -> usize {
         self.dropped
     }
 
     fn keep(&mut self, bytes: &[u8]) {
-        let room = MAX_RECORD.saturating_sub(self.tail.len());
-        let take = room.min(bytes.len());
-        self.tail.extend_from_slice(&bytes[..take]);
-        self.dropped += bytes.len() - take;
+        if self.discarding {
+            return;
+        }
+        if self.tail.len() + bytes.len() > MAX_RECORD {
+            // Free what was buffered too — nobody will ever see this record.
+            self.tail.clear();
+            self.discarding = true;
+            return;
+        }
+        self.tail.extend_from_slice(bytes);
     }
 }
 
@@ -474,6 +501,67 @@ mod tests {
         split.finish(|l| got.push(l.to_string()));
         assert_eq!(got.len(), 1);
         assert!(got[0].starts_with("caf"), "{:?}", got[0]);
+    }
+
+    #[test]
+    fn record_splitter_rejoins_across_chunks_and_emits_a_trailing_record() {
+        let mut split = RecordSplitter::new(0);
+        let mut got = Vec::new();
+        split.push(b"alpha\0be", |r| got.push(r.to_vec()));
+        assert_eq!(got, [b"alpha".to_vec()], "only the complete record so far");
+        split.push(b"ta\0gamma", |r| got.push(r.to_vec()));
+        // Well-formed `-z` output ends with a separator; a trailing record
+        // without one still comes out at `finish`.
+        assert_eq!(split.finish(|r| got.push(r.to_vec())), 0);
+        assert_eq!(
+            got,
+            [b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
+        );
+    }
+
+    /// An overlong record is dropped whole and *counted* — delivered cut
+    /// short it would still parse, and a commit body cut mid-way reads as the
+    /// real message.
+    #[test]
+    fn record_splitter_drops_an_absurd_record_whole_and_says_so() {
+        let mut split = RecordSplitter::new(0);
+        let mut got = Vec::new();
+        let huge = vec![b'x'; MAX_RECORD + 5_000];
+        split.push(b"before\0", |r| got.push(r.to_vec()));
+        for piece in huge.chunks(64 * 1024) {
+            split.push(piece, |r| got.push(r.to_vec()));
+        }
+        split.push(b"\0after\0", |r| got.push(r.to_vec()));
+        let dropped = split.finish(|r| got.push(r.to_vec()));
+
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            got,
+            [b"before".to_vec(), b"after".to_vec()],
+            "no truncated ghost between the two, and the next record survives"
+        );
+
+        // A single-chunk oversized record takes the borrow fast path and must
+        // be counted the same way.
+        let mut split = RecordSplitter::new(0);
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut one = vec![b'y'; MAX_RECORD + 1];
+        one.push(0);
+        one.extend_from_slice(b"tail\0");
+        split.push(&one, |r| got.push(r.to_vec()));
+        assert_eq!(split.finish(|r| got.push(r.to_vec())), 1);
+        assert_eq!(got, [b"tail".to_vec()]);
+    }
+
+    /// A stream that *ends* mid-way through an oversized record still reports
+    /// the drop.
+    #[test]
+    fn record_splitter_counts_a_truncated_trailing_record() {
+        let mut split = RecordSplitter::new(0);
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        split.push(&vec![b'z'; MAX_RECORD + 1], |r| got.push(r.to_vec()));
+        assert_eq!(split.finish(|r| got.push(r.to_vec())), 1);
+        assert!(got.is_empty());
     }
 
     #[test]

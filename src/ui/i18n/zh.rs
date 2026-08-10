@@ -808,7 +808,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::ScmGroupStaged => "暂存的更改",
         L10nKey::ScmGroupChanges => "更改",
         L10nKey::ScmGroupUntracked => "未跟踪",
-        L10nKey::ScmCommitPlaceholder => "写点什么改了…",
+        L10nKey::ScmCommitPlaceholder => "说说改了什么…",
         L10nKey::ScmCommitButton => "提交",
         L10nKey::ScmCommitAllButton => "提交全部",
         L10nKey::ScmCommitAmendButton => "提交（修订）",
@@ -818,6 +818,21 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::ScmCommitStaged => "提交已暂存的更改",
         L10nKey::ScmStashAll => "全部贮藏",
         L10nKey::ScmNothingToCommit => "没有可提交的内容",
+        L10nKey::ScmNetworkBusy => "这个仓库还有一个网络操作在进行中",
+        L10nKey::ScmCommitNeedsMessage => "先写一条提交信息",
+        L10nKey::ScmDetailFilesFailed => "无法读取文件列表",
+        L10nKey::ScmTimeNow => "刚刚",
+        L10nKey::ScmTimeMinutes => "{n}分",
+        L10nKey::ScmTimeHours => "{n}时",
+        L10nKey::ScmTimeDays => "{n}天",
+        // "个月" 而不是 "月":"3月" 会被读成月份名。
+        L10nKey::ScmTimeMonths => "{n}个月",
+        L10nKey::ScmTimeYears => "{n}年",
+        L10nKey::ScmResetHardConfirm => {
+            "把分支重置到这个提交?之后的提交会从分支上消失,未提交的更改会被丢弃。"
+        }
+        L10nKey::ScmReset => "重置",
+        L10nKey::ScmChipStaged => "已暂存",
         L10nKey::ScmStage => "暂存更改",
         L10nKey::ScmStageAll => "暂存全部更改",
         L10nKey::ScmUnstage => "取消暂存",
@@ -1251,7 +1266,6 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SftpErrorUnsafeRemoteName => "拒绝不安全的远程名称 {name}",
         L10nKey::SftpErrorInvalidOctalMode => "无效的八进制模式",
         L10nKey::PanelMoreChangedFiles => "…还有 {count} 个变更文件——运行 `git diff` 查看。",
-        L10nKey::PanelUntracked => "{count} 个未跟踪文件",
         L10nKey::ScmFilesChanged => "{count} 个文件改动",
         L10nKey::ScmStagedFileCount => "已暂存 {count} 个文件",
         L10nKey::AppMenuAbout => "关于 tty7",
@@ -1358,9 +1372,6 @@ pub fn translate_variant_zh(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::ScmStagedFileCount, "zero") => "没有暂存的更改",
         (L10nKey::ScmStagedFileCount, "one") => "已暂存 1 个文件",
         (L10nKey::ScmStagedFileCount, "other") => "已暂存 {count} 个文件",
-        (L10nKey::PanelUntracked, "zero") => "0 个未跟踪文件",
-        (L10nKey::PanelUntracked, "one") => "1 个未跟踪文件",
-        (L10nKey::PanelUntracked, "other") => "{count} 个未跟踪文件",
         (L10nKey::PanelMoreChangedFiles, "zero") => "…还有 0 个变更文件——运行 `git diff` 查看。",
         (L10nKey::PanelMoreChangedFiles, "one") => "…还有 1 个变更文件——运行 `git diff` 查看。",
         (L10nKey::PanelMoreChangedFiles, "other") => {

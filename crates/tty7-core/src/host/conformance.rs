@@ -669,24 +669,32 @@ pub fn git_terminal_prompt_is_disabled(h: &dyn Host, sb: &dyn Sandbox) {
     mkdir(h, &repo);
     let Some(()) = git_repo(h, &repo) else { return };
 
-    let configured = h.git(
-        &repo,
-        &[
-            "config",
-            "alias.tty7prompt",
-            "!echo PROMPT=[$GIT_TERMINAL_PROMPT] REQUIRE=[$SSH_ASKPASS_REQUIRE]",
-        ],
+    // Failures past this point assert rather than return: a broken alias or a
+    // failing run is exactly a git that misbehaved, and returning would make
+    // this case pass vacuously in precisely that situation.
+    let out = h
+        .git(
+            &repo,
+            &[
+                "config",
+                "alias.tty7prompt",
+                "!echo PROMPT=[$GIT_TERMINAL_PROMPT] REQUIRE=[$SSH_ASKPASS_REQUIRE]",
+            ],
+        )
+        .unwrap();
+    assert!(
+        out.success(),
+        "config exited {:?}: {:?}",
+        out.status,
+        out.stderr_trimmed()
     );
-    let Ok(out) = configured else { return };
-    if !out.success() {
-        return;
-    }
-    let Ok(out) = h.git(&repo, &["tty7prompt"]) else {
-        return;
-    };
-    if !out.success() {
-        return;
-    }
+    let out = h.git(&repo, &["tty7prompt"]).unwrap();
+    assert!(
+        out.success(),
+        "alias run exited {:?}: {:?}",
+        out.status,
+        out.stderr_trimmed()
+    );
     // A `push` that stops to ask for a username never comes back — and on the
     // far side of a control link there is no terminal to answer at anyway. The
     // remote host inherits this from the server's own local host, so both ends

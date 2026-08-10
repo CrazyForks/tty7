@@ -123,6 +123,30 @@ impl ScmPanelState {
         self.repo_override.as_ref().or(self.repo.as_ref())
     }
 
+    /// Drop everything keyed to a host that left the registry. Without this,
+    /// `roots` and friends grow one entry per directory ever visited on a
+    /// link that no longer exists. Drafts survive on purpose: a reconnect
+    /// brings the same repositories back, and unsent messages with them.
+    pub(crate) fn forget_host(&mut self, host: HostId) {
+        self.roots.retain(|(h, _), _| *h != host);
+        self.root_lookups.retain(|(h, _)| *h != host);
+        self.probe_attempt.retain(|(h, _), _| *h != host);
+        self.branches.retain(|k, _| k.host != host);
+        self.branches_loading.retain(|k| k.host != host);
+        if self.repo_override.as_ref().is_some_and(|k| k.host == host) {
+            self.repo_override = None;
+            self.override_tab = None;
+        }
+    }
+
+    /// A probe just answered "no repository" for `root`: every directory that
+    /// resolved to it has to re-ask. Left cached, the panel keeps mapping the
+    /// cwd to a repository that is gone and draws its Loading state forever.
+    pub(crate) fn forget_root(&mut self, host: HostId, root: &std::path::Path) {
+        self.roots
+            .retain(|(h, _), (_, held)| !(*h == host && held.as_deref() == Some(root)));
+    }
+
     pub(crate) fn draft(&self, repo: &RepoKey) -> &str {
         self.drafts.get(repo).map(String::as_str).unwrap_or("")
     }
@@ -175,6 +199,11 @@ pub(crate) struct GraphState {
     /// own entity; without this the box would take text the list never sees.
     pub(crate) search: Option<Entity<InputState>>,
     pub(crate) search_sub: Option<gpui::Subscription>,
+    /// Which commit indices the list shows, cached per (page identity, query).
+    /// The filter case-folds every subject and author; re-running that over
+    /// 5000 commits on every frame while the box is open is real work, and
+    /// even the unfiltered identity list is 40KB of indices a frame.
+    pub(crate) filter_cache: Option<(Option<String>, usize, Arc<Vec<usize>>)>,
     /// An open "name a branch at this commit" input, and the rev it starts
     /// from. The panel's own naming row cannot serve this: it always creates
     /// at HEAD, and the whole point here is the commit under the cursor.
@@ -219,6 +248,11 @@ pub(crate) struct CommitDetailView {
     /// that is not in this repository.
     pub(crate) commit: Option<Arc<Commit>>,
     pub(crate) files: Option<Arc<Vec<CommitFile>>>,
+    /// The file read came back with nothing — git errored, or the link
+    /// dropped mid-read. Distinct from "still loading", and from an empty
+    /// list: "0 files changed" for a commit whose files could not be read
+    /// would be a confident lie.
+    pub(crate) files_failed: bool,
     /// A long body starts folded — a merge from a bot can run to fifty lines,
     /// and the file list is what the reader came for.
     pub(crate) body_expanded: bool,
@@ -238,6 +272,7 @@ impl CommitDetailView {
             loaded: false,
             commit: seed.map(Arc::new),
             files: None,
+            files_failed: false,
             body_expanded: false,
         }
     }

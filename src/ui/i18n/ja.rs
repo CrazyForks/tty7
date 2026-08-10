@@ -895,6 +895,22 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::ScmCommitStaged => "ステージ済みをコミット",
         L10nKey::ScmStashAll => "すべてスタッシュ",
         L10nKey::ScmNothingToCommit => "コミットするものがありません",
+        L10nKey::ScmNetworkBusy => "このリポジトリでは別のネットワーク操作が実行中です",
+        L10nKey::ScmCommitNeedsMessage => "先にコミットメッセージを入力してください",
+        L10nKey::ScmDetailFilesFailed => "ファイル一覧を読み込めませんでした",
+        L10nKey::ScmTimeNow => "今",
+        L10nKey::ScmTimeMinutes => "{n}分",
+        // 「{n}時」は時刻に読めるので「時間」のまま。
+        L10nKey::ScmTimeHours => "{n}時間",
+        L10nKey::ScmTimeDays => "{n}日",
+        L10nKey::ScmTimeMonths => "{n}か月",
+        L10nKey::ScmTimeYears => "{n}年",
+        L10nKey::ScmResetHardConfirm => {
+            "ブランチをこのコミットへリセットしますか?それ以降のコミットはブランチから外れ、\
+             未コミットの変更は破棄されます。"
+        }
+        L10nKey::ScmReset => "リセット",
+        L10nKey::ScmChipStaged => "ステージ済み",
         L10nKey::ScmStage => "変更をステージ",
         L10nKey::ScmStageAll => "すべての変更をステージ",
         L10nKey::ScmUnstage => "ステージを取り消す",
@@ -1359,7 +1375,6 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::PanelMoreChangedFiles => {
             "… さらに変更されたファイル {count} 個 — 表示するには `git diff` を実行してください"
         }
-        L10nKey::PanelUntracked => "未追跡 {count}",
         L10nKey::ScmFilesChanged => "{count} 個のファイルが変更されました",
         L10nKey::ScmStagedFileCount => "{count} 個のファイルがステージされました",
         L10nKey::AppMenuAbout => "tty7 について",
@@ -1468,9 +1483,6 @@ pub fn translate_variant_ja(key: L10nKey, branch: &'static str) -> Option<&'stat
         (L10nKey::ScmStagedFileCount, "zero") => "ステージされた変更はありません",
         (L10nKey::ScmStagedFileCount, "one") => "1 個のファイルがステージされました",
         (L10nKey::ScmStagedFileCount, "other") => "{count} 個のファイルがステージされました",
-        (L10nKey::PanelUntracked, "zero") => "未追跡 0",
-        (L10nKey::PanelUntracked, "one") => "未追跡 1",
-        (L10nKey::PanelUntracked, "other") => "未追跡 {count}",
         (L10nKey::PanelMoreChangedFiles, "zero") => {
             "… さらに変更されたファイル 0 個 — 表示するには `git diff` を実行してください"
         }
