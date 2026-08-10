@@ -6566,6 +6566,7 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
             SessionPane::Leaf {
                 cwd: spawn.working_directory.clone(),
                 pane_id: spawn.restore_pane,
+                shell: spawn.shell.clone(),
                 ssh_spec: None,
                 agent: spawn.agent,
                 agent_session_id: spawn.agent_session_id.clone(),
@@ -6577,6 +6578,11 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
             SessionPane::Leaf {
                 cwd: view.spawnable_cwd(),
                 pane_id: Some(view.pane_id),
+                // `None` for a pane this window attached to rather than
+                // spawned: it never knew what was on the other end. The tree
+                // does — the daemon records it — and that is what a restore
+                // reads, so the gap here costs nothing it can see.
+                shell: view.shell_spec(),
                 ssh_spec: view.ssh_spec(),
                 agent: view.agent(),
                 agent_session_id: view.agent_session().and_then(|s| s.session_id),
@@ -6597,6 +6603,7 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
         Pane::Empty => SessionPane::Leaf {
             cwd: None,
             pane_id: None,
+            shell: None,
             ssh_spec: None,
             agent: None,
             agent_session_id: None,
@@ -6736,6 +6743,7 @@ fn session_to_pane(
         SessionPane::Leaf {
             cwd,
             pane_id,
+            shell,
             ssh_spec,
             agent,
             agent_session_id,
@@ -6762,7 +6770,7 @@ fn session_to_pane(
                 font_size,
                 cwd.clone(),
                 restore,
-                None,
+                shell.clone(),
                 window,
                 cx,
             ) {

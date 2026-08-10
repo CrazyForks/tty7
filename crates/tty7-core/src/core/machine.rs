@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::cli_agent::CLIAgent;
 use crate::core::session::WorkspaceId;
-use crate::daemon::protocol::NativeSshSpec;
+use crate::daemon::protocol::{NativeSshSpec, ShellSpec};
 
 pub const MACHINE_FILE: &str = "machine.json";
 
@@ -276,6 +276,15 @@ pub struct PaneRecord {
     pub ssh_spec: Option<Box<NativeSshSpec>>,
     #[serde(default)]
     pub agent: Option<AgentFacts>,
+    /// What the pane is actually running, resolved: the spawn's override if it
+    /// had one, otherwise the shell the config named at the time.
+    ///
+    /// Without it a pane rebuilt from this tree comes back on whatever the
+    /// default shell is now, so a daemon restart silently turns a bash pane
+    /// into a PowerShell one. The rest of the record describes where a pane is
+    /// and what is running in it; this is the part that says what it *is*.
+    #[serde(default)]
+    pub shell: Option<ShellSpec>,
     #[serde(default)]
     pub live: bool,
 }
@@ -288,6 +297,7 @@ impl PaneRecord {
             title: String::new(),
             ssh_spec: None,
             agent: None,
+            shell: None,
             live: false,
         }
     }
@@ -313,6 +323,11 @@ pub struct PaneSeed {
     pub ssh_spec: Option<Box<NativeSshSpec>>,
     #[serde(default)]
     pub agent: Option<AgentFacts>,
+    /// See [`PaneRecord::shell`]. Carried here too so a pane that reaches the
+    /// tree as a seed — a split, a `tty7` CLI call — names its shell from the
+    /// start rather than only once the daemon has observed it.
+    #[serde(default)]
+    pub shell: Option<ShellSpec>,
 }
 
 impl PaneSeed {
@@ -322,6 +337,7 @@ impl PaneSeed {
             cwd: None,
             ssh_spec: None,
             agent: None,
+            shell: None,
         }
     }
 
@@ -332,6 +348,7 @@ impl PaneSeed {
             title: String::new(),
             ssh_spec: self.ssh_spec.map(|s| Box::new(s.without_secrets())),
             agent: self.agent,
+            shell: self.shell,
             live,
         }
     }
@@ -1364,6 +1381,7 @@ mod tests {
             cwd: Some(cwd.to_string()),
             ssh_spec: None,
             agent: None,
+            shell: None,
         }
     }
 

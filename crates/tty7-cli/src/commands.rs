@@ -346,6 +346,7 @@ fn new_workspace(path: Option<String>, open: bool, backend: &mut dyn Backend) ->
             cwd: path,
             ssh_spec: None,
             agent: None,
+            shell: None,
         },
         tab: None,
     })?;
@@ -418,6 +419,7 @@ fn run(args: RunArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcom
                 cwd: args.cwd,
                 ssh_spec: None,
                 agent: None,
+                shell: None,
             },
             tab: None,
         })?;
@@ -472,6 +474,7 @@ fn pane_split(args: SplitArgs, ctx: &Context, backend: &mut dyn Backend) -> Resu
             cwd,
             ssh_spec: None,
             agent: None,
+            shell: None,
         },
         first: false,
     })?;
@@ -595,6 +598,7 @@ fn tab_new(
             cwd,
             ssh_spec: None,
             agent: None,
+            shell: None,
         },
         tab: None,
     })? {
@@ -1397,6 +1401,7 @@ mod tests {
                         cwd: Some("C:\\newproj".into()),
                         ssh_spec: None,
                         agent: None,
+                        shell: None,
                     },
                     tab: None,
                 },
@@ -1635,6 +1640,7 @@ mod tests {
                     cwd: Some("C:\\elsewhere".into()),
                     ssh_spec: None,
                     agent: None,
+                    shell: None,
                 },
                 tab: None,
             }
@@ -1668,6 +1674,7 @@ mod tests {
                         cwd: Some("C:\\proj".into()),
                         ssh_spec: None,
                         agent: None,
+                        shell: None,
                     },
                     first: false,
                 },
@@ -1898,6 +1905,7 @@ mod tests {
                         cwd: Some("C:\\proj".into()),
                         ssh_spec: None,
                         agent: None,
+                        shell: None,
                     },
                     tab: None,
                 },

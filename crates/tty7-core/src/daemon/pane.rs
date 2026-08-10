@@ -111,6 +111,10 @@ struct SpawnConfig {
     initial_cwd: Option<PathBuf>,
     integration_dir: Option<PathBuf>,
     remote: Option<RemoteContext>,
+    /// The shell this pane actually got, after the override and the config have
+    /// been resolved against each other. Recorded so the machine tree can name
+    /// it — see [`crate::core::machine::PaneRecord::shell`].
+    shell: Option<ShellSpec>,
 }
 
 /// Why a configured shell cannot be run, in one sentence, before anything
@@ -156,12 +160,21 @@ fn build_spawn_config(
         anyhow::bail!(problem);
     }
     let remote = wsl_remote_context(configured.as_ref());
+    // Taken before the chosen shell is consumed by the command builder: what
+    // goes in the tree is what was resolved here, not the possibly-empty
+    // override the caller sent.
+    let shell = configured.as_ref().map(|c| ShellSpec {
+        program: c.program.clone(),
+        args: c.args.clone(),
+        args_are_tty7_defaults: c.args_are_tty7_defaults,
+    });
     let (cmd, integration_dir) = build_shell_command(configured, &initial_cwd, pane, workspace)?;
     Ok(SpawnConfig {
         cmd,
         initial_cwd,
         integration_dir,
         remote,
+        shell,
     })
 }
 
@@ -630,6 +643,9 @@ struct PaneState {
     observer_seq: u64,
     cwd: Option<PathBuf>,
     shell: ShellState,
+    /// What this pane is running, for the machine tree to record. Distinct from
+    /// `shell` above, which is the shell-integration state.
+    shell_spec: Option<ShellSpec>,
     remote: Option<RemoteContext>,
     agent: Option<crate::core::cli_agent::CLIAgent>,
     agent_argv: Option<Vec<String>>,
@@ -954,6 +970,11 @@ pub struct Carried {
     pub size: WinSize,
     pub ring: Vec<crate::daemon::scrollback::Segment>,
     pub cwd: Option<PathBuf>,
+    /// What the pane is running. Nothing on the other side of the exec can work
+    /// it out again — the command line belongs to a child this image never
+    /// spawned — so a handoff that dropped it would leave the tree naming no
+    /// shell for a pane that plainly has one.
+    pub shell_spec: Option<ShellSpec>,
     pub shell_active: bool,
     pub at_prompt: bool,
     pub last_exit: Option<i32>,
@@ -1268,6 +1289,7 @@ impl DaemonPane {
                 observer_seq: 0,
                 cwd: spawn.initial_cwd,
                 shell: ShellState::default(),
+                shell_spec: spawn.shell.clone(),
                 remote: spawn.remote.clone(),
                 agent: None,
                 agent_session: None,
@@ -1415,6 +1437,7 @@ impl DaemonPane {
             size: st.ring.tail_size(),
             ring: st.ring.snapshot(),
             cwd: st.cwd.clone(),
+            shell_spec: st.shell_spec.clone(),
             shell_active: st.shell.active,
             at_prompt: st.shell.at_prompt,
             last_exit: st.shell.last_exit_code,
@@ -1477,6 +1500,7 @@ impl DaemonPane {
                 observers: Vec::new(),
                 observer_seq: 0,
                 cwd: carried.cwd,
+                shell_spec: carried.shell_spec,
                 shell: ShellState {
                     active: carried.shell_active,
                     at_prompt: carried.at_prompt,
@@ -1526,6 +1550,9 @@ impl DaemonPane {
             subscriber_epoch: 0,
             observers: Vec::new(),
             observer_seq: 0,
+            // A native ssh pane is not running a shell of this machine's; what
+            // it is, `ssh_spec` already says.
+            shell_spec: None,
             cwd: None,
             shell: ShellState::default(),
             remote: Some(remote),
@@ -1814,12 +1841,15 @@ impl DaemonPane {
                                 && let (Some(before), Some(after)) = (facts_before, facts_after)
                                 && facts_changed(&before, &after)
                             {
-                                let (cwd, agent) = after;
+                                let (cwd, agent, shell) = after;
                                 crate::core::machine::observe_pane(pane, |p| {
                                     if cwd.is_some() {
                                         p.cwd = cwd;
                                     }
                                     p.agent = agent;
+                                    if shell.is_some() {
+                                        p.shell = shell;
+                                    }
                                     if alive {
                                         p.live = true;
                                     }
@@ -2373,7 +2403,13 @@ fn agent_state_snapshot(st: &PaneState) -> Option<crate::daemon::control::PaneAg
         })
 }
 
-fn observed_facts(st: &PaneState) -> (Option<String>, Option<crate::core::machine::AgentFacts>) {
+type ObservedFacts = (
+    Option<String>,
+    Option<crate::core::machine::AgentFacts>,
+    Option<ShellSpec>,
+);
+
+fn observed_facts(st: &PaneState) -> ObservedFacts {
     let cwd = st.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
     let agent = st.agent.map(|agent| crate::core::machine::AgentFacts {
         agent,
@@ -2385,14 +2421,13 @@ fn observed_facts(st: &PaneState) -> (Option<String>, Option<crate::core::machin
             .or_else(|| st.agent_argv.clone()),
         status: st.agent_session.as_ref().map(|s| s.status),
     });
-    (cwd, agent)
+    (cwd, agent, st.shell_spec.clone())
 }
 
-fn facts_changed(
-    before: &(Option<String>, Option<crate::core::machine::AgentFacts>),
-    after: &(Option<String>, Option<crate::core::machine::AgentFacts>),
-) -> bool {
-    before.0 != after.0 || agent_facts_changed(before.1.as_ref(), after.1.as_ref())
+fn facts_changed(before: &ObservedFacts, after: &ObservedFacts) -> bool {
+    before.0 != after.0
+        || agent_facts_changed(before.1.as_ref(), after.1.as_ref())
+        || before.2 != after.2
 }
 
 fn agent_facts_changed(
@@ -3923,6 +3958,7 @@ mod tests {
             subscriber_epoch: 0,
             observers: Vec::new(),
             observer_seq: 0,
+            shell_spec: None,
             cwd: None,
             shell: ShellState::default(),
             remote: None,
@@ -3939,7 +3975,7 @@ mod tests {
         use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
 
         let mut st = test_state(true);
-        assert_eq!(observed_facts(&st), (None, None));
+        assert_eq!(observed_facts(&st), (None, None, None));
 
         st.cwd = Some(PathBuf::from("/work/api"));
         st.agent = Some(CLIAgent::Claude);
@@ -3951,7 +3987,7 @@ mod tests {
             ..Default::default()
         });
 
-        let (cwd, agent) = observed_facts(&st);
+        let (cwd, agent, _shell) = observed_facts(&st);
         assert_eq!(cwd.as_deref(), Some("/work/api"));
         let agent = agent.expect("an agent in the foreground is a fact");
         assert_eq!(agent.agent, CLIAgent::Claude);
@@ -3964,7 +4000,7 @@ mod tests {
         assert_eq!(agent.status, Some(AgentStatus::Working));
 
         st.agent_session = None;
-        let (_, agent) = observed_facts(&st);
+        let (_, agent, _) = observed_facts(&st);
         assert_eq!(
             agent.unwrap().launch_argv.as_deref(),
             Some(&["claude".to_string()][..])
@@ -3998,6 +4034,7 @@ mod tests {
                         launch_argv: Some(vec!["claude".to_string()]),
                         status: None,
                     }),
+                    shell: None,
                 },
                 None,
                 None,

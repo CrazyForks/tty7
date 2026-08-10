@@ -47,6 +47,7 @@ pub fn two_workspace_machine() -> Machine {
         title: String::new(),
         ssh_spec: None,
         agent: None,
+        shell: None,
         live: true,
     };
     Machine {

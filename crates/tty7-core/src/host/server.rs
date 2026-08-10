@@ -1716,6 +1716,7 @@ mod aggregate_tests {
                     cwd: Some("/repo/tty7".into()),
                     ssh_spec: None,
                     agent: None,
+                    shell: None,
                 },
                 None,
                 None,

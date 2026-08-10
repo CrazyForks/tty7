@@ -159,14 +159,21 @@ fn restorable_pane_ids(registry: &Registry) -> std::collections::HashSet<u64> {
     let mut ids: std::collections::HashSet<u64> =
         registry.list().into_iter().map(|p| p.pane_id).collect();
     if let Some(store) = crate::core::machine::observed_store() {
+        let machine = store.machine();
         ids.extend(
-            store
-                .machine()
+            machine
                 .workspaces
                 .iter()
                 .flat_map(|w| w.tabs.iter())
                 .flat_map(|t| t.root.pane_ids()),
         );
+        // And the pane list, not only the panes some tab currently stands on.
+        // The two disagree while a window is between layouts — a pane whose
+        // tab has been taken down and not yet put back is still a pane the
+        // tree knows about — and the cost of being wrong is asymmetric: an
+        // extra file is swept a tick later, a missing one is somebody's
+        // terminal.
+        ids.extend(machine.panes.iter().map(|p| p.id));
     }
     ids
 }
@@ -243,10 +250,13 @@ fn restored_screen(
         return None;
     }
     let segments = crate::daemon::scrollback::load(request.pane_id)?;
-    crate::daemon::scrollback::forget(request.pane_id);
     if segments.is_empty() {
         return None;
     }
+    // After the emptiness check, not before it: dropping the file is how a
+    // screen that *was* handed out stops being handed out twice, and a
+    // snapshot that turned out to hold nothing was never handed out at all.
+    crate::daemon::scrollback::forget(request.pane_id);
     log::info!(
         "pane {} is gone; its last screen is restored into a fresh pane",
         request.pane_id
@@ -559,14 +569,24 @@ fn run_with(registry: Arc<Registry>) -> anyhow::Result<()> {
     }
 
     spawn_orphan_sweep(registry.clone());
-    // Before the writer starts: a daemon that has just come up owns no panes,
-    // so everything on disk belongs to panes the machine tree either still
-    // names — those are the ones a window is about to ask to restore — or has
-    // forgotten, and the latter are nobody's to restore any more.
     let restorable = restorable_pane_ids(&registry);
-    if crate::daemon::scrollback::enabled() {
-        crate::daemon::scrollback::sweep(&restorable);
-    } else {
+    // Deliberately not swept here while the setting is on. Startup is the one
+    // moment this process knows least: it owns no panes yet, and the windows
+    // that know which screens are still wanted cannot say so until the
+    // endpoint below is listening. Answering "is anyone going to ask for
+    // this?" here answers it when nobody can — and the answer deletes. A tree
+    // that failed to parse makes it worse, because `read_machine` quarantines
+    // it and hands back an empty `Machine`, so one bad file would take every
+    // pane's screen with it.
+    //
+    // The periodic sweep asks the same question a tick later, with the
+    // registry filled in and the tree caught up, and that is soon enough:
+    // nothing here is serving a request in the meantime.
+    //
+    // Off is not the same question. Then nothing on disk is worth keeping and
+    // deleting it promptly is the setting's whole promise, so that one still
+    // happens before anything else runs.
+    if !crate::daemon::scrollback::enabled() {
         crate::daemon::scrollback::sweep(&std::collections::HashSet::new());
     }
     // A daemon that was killed outright never retired anything, so the files of
