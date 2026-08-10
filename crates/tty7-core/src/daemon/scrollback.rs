@@ -22,10 +22,15 @@
 //!   screen or two, not the ring's whole 8 MiB. The value of scrollback decays
 //!   steeply with distance from the bottom, and every byte here is a byte of
 //!   someone's terminal sitting on disk.
-//! - **It is off unless asked for.** These bytes include whatever was echoed
-//!   into the pane: tokens, `env` output, an agent's transcript. In memory
-//!   they die with the daemon. On disk they outlive it, which is the whole
-//!   point and also the whole risk, so the choice is the user's.
+//! - **It is not asked for.** These bytes include whatever was echoed into the
+//!   pane: tokens, `env` output, an agent's transcript. In memory they die
+//!   with the daemon; on disk they outlive it, which is the whole point and
+//!   also the whole risk. It was a setting once, defaulting to off. That was
+//!   wrong about *when* the choice gets made: the moment anyone learns they
+//!   wanted this is the moment a daemon has already died, and by then the
+//!   switch could only be flipped for next time. A feature that exists to
+//!   survive an unscheduled event cannot be opt-in. So the cost is paid for
+//!   everyone, and the two bullets below are what keep it small.
 //! - **It is dropped as soon as it is meaningless.** A pane that is closed, or
 //!   that no workspace refers to any more, has its file removed. Retention is
 //!   by relevance, not by calendar: a snapshot of a pane nobody will reopen is

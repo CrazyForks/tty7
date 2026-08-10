@@ -332,9 +332,11 @@ fn the_tree_records_the_shell_a_pane_is_running() {
 
     // A pane reaches the tree by being put in a tab, which is what the window
     // does right after it spawns one — carrying the same seed it spawned with.
-    // Until then the daemon has nothing to record its facts against, so the
-    // seed is the pane's first and only chance to say what it is running.
-    let mut control = ControlClient::connect_at(
+    // Until then the daemon has nothing to record its facts against, so this is
+    // the pane's first chance to say what it is running, and for a pane that
+    // then sits at a prompt it is the only one: the daemon's own observation
+    // rides on a fact *changing*, and a pane's shell never does.
+    let control = ControlClient::connect_at(
         &instance.control_endpoint(),
         &ControlHello::host_rpc("probe", "probe"),
     )

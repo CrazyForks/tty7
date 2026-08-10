@@ -178,12 +178,19 @@ fn restorable_pane_ids(registry: &Registry) -> std::collections::HashSet<u64> {
     ids
 }
 
-/// Keep each pane's stored screen roughly current.
+/// Keep each pane's stored screen roughly current, and collect what no pane
+/// can be asked about any more.
 ///
 /// Only panes whose ring has moved are written, so an idle machine does no IO
 /// at all, and the busy pane that most needs a fresh copy is the one that gets
 /// it.
-fn spawn_scrollback_writer(registry: Arc<Registry>) {
+///
+/// The two sweeps ride along here rather than at startup because this is where
+/// the question they ask can be answered: by now the registry holds this
+/// daemon's panes and the windows have had time to put their trees back. Both
+/// take the same set, because a pane whose screen is still worth restoring is
+/// exactly a pane whose commands are still worth carrying.
+fn spawn_snapshot_keeper(registry: Arc<Registry>) {
     let spawned = std::thread::Builder::new()
         .name("tty7-scrollback".into())
         .spawn(move || {
@@ -198,7 +205,9 @@ fn spawn_scrollback_writer(registry: Arc<Registry>) {
                     crate::daemon::scrollback::save(pane.id, &segments);
                     marks.insert(pane.id, mark);
                 }
-                crate::daemon::scrollback::sweep(&restorable_pane_ids(&registry));
+                let restorable = restorable_pane_ids(&registry);
+                crate::daemon::scrollback::sweep(&restorable);
+                crate::daemon::history::sweep(&restorable);
                 marks.retain(|id, _| registry.get(*id).is_some());
             }
         });
@@ -230,13 +239,15 @@ fn restored_screen(
     request: crate::daemon::protocol::RestoreFrom,
 ) -> Option<crate::daemon::pane::Restore> {
     let segments = crate::daemon::scrollback::load(request.pane_id)?;
+    // Dropped either way — this is the one request that will ever be made about
+    // this pane, so nothing is served by keeping the file past it. What the
+    // emptiness check decides is whether a *restore* happened, not whether the
+    // file stays: a snapshot holding nothing is not a screen to hand over, but
+    // it is still a file nobody will read again.
+    crate::daemon::scrollback::forget(request.pane_id);
     if segments.is_empty() {
         return None;
     }
-    // After the emptiness check, not before it: dropping the file is how a
-    // screen that *was* handed out stops being handed out twice, and a
-    // snapshot that turned out to hold nothing was never handed out at all.
-    crate::daemon::scrollback::forget(request.pane_id);
     log::info!(
         "pane {} is gone; its last screen is restored into a fresh pane",
         request.pane_id
@@ -549,25 +560,26 @@ fn run_with(registry: Arc<Registry>) -> anyhow::Result<()> {
     }
 
     spawn_orphan_sweep(registry.clone());
-    let restorable = restorable_pane_ids(&registry);
-    // No scrollback sweep here, deliberately. Startup is the one moment this
-    // process knows least: it owns no panes yet, and the windows that know
-    // which screens are still wanted cannot say so until the endpoint below is
-    // listening. Answering "is anyone going to ask for this?" here answers it
-    // when nobody can — and the answer deletes. A tree that failed to parse
-    // makes it worse, because `read_machine` quarantines it and hands back an
-    // empty `Machine`, so one bad file would take every pane's screen with it.
+    // No sweeping here, deliberately — of either kind. Startup is the one
+    // moment this process knows least: it owns no panes yet, and the windows
+    // that know which of a dead daemon's files are still wanted cannot say so
+    // until the endpoint below is listening. Answering "is anyone going to ask
+    // for this?" here answers it when nobody can — and the answer deletes. A
+    // tree that failed to parse makes it worse, because `read_machine`
+    // quarantines it and hands back an empty `Machine`, so one bad file would
+    // take every pane's screen and every pane's history with it.
     //
-    // The periodic sweep asks the same question a tick later, with the registry
-    // filled in and the tree caught up, and that is soon enough: nothing here
-    // is serving a request in the meantime.
+    // History was swept here until it was noticed that a restore carries the
+    // dead pane's commands to its successor (`history::carry`, at the top of
+    // the `Spawn` handler): sweeping before the window can ask deletes the very
+    // file the request is about. Same shape as the scrollback bug, one file
+    // over.
     //
-    // A daemon that was killed outright never retired anything, so the files of
-    // panes that died with it are still here. Their commands cannot be
-    // recovered — the mark saying which were new belongs to a shell that is
-    // gone — so what is left is not to hoard them.
-    crate::daemon::history::sweep(&restorable);
-    spawn_scrollback_writer(registry.clone());
+    // Both sweeps run on the writer's tick instead, with the registry filled in
+    // and the tree caught up. That is soon enough: nothing here is serving a
+    // request in the meantime, and a daemon killed outright left its files for
+    // exactly this pass to collect.
+    spawn_snapshot_keeper(registry.clone());
 
     for stream in listener.incoming() {
         match stream {

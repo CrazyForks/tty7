@@ -6633,16 +6633,6 @@ pub(crate) fn alive_panes_on(
     }
 }
 
-fn pane_attachable(
-    alive: Option<&std::collections::HashMap<u64, Option<String>>>,
-    id: u64,
-    owner: crate::core::session::WorkspaceId,
-) -> bool {
-    // Listed at all, and then whose it is. A pane missing from the listing is
-    // one there is nothing to attach to.
-    alive.is_none_or(|listed| listed.contains_key(&id)) && pane_free_for(alive, id, owner)
-}
-
 /// Whether this window may stand on `id` — as the pane it attaches to, or as
 /// the dead predecessor whose screen a fresh pane opens showing.
 ///
@@ -6652,8 +6642,13 @@ fn pane_attachable(
 /// Ruling the id out there threw away the only thing that could ask: the
 /// window spawned a pane that had never heard of a predecessor, so no attach
 /// was tried, no restore was requested, and the screen the daemon still had on
-/// disk was swept a tick later, unread. Attaching is still tried first and
-/// still fails harmlessly when the pane really is gone.
+/// disk was swept a tick later, unread.
+///
+/// There used to be a second predicate here that also required the id to be
+/// listed, and the attach site consulted it. Nothing does now: the attach is
+/// simply tried, and a pane that really is gone fails it and falls through to
+/// the fresh spawn — the same outcome the listing was consulted to predict,
+/// reached by asking the daemon instead of guessing ahead of it.
 ///
 /// Ownership does come into it. Another workspace's pane is not this window's
 /// to attach to, and its screen is not this window's to show.
@@ -7389,8 +7384,8 @@ mod window_drag_tests {
 mod tests {
     use super::{
         CloseReason, TabAgentSession, clear_window_override_values, close_prompt,
-        leaf_shares_the_window_daemon, mru_order, pane_attachable, pane_free_for,
-        parse_ssh_connect_input, parse_ssh_option_words,
+        leaf_shares_the_window_daemon, mru_order, pane_free_for, parse_ssh_connect_input,
+        parse_ssh_option_words,
     };
 
     #[test]
@@ -7502,28 +7497,24 @@ mod tests {
         .collect();
 
         assert!(
-            pane_attachable(Some(&alive), 1, ours),
+            pane_free_for(Some(&alive), 1, ours),
             "our own pane attaches"
         );
         assert!(
-            !pane_attachable(Some(&alive), 2, ours),
+            !pane_free_for(Some(&alive), 2, ours),
             "another workspace's pane must spawn fresh instead"
         );
         assert!(
-            pane_attachable(Some(&alive), 3, ours),
+            pane_free_for(Some(&alive), 3, ours),
             "an unowned pane is legacy"
         );
         assert!(
-            pane_attachable(Some(&alive), 5, ours),
+            pane_free_for(Some(&alive), 5, ours),
             "an owner that names no workspace is not a rival's claim: older CLIs \
              wrote their own name there, and respawning strands the live pane"
         );
         assert!(
-            !pane_attachable(Some(&alive), 4, ours),
-            "a dead id never attaches"
-        );
-        assert!(
-            pane_attachable(None, 4, ours),
+            pane_free_for(None, 4, ours),
             "a failed List says nothing about pane 4; the attach itself must decide, \
              because respawning on a transient RPC error destroys a live session"
         );
@@ -7545,10 +7536,6 @@ mod tests {
         assert!(
             pane_free_for(Some(&alive), 4, ours),
             "a dead pane's id has to survive; the restore is keyed on it"
-        );
-        assert!(
-            !pane_attachable(Some(&alive), 4, ours),
-            "attaching to it is still hopeless, and that stays true"
         );
 
         // What being free does not mean: helping yourself to a pane that is
