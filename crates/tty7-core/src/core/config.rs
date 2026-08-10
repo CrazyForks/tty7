@@ -168,6 +168,15 @@ pub struct Config {
     pub right_panel_width: f32,
     #[serde(default, deserialize_with = "de_lenient")]
     pub right_panel_tab: RightPanelTab,
+    /// Global, not per-overlay — the same call VS Code's
+    /// `diffEditor.renderSideBySide` makes.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub diff_view: DiffViewMode,
+    /// The source control panel's history section starts collapsed: a graph
+    /// unfurling the first time someone opens the panel is a worse first
+    /// impression than one they asked for.
+    #[serde(default)]
+    pub scm_graph_expanded: bool,
     #[serde(default, deserialize_with = "de_lenient")]
     pub sidebar_grouping: SidebarGrouping,
     #[serde(default = "default_true")]
@@ -508,6 +517,8 @@ impl Default for Config {
             right_panel_visible: false,
             right_panel_width: default_right_panel_width(),
             right_panel_tab: RightPanelTab::Info,
+            diff_view: DiffViewMode::Split,
+            scm_graph_expanded: false,
             sidebar_grouping: SidebarGrouping::Repo,
             sidebar_diff_preview: true,
             notify_on_command_finish: NotifyMode::Unfocused,
@@ -828,8 +839,26 @@ fn default_prefix() -> String {
 pub enum RightPanelTab {
     #[default]
     Info,
-    Changes,
+    /// The source control panel. Renamed from `Changes` in place rather than
+    /// added alongside it: `rename` works in both directions, so a config
+    /// written by this version still says `"changes"` and an older build reads
+    /// it back unchanged. A fourth variant could not do that — the old build
+    /// would fall through `de_lenient` to `Info` and kick anyone who rolled
+    /// back off the panel they were sitting on. 260px has no room for a fourth
+    /// tab tile either.
+    #[serde(rename = "changes", alias = "scm", alias = "git")]
+    Scm,
     Files,
+}
+
+/// How the diff overlay lays a file out. Side-by-side is the default because
+/// that is what everyone already sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffViewMode {
+    #[default]
+    Split,
+    Unified,
 }
 
 fn default_right_panel_width() -> f32 {

@@ -5,6 +5,7 @@ pub mod element;
 pub mod fps;
 mod fuzzy;
 mod generator;
+pub(crate) mod git_data;
 pub(crate) mod git_diff;
 pub(crate) mod git_status;
 mod highlight;

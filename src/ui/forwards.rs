@@ -5,7 +5,7 @@ use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_f
 
 use crate::daemon::protocol::{ForwardStatus, ManagedForward, SshForwardKind};
 use crate::terminal::view::TerminalView;
-use crate::ui::app::{CONTENT_INSET, Tty7App};
+use crate::ui::app::{CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::right_panel::{META, TEXT, TEXT_MONO};
 
@@ -61,6 +61,10 @@ impl Tty7App {
             .border_1()
             .border_color(theme.danger.opacity(0.4))
             .shadow_md()
+            // Off the right panel's ramp on purpose: this bar floats over the
+            // terminal, not inside the panel, and it is sized against the
+            // terminal's own text. `app.rs` draws it, `render_panel_info` does
+            // not.
             .text_xs()
             .text_color(theme.muted_foreground)
             .child(
@@ -136,15 +140,21 @@ impl Tty7App {
     ) -> Option<AnyElement> {
         let pane_id = pane_id?;
         let open = self.loopback_panel.form_pane_id == Some(pane_id);
-        let add = crate::ui::tab_strip::chrome_tile(
+        // The section's own affordance, and the same 24px chrome tile the Info
+        // tab's cwd actions use. It used to be built by hand — a 32px tile
+        // forced down to 24 and then set `.xsmall()`, which quietly overrode
+        // the 13px the icon asked for with the button size's own 12, so the
+        // glyph never was the size the code claimed. `chrome_tile_sized`
+        // derives it instead: `TILE_GLYPH_SM / BUTTON_ICON_SCALE` of the button
+        // size, the same pair every other 24px tile in the panel is on.
+        let add = crate::ui::tab_strip::chrome_tile_sized(
             Button::new(("ssh-forward-add-toggle", pane_id))
-                .icon(Icon::empty().path("icons/plus.svg").size(px(13.))),
+                .icon(Icon::empty().path("icons/plus.svg")),
+            TILE_SIZE_SM,
+            TILE_GLYPH_SM,
             open,
             cx,
         )
-        .xsmall()
-        .w(px(24.))
-        .h(px(24.))
         .rounded_md()
         .tooltip(if open {
             t(L10nKey::Cancel)

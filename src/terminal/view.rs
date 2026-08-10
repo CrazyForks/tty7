@@ -2830,12 +2830,42 @@ impl TerminalView {
             })
             .flatten();
         if cwd_now.as_ref() != self.git_status_cwd.as_ref() || cmd_finished || turn_finished {
+            if cmd_finished || turn_finished {
+                self.mark_repo_changed(cwd_now.as_deref(), cx);
+            }
             self.refresh_git_status(cwd_now, GitRefresh::Edge, cx);
         } else if tool_activity {
             self.refresh_git_status(cwd_now, GitRefresh::Opportunistic, cx);
         }
 
         self.follow_history_scope(cx);
+    }
+
+    /// Tell the source control cache that a command just ran here.
+    ///
+    /// The `.git` watch catches anything that writes the repository, and the
+    /// file tree catches edits in the directories it is showing. What is left
+    /// is the common case neither sees: a command that edits a file somewhere
+    /// the tree is not looking. A command boundary is the cheapest honest
+    /// signal that that may have happened.
+    ///
+    /// Only the epoch moves. Scheduling the debounced re-read needs the app
+    /// entity, which a pane does not hold — but `refresh_git_status` below
+    /// writes `GitStatusCache`, the app observes that global, and the panel's
+    /// next render finds the repository stale and asks. One notify, not two.
+    fn mark_repo_changed(&self, cwd: Option<&std::path::Path>, cx: &mut Context<Self>) {
+        use crate::terminal::git_data::ScmData;
+        use crate::terminal::git_status::GitStatusCache;
+
+        let Some(cwd) = cwd else { return };
+        let Some(root) = cx
+            .try_global::<GitStatusCache>()
+            .and_then(|cache| cache.repo_root_for(self.host_id, cwd))
+            .map(std::path::Path::to_path_buf)
+        else {
+            return;
+        };
+        cx.default_global::<ScmData>().bump(self.host_id, &root);
     }
 
     fn desired_history_scope(&self) -> super::history::Scope {

@@ -34,7 +34,10 @@ use crate::ui::palette::{
 };
 use crate::ui::pane::{CloseOutcome, Dir, Pane, PaneSlot};
 use crate::ui::presets::Fill;
-use crate::ui::settings::{Recording, SettingsSection, SettingsState, ThemeEditor};
+use crate::ui::scm::ScmIntent;
+use crate::ui::settings::{
+    Recording, SettingsSection, SettingsState, ThemeEditor, humanize_action,
+};
 use crate::ui::theme::{apply_theme, set_menus};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,6 +117,15 @@ pub(crate) const TILE_GLYPH: f32 = 13.;
 /// smaller folder in the same column as the panel's folder tab.
 pub(crate) const TILE_SIZE_SM: f32 = 24.;
 pub(crate) const TILE_GLYPH_SM: f32 = TILE_GLYPH;
+
+/// The tile that lives *inside* a list row rather than beside one, for the
+/// buttons a row reveals on hover.
+///
+/// A box below [`TILE_SIZE_SM`] because of width: three `TILE_SIZE_SM` squares
+/// would eat 72 of the 236px a file name has to live in, where three of these
+/// eat 54.
+pub(crate) const TILE_SIZE_XS: f32 = 18.;
+pub(crate) const TILE_GLYPH_XS: f32 = 11.;
 
 pub(crate) const TILE_GLYPH_LINE: f32 = 16.;
 
@@ -430,6 +442,7 @@ pub struct Tty7App {
     pub(crate) loopback_panel: LoopbackForwardPanelState,
     pub(crate) sftp_panel: crate::ui::sftp::SftpPanelState,
     pub(crate) right_panel: crate::ui::right_panel::RightPanelState,
+    pub(crate) scm: crate::ui::scm::ScmPanelState,
     pub(crate) diff_probes_inflight:
         std::collections::HashSet<(crate::ui::host_ops::HostId, std::path::PathBuf)>,
     pub(crate) diff_probes_restale:
@@ -827,6 +840,7 @@ impl Tty7App {
         let right_panel_width = cx.global::<Config>().right_panel_width;
         let right_panel_visible = cx.global::<Config>().right_panel_visible;
         let right_panel_tab = cx.global::<Config>().right_panel_tab;
+        let scm_graph_expanded = cx.global::<Config>().scm_graph_expanded;
         let sidebar_collapsed = cx.global::<Config>().sidebar_collapsed;
         let config_watch = cx.observe_global_in::<Config>(window, |this, window, cx| {
             this.reload_from_config(window, cx)
@@ -974,6 +988,13 @@ impl Tty7App {
             },
             sftp_panel,
             right_panel: Default::default(),
+            scm: crate::ui::scm::ScmPanelState {
+                graph: crate::ui::scm::GraphState {
+                    expanded: scm_graph_expanded,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             diff_probes_inflight: Default::default(),
             diff_probes_restale: Default::default(),
             file_tree,
@@ -4078,6 +4099,20 @@ impl Tty7App {
             OpenSshProfiles => self.open_settings_section(SettingsSection::Ssh, window, cx),
             SendSelectionToAgent => self.send_selection_to_agent(window, cx),
             SendGitDiffToAgent => self.send_git_diff_to_agent(window, cx),
+            ScmCommit => self.run_scm_action(ScmIntent::Commit, window, cx),
+            ScmStageAll => self.run_scm_action(ScmIntent::StageAll, window, cx),
+            ScmUnstageAll => self.run_scm_action(ScmIntent::UnstageAll, window, cx),
+            ScmDiscardAll => self.run_scm_action(ScmIntent::DiscardAll, window, cx),
+            ScmPush => self.run_scm_action(ScmIntent::Push, window, cx),
+            ScmPull => self.run_scm_action(ScmIntent::Pull, window, cx),
+            ScmFetch => self.run_scm_action(ScmIntent::Fetch, window, cx),
+            ScmSync => self.run_scm_action(ScmIntent::Sync, window, cx),
+            ScmCreateBranch => self.run_scm_action(ScmIntent::CreateBranch, window, cx),
+            OpenBranchPicker => self.run_scm_action(ScmIntent::CheckoutBranch, window, cx),
+            // The branch picker fills this in once it can list refs; until
+            // then the palette never emits it.
+            CheckoutBranch(_) => {}
+            ToggleDiffViewMode => self.toggle_diff_view_mode(cx),
             OpenThemePicker | OpenSshConnectInput => {}
             ActivateTab(i) => self.activate(i, window, cx),
         }
@@ -5949,6 +5984,7 @@ impl Render for Tty7App {
         window.set_rem_size(px(cx.global::<Config>().ui_font_size));
         self.claim_pending_tab(window, cx);
         self.touch_active_tab();
+        self.scm_sync_watchers(window, cx);
         if cx.has_active_drag() {
             crate::ui::reorder::clear_pending(&self.reorder);
             crate::ui::pane_drag::clear_landing(&self.pane_drag);
@@ -6333,10 +6369,52 @@ impl Render for Tty7App {
                     this.set_right_panel_tab(crate::core::config::RightPanelTab::Info, cx)
                 }))
                 .on_action(cx.listener(|this, _: &ShowRightPanelChanges, _window, cx| {
-                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Changes, cx)
+                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Scm, cx)
                 }))
                 .on_action(cx.listener(|this, _: &ShowRightPanelFiles, _window, cx| {
                     this.set_right_panel_tab(crate::core::config::RightPanelTab::Files, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &ScmToggleGraph, _window, cx| this.scm_toggle_graph(cx)),
+                )
+                .on_action(cx.listener(|this, _: &ToggleDiffViewMode, _window, cx| {
+                    this.toggle_diff_view_mode(cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmCommit, window, cx| {
+                    this.run_scm_action(ScmIntent::Commit, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmCommitAmend, window, cx| {
+                    this.run_scm_action(ScmIntent::CommitAmend, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmStageAll, window, cx| {
+                    this.run_scm_action(ScmIntent::StageAll, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmUnstageAll, window, cx| {
+                    this.run_scm_action(ScmIntent::UnstageAll, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmDiscardAll, window, cx| {
+                    this.run_scm_action(ScmIntent::DiscardAll, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmRefresh, window, cx| {
+                    this.run_scm_action(ScmIntent::Refresh, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmSync, window, cx| {
+                    this.run_scm_action(ScmIntent::Sync, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmPush, window, cx| {
+                    this.run_scm_action(ScmIntent::Push, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmPull, window, cx| {
+                    this.run_scm_action(ScmIntent::Pull, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmFetch, window, cx| {
+                    this.run_scm_action(ScmIntent::Fetch, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmCheckoutBranch, window, cx| {
+                    this.run_scm_action(ScmIntent::CheckoutBranch, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScmCreateBranch, window, cx| {
+                    this.run_scm_action(ScmIntent::CreateBranch, window, cx)
                 }))
                 .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                     this.toggle_settings(window, cx)

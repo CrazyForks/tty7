@@ -5,16 +5,14 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, h_flex, v_flex,
 };
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::core::config::{Config, RightPanelTab};
 use crate::daemon::protocol::PaneProcs;
-use crate::terminal::git_diff::{DiffSnapshot, MAX_RENDERED_FILES};
 use crate::ui::app::{
     CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App, tile_trailing_inset,
     tile_trailing_inset_sm,
 };
-use crate::ui::i18n::{L10nKey, t, t_plural};
+use crate::ui::i18n::{L10nKey, t};
 use crate::ui::scrollbar::with_vertical_scrollbar;
 
 pub(crate) const MIN_WIDTH: f32 = 216.;
@@ -48,11 +46,33 @@ pub(crate) const META_MONO: f32 = META - STEP;
 /// sidebar's group headings, which are the same thing one panel over.
 const HEADING: f32 = 11. * STEP;
 
+// The right panel's type ramp: four steps, half a point apart, that the Info
+// and Source Control tabs draw from so switching between them does not change
+// the apparent size of the panel. (The Files tab, in `file_tree.rs`, is the
+// one holdout — it renders its rows with `text_sm()` = 14px.) The steps are
+// close together on purpose: the panel is a dense aside next to the terminal,
+// and the differences between them are meant to be felt as hierarchy rather
+// than seen as different type sizes.
+//
+// (The px constants that used to live here — PANEL_TEXT and its steps — were
+// superseded by the interface font scale's rems tokens; the Source Control
+// panel still names its own px steps locally until it moves onto that scale.)
+
+/// Height of the search strip.
+///
+/// gpui-component sizes an `Input` border-box, and `.xsmall()` is
+/// `input_h(Size::XSmall)` = `h_5()` = 20px: one `LINE_HEIGHT` of `Rems(1.25)`
+/// = 20px with `input_py(Size::XSmall)` = 0 above and below. (`.appearance(false)`
+/// only drops the background, border and radius; the padding and the height
+/// stay.) Thirty leaves that field 5px of slack top and bottom.
+///
+/// Load-bearing beyond this file: `scm/panel.rs` pins its commit box to the
+/// same height with a `const _: () = assert!(…)`, so the two tabs' top strips
+/// line up.
+pub(crate) const SEARCH_H: f32 = 30.;
+
 #[derive(Default)]
 pub(crate) struct RightPanelState {
-    pub(crate) diff_cwd: Option<(crate::ui::host_ops::HostId, PathBuf)>,
-    pub(crate) diff: Option<Option<Arc<DiffSnapshot>>>,
-    pub(crate) diff_pending: Option<(crate::ui::host_ops::HostId, PathBuf)>,
     pub(crate) procs_pane: Option<u64>,
     pub(crate) procs: Option<PaneProcs>,
     pub(crate) procs_loading: bool,
@@ -164,7 +184,7 @@ impl Tty7App {
 
         let body = match tab {
             RightPanelTab::Info => self.render_panel_info(window, cx),
-            RightPanelTab::Changes => self.render_panel_changes(window, cx),
+            RightPanelTab::Scm => self.render_panel_scm(window, cx),
             RightPanelTab::Files => self.render_panel_files(window, cx),
         };
         let (backing, handle) = self.right_panel_resize(cx);
@@ -340,6 +360,9 @@ impl Tty7App {
                     .items_baseline()
                     .gap(px(7.))
                     .child(
+                        // The title step of the panel ramp, SEMIBOLD and
+                        // uppercased. It reads as a label rather than as
+                        // content because of the weight and the caps.
                         div()
                             .text_size(rems(META))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -348,6 +371,8 @@ impl Tty7App {
                     )
                     .when_some(count, |this, c| {
                         this.child(
+                            // A count is a token hanging off the heading, not
+                            // part of it: one step down, mono, regular weight.
                             div()
                                 .text_size(rems(META_MONO))
                                 .font_family(cx.theme().mono_font_family.clone())
@@ -379,8 +404,10 @@ impl Tty7App {
         h_flex()
             .flex_none()
             .items_center()
+            // 8 here plus the `.xsmall()` field's own 4px of leading padding
+            // is 12px of daylight between the glyph and the first character.
             .gap(px(8.))
-            .h(px(30.))
+            .h(px(SEARCH_H))
             .px(px(CONTENT_INSET))
             .child(
                 Icon::new(IconName::Search)
@@ -396,7 +423,7 @@ impl Tty7App {
             .into_any_element()
     }
 
-    fn panel_scroll(&self, inner: AnyElement, title: AnyElement) -> AnyElement {
+    pub(crate) fn panel_scroll(&self, inner: AnyElement, title: AnyElement) -> AnyElement {
         let body = div()
             .id("right-panel-body")
             .flex_1()
@@ -416,7 +443,12 @@ impl Tty7App {
             .into_any_element()
     }
 
-    fn panel_empty(&self, text: &str, hint: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn panel_empty(
+        &self,
+        text: &str,
+        hint: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         v_flex()
             .px(px(CONTENT_INSET))
@@ -637,6 +669,9 @@ impl Tty7App {
             }))
             .pb(px(if trailing.is_some() { 0. } else { 4. }))
             .child(
+                // A group header sits below the panel's own title in the
+                // hierarchy, so it sits below it in the ramp too: the smallest
+                // step, carried by weight and caps rather than by size.
                 div()
                     .text_size(rems(HEADING))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -810,207 +845,6 @@ impl Tty7App {
         .detach();
     }
 
-    fn render_panel_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
-        let target = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.detail_pane(window, cx))
-            .and_then(|leaf| {
-                let v = leaf.read(cx);
-                let cwd = v
-                    .git_status_cwd()
-                    .map(|p| p.to_path_buf())
-                    .or_else(|| v.host_cwd())?;
-                Some((v.host(cx)?, cwd))
-            });
-
-        let Some((host, cwd)) = target else {
-            let title = self.panel_title(t(L10nKey::PanelChangesTitle), None, None, window, cx);
-            return self.panel_scroll(
-                self.panel_empty(
-                    t(L10nKey::PanelNoWorkingDirectory),
-                    Some(t(L10nKey::PanelNoWorkingDirectoryHint)),
-                    cx,
-                ),
-                title,
-            );
-        };
-        let key = (host.id(), cwd.clone());
-        if self.right_panel.diff_cwd.as_ref() != Some(&key) {
-            self.right_panel.diff_cwd = Some(key);
-            self.right_panel.diff = None;
-            self.spawn_right_panel_diff(host.clone(), cwd.clone(), cx);
-        } else if self.right_panel.diff.is_none() && self.right_panel.diff_pending.is_none() {
-            self.spawn_right_panel_diff(host.clone(), cwd.clone(), cx);
-        }
-
-        let count = match &self.right_panel.diff {
-            Some(Some(snap)) => {
-                let n = snap.files.len() + snap.untracked_count();
-                (n > 0).then(|| n.to_string())
-            }
-            _ => None,
-        };
-        let title = self.panel_title(t(L10nKey::PanelChangesTitle), count, None, window, cx);
-        let mono = cx.theme().mono_font_family.clone();
-
-        let inner = match &self.right_panel.diff {
-            None => self.panel_empty(t(L10nKey::PanelLoading), None, cx),
-            Some(None) => self.panel_empty(
-                t(L10nKey::PanelNotAGitRepo),
-                Some(t(L10nKey::PanelNotAGitRepoHint)),
-                cx,
-            ),
-            Some(Some(snap)) if snap.files.is_empty() && snap.untracked.is_empty() => self
-                .panel_empty(
-                    t(L10nKey::PanelNoChanges),
-                    Some(t(L10nKey::PanelNoChangesHint)),
-                    cx,
-                ),
-            Some(Some(snap)) => {
-                let snap = Arc::clone(snap);
-                let untracked = snap.untracked_count();
-                let focused = self.diff_overlay_focus(host.id(), &cwd).map(str::to_string);
-                let shown = snap.files.len().min(MAX_RENDERED_FILES);
-                let mut list = v_flex().px(px(CONTENT_INSET - 4.)).py(px(2.)).gap(px(1.));
-                for file in snap.files.iter().take(shown) {
-                    let path = file.path.clone();
-                    let (added, removed) = (file.added, file.removed);
-                    let selected = focused.as_deref() == Some(path.as_str());
-                    list = list.child(
-                        h_flex()
-                            .id(gpui::SharedString::from(format!("panel-change-{path}")))
-                            .items_center()
-                            .gap(px(8.))
-                            .px(px(4.))
-                            .py(px(3.))
-                            .rounded(px(5.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(gpui::rgb(sf.hover)))
-                            .when(selected, |s| s.bg(gpui::rgb(sf.selected)))
-                            .on_click({
-                                let host_id = host.id();
-                                let cwd = cwd.clone();
-                                let path = path.clone();
-                                cx.listener(move |this, _, window, cx| {
-                                    this.toggle_diff_overlay_at(
-                                        host_id,
-                                        cwd.clone(),
-                                        Some(path.clone()),
-                                        window,
-                                        cx,
-                                    );
-                                })
-                            })
-                            .child(git_badge("M", cx.theme().muted_foreground, &mono))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(rems(TEXT_MONO))
-                                    .font_family(mono.clone())
-                                    .text_color(cx.theme().foreground)
-                                    .child(path),
-                            )
-                            .when(added > 0, |this| {
-                                this.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(rems(META_MONO))
-                                        .font_family(mono.clone())
-                                        .text_color(cx.theme().success)
-                                        .child(format!("+{added}")),
-                                )
-                            })
-                            .when(removed > 0, |this| {
-                                this.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(rems(META_MONO))
-                                        .font_family(mono.clone())
-                                        .text_color(cx.theme().danger)
-                                        .child(format!("−{removed}")),
-                                )
-                            }),
-                    );
-                }
-                if snap.files.len() > shown {
-                    let rest = snap.files.len() - shown;
-                    list = list.child(
-                        div()
-                            .px(px(4.))
-                            .py(px(3.))
-                            .text_size(rems(META))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t_plural(L10nKey::PanelMoreChangedFiles, rest, &[])),
-                    );
-                }
-                if untracked > 0 {
-                    list = list.child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .px(px(4.))
-                            .py(px(3.))
-                            .child(git_badge(
-                                "U",
-                                cx.theme().muted_foreground.opacity(0.75),
-                                &mono,
-                            ))
-                            .child(
-                                div()
-                                    .text_size(rems(META))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(t_plural(L10nKey::PanelUntracked, untracked, &[])),
-                            ),
-                    );
-                }
-                list.into_any_element()
-            }
-        };
-        self.panel_scroll(inner, title)
-    }
-
-    fn spawn_right_panel_diff(
-        &mut self,
-        host: crate::ui::host_ops::SharedHost,
-        cwd: PathBuf,
-        cx: &mut Context<Self>,
-    ) {
-        if self.right_panel.diff_pending.is_some() {
-            return;
-        }
-        self.right_panel.diff_pending = Some((host.id(), cwd.clone()));
-        self.spawn_shared_diff_probe(host, cwd, cx);
-    }
-
-    pub(crate) fn right_panel_refresh_changes(&mut self, cx: &mut Context<Self>) {
-        if self.right_panel.diff_pending.is_some() {
-            return;
-        }
-        let Some((id, cwd)) = self.right_panel.diff_cwd.clone() else {
-            return;
-        };
-        let Some(host) = crate::ui::host_registry::HostRegistry::get(cx, id) else {
-            return;
-        };
-        let Some(Some(snap)) = &self.right_panel.diff else {
-            return;
-        };
-        let Some(status) = cx
-            .try_global::<crate::terminal::git_status::GitStatusCache>()
-            .and_then(|cache| cache.status_for(id, &cwd))
-        else {
-            return;
-        };
-        let stale = status.branch != snap.branch || (status.added, status.removed) != snap.totals();
-        if stale {
-            self.spawn_right_panel_diff(host, cwd, cx);
-        }
-    }
-
     fn render_panel_files(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let remote = self.remote_files_pane(window, cx);
         let host = remote.as_ref().map(|(_, host)| host.clone());
@@ -1058,10 +892,25 @@ impl Tty7App {
     }
 }
 
+/// Width of the fixed cell a git status letter is centred in.
+///
+/// Load-bearing beyond this function: `scm/panel.rs` gives its group-header
+/// chevron box exactly this width so the group arrows and the status letters
+/// stack into one vertical line down the right edge of the panel, and it keeps
+/// its own `BADGE_W` in step. Changing it here without changing it there
+/// breaks that column.
+pub(crate) const BADGE_W: f32 = 14.;
+
+/// A single-letter git status marker in a fixed-width cell.
+///
+/// Mono and SEMIBOLD so `M`, `A`, `D` and `U` all read as the same kind of
+/// mark at a glance, and centred in a cell wide enough for the widest of them
+/// at [`PANEL_TEXT_META`] — that is what makes a column of them line up
+/// instead of drifting with the glyph widths.
 pub(crate) fn git_badge(letter: &str, color: gpui::Hsla, mono: &gpui::SharedString) -> AnyElement {
     div()
         .flex_none()
-        .w(px(14.))
+        .w(px(BADGE_W))
         .text_center()
         .text_size(rems(META_MONO))
         .font_family(mono.clone())
@@ -1071,6 +920,14 @@ pub(crate) fn git_badge(letter: &str, color: gpui::Hsla, mono: &gpui::SharedStri
         .into_any_element()
 }
 
+/// A small filled pill around a mono token — a pid, a port number.
+///
+/// The padding and the radius are derived from the text size: at
+/// [`PANEL_TEXT_META`] the line box is `round(10.5 × 1.618) = 17px`, so 1.5px
+/// of vertical padding makes the pill 20px tall — one pixel more than the 19px
+/// line of [`PANEL_TEXT`] beside it, which is what sets the height of a ports
+/// row. Horizontal padding of 5px is about half an em of breathing room on
+/// each side, and radius 4 is a fifth of the pill's height.
 pub(crate) fn info_chip(
     text: &str,
     bg: gpui::Hsla,

@@ -48,6 +48,12 @@ sha2 = "0.11"
 # implementation.
 ignore = "0.4"
 
+# Lane assignment for the commit graph (`core::git::log`) keeps a couple of
+# parents and a handful of edges per row; a SmallVec keeps those off the heap
+# for the shapes that make up almost all of a real history. Already in the tree
+# via the GUI, so this pins no new code.
+smallvec.workspace = true
+
 # Cross-platform PTY for the daemon: a Unix pty on Unix, ConPTY on Windows,
 # behind one blocking `Read`/`Write`/`resize` API. This is what lets
 # `daemon::pane` share a single code path across platforms instead of

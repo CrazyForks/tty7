@@ -1,13 +1,18 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::config::RightPanelTab;
+use crate::core::git::status::{DecoStatus, DirRollup, StatusIndex};
+use crate::terminal::git_data::index_of;
 use crate::ui::app::Tty7App;
 use crate::ui::file_copy;
 use crate::ui::host_ops::{ByHost, HostId, HostOps, InFlight, SharedHost, WatchSub};
 use crate::ui::host_registry::HostRegistry;
 use crate::ui::i18n::{L10nKey, t, t_fmt};
+use crate::ui::right_panel::git_badge;
+use crate::ui::scm::status::{status_color, status_glyph};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, ExternalPaths, FocusHandle, KeyDownEvent, MouseButton,
@@ -815,6 +820,21 @@ impl Tty7App {
         }) {
             roots_moved = self.file_tree.invalidate_repo_roots();
         }
+        // Working-tree edits the source control cache has no other way to hear
+        // about. Anything under `.git` is skipped: the repository has its own
+        // watch, and routing it through here would only double the events that
+        // land in one debounce window.
+        let mut announced: HashSet<&Path> = HashSet::new();
+        for path in paths {
+            if path.components().any(|c| c.as_os_str() == ".git") {
+                continue;
+            }
+            let Some(dir) = path.parent() else { continue };
+            if announced.insert(dir) {
+                self.scm_invalidate_cwd(host, dir, cx);
+            }
+        }
+
         let gitignore_touched = paths
             .iter()
             .any(|p| p.file_name().is_some_and(|n| n == ".gitignore"));
@@ -1369,6 +1389,7 @@ impl Tty7App {
         if let Some(host) = host.clone() {
             self.file_tree_sync_watch(host, cx);
         }
+        let decor = self.file_tree_decorations(host.as_ref(), host_id, &roots, cx);
         self.file_tree.sync_search(&query, &roots, cx);
         let rows = if self.file_tree_searching(cx) {
             self.file_tree.search_rows()
@@ -1406,10 +1427,10 @@ impl Tty7App {
                 this.file_tree_key_down(ev, window, cx);
             }))
             .children(blank)
-            .children(
-                rows.iter()
-                    .flat_map(|row| self.render_tree_row(row, window, cx)),
-            )
+            .children(rows.iter().flat_map(|row| {
+                let deco = row_decoration(&decor, &row.entry);
+                self.render_tree_row(row, deco, window, cx)
+            }))
             // Everything the rows do not cover — the gap below the last one,
             // and the whole column while the tree is still empty — belongs to
             // the top of the tree. A row under the cursor wins: gpui hands a
@@ -1431,9 +1452,36 @@ impl Tty7App {
         )
     }
 
+    /// Ask each root for a fresh status and take the index it already holds.
+    ///
+    /// The `Arc` is cloned here, outside the row loop: a tree can be thousands
+    /// of rows and every one of them wants the same index. `scm_refresh` is
+    /// idempotent and drops a probe that is already running or already current,
+    /// which is what makes it safe from a render.
+    fn file_tree_decorations(
+        &mut self,
+        host: Option<&SharedHost>,
+        host_id: HostId,
+        roots: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) -> Decorations {
+        let mut decor: Decorations = Vec::new();
+        for root in roots {
+            if let Some(host) = host {
+                self.scm_refresh(host.clone(), root.clone(), cx);
+            }
+            if let Some(index) = index_of(cx, host_id, root) {
+                decor.push((root.clone(), index));
+            }
+        }
+        order_innermost_first(&mut decor);
+        decor
+    }
+
     fn render_tree_row(
         &self,
         row: &TreeRow,
+        deco: RowDeco,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
@@ -1527,6 +1575,13 @@ impl Tty7App {
                 .when(row.entry.ignored, |d| {
                     d.italic().text_color(muted.opacity(0.7))
                 })
+                // The name carrying the colour is the signal people actually
+                // read; the letter at the end of the row is the confirmation.
+                .when_some(deco.tint, |d, status| {
+                    d.text_color(status_color(status, cx))
+                })
+                .when(deco.strike, |d| d.line_through())
+                .when(deco.bold, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
                 .when(row.is_root, |d| d.font_weight(gpui::FontWeight::MEDIUM))
                 .child(SharedString::from(row.entry.name.clone()))
                 .into_any_element()
@@ -1549,6 +1604,10 @@ impl Tty7App {
                 muted
             }))
             .child(label)
+            // Two indicators, two columns, two shapes. The dot is an unsaved
+            // editor buffer and has nothing to do with git; keeping it round and
+            // `warning` while the git letter sits in its own trailing cell is
+            // what stops the two from ever being read as one.
             .when(dirty, |d| {
                 d.child(
                     div()
@@ -1557,6 +1616,13 @@ impl Tty7App {
                         .rounded_full()
                         .bg(cx.theme().warning),
                 )
+            })
+            .when_some(deco.badge(), |d, (letter, status)| {
+                d.child(git_badge(
+                    letter,
+                    status_color(status, cx),
+                    &cx.theme().mono_font_family,
+                ))
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -1843,6 +1909,117 @@ fn dirs_to_relist(paths: &HashSet<PathBuf>, show_hidden: bool) -> HashSet<&Path>
         .collect()
 }
 
+/// Every repository behind the tree, paired with the root its index keys are
+/// relative to. Built once per render and ordered innermost-first.
+type Decorations = Vec<(PathBuf, Arc<StatusIndex>)>;
+
+/// What git says about one row: a letter for the trailing badge and the shape
+/// of the name beside it.
+///
+/// The colour is carried as a `DecoStatus` rather than an `Hsla` so that it
+/// resolves through the one table in `scm::status` — the panel, the diff cards
+/// and the tree cannot grow three opinions about what "modified" looks like —
+/// and so that everything below stays a pure function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct RowDeco {
+    /// Empty wherever no badge is drawn: directories, because a folder is not
+    /// "M", and ignored rows, because a tree full of `!` is noise.
+    letter: &'static str,
+    tint: Option<DecoStatus>,
+    strike: bool,
+    bold: bool,
+}
+
+impl RowDeco {
+    fn file(status: DecoStatus) -> RowDeco {
+        RowDeco {
+            letter: status_glyph(status),
+            tint: Some(status),
+            // The name says "gone" twice — struck through and greyed — because
+            // the row still occupies a slot in a listing that no longer has the
+            // file in it.
+            strike: status == DecoStatus::Deleted,
+            bold: status == DecoStatus::Conflict,
+        }
+    }
+
+    /// A directory is two states, never seven: work happened under it, or a
+    /// conflict is waiting under it. `Modified` and `Conflict` appear here only
+    /// as the way to reach `warning` and `danger` through the shared table.
+    fn dir(rollup: DirRollup) -> RowDeco {
+        let tint = if rollup.conflict {
+            Some(DecoStatus::Conflict)
+        } else if rollup.changed {
+            Some(DecoStatus::Modified)
+        } else {
+            None
+        };
+        RowDeco {
+            tint,
+            ..RowDeco::default()
+        }
+    }
+
+    /// The badge is laid out only where there is a letter for it, so a tree with
+    /// no repository behind it gives up no width.
+    fn badge(&self) -> Option<(&'static str, DecoStatus)> {
+        let status = self.tint?;
+        (!self.letter.is_empty()).then_some((self.letter, status))
+    }
+}
+
+/// `StatusIndex` is keyed by a repo-root-relative, `/`-separated path. Borrowed
+/// rather than built, which on Unix is every row.
+fn repo_relative<'a>(root: &Path, path: &'a Path) -> Option<Cow<'a, str>> {
+    let rel = path.strip_prefix(root).ok()?.to_str()?;
+    if rel.is_empty() {
+        // The root row itself, which has no key and nothing worth saying:
+        // "this repository contains changes" is not news.
+        return None;
+    }
+    Some(with_forward_slashes(rel, std::path::MAIN_SEPARATOR))
+}
+
+/// Split out of `repo_relative` so the Windows separator is reachable from a
+/// test on any platform — `strip_prefix` only ever splits on the host's own
+/// separator, which leaves a backslash path untestable through the caller.
+fn with_forward_slashes(text: &str, sep: char) -> Cow<'_, str> {
+    if sep == '/' || !text.contains(sep) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace(sep, "/"))
+}
+
+/// Innermost first, so a submodule nested inside another root answers for its
+/// own files instead of the repository that contains it.
+fn order_innermost_first(decor: &mut Decorations) {
+    decor.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
+}
+
+/// One hash probe per row and no allocation on the path that matters.
+fn row_decoration(decor: &Decorations, entry: &TreeEntry) -> RowDeco {
+    // A gitignored row keeps the italic-and-dim it has always worn and takes
+    // nothing else: a letter and a colour would be describing a file the
+    // repository is not tracking.
+    if entry.ignored {
+        return RowDeco::default();
+    }
+    for (root, index) in decor {
+        let Some(rel) = repo_relative(root, &entry.path) else {
+            continue;
+        };
+        return if entry.is_dir {
+            index.dir(&rel).map(RowDeco::dir).unwrap_or_default()
+        } else {
+            // `file` comes back empty once the change count blew past
+            // `MAX_DECORATED_FILES`. The rollups survive that, so the folders
+            // keep saying where the work is.
+            index.file(&rel).map(RowDeco::file).unwrap_or_default()
+        };
+    }
+    RowDeco::default()
+}
+
 fn event_can_change_a_row(path: &Path, show_hidden: bool) -> bool {
     show_hidden
         || !path
@@ -2022,6 +2199,210 @@ mod tests {
         sort_entries(&mut v);
         let names: Vec<&str> = v.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["Alpha", "beta", "Apple.rs", "zeta.rs"]);
+    }
+
+    fn tree_entry(path: &str, is_dir: bool, ignored: bool) -> TreeEntry {
+        let path = PathBuf::from(path);
+        TreeEntry {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path,
+            is_dir,
+            ignored,
+        }
+    }
+
+    fn one_repo(paths: &[(&str, DecoStatus)]) -> Decorations {
+        let mut index = StatusIndex::default();
+        for (path, status) in paths {
+            index.insert(path, *status);
+        }
+        vec![(PathBuf::from("/repo"), Arc::new(index))]
+    }
+
+    #[test]
+    fn a_row_is_keyed_by_where_it_sits_below_the_repository_root() {
+        let root = Path::new("/repo");
+        assert!(
+            repo_relative(root, Path::new("/repo")).is_none(),
+            "the root row has no key of its own"
+        );
+        assert_eq!(
+            repo_relative(root, Path::new("/repo/README.md")).as_deref(),
+            Some("README.md")
+        );
+        assert_eq!(
+            repo_relative(root, Path::new("/repo/src/ui/file_tree.rs")).as_deref(),
+            Some("src/ui/file_tree.rs")
+        );
+        assert!(
+            repo_relative(root, Path::new("/elsewhere/a.rs")).is_none(),
+            "a row outside the repository is not decorated"
+        );
+        assert!(
+            repo_relative(root, Path::new("/repository/a.rs")).is_none(),
+            "a shared text prefix is not a shared root"
+        );
+    }
+
+    #[test]
+    fn a_windows_path_is_keyed_with_forward_slashes() {
+        assert_eq!(
+            with_forward_slashes(r"src\ui\file_tree.rs", '\\'),
+            "src/ui/file_tree.rs"
+        );
+        assert_eq!(with_forward_slashes("README.md", '\\'), "README.md");
+        assert_eq!(
+            with_forward_slashes("src/ui/file_tree.rs", '/'),
+            "src/ui/file_tree.rs"
+        );
+        // The rows that exist in their thousands must not allocate a key.
+        assert!(matches!(
+            with_forward_slashes("src/ui/file_tree.rs", '/'),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            with_forward_slashes("README.md", '\\'),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn every_status_gets_its_letter_and_its_own_name_shape() {
+        // (status, letter, bold, struck through)
+        let cases = [
+            (DecoStatus::Conflict, "U", true, false),
+            (DecoStatus::Deleted, "D", false, true),
+            (DecoStatus::Added, "A", false, false),
+            (DecoStatus::Untracked, "?", false, false),
+            (DecoStatus::Modified, "M", false, false),
+            (DecoStatus::Renamed, "R", false, false),
+        ];
+        for (status, letter, bold, strike) in cases {
+            let deco = RowDeco::file(status);
+            assert_eq!(deco.letter, letter, "{status:?}");
+            assert_eq!(
+                deco.tint,
+                Some(status),
+                "{status:?} colours the name through the shared table"
+            );
+            assert_eq!(deco.bold, bold, "{status:?}");
+            assert_eq!(deco.strike, strike, "{status:?}");
+            assert_eq!(deco.badge(), Some((letter, status)), "{status:?}");
+        }
+
+        let ignored = RowDeco::file(DecoStatus::Ignored);
+        assert_eq!(ignored.letter, "");
+        assert!(
+            ignored.badge().is_none(),
+            "a tree full of `!` is noise, not information"
+        );
+    }
+
+    #[test]
+    fn a_folder_is_only_ever_changed_or_conflicted_and_never_lettered() {
+        assert_eq!(RowDeco::dir(DirRollup::default()), RowDeco::default());
+
+        let changed = RowDeco::dir(DirRollup {
+            changed: true,
+            conflict: false,
+        });
+        assert_eq!(
+            changed.tint,
+            Some(DecoStatus::Modified),
+            "the same warning a modified file wears"
+        );
+        assert_eq!(changed.letter, "");
+        assert!(changed.badge().is_none(), "a folder is not `M`");
+
+        let conflict = RowDeco::dir(DirRollup {
+            changed: true,
+            conflict: true,
+        });
+        assert_eq!(
+            conflict.tint,
+            Some(DecoStatus::Conflict),
+            "a conflict below outranks a mere change below"
+        );
+        assert_eq!(conflict.letter, "");
+        assert!(
+            !conflict.bold,
+            "the folder points; the file inside it shouts"
+        );
+    }
+
+    #[test]
+    fn dropping_the_file_map_leaves_the_folders_decorated() {
+        let mut index = StatusIndex::default();
+        index.insert("src/ui/a.rs", DecoStatus::Modified);
+        index.drop_files();
+        let decor: Decorations = vec![(PathBuf::from("/repo"), Arc::new(index))];
+
+        assert_eq!(
+            row_decoration(&decor, &tree_entry("/repo/src/ui/a.rs", false, false)),
+            RowDeco::default(),
+            "no letter survives the circuit breaker"
+        );
+        assert_eq!(
+            row_decoration(&decor, &tree_entry("/repo/src", true, false)).tint,
+            Some(DecoStatus::Modified),
+            "but the folders still say where the work is"
+        );
+    }
+
+    #[test]
+    fn a_gitignored_row_is_left_with_the_styling_it_already_had() {
+        let decor = one_repo(&[("target/debug/app", DecoStatus::Untracked)]);
+        assert_eq!(
+            row_decoration(&decor, &tree_entry("/repo/target/debug/app", false, false)).letter,
+            "?",
+            "the same row without the ignore flag is decorated"
+        );
+        assert_eq!(
+            row_decoration(&decor, &tree_entry("/repo/target/debug/app", false, true)),
+            RowDeco::default(),
+            "italic and dim is the whole of what an ignored row says"
+        );
+        assert_eq!(
+            row_decoration(&decor, &tree_entry("/repo/target", true, true)),
+            RowDeco::default(),
+            "and an ignored folder does not get a rollup colour either"
+        );
+    }
+
+    #[test]
+    fn the_innermost_repository_answers_for_its_own_rows() {
+        let mut outer = StatusIndex::default();
+        outer.insert("vendor/lib/a.rs", DecoStatus::Modified);
+        let mut inner = StatusIndex::default();
+        inner.insert("a.rs", DecoStatus::Conflict);
+        let mut decor: Decorations = vec![
+            (PathBuf::from("/repo"), Arc::new(outer)),
+            (PathBuf::from("/repo/vendor/lib"), Arc::new(inner)),
+        ];
+        order_innermost_first(&mut decor);
+
+        assert_eq!(
+            row_decoration(&decor, &tree_entry("/repo/vendor/lib/a.rs", false, false)).letter,
+            "U",
+            "the submodule, not the repository holding it"
+        );
+        assert_eq!(
+            row_decoration(&decor, &tree_entry("/repo/vendor", true, false)).tint,
+            Some(DecoStatus::Modified),
+            "the outer repository still rolls its own directories up"
+        );
+        assert_eq!(
+            row_decoration(&decor, &tree_entry("/elsewhere/a.rs", false, false)),
+            RowDeco::default()
+        );
+        assert_eq!(
+            row_decoration(&decor, &tree_entry("/repo/README.md", false, false)),
+            RowDeco::default(),
+            "a clean tracked file is left alone"
+        );
     }
 
     #[test]
@@ -2356,6 +2737,50 @@ mod render_idle_gpui_tests {
         panic!("the tree never went quiet");
     }
 
+    /// Runs git with the identity and signing pinned, so the test does not
+    /// depend on whatever is in the developer's `~/.gitconfig`.
+    fn git(root: &Path, args: &[&str]) -> bool {
+        let mut full = vec![
+            "-c",
+            "user.name=tty7 test",
+            "-c",
+            "user.email=test@tty7.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        full.extend_from_slice(args);
+        std::process::Command::new("git")
+            .args(&full)
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// The status probe only goes out from `render`, so this drives frames
+    /// until the index it produces is on the global.
+    fn scm_index(
+        app: &Entity<Tty7App>,
+        vcx: &mut VisualTestContext,
+        root: &Path,
+    ) -> Arc<StatusIndex> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            app.update_in(vcx, |_, _, cx| cx.notify());
+            vcx.background_executor.run_until_parked();
+            if let Some(index) = app.update_in(vcx, |_, _, cx| index_of(cx, HostId::LOCAL, root)) {
+                return index;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the repository status never landed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     fn draws_while_idle(vcx: &mut VisualTestContext) -> u64 {
         render_probe::arm(BUDGET);
         vcx.background_executor.run_until_parked();
@@ -2379,6 +2804,54 @@ mod render_idle_gpui_tests {
         }
         let (app, mut vcx, _pane) = files_panel_on(cx, &root);
         assert!(rows(&app, &mut vcx) > 1, "the tree listed nothing");
+        assert_eq!(draws_while_idle(&mut vcx), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn a_decorated_tree_settles_and_then_reaches_render_idle(cx: &mut TestAppContext) {
+        let _serial = serial();
+        crate::core::config::pin_test_config_dir();
+        let root = scratch("decorated");
+        if !git(&root, &["init", "--quiet"]) {
+            return; // no git on this machine
+        }
+        std::fs::write(root.join("tracked.rs"), "one\n").unwrap();
+        assert!(git(&root, &["add", "-A"]));
+        assert!(git(&root, &["commit", "--quiet", "-m", "base"]));
+        std::fs::write(root.join("tracked.rs"), "one\ntwo\n").unwrap();
+        std::fs::write(root.join("loose.rs"), "new\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/deep.rs"), "new\n").unwrap();
+
+        let (app, mut vcx, _pane) = files_panel_on(cx, &root);
+        let decor: Decorations = vec![(root.clone(), scm_index(&app, &mut vcx, &root))];
+        let deco = |name: &str, is_dir: bool| {
+            row_decoration(
+                &decor,
+                &TreeEntry {
+                    name: name.to_string(),
+                    path: root.join(name),
+                    is_dir,
+                    ignored: false,
+                },
+            )
+        };
+
+        assert_eq!(deco("tracked.rs", false).letter, "M");
+        assert_eq!(deco("loose.rs", false).letter, "?");
+        assert_eq!(
+            deco("src", true).tint,
+            Some(DecoStatus::Modified),
+            "the collapsed folder says there is work under it"
+        );
+        assert_eq!(
+            deco("src", true).letter,
+            "",
+            "without pretending to be a file"
+        );
+
+        settle(&app, &mut vcx, &root);
         assert_eq!(draws_while_idle(&mut vcx), 0);
         let _ = std::fs::remove_dir_all(&root);
     }

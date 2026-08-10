@@ -26,6 +26,11 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
     let bytes: &'static [u8] = match path {
         "icons/terminal.svg" => include_bytes!("../../assets/icons/terminal.svg"),
         "icons/git-branch.svg" => include_bytes!("../../assets/icons/git-branch.svg"),
+        // Deliberately not `refresh.svg`: the panel header already carries a
+        // refresh tile, and the same glyph meaning two different things one row
+        // apart reads as a bug.
+        "icons/git-sync.svg" => include_bytes!("../../assets/icons/git-sync.svg"),
+        "icons/git-commit.svg" => include_bytes!("../../assets/icons/git-commit.svg"),
         "icons/panel-left.svg" => include_bytes!("../../assets/icons/panel-left.svg"),
         "icons/panel-right.svg" => include_bytes!("../../assets/icons/panel-right.svg"),
         "icons/plus.svg" => include_bytes!("../../assets/icons/plus.svg"),
@@ -89,6 +94,22 @@ mod tests {
                 Assets.load(path).unwrap().is_some(),
                 "{} points at {path}, which nothing serves",
                 agent.display_name()
+            );
+        }
+    }
+
+    #[test]
+    fn every_git_icon_resolves() {
+        // An SVG on disk that nobody added to the match above silently renders
+        // as nothing, which is exactly the kind of miss no one notices.
+        for path in [
+            "icons/git-branch.svg",
+            "icons/git-sync.svg",
+            "icons/git-commit.svg",
+        ] {
+            assert!(
+                Assets.load(path).unwrap().is_some(),
+                "{path} is not registered in `agent_icon`"
             );
         }
     }

@@ -329,6 +329,23 @@ pub(crate) fn default_bindings() -> Vec<(&'static str, &'static str)> {
             },
         ),
         ("ZoomWindow", ""),
+        // `secondary-enter` is `ToggleFullscreen` on macOS. That is not a
+        // clash: `ScmCommit` binds inside the `ScmCommit` key context, so it
+        // only wins while the caret sits in the commit box.
+        ("ScmCommit", "secondary-enter"),
+        ("ScmCommitAmend", ""),
+        ("ScmStageAll", ""),
+        ("ScmUnstageAll", ""),
+        ("ScmDiscardAll", ""),
+        ("ScmRefresh", ""),
+        ("ScmSync", ""),
+        ("ScmPush", ""),
+        ("ScmPull", ""),
+        ("ScmFetch", ""),
+        ("ScmCheckoutBranch", ""),
+        ("ScmCreateBranch", ""),
+        ("ScmToggleGraph", ""),
+        ("ToggleDiffViewMode", ""),
         ("ToggleSftp", ""),
         ("ShowSshForwards", ""),
         ("ToggleCodePanel", "secondary-shift-e"),
@@ -636,6 +653,31 @@ fn authored_entry(action: &str) -> Option<(CommandGroup, String)> {
             CommandGroup::Application,
             t(L10nKey::CmdQuitTty7).to_string(),
         ),
+        // The source control verbs wear their palette names, so the
+        // Keybindings page and the palette agree on what a chord does.
+        "ScmCommit" => (CommandGroup::Git, t(L10nKey::CmdGitCommit).to_string()),
+        "ScmCommitAmend" => (
+            CommandGroup::Git,
+            t(L10nKey::ScmAmendLastCommit).to_string(),
+        ),
+        "ScmStageAll" => (CommandGroup::Git, t(L10nKey::CmdGitStageAll).to_string()),
+        "ScmUnstageAll" => (CommandGroup::Git, t(L10nKey::CmdGitUnstageAll).to_string()),
+        "ScmDiscardAll" => (CommandGroup::Git, t(L10nKey::CmdGitDiscardAll).to_string()),
+        "ScmRefresh" => (CommandGroup::Git, t(L10nKey::ScmRefresh).to_string()),
+        "ScmSync" => (CommandGroup::Git, t(L10nKey::CmdGitSync).to_string()),
+        "ScmPush" => (CommandGroup::Git, t(L10nKey::CmdGitPush).to_string()),
+        "ScmPull" => (CommandGroup::Git, t(L10nKey::CmdGitPull).to_string()),
+        "ScmFetch" => (CommandGroup::Git, t(L10nKey::CmdGitFetch).to_string()),
+        "ScmCheckoutBranch" => (CommandGroup::Git, t(L10nKey::CmdGitCheckoutTo).to_string()),
+        "ScmCreateBranch" => (
+            CommandGroup::Git,
+            t(L10nKey::CmdGitCreateBranch).to_string(),
+        ),
+        "ScmToggleGraph" => (CommandGroup::Git, t(L10nKey::CmdGitToggleGraph).to_string()),
+        "ToggleDiffViewMode" => (
+            CommandGroup::View,
+            t(L10nKey::CmdToggleDiffViewMode).to_string(),
+        ),
         _ => return None,
     })
 }
@@ -845,6 +887,7 @@ fn action_context(action: &str) -> Option<&'static str> {
     match action {
         "FindInTerminal" | "FindNext" | "FindPrevious" | "ClearScrollback" | "InsertNewline"
         | "CopyText" | "PasteText" => Some("Terminal"),
+        "ScmCommit" | "ScmCommitAmend" => Some("ScmCommit"),
         _ => None,
     }
 }
@@ -917,6 +960,20 @@ fn make_binding(action: &str, keystroke: &str) -> Option<KeyBinding> {
         "ShowRightPanelInfo" => KeyBinding::new(keystroke, ShowRightPanelInfo, None),
         "ShowRightPanelChanges" => KeyBinding::new(keystroke, ShowRightPanelChanges, None),
         "ShowRightPanelFiles" => KeyBinding::new(keystroke, ShowRightPanelFiles, None),
+        "ScmCommit" => KeyBinding::new(keystroke, ScmCommit, action_context(action)),
+        "ScmCommitAmend" => KeyBinding::new(keystroke, ScmCommitAmend, action_context(action)),
+        "ScmStageAll" => KeyBinding::new(keystroke, ScmStageAll, None),
+        "ScmUnstageAll" => KeyBinding::new(keystroke, ScmUnstageAll, None),
+        "ScmDiscardAll" => KeyBinding::new(keystroke, ScmDiscardAll, None),
+        "ScmRefresh" => KeyBinding::new(keystroke, ScmRefresh, None),
+        "ScmSync" => KeyBinding::new(keystroke, ScmSync, None),
+        "ScmPush" => KeyBinding::new(keystroke, ScmPush, None),
+        "ScmPull" => KeyBinding::new(keystroke, ScmPull, None),
+        "ScmFetch" => KeyBinding::new(keystroke, ScmFetch, None),
+        "ScmCheckoutBranch" => KeyBinding::new(keystroke, ScmCheckoutBranch, None),
+        "ScmCreateBranch" => KeyBinding::new(keystroke, ScmCreateBranch, None),
+        "ScmToggleGraph" => KeyBinding::new(keystroke, ScmToggleGraph, None),
+        "ToggleDiffViewMode" => KeyBinding::new(keystroke, ToggleDiffViewMode, None),
         "FindInTerminal" => KeyBinding::new(keystroke, FindInTerminal, action_context(action)),
         "FindNext" => KeyBinding::new(keystroke, FindNext, action_context(action)),
         "FindPrevious" => KeyBinding::new(keystroke, FindPrevious, action_context(action)),
@@ -1061,6 +1118,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_action_has_a_binding_arm() {
+        // The sibling test above only reaches actions that ship with a default
+        // keystroke, which leaves the unbound ones — the majority — free to be
+        // listed in `default_bindings` with no `make_binding` arm behind them.
+        // Nothing surfaces that: the action shows up in Settings, the user
+        // assigns a key, and the key silently does nothing.
+        for (action, _) in default_bindings() {
+            assert!(
+                make_binding(action, "ctrl-f12").is_some(),
+                "no make_binding arm for action {action}; \
+                 anyone who binds a key to it in Settings gets nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_commit_key_only_fires_inside_the_commit_box() {
+        // `secondary-enter` is `ToggleFullscreen` on macOS. The two coexist
+        // only because the commit binding is scoped; drop the context and
+        // committing steals full screen everywhere.
+        assert_eq!(action_context("ScmCommit"), Some("ScmCommit"));
+        assert_eq!(action_context("ScmCommitAmend"), Some("ScmCommit"));
+        assert_eq!(action_context("ToggleFullscreen"), None);
     }
 
     #[test]
@@ -1310,15 +1393,23 @@ mod tests {
 
     #[test]
     fn every_default_chord_is_claimed_by_exactly_one_action() {
-        let mut seen: Vec<(&str, &str)> = Vec::new();
+        // Per context, not globally: gpui resolves a keystroke by walking the
+        // focus chain outwards, so a chord bound inside a narrow context and
+        // again with no context is not a clash — the narrow one wins while
+        // that element has focus and the global one applies everywhere else.
+        // `ScmCommit` and `ToggleFullscreen` both take secondary-enter on that
+        // basis. Two bindings sharing a chord *and* a context is still a bug,
+        // because then which one fires is arbitrary.
+        let mut seen: Vec<(&str, &str, Option<&'static str>)> = Vec::new();
         for (action, spec) in default_bindings() {
             if spec.is_empty() {
                 continue;
             }
-            if let Some((other, _)) = seen.iter().find(|(_, s)| *s == spec) {
-                panic!("{action} and {other} both claim {spec}");
+            let context = action_context(action);
+            if let Some((other, _, _)) = seen.iter().find(|(_, s, c)| *s == spec && *c == context) {
+                panic!("{action} and {other} both claim {spec} in context {context:?}");
             }
-            seen.push((action, spec));
+            seen.push((action, spec, context));
         }
     }
 

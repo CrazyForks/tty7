@@ -2211,6 +2211,46 @@ mod tests {
     }
 
     #[test]
+    fn a_short_deadline_gives_up_on_a_slow_git() {
+        let p = pair_with(Arc::new(SlowGit {
+            inner: LocalHost::new(),
+            delay: Duration::from_millis(300),
+            running: Arc::new(AtomicBool::new(false)),
+        }));
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let err = p
+            .host
+            .git_with_deadline(tmp.path(), &["status"], Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+    }
+
+    #[test]
+    fn a_long_deadline_outlasts_the_one_a_git_request_would_get() {
+        let p = pair_with(Arc::new(SlowGit {
+            inner: LocalHost::new(),
+            delay: Duration::from_millis(300),
+            running: Arc::new(AtomicBool::new(false)),
+        }));
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // The first call abandons its request mid-flight. The server has no
+        // timer of its own — it runs the job to completion and answers into a
+        // slot nobody is waiting on — so the point of doing it twice is that
+        // the link is still usable afterwards. A `push` behind a cancelled
+        // probe depends on exactly that.
+        let _ = p
+            .host
+            .git_with_deadline(tmp.path(), &["status"], Duration::from_millis(100));
+        let out = p
+            .host
+            .git_with_deadline(tmp.path(), &["status"], Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(out.stdout, b"slow");
+    }
+
+    #[test]
     fn replies_come_back_out_of_order() {
         let running = Arc::new(AtomicBool::new(false));
         let p = pair_with(Arc::new(SlowGit {

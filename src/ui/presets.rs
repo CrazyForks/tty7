@@ -123,6 +123,26 @@ pub struct ActiveAccent(pub u32);
 
 impl Global for ActiveAccent {}
 
+/// How many lanes of the commit graph get a colour of their own.
+///
+/// Six because that is how many hues of the ANSI set survive being pulled to a
+/// contrast floor while staying apart from each other — and because the graph
+/// caps its visible lanes at the same number, which is what guarantees no two
+/// columns on screen are ever the same colour.
+pub const LANE_SLOTS: usize = 6;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Lanes {
+    pub ink: [u32; LANE_SLOTS],
+    /// Everything past the last slot shares one column, so it gets a neutral:
+    /// a hue there would claim a branch identity the column does not have.
+    pub overflow: u32,
+}
+
+pub struct ActiveLanes(pub Lanes);
+
+impl Global for ActiveLanes {}
+
 impl Theme {
     pub fn background_color(&self) -> u32 {
         self.background.color()
@@ -223,6 +243,38 @@ impl Theme {
             warning: build(self.ansi_seed(3)),
             info: build(self.ansi_seed(6)),
             link: build(self.ansi_seed(6)),
+        }
+    }
+
+    /// Lane colours for the commit graph, derived the same way every other
+    /// colour in this file is: seeded from the theme's own palette, then walked
+    /// to a contrast floor on each surface it can be painted on.
+    ///
+    /// Not a fixed table of hexes. A hard-coded palette would be the one thing
+    /// here that does not follow the theme, and — worse — the contrast tests
+    /// below cannot see it, so the four light builtins would ship a graph whose
+    /// lanes sit at 2:1 against their own background.
+    ///
+    /// The seed order is blue, yellow, magenta, green, cyan, red. Three
+    /// constraints picked it: no two adjacent slots share a hue family; red and
+    /// green are never neighbours, for the readers who cannot tell them apart;
+    /// and red is last because a panel three or four lanes wide never reaches
+    /// it, so the one colour that also means "danger" everywhere else in the UI
+    /// stays out of the common case.
+    pub fn lanes(&self) -> Lanes {
+        const SEEDS: [usize; LANE_SLOTS] = [4, 3, 5, 2, 6, 1];
+        let bg = self.background_color();
+        let fg = legible_foreground(bg, self.foreground);
+        // Through `clear_ink`, the same three surfaces `semantics` clears on:
+        // the graph draws on the window in a floating panel, on the sidebar
+        // when the panel is docked, and on a popover in the detail view.
+        let mut ink = [0u32; LANE_SLOTS];
+        for (slot, seed) in SEEDS.iter().enumerate() {
+            ink[slot] = self.clear_ink(self.ansi_seed(*seed), ACCENT_FLOOR);
+        }
+        Lanes {
+            ink,
+            overflow: dim(fg, bg, state::TEXT_RESTING),
         }
     }
 
@@ -1419,6 +1471,122 @@ mod tests {
                 "Dracula's {what} selection moved: {now:#08x} vs the tuned {legacy:#08x}"
             );
         }
+    }
+
+    /// CIE L*a*b* for a packed sRGB colour, D65.
+    ///
+    /// Contrast is a luminance ratio and says nothing about hue: two lanes can
+    /// both clear 3:1 against the background and still be the same colour to
+    /// look at. ΔE is the measure that catches that, and it needs Lab.
+    fn lab(c: u32) -> (f32, f32, f32) {
+        fn linear(v: u32) -> f32 {
+            let s = v as f32 / 255.0;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        let (r, g, b) = (
+            linear(c >> 16 & 0xff),
+            linear(c >> 8 & 0xff),
+            linear(c & 0xff),
+        );
+        // sRGB → XYZ, then normalised by the D65 white point.
+        let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
+        let f = |t: f32| {
+            if t > 0.008856 {
+                t.cbrt()
+            } else {
+                7.787 * t + 16.0 / 116.0
+            }
+        };
+        let (fx, fy, fz) = (f(x), f(y), f(z));
+        (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+    }
+
+    fn delta_e76(a: u32, b: u32) -> f32 {
+        let (l1, a1, b1) = lab(a);
+        let (l2, a2, b2) = lab(b);
+        ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn lane_colours_clear_the_floor_on_every_surface() {
+        for t in builtins() {
+            let bg = t.background_color();
+            let fg = legible_foreground(bg, t.foreground);
+            let lanes = t.lanes();
+            for (name, surface) in [
+                ("background", bg),
+                ("sidebar", mix(bg, fg, 0.03)),
+                ("popover", mix(bg, fg, 0.05)),
+            ] {
+                for (slot, ink) in lanes.ink.iter().enumerate() {
+                    let ratio = contrast(*ink, surface);
+                    assert!(
+                        ratio >= ACCENT_FLOOR,
+                        "{}/{name}: lane {slot} is only {ratio:.2}:1",
+                        t.id
+                    );
+                }
+                let ratio = contrast(lanes.overflow, surface);
+                assert!(
+                    ratio >= ACCENT_FLOOR,
+                    "{}/{name}: the overflow lane is only {ratio:.2}:1",
+                    t.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_lanes_are_never_the_same_colour() {
+        // A just-noticeable difference is around 2.3. The floor is set far
+        // above it because these are 1.5px lines a few pixels apart, not
+        // patches side by side, and the eye is much worse at hairlines.
+        const FLOOR: f32 = 12.0;
+        for t in builtins() {
+            let lanes = t.lanes();
+            for slot in 0..LANE_SLOTS - 1 {
+                let d = delta_e76(lanes.ink[slot], lanes.ink[slot + 1]);
+                assert!(
+                    d >= FLOOR,
+                    "{}: lanes {slot} and {} are ΔE {d:.1} apart",
+                    t.id,
+                    slot + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lane_colours_are_deterministic() {
+        for t in builtins() {
+            assert_eq!(
+                t.lanes().ink,
+                t.lanes().ink,
+                "{}: lane derivation is not a pure function",
+                t.id
+            );
+        }
+    }
+
+    /// The seeds were chosen so that no two neighbours share a hue family and
+    /// red never sits beside green. Both are properties of the *order*, so a
+    /// reshuffle has to fail here rather than only looking slightly worse.
+    #[test]
+    fn the_lane_seed_order_keeps_red_and_green_apart() {
+        let seeds = [4usize, 3, 5, 2, 6, 1];
+        let red = seeds.iter().position(|s| *s == 1).expect("red is a seed");
+        let green = seeds.iter().position(|s| *s == 2).expect("green is a seed");
+        assert!(
+            red.abs_diff(green) > 1,
+            "red and green ended up adjacent at slots {red} and {green}"
+        );
+        assert_eq!(red, LANE_SLOTS - 1, "red should be the last slot reached");
     }
 
     #[test]

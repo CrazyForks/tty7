@@ -20,7 +20,7 @@ use crate::daemon::protocol::{
 };
 use crate::daemon::ssh::sftp::{remote_basename, remote_join, remote_parent, safe_local_name};
 use crate::terminal::RemoteTerminal;
-use crate::ui::app::{CONTENT_INSET, Tty7App};
+use crate::ui::app::{CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::right_panel::{META, TEXT};
 
@@ -1111,12 +1111,21 @@ impl Tty7App {
 
     fn sftp_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         let history = self.sftp_panel.show_history;
+        // The title bar's 24px chrome tile, the same one the Info tab puts its
+        // cwd actions in. It used to be built by hand — a 32px tile forced to
+        // 24 and then set `.xsmall()`, which overrode the 13px each icon below
+        // asked for with the button size's own 12, so the glyph never was the
+        // size the code claimed. `chrome_tile_sized` derives it from the tile
+        // instead, which is what every other 24px tile in the panel does.
         let tile = |button: Button, selected: bool, cx: &mut Context<Self>| {
-            crate::ui::tab_strip::chrome_tile(button, selected, cx)
-                .xsmall()
-                .w(px(24.))
-                .h(px(24.))
-                .rounded_md()
+            crate::ui::tab_strip::chrome_tile_sized(
+                button,
+                TILE_SIZE_SM,
+                TILE_GLYPH_SM,
+                selected,
+                cx,
+            )
+            .rounded_md()
         };
 
         h_flex()
@@ -1126,7 +1135,7 @@ impl Tty7App {
                 div().occlude().child(
                     tile(
                         Button::new("panel-sftp-refresh")
-                            .icon(Icon::empty().path("icons/refresh.svg").size(px(13.))),
+                            .icon(Icon::empty().path("icons/refresh.svg")),
                         false,
                         cx,
                     )
@@ -1138,7 +1147,7 @@ impl Tty7App {
                 div().occlude().child(
                     tile(
                         Button::new("panel-sftp-menu")
-                            .icon(Icon::empty().path("icons/ellipsis.svg").size(px(13.))),
+                            .icon(Icon::empty().path("icons/ellipsis.svg")),
                         false,
                         cx,
                     )

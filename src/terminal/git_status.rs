@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub use crate::core::git::{GitStatus, RepoSnapshot, branch_name, git, probe};
+pub use crate::core::git::{GitStatus, RepoSnapshot, probe};
 use crate::ui::host_ops::{ByHost, HostId, InFlight};
 
 #[derive(Default)]
@@ -29,6 +29,25 @@ impl GitStatusCache {
                 .cloned()
                 .unwrap_or_else(|| root.clone())
         }))
+    }
+
+    /// The working tree `cwd` is in, if this cache has already found out.
+    ///
+    /// Distinct from [`GitStatusCache::known_repo_for`], which answers with the
+    /// *home* — the main working tree a linked one belongs to, which is what
+    /// a "which project is this" question wants. This answers with the root,
+    /// which is the key everything git-shaped is stored under.
+    pub fn repo_root_for(&self, host: HostId, cwd: &Path) -> Option<&Path> {
+        self.roots.get(host, cwd)?.as_deref()
+    }
+
+    /// Forget a machine we have stopped talking to, so a reconnect starts from
+    /// nothing rather than from whatever it looked like on the way down.
+    pub fn clear_host(&mut self, host: HostId) {
+        self.roots.clear_host(host);
+        self.homes.clear_host(host);
+        self.status.clear_host(host);
+        self.last_probe.clear_host(host);
     }
 
     pub fn begin_probe(&mut self, host: HostId, cwd: &Path) -> bool {
@@ -319,6 +338,49 @@ mod tests {
         assert_eq!(cache.status_for(L, main).unwrap().branch, "main");
         assert_eq!(cache.status_for(L, wt).unwrap().branch, "feat/x");
     }
+    #[test]
+    fn a_linked_worktrees_root_is_not_its_home() {
+        // `known_repo_for` groups a worktree with the repository it belongs
+        // to; `repo_root_for` answers with the working tree itself, which is
+        // the key every git-shaped cache is stored under.
+        let mut cache = GitStatusCache::default();
+        let wt = Path::new("/repo/.wt/feat");
+        cache.finish_probe(L, wt, Some(wt_snap("/repo/.wt/feat", "/repo", "feat/x")));
+
+        assert_eq!(
+            cache.repo_root_for(L, wt),
+            Some(Path::new("/repo/.wt/feat"))
+        );
+        assert_eq!(
+            cache.known_repo_for(L, wt),
+            Some(Some(PathBuf::from("/repo")))
+        );
+
+        let plain = Path::new("/tmp/notes");
+        cache.finish_probe(L, plain, None);
+        assert_eq!(cache.repo_root_for(L, plain), None, "not a repository");
+        assert_eq!(cache.repo_root_for(L, Path::new("/never")), None);
+    }
+
+    #[test]
+    fn clearing_a_host_leaves_the_others_alone() {
+        let mut cache = GitStatusCache::default();
+        let gone = HostId::from_connection_key("ssh-direct:me@box:22");
+        let cwd = Path::new("/src/app");
+        cache.finish_probe(L, cwd, Some(snap("/src/app", "main", Some((1, 2)))));
+        cache.finish_probe(gone, cwd, Some(snap("/src/app", "feat/x", Some((3, 4)))));
+
+        cache.clear_host(gone);
+
+        assert_eq!(cache.status_for(gone, cwd), None);
+        assert_eq!(cache.known_repo_for(gone, cwd), None);
+        assert!(
+            cache.begin_probe_throttled(gone, cwd, Duration::from_secs(60)),
+            "a reconnect must be free to ask again straight away"
+        );
+        assert_eq!(cache.status_for(L, cwd).unwrap().branch, "main");
+    }
+
     #[test]
     fn throttled_probes_decline_instead_of_queueing() {
         let mut cache = GitStatusCache::default();

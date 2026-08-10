@@ -54,7 +54,10 @@ macro_rules! for_each_host_case {
             git_nonzero_exit_is_ok_not_err,
             git_that_cannot_run_is_err,
             git_optional_locks_env_is_set,
+            git_terminal_prompt_is_disabled,
             git_stdin_is_null,
+            git_output_preserves_nul_bytes,
+            git_args_survive_pathspec_magic,
             join_uses_host_separator,
             is_absolute_matches_host_semantics,
             search_is_breadth_first,
@@ -660,6 +663,53 @@ pub fn git_optional_locks_env_is_set(h: &dyn Host, sb: &dyn Sandbox) {
     );
 }
 
+pub fn git_terminal_prompt_is_disabled(h: &dyn Host, sb: &dyn Sandbox) {
+    let sandbox = sb.path();
+    let repo = h.join(sandbox, "repo");
+    mkdir(h, &repo);
+    let Some(()) = git_repo(h, &repo) else { return };
+
+    // Failures past this point assert rather than return: a broken alias or a
+    // failing run is exactly a git that misbehaved, and returning would make
+    // this case pass vacuously in precisely that situation.
+    let out = h
+        .git(
+            &repo,
+            &[
+                "config",
+                "alias.tty7prompt",
+                "!echo PROMPT=[$GIT_TERMINAL_PROMPT] REQUIRE=[$SSH_ASKPASS_REQUIRE]",
+            ],
+        )
+        .unwrap();
+    assert!(
+        out.success(),
+        "config exited {:?}: {:?}",
+        out.status,
+        out.stderr_trimmed()
+    );
+    let out = h.git(&repo, &["tty7prompt"]).unwrap();
+    assert!(
+        out.success(),
+        "alias run exited {:?}: {:?}",
+        out.status,
+        out.stderr_trimmed()
+    );
+    // A `push` that stops to ask for a username never comes back — and on the
+    // far side of a control link there is no terminal to answer at anyway. The
+    // remote host inherits this from the server's own local host, so both ends
+    // have to agree.
+    let text = out.stdout_trimmed();
+    assert!(
+        text.contains("PROMPT=[0]"),
+        "GIT_TERMINAL_PROMPT must reach git: {text:?}"
+    );
+    assert!(
+        text.contains("REQUIRE=[never]"),
+        "SSH_ASKPASS_REQUIRE must reach git: {text:?}"
+    );
+}
+
 pub fn git_stdin_is_null(h: &dyn Host, sb: &dyn Sandbox) {
     let sandbox = sb.path();
     let repo = h.join(sandbox, "repo");
@@ -676,6 +726,74 @@ pub fn git_stdin_is_null(h: &dyn Host, sb: &dyn Sandbox) {
             Err(_) => panic!("git blocked on stdin — it must be nulled"),
         }
     });
+}
+
+pub fn git_output_preserves_nul_bytes(h: &dyn Host, sb: &dyn Sandbox) {
+    let sandbox = sb.path();
+    let repo = h.join(sandbox, "repo");
+    mkdir(h, &repo);
+    let Some(()) = git_repo(h, &repo) else { return };
+
+    write(h, &h.join(&repo, "one two.txt"), "x");
+    write(h, &h.join(&repo, "three.txt"), "y");
+    let out = h.git(&repo, &["status", "--porcelain=v2", "-z"]).unwrap();
+    assert!(
+        out.success(),
+        "status exited {:?}: {:?}",
+        out.status,
+        out.stderr_trimmed()
+    );
+
+    // `git` hands back bytes, not lines. The `-z` formats are the only ones
+    // whose paths are unambiguous, and the SCM panel reads them through this
+    // method precisely because `git_lines` cannot: it splits on newlines and
+    // rejoins with them, which turns a NUL stream into mush.
+    assert!(
+        out.stdout.contains(&0),
+        "`-z` came back with no NUL at all: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !out.stdout.contains(&b'\n'),
+        "`-z` records were re-terminated with newlines: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        contains_bytes(&out.stdout, b"one two.txt"),
+        "the raw, unquoted path did not survive: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+pub fn git_args_survive_pathspec_magic(h: &dyn Host, sb: &dyn Sandbox) {
+    let sandbox = sb.path();
+    let repo = h.join(sandbox, "repo");
+    mkdir(h, &repo);
+    let Some(()) = git_repo(h, &repo) else { return };
+
+    // Staging a single file means naming it as a pathspec, and a name with
+    // glob characters only stages itself behind `:(literal)`. Nothing between
+    // here and git may re-split, re-quote or shell-expand that argument.
+    let name = "a[b].txt";
+    write(h, &h.join(&repo, name), "x");
+    let added = h.git(&repo, &["add", "--", ":(literal)a[b].txt"]).unwrap();
+    assert!(
+        added.success(),
+        "add exited {:?}: {:?}",
+        added.status,
+        added.stderr_trimmed()
+    );
+
+    let out = h.git(&repo, &["status", "--porcelain"]).unwrap();
+    let text = out.stdout_trimmed();
+    assert!(
+        text.lines().any(|l| l.starts_with('A') && l.contains(name)),
+        "`:(literal)` did not reach git intact: {text:?}"
+    );
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 pub fn join_uses_host_separator(h: &dyn Host, sb: &dyn Sandbox) {

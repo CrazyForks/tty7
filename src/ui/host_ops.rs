@@ -259,6 +259,14 @@ impl<K: Eq + Hash + Clone> InFlight<K> {
         self.stale.extend(self.in_flight.iter().cloned());
     }
 
+    /// Drop every key the predicate rejects — bookkeeping for work that will
+    /// never land (a host cleared away under an in-flight job). If the job
+    /// does land after all, its `finish` is a no-op rather than a poison.
+    pub fn retain(&mut self, keep: impl Fn(&K) -> bool) {
+        self.in_flight.retain(|k| keep(k));
+        self.stale.retain(|k| keep(k));
+    }
+
     pub fn finish(&mut self, key: &K) -> bool {
         self.in_flight.remove(key);
         !self.stale.remove(key)
