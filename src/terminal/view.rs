@@ -229,6 +229,19 @@ pub struct TerminalView {
     editor_drag_word: Option<(usize, usize)>,
     editor_goal_col: Option<usize>,
     pub(super) hovered_link: Option<HoveredLink>,
+    /// How opaque the pane wants this terminal painted this frame: 1.0 at
+    /// rest, [`crate::ui::pane::INACTIVE_DIM`] for an unfocused pane in a
+    /// split, [`crate::ui::pane::LIFTED_DIM`] while the pane is being
+    /// dragged. The pane leaf computes it and stores it here, because the
+    /// dim is applied by blending the terminal's own colours toward the
+    /// window background instead of the pane's element opacity — an opacity
+    /// style would alpha-multiply every quad and path separately, so a
+    /// powerline triangle stacked over a segment quad would show the
+    /// already-dimmed segment through its own (1-dim) alpha and land with a
+    /// visible seam where it meets the segment. The terminal element resets
+    /// the field to 1.0 at the end of every paint, so the value never
+    /// outlives the frame it was written for.
+    pub(super) dim: f32,
     _focus_subs: Vec<gpui::Subscription>,
 }
 
@@ -1123,6 +1136,7 @@ impl TerminalView {
             search: None,
             cursor_visible: true,
             focused: true,
+            dim: 1.,
             search_focused: false,
             search_case_sensitive: false,
             search_regex: false,
@@ -1213,6 +1227,17 @@ impl TerminalView {
 
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         self.terminal.foreground_cwd()
+    }
+
+    /// Sets how opaque the pane wants this terminal painted; the pane leaf
+    /// calls this every frame while rendering, and the terminal element
+    /// blends its colours toward the window background during paint (see
+    /// [`Self::dim`] for why that beats an element-opacity style). The
+    /// element resets the value to 1.0 at the end of every paint, so a
+    /// render site that forgets to set it gets full brightness next frame —
+    /// never a stale dim.
+    pub(crate) fn set_dim(&mut self, dim: f32) {
+        self.dim = dim;
     }
 
     pub fn remote_context(&self) -> Option<RemoteContext> {
