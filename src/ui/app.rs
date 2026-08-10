@@ -6646,6 +6646,30 @@ fn pane_attachable(
     id: u64,
     owner: crate::core::session::WorkspaceId,
 ) -> bool {
+    // Listed at all, and then whose it is. A pane missing from the listing is
+    // one there is nothing to attach to.
+    alive.is_none_or(|listed| listed.contains_key(&id)) && pane_free_for(alive, id, owner)
+}
+
+/// Whether this window may stand on `id` — as the pane it attaches to, or as
+/// the dead predecessor whose screen a fresh pane opens showing.
+///
+/// Liveness deliberately does not come into it, and that is the whole point.
+/// A pane missing from the listing is usually one whose daemon has just
+/// restarted, which is exactly when its stored screen is worth asking for.
+/// Ruling the id out there threw away the only thing that could ask: the
+/// window spawned a pane that had never heard of a predecessor, so no attach
+/// was tried, no restore was requested, and the screen the daemon still had on
+/// disk was swept a tick later, unread. Attaching is still tried first and
+/// still fails harmlessly when the pane really is gone.
+///
+/// Ownership does come into it. Another workspace's pane is not this window's
+/// to attach to, and its screen is not this window's to show.
+fn pane_free_for(
+    alive: Option<&std::collections::HashMap<u64, Option<String>>>,
+    id: u64,
+    owner: crate::core::session::WorkspaceId,
+) -> bool {
     let Some(alive) = alive else {
         // No listing to consult. Attaching is the safe guess in both
         // directions: if the daemon is really unreachable the attach fails and
@@ -6654,7 +6678,7 @@ fn pane_attachable(
         return true;
     };
     match alive.get(&id) {
-        None => false,
+        None => true,
         Some(None) => true,
         Some(Some(recorded)) => {
             // Only a workspace id is a claim. Anything else is a client
@@ -6753,7 +6777,10 @@ fn session_to_pane(
                 leaf_shares_the_window_daemon(workspace.is_some(), ssh_spec.is_some());
             let restore = match workspace.is_some() {
                 true => (*pane_id).filter(|_| same_daemon),
-                false => (*pane_id).filter(|id| same_daemon && pane_attachable(alive, *id, owner)),
+                // Not `pane_attachable`: a dead pane's id is what the restore
+                // is keyed on, so it has to survive being dead. The attach is
+                // still attempted first and still gives way to a fresh spawn.
+                false => (*pane_id).filter(|id| same_daemon && pane_free_for(alive, *id, owner)),
             };
             if restore.is_none() {
                 if let Some(spec) = ssh_spec.clone() {
@@ -7370,7 +7397,8 @@ mod window_drag_tests {
 mod tests {
     use super::{
         CloseReason, TabAgentSession, clear_window_override_values, close_prompt,
-        leaf_shares_the_window_daemon, mru_order, pane_attachable, parse_ssh_connect_input,
+        leaf_shares_the_window_daemon, mru_order, pane_attachable, pane_free_for,
+        parse_ssh_connect_input,
         parse_ssh_option_words,
     };
 
@@ -7508,6 +7536,38 @@ mod tests {
             "a failed List says nothing about pane 4; the attach itself must decide, \
              because respawning on a transient RPC error destroys a live session"
         );
+    }
+
+    #[test]
+    fn a_dead_pane_keeps_its_id_so_its_screen_can_be_asked_for() {
+        let ours = crate::core::session::WorkspaceId::new();
+        let theirs = crate::core::session::WorkspaceId::new();
+        let alive: std::collections::HashMap<u64, Option<String>> =
+            [(1, Some(ours.to_string())), (2, Some(theirs.to_string()))]
+                .into_iter()
+                .collect();
+
+        // The restart case: every pane the window held is missing from the new
+        // daemon's listing. Their ids are the only handle on the screens it
+        // still has stored, so being dead must not erase them — this is what
+        // made a restarted server come back to a row of blank shells.
+        assert!(
+            pane_free_for(Some(&alive), 4, ours),
+            "a dead pane's id has to survive; the restore is keyed on it"
+        );
+        assert!(
+            !pane_attachable(Some(&alive), 4, ours),
+            "attaching to it is still hopeless, and that stays true"
+        );
+
+        // What being free does not mean: helping yourself to a pane that is
+        // alive and belongs to another workspace, whose screen is not this
+        // window's to show either.
+        assert!(
+            !pane_free_for(Some(&alive), 2, ours),
+            "another workspace's pane is not ours to restore from"
+        );
+        assert!(pane_free_for(Some(&alive), 1, ours), "our own pane is ours");
     }
 
     #[test]
