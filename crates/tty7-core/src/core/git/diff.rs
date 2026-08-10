@@ -374,6 +374,55 @@ pub fn probe(host: &dyn Host, cwd: &Path) -> Option<DiffSnapshot> {
     probe_diff(host, cwd, &DiffRequest::default())
 }
 
+/// A whole file rendered as one addition — what an *untracked* file looks
+/// like as a patch. git cannot produce this one: `diff` does not know the
+/// file, and `--no-index` needs a null device whose spelling is platform
+/// business. So the overlay reads the bytes and this builds the same model a
+/// parsed patch would, on the same budget a real single-file patch gets —
+/// `added` stays the true count past every truncation, like the parser's.
+pub fn synthesize_added(path: &str, bytes: &[u8], budget: &DiffBudget) -> FileDiff {
+    // The same test git itself applies: a NUL anywhere in the first 8000
+    // bytes means binary.
+    let binary = bytes[..bytes.len().min(8000)].contains(&0);
+    let mut file = FileDiff {
+        path: path.to_string(),
+        old_path: None,
+        status: FileStatus::Added,
+        added: 0,
+        removed: 0,
+        binary,
+        truncated: None,
+        hunks: Vec::new(),
+    };
+    if binary {
+        return file;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let total = text.lines().count();
+    file.added = total as u32;
+    if total == 0 {
+        return file;
+    }
+    let mut lines = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if i >= budget.max_lines_per_file {
+            file.truncated = Some(Truncation::PerFile);
+            break;
+        }
+        lines.push(DiffLine {
+            kind: LineKind::Added,
+            old_no: None,
+            new_no: Some(i as u32 + 1),
+            text: line.to_string(),
+        });
+    }
+    file.hunks.push(Hunk {
+        header: format!("@@ -0,0 +1,{total} @@"),
+        lines,
+    });
+    file
+}
+
 pub fn probe_diff(host: &dyn Host, root: &Path, req: &DiffRequest<'_>) -> Option<DiffSnapshot> {
     if !req.source.revs_are_arguments() {
         return None;
@@ -1076,6 +1125,45 @@ Binary files a/img.png and b/img.png differ
 
         let raw = parse_unified("diff --git a/中文名.txt b/中文名.txt\n");
         assert_eq!(raw[0].path, "中文名.txt");
+    }
+
+    /// The synthesized card for an untracked file mirrors what a parsed
+    /// added-file patch looks like: true counts past the budget, a hunk
+    /// header the renderer can show, git's own binary rule.
+    #[test]
+    fn an_untracked_file_synthesizes_as_one_addition() {
+        let file = synthesize_added("notes.md", b"one\ntwo\nthree\n", &DiffBudget::SINGLE_FILE);
+        assert_eq!(file.status, FileStatus::Added);
+        assert_eq!((file.added, file.removed), (3, 0));
+        assert!(!file.binary);
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.hunks[0].header, "@@ -0,0 +1,3 @@");
+        let lines = &file.hunks[0].lines;
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|l| l.kind == LineKind::Added));
+        assert_eq!((lines[2].old_no, lines[2].new_no), (None, Some(3)));
+        assert_eq!(lines[2].text, "three");
+
+        let empty = synthesize_added("empty", b"", &DiffBudget::SINGLE_FILE);
+        assert_eq!(empty.added, 0);
+        assert!(empty.hunks.is_empty(), "no hunk for a file with no lines");
+
+        let binary = synthesize_added("blob.png", b"\x89PNG\x00\x01", &DiffBudget::SINGLE_FILE);
+        assert!(binary.binary);
+        assert!(binary.hunks.is_empty());
+
+        let over = "x\n".repeat(DiffBudget::SINGLE_FILE.max_lines_per_file + 5);
+        let over = synthesize_added("big.txt", over.as_bytes(), &DiffBudget::SINGLE_FILE);
+        assert_eq!(over.truncated, Some(Truncation::PerFile));
+        assert_eq!(
+            over.added as usize,
+            DiffBudget::SINGLE_FILE.max_lines_per_file + 5,
+            "the count stays true past the budget"
+        );
+        assert_eq!(
+            over.hunks[0].lines.len(),
+            DiffBudget::SINGLE_FILE.max_lines_per_file
+        );
     }
 
     /// git never quotes a path for a mere space, so a `diff --git` header

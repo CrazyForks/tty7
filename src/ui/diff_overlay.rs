@@ -15,6 +15,11 @@ use crate::terminal::git_diff::{
     self, AUTO_COLLAPSE_LINES, CommitLabel, DiffSnapshot, DiffSource, DiffStats, FileDiff,
     FileStatus, LineKind, MAX_RENDERED_FILES, Truncation,
 };
+
+/// How much of an untracked file the preview will read. Past this the card
+/// says the read failed rather than showing a silently cut-off file — and the
+/// line budget below cuts rendering long before this does anyway.
+const MAX_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
 use crate::ui::app::Tty7App;
 use crate::ui::diff_rows::{Side, SplitCell, SplitRow, UnifiedRow, split_hunk, unified_rows};
 use crate::ui::i18n::{L10nKey, t, t_fmt, t_plural};
@@ -41,6 +46,14 @@ pub(crate) struct DiffOverlayState {
     pub(crate) loading: bool,
     pub(crate) expanded: HashMap<String, bool>,
     pub(crate) focus: Option<String>,
+    /// A synthesized all-added card for a focused *untracked* file, keyed by
+    /// path; `None` in the value means the read failed. git has no patch for
+    /// an untracked file, so focusing one reads its bytes instead — lazily,
+    /// only for the file on screen, never for the whole list. Cleared when a
+    /// fresh snapshot lands, so an edit to the file shows up on the same
+    /// cadence a tracked file's does.
+    pub(crate) preview: Option<(String, Option<Arc<FileDiff>>)>,
+    pub(crate) preview_loading: Option<String>,
     pub(crate) scroll: gpui::ScrollHandle,
     /// The [`ScmData`](crate::terminal::git_data::ScmData) epoch this patch was
     /// read at, for the two sources that can go stale.
@@ -163,6 +176,8 @@ impl Tty7App {
             loading: false,
             expanded: HashMap::new(),
             focus,
+            preview: None,
+            preview_loading: None,
             scroll: gpui::ScrollHandle::new(),
             epoch: None,
         });
@@ -292,6 +307,9 @@ impl Tty7App {
                 Some(snap) => DiffLoad::Ready(Arc::clone(snap)),
                 None => DiffLoad::NotARepo,
             };
+            // A new snapshot restarts any untracked preview: the file may
+            // have changed with the tree, and the re-read costs one file.
+            overlay.preview = None;
             landed = true;
         }
         if landed {
@@ -346,10 +364,11 @@ impl Tty7App {
     }
 
     pub(crate) fn render_diff_overlay(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        self.spawn_untracked_preview_if_needed(cx);
         let overlay = self.tabs.get(self.active)?.diff_overlay.as_ref()?;
 
         let content = match &overlay.load {
@@ -360,6 +379,20 @@ impl Tty7App {
             }
             DiffLoad::Ready(snap) if empty_snapshot(snap) => {
                 self.diff_message(t(L10nKey::DiffWorkingTreeClean), cx)
+            }
+            // A focused *untracked* file has no patch in the snapshot; its
+            // card is synthesized from the file's own bytes — see `preview`.
+            DiffLoad::Ready(snap) if untracked_focus(snap, overlay.focus.as_deref()).is_some() => {
+                let path = untracked_focus(snap, overlay.focus.as_deref()).unwrap();
+                match &overlay.preview {
+                    Some((held, Some(file))) if held == path => {
+                        self.diff_preview_card(file.as_ref(), &overlay.scroll, cx)
+                    }
+                    Some((held, None)) if held == path => {
+                        self.diff_message(t(L10nKey::DiffReadFailed), cx)
+                    }
+                    _ => self.diff_message(t(L10nKey::DiffReading), cx),
+                }
             }
             DiffLoad::Ready(snap) => self.diff_file_list(
                 snap,
@@ -603,6 +636,106 @@ impl Tty7App {
                     })),
                 ),
             )
+    }
+
+    /// Dispatch the byte read behind an untracked file's preview, at most
+    /// once per (path, snapshot). Runs from `render`, so the guards are the
+    /// point: `preview` says the answer is in hand, `preview_loading` says it
+    /// is on the way.
+    fn spawn_untracked_preview_if_needed(&mut self, cx: &mut Context<Self>) {
+        let want = {
+            let overlay = self
+                .tabs
+                .get(self.active)
+                .and_then(|t| t.diff_overlay.as_ref());
+            match overlay {
+                Some(o) => match &o.load {
+                    DiffLoad::Ready(snap) => {
+                        untracked_focus(snap, o.focus.as_deref()).and_then(|path| {
+                            let seen = o.preview.as_ref().is_some_and(|(held, _)| held == path)
+                                || o.preview_loading.as_deref() == Some(path);
+                            (!seen).then(|| (o.host_id, snap.root.clone(), path.to_string()))
+                        })
+                    }
+                    _ => None,
+                },
+                None => None,
+            }
+        };
+        let Some((host_id, root, path)) = want else {
+            return;
+        };
+        let Some(host) = crate::ui::host_registry::HostRegistry::lookup(cx, host_id) else {
+            return;
+        };
+        let active = self.active;
+        if let Some(o) = self
+            .tabs
+            .get_mut(active)
+            .and_then(|t| t.diff_overlay.as_mut())
+        {
+            o.preview_loading = Some(path.clone());
+        }
+        let read_path = root.join(&path);
+        let key_path = path.clone();
+        crate::ui::host_ops::HostOps::run(
+            host,
+            cx,
+            move |h| {
+                h.read_file(&read_path, MAX_PREVIEW_BYTES)
+                    .ok()
+                    .map(|bytes| {
+                        Arc::new(git_diff::synthesize_added(
+                            &path,
+                            &bytes,
+                            &git_diff::DiffBudget::SINGLE_FILE,
+                        ))
+                    })
+            },
+            move |this, file, cx| {
+                let active = this.active;
+                let Some(o) = this
+                    .tabs
+                    .get_mut(active)
+                    .and_then(|t| t.diff_overlay.as_mut())
+                    .filter(|o| o.host_id == host_id)
+                else {
+                    return;
+                };
+                if o.preview_loading.as_deref() == Some(key_path.as_str()) {
+                    o.preview_loading = None;
+                }
+                o.preview = Some((key_path.clone(), file));
+                cx.notify();
+            },
+        );
+    }
+
+    /// The one synthesized card, in the same scroll shell the file list uses.
+    fn diff_preview_card(
+        &self,
+        file: &FileDiff,
+        scroll: &gpui::ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mode = view_mode(cx);
+        let list = v_flex()
+            .gap_3()
+            .p_4()
+            .w_full()
+            // `usize::MAX` keeps the element ids clear of the real list's.
+            .child(self.diff_file_card(usize::MAX, file, true, mode, cx));
+        crate::ui::scrollbar::with_vertical_scrollbar(
+            "diff-overlay-scrollbar",
+            div()
+                .id("diff-overlay-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(scroll)
+                .child(list),
+            scroll,
+        )
     }
 
     fn diff_message(&self, text: &'static str, cx: &Context<Self>) -> AnyElement {
@@ -1208,6 +1341,17 @@ fn focused_file(snap: &DiffSnapshot, overlay: &DiffOverlayState) -> Option<usize
     snap.files.iter().position(|f| f.path == path)
 }
 
+/// The focused path, when it is an *untracked* file — one the snapshot lists
+/// by name but holds no patch for. A path that is both (staged half tracked,
+/// say) prefers the real patch.
+fn untracked_focus<'a>(snap: &DiffSnapshot, focus: Option<&'a str>) -> Option<&'a str> {
+    let path = focus?;
+    if snap.files.iter().any(|f| f.path == path) {
+        return None;
+    }
+    snap.untracked.iter().any(|u| u == path).then_some(path)
+}
+
 fn focused_name(overlay: &DiffOverlayState) -> Option<String> {
     let DiffLoad::Ready(snap) = &overlay.load else {
         return None;
@@ -1738,6 +1882,23 @@ mod tests {
             40_000,
             "while the reported count stays the true total"
         );
+    }
+
+    #[test]
+    fn a_focused_untracked_file_asks_for_a_preview_not_the_list() {
+        let snap = DiffSnapshot {
+            files: vec![small_file("tracked.rs", 3)],
+            untracked: vec!["new.md".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(untracked_focus(&snap, Some("new.md")), Some("new.md"));
+        assert_eq!(
+            untracked_focus(&snap, Some("tracked.rs")),
+            None,
+            "a real patch wins over the name list"
+        );
+        assert_eq!(untracked_focus(&snap, Some("absent.rs")), None);
+        assert_eq!(untracked_focus(&snap, None), None);
     }
 
     #[test]
