@@ -705,10 +705,10 @@ impl Tty7App {
                     //
                     // Its counterpart spells the same two out for the same
                     // reason, and says so in a comment pointing back here.
-                    // They happen to be `right_panel`'s `PANEL_TEXT` and
-                    // `PANEL_TEXT_SECONDARY`; a move of that ramp has to be
-                    // carried into both rows by hand, and nothing but these
-                    // two comments says so.
+                    // They are the SCM panel's own 12/11px steps (the panel
+                    // has not moved onto the interface font scale yet); a move
+                    // of that ramp has to be carried into both rows by hand,
+                    // and nothing but these two comments says so.
                     .text_size(px(12.))
                     .font_family(mono.clone())
                     .text_color(if deco == DecoStatus::Deleted {

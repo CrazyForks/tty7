@@ -1,4 +1,4 @@
-use gpui::{AnyElement, Context, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Window, div, prelude::*, px, rems};
 use gpui_component::button::Button;
 use gpui_component::input::Input;
 use gpui_component::{
@@ -18,7 +18,33 @@ use crate::ui::scrollbar::with_vertical_scrollbar;
 pub(crate) const MIN_WIDTH: f32 = 216.;
 pub(crate) const MAX_WIDTH_RATIO: f32 = 0.5;
 
-const RESIZE_HANDLE_WIDTH: f32 = 8.;
+/// How wide a panel edge is to grab. Both edges a window can drag — the tab
+/// sidebar's and this panel's — are the same target, so they are one number.
+pub(crate) const RESIZE_HANDLE_WIDTH: f32 = 8.;
+
+/// The panel's type scale, in rems, on the same ladder as the rest of the
+/// window.
+///
+/// This panel used to carry its own run of pixel sizes — 12 for body, 11.5/11
+/// under it — which put its *primary* text at the size everything else uses
+/// for *secondary* text, so the panel read a step smaller than the sidebar
+/// beside it, and stayed that size when `ui_font_size` moved. In rems `TEXT`
+/// and `META` are exactly `text_sm()` and `text_xs()`; they are spelled out
+/// only because the mono variants have to be derived from them.
+///
+/// Mono sits a notch under the sans it pairs with: at an equal size its
+/// x-height and stems read a size larger, which turns a label and its value
+/// into two sizes instead of one line. The notch is a rem fraction rather than
+/// a fixed pixel, so the correction scales with the text it is correcting.
+const STEP: f32 = 1. / 16.;
+pub(crate) const TEXT: f32 = 14. * STEP;
+pub(crate) const TEXT_MONO: f32 = TEXT - STEP;
+pub(crate) const META: f32 = 12. * STEP;
+pub(crate) const META_MONO: f32 = META - STEP;
+
+/// Uppercase section headings. Deliberately below `META` — it matches the tab
+/// sidebar's group headings, which are the same thing one panel over.
+const HEADING: f32 = 11. * STEP;
 
 // The right panel's type ramp: four steps, half a point apart, that the Info
 // and Source Control tabs draw from so switching between them does not change
@@ -28,24 +54,9 @@ const RESIZE_HANDLE_WIDTH: f32 = 8.;
 // and the differences between them are meant to be felt as hierarchy rather
 // than seen as different type sizes.
 //
-/// Primary content: row text, values, names, empty-state prose.
-pub(crate) const PANEL_TEXT: f32 = 12.;
-/// The panel's own title heading. A half-step under the content beneath it, so
-/// it caps the panel without competing with it — the SEMIBOLD weight and the
-/// caps are what make it read as a title, not the size.
-pub(crate) const PANEL_TEXT_TITLE: f32 = 11.5;
-/// Secondary: directory paths, bylines, hints, counts. One notch below the
-/// content it hangs off, close enough to stay readable.
-pub(crate) const PANEL_TEXT_SECONDARY: f32 = 11.;
-/// The smallest step, for marks rather than prose: group headers (SEMIBOLD,
-/// uppercased), git status letters, and the mono tokens that sit in pills —
-/// pids, ports.
-pub(crate) const PANEL_TEXT_META: f32 = 10.5;
-
-/// gpui lays text out at its default `phi` line height, so one line of
-/// [`PANEL_TEXT`] measures `round(12 × 1.618) = 19px` before any padding. One
-/// pixel on each side is all the key/value rows need to stop touching: 21px.
-const ROW_PAD_Y: f32 = 1.;
+// (The px constants that used to live here — PANEL_TEXT and its steps — were
+// superseded by the interface font scale's rems tokens; the Source Control
+// panel still names its own px steps locally until it moves onto that scale.)
 
 /// Height of the search strip.
 ///
@@ -72,6 +83,60 @@ pub(crate) struct RightPanelState {
 }
 
 const PROCS_POLL: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Widest of the labels actually on screen, so the values line up without a
+/// fixed width guessing at them.
+///
+/// A hardcoded 46px fitted "cwd" and "shell" and nothing else: English
+/// "changes" wrapped mid-word to "change / s", and in Chinese and Japanese
+/// almost every label wrapped — ja "作業ディレクトリ" is eight glyphs. The
+/// clamp keeps the longest of those from eating the panel; anything past it
+/// runs into the gap rather than folding, which `whitespace_nowrap` on the
+/// label guarantees.
+fn info_label_column(
+    rows: &[(&'static str, String)],
+    window: &mut Window,
+    cx: &gpui::App,
+) -> gpui::Pixels {
+    // Shaping needs real pixels, so this is the one place the rem has to be
+    // resolved by hand. Both bounds were measured against a 12px label, so
+    // they are carried as multiples of it rather than as pixels — otherwise
+    // raising `ui_font_size` grows the labels into a clamp fitted to a
+    // smaller face, and every one of them wraps.
+    let label_px = TEXT * window.rem_size().as_f32();
+    let min = 46. / 12. * label_px;
+    let max = 108. / 12. * label_px;
+    let font = gpui::Font {
+        family: cx.theme().font_family.clone(),
+        features: Default::default(),
+        fallbacks: None,
+        weight: Default::default(),
+        style: Default::default(),
+    };
+    let widest = rows
+        .iter()
+        .map(|(k, _)| {
+            window
+                .text_system()
+                .shape_line(
+                    gpui::SharedString::from(*k),
+                    px(label_px),
+                    &[gpui::TextRun {
+                        len: k.len(),
+                        font: font.clone(),
+                        color: gpui::Hsla::default(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                )
+                .width
+                .as_f32()
+        })
+        .fold(min, f32::max);
+    px(widest.clamp(min, max).ceil())
+}
 
 impl Tty7App {
     pub(crate) fn right_panel_open(&self, _cx: &gpui::App) -> bool {
@@ -299,7 +364,7 @@ impl Tty7App {
                         // uppercased. It reads as a label rather than as
                         // content because of the weight and the caps.
                         div()
-                            .text_size(px(PANEL_TEXT_TITLE))
+                            .text_size(rems(META))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(cx.theme().secondary_foreground)
                             .child(text.to_uppercase()),
@@ -309,7 +374,7 @@ impl Tty7App {
                             // A count is a token hanging off the heading, not
                             // part of it: one step down, mono, regular weight.
                             div()
-                                .text_size(px(PANEL_TEXT_SECONDARY))
+                                .text_size(rems(META_MONO))
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .text_color(cx.theme().muted_foreground.opacity(0.75))
                                 .child(c),
@@ -389,15 +454,12 @@ impl Tty7App {
             .px(px(CONTENT_INSET))
             .py(px(4.))
             .gap(px(3.))
-            // The first line is the only thing in the panel when this renders,
-            // so it is content, not an aside: it stays on the primary step.
-            // The hint under it is the aside, and drops to secondary.
-            .text_size(px(PANEL_TEXT))
+            .text_size(rems(TEXT))
             .text_color(muted)
             .child(text.to_string())
             .children(hint.map(|h| {
                 div()
-                    .text_size(px(PANEL_TEXT_SECONDARY))
+                    .text_size(rems(META))
                     .text_color(muted.opacity(0.75))
                     .child(h.to_string())
             }))
@@ -407,7 +469,7 @@ impl Tty7App {
     fn render_panel_info(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let title = self.panel_title(t(L10nKey::PanelInfoTitle), None, None, window, cx);
         let mut rows: Vec<(&'static str, String)> = Vec::new();
-        let mut cwd_for_actions: Option<PathBuf> = None;
+        let mut cwd_for_actions: Option<(PathBuf, bool)> = None;
         let mut pane_id: Option<u64> = None;
         let mut forwards_pane: Option<u64> = None;
 
@@ -421,7 +483,9 @@ impl Tty7App {
                     .or_else(|| view.cwd())
                 {
                     rows.push((t(L10nKey::PanelCwd), compact_path(&cwd)));
-                    cwd_for_actions = Some(cwd);
+                    // Copy Path is right either way; Reveal only means anything
+                    // when the path is on the machine the file manager can see.
+                    cwd_for_actions = Some((cwd, view.local_cwd().is_some()));
                 }
                 let shell = match view.shell_spec().map(|s| s.program.clone()) {
                     Some(program) => crate::core::shells::default_shell_name(Some(&program)),
@@ -474,38 +538,60 @@ impl Tty7App {
         self.sync_procs(pane_id, route, cx);
 
         let mono = cx.theme().mono_font_family.clone();
+        let cwd_label = t(L10nKey::PanelCwd);
+        let label_w = info_label_column(&rows, window, cx);
         let mut list = v_flex().px(px(CONTENT_INSET)).py(px(2.)).gap(px(3.));
         for (k, v) in rows {
             list = list.child(
                 h_flex()
                     .items_baseline()
                     .gap(px(9.))
-                    .py(px(ROW_PAD_Y))
-                    .text_size(px(PANEL_TEXT))
+                    .py(px(1.))
+                    .text_size(rems(TEXT))
                     .child(
                         div()
                             .flex_none()
-                            .w(px(46.))
+                            .w(label_w)
+                            .whitespace_nowrap()
                             .text_color(cx.theme().muted_foreground)
                             .child(k),
                     )
-                    .child(
-                        div()
+                    .child(match k == cwd_label {
+                        // A path identifies a pane by its last segment, and
+                        // plain truncation eats exactly that: a deep checkout
+                        // read "/private/tmp/claude-501…" and told you
+                        // nothing. Let the head absorb the shrinking so the
+                        // leaf survives, the way a file manager shows a path.
+                        true => {
+                            let (head, leaf) = split_path_leaf(&v);
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(rems(TEXT_MONO))
+                                .font_family(mono.clone())
+                                .text_color(cx.theme().foreground)
+                                .child(div().min_w_0().flex_shrink(999.).truncate().child(head))
+                                .child(div().min_w_0().flex_shrink(1.).truncate().child(leaf))
+                                .into_any_element()
+                        }
+                        false => div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .text_size(rems(TEXT_MONO))
                             .font_family(mono.clone())
                             .text_color(cx.theme().foreground)
-                            .child(v),
-                    ),
+                            .child(v)
+                            .into_any_element(),
+                    }),
             );
         }
 
         let inner = v_flex()
             .child(self.panel_subtitle(t(L10nKey::PanelSessionSubtitle), false, None, cx))
             .child(list)
-            .when_some(cwd_for_actions, |this, cwd| {
-                this.child(self.cwd_actions(cwd, cx))
+            .when_some(cwd_for_actions, |this, (cwd, local)| {
+                this.child(self.cwd_actions(cwd, local, cx))
             })
             .children(self.procs_section(pane_id, cx))
             .children(self.ports_section(pane_id, cx))
@@ -514,27 +600,29 @@ impl Tty7App {
         self.panel_scroll(inner, title)
     }
 
-    fn cwd_actions(&self, cwd: PathBuf, cx: &mut Context<Self>) -> AnyElement {
+    fn cwd_actions(&self, cwd: PathBuf, local: bool, cx: &mut Context<Self>) -> AnyElement {
         let reveal_label = reveal_label();
         h_flex()
             .gap(px(2.))
             .px(px(tile_trailing_inset_sm()))
             .pt(px(6.))
-            .child(
-                crate::ui::tab_strip::chrome_tile_sized(
-                    Button::new("panel-info-reveal").icon(Icon::new(IconName::FolderOpen)),
-                    TILE_SIZE_SM,
-                    TILE_GLYPH_SM,
-                    false,
-                    cx,
+            .when(local, |this| {
+                this.child(
+                    crate::ui::tab_strip::chrome_tile_sized(
+                        Button::new("panel-info-reveal").icon(Icon::new(IconName::FolderOpen)),
+                        TILE_SIZE_SM,
+                        TILE_GLYPH_SM,
+                        false,
+                        cx,
+                    )
+                    .rounded_md()
+                    .tooltip(reveal_label)
+                    .on_click({
+                        let cwd = cwd.clone();
+                        move |_, _window, cx| cx.reveal_path(&cwd)
+                    }),
                 )
-                .rounded_md()
-                .tooltip(reveal_label)
-                .on_click({
-                    let cwd = cwd.clone();
-                    move |_, _window, cx| cx.reveal_path(&cwd)
-                }),
-            )
+            })
             .child(
                 crate::ui::tab_strip::chrome_tile_sized(
                     Button::new("panel-info-copy-path").icon(Icon::new(IconName::Copy)),
@@ -585,7 +673,7 @@ impl Tty7App {
                 // hierarchy, so it sits below it in the ramp too: the smallest
                 // step, carried by weight and caps rather than by size.
                 div()
-                    .text_size(px(PANEL_TEXT_META))
+                    .text_size(rems(HEADING))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(cx.theme().muted_foreground)
                     .child(text.to_uppercase()),
@@ -612,7 +700,7 @@ impl Tty7App {
                             .min_w_0()
                             .truncate()
                             .pl(px(f32::from(p.depth) * 10.))
-                            .text_size(px(PANEL_TEXT))
+                            .text_size(rems(TEXT_MONO))
                             .font_family(mono.clone())
                             .text_color(if p.foreground {
                                 cx.theme().foreground
@@ -660,7 +748,7 @@ impl Tty7App {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(PANEL_TEXT))
+                            .text_size(rems(TEXT_MONO))
                             .font_family(mono.clone())
                             .text_color(cx.theme().muted_foreground)
                             .child(p.name.clone()),
@@ -776,6 +864,16 @@ impl Tty7App {
             .into_any_element()
     }
 
+    /// The host label for whatever the Files panel is currently showing over
+    /// SFTP, for copy that has to name the machine it is about to change.
+    pub(crate) fn remote_files_host(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        self.remote_files_pane(window, cx).map(|(_, host)| host)
+    }
+
     fn remote_files_pane(
         &self,
         window: &mut Window,
@@ -814,7 +912,7 @@ pub(crate) fn git_badge(letter: &str, color: gpui::Hsla, mono: &gpui::SharedStri
         .flex_none()
         .w(px(BADGE_W))
         .text_center()
-        .text_size(px(PANEL_TEXT_META))
+        .text_size(rems(META_MONO))
         .font_family(mono.clone())
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(color)
@@ -842,7 +940,7 @@ pub(crate) fn info_chip(
         .py(px(1.5))
         .rounded(px(4.))
         .bg(bg)
-        .text_size(px(PANEL_TEXT_META))
+        .text_size(rems(META_MONO))
         .font_family(mono.clone())
         .text_color(fg)
         .child(text.to_string())
@@ -867,10 +965,51 @@ fn agent_status_label(status: crate::core::cli_agent::AgentStatus) -> &'static s
     }
 }
 
+/// Splits a path into everything-but-the-last-segment and the last segment,
+/// so a row can shrink the first and keep the second.
+fn split_path_leaf(s: &str) -> (String, String) {
+    match s.rfind('/') {
+        // Keep the separator with the head: "~/a/b/" + "c" rejoins exactly.
+        Some(i) if i + 1 < s.len() => (s[..=i].to_string(), s[i + 1..].to_string()),
+        _ => (String::new(), s.to_string()),
+    }
+}
+
 fn compact_path(path: &std::path::Path) -> String {
     let s = path.to_string_lossy().to_string();
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && s.starts_with(&home) => s.replacen(&home, "~", 1),
         _ => s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_path_leaf;
+
+    #[test]
+    fn the_head_and_leaf_rejoin_into_the_path_they_came_from() {
+        for p in [
+            "~/repo/tty7",
+            "/private/tmp/claude-501/a-very-long-directory/and-another-level",
+            "/",
+            "relative",
+            "",
+        ] {
+            let (head, leaf) = split_path_leaf(p);
+            assert_eq!(format!("{head}{leaf}"), p, "rejoining {p:?}");
+        }
+    }
+
+    #[test]
+    fn the_leaf_is_the_segment_that_names_the_directory() {
+        let (head, leaf) = split_path_leaf("/a/b/c");
+        assert_eq!((head.as_str(), leaf.as_str()), ("/a/b/", "c"));
+        // A trailing slash has no leaf to keep, so the whole thing is head.
+        let (head, leaf) = split_path_leaf("/a/b/");
+        assert_eq!((head.as_str(), leaf.as_str()), ("", "/a/b/"));
+        // Root is one segment with nothing before it.
+        let (head, leaf) = split_path_leaf("/");
+        assert_eq!((head.as_str(), leaf.as_str()), ("", "/"));
     }
 }

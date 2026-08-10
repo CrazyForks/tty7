@@ -205,11 +205,29 @@ impl HostOps {
         window.push_notification(
             t_fmt(
                 L10nKey::HostOpsError,
-                &[("context", context), ("error", &err.to_string())],
+                &[("context", context), ("error", &explain_io(err))],
             ),
             cx,
         );
     }
+}
+
+/// A sentence for the failures someone can act on, and the raw error for the
+/// rest. `Display` on an `io::Error` answers "what happened" for a developer
+/// reading a log; it does not answer "what now" for the person who just lost
+/// a save, and "Permission denied (os error 13)" is the shape of that gap.
+pub fn explain_io(err: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    let key = match err.kind() {
+        ErrorKind::PermissionDenied => L10nKey::IoDenied,
+        ErrorKind::NotFound => L10nKey::IoGone,
+        ErrorKind::StorageFull => L10nKey::IoNoSpace,
+        ErrorKind::ReadOnlyFilesystem => L10nKey::IoReadOnly,
+        ErrorKind::ResourceBusy => L10nKey::IoBusy,
+        ErrorKind::TimedOut => L10nKey::IoTimedOut,
+        _ => return err.to_string(),
+    };
+    crate::ui::i18n::t(key).to_string()
 }
 
 pub struct InFlight<K: Eq + Hash + Clone> {
@@ -330,6 +348,31 @@ impl<K: Eq + Hash, V> ByHost<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_failures_people_can_act_on_get_a_sentence() {
+        use std::io::{Error, ErrorKind};
+        crate::ui::i18n::set_locale("en");
+
+        // The kinds that change what you would do next.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::StorageFull,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::NotFound,
+        ] {
+            let text = explain_io(&Error::new(kind, "os error 13"));
+            assert!(!text.contains("os error"), "{kind:?}: {text}");
+            assert!(text.ends_with('.'), "{kind:?}: {text}");
+        }
+
+        // Anything unclassified keeps its detail rather than losing it to a
+        // vague house sentence.
+        assert_eq!(
+            explain_io(&Error::other("the widget frobnicated")),
+            "the widget frobnicated"
+        );
+    }
     use std::path::{Path, PathBuf};
 
     #[test]

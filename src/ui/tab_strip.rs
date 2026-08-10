@@ -9,11 +9,13 @@ use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, Po
 use gpui_component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
 use std::cell::RefCell;
 use std::rc::Rc;
+use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::core::actions::{
-    OpenSettings, SelectWorkspace1, SelectWorkspace2, SelectWorkspace3, SelectWorkspace4,
-    SelectWorkspace5, SelectWorkspace6, SelectWorkspace7, SelectWorkspace8, SelectWorkspace9,
-    TogglePalette,
+    CloseActiveTab, CloseOtherTabs, CloseTabsToTheRight, CopyAgentSessionId, CopyWorkingDirectory,
+    ForkAgentSession, MarkTabUnread, NewWorktreeTab, OpenSettings, RenameTab, SelectWorkspace1,
+    SelectWorkspace2, SelectWorkspace3, SelectWorkspace4, SelectWorkspace5, SelectWorkspace6,
+    SelectWorkspace7, SelectWorkspace8, SelectWorkspace9, SplitDown, SplitRight, TogglePalette,
 };
 use crate::core::config::RightPanelTab;
 use crate::core::shells::DetectedShell;
@@ -23,7 +25,11 @@ use crate::ui::hints::tab_badge_label;
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::reorder::{self, Reorder, Surface};
 
-pub(crate) const REORDER_SLIDE_MS: u64 = 140;
+/// One duration and one curve for every transition the app runs, so a fade and
+/// a slide read as the same hand. Long enough to be seen as movement, short
+/// enough that nobody waits on it.
+pub(crate) const TRANSITION_MS: u64 = 140;
+pub(crate) const REORDER_SLIDE_MS: u64 = TRANSITION_MS;
 const CHIP_GAP: f32 = 6.;
 
 pub(crate) const GRAB_HANDLE_W: f32 = 80.;
@@ -38,6 +44,16 @@ fn shell_spec(shell: &DetectedShell) -> ShellSpec {
         program: shell.program.clone(),
         args: shell.args.clone(),
         args_are_tty7_defaults: shell.args_are_tty7_defaults,
+    }
+}
+
+/// Strips a `user@host:` prefix a shell put in front of its title, leaving
+/// the path (or command) it actually names. A bare `host:` with no user is
+/// left alone — that is a drive letter on Windows.
+pub(crate) fn strip_host_prefix(raw: &str) -> &str {
+    match raw.split_once(':') {
+        Some((head, tail)) if head.contains('@') => tail,
+        _ => raw,
     }
 }
 
@@ -63,15 +79,24 @@ pub(crate) fn abbreviate_home(path: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The separator a path spells itself with. A path carrying a single `\` is
+/// a Windows path and has to be put back together with `\`: rejoining it with
+/// `/` would make one tab spell its location two ways, `C:\Users\dev\app`
+/// while it fits and `C:/…/app` once it has to be elided.
+fn path_separator(path: &str) -> char {
+    if path.contains('\\') { '\\' } else { '/' }
+}
+
+fn join_segments(segments: &[&str], sep: char) -> String {
+    segments.join(sep.encode_utf8(&mut [0u8; 4]) as &str)
+}
+
 pub(crate) fn short_title(raw: &str) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
         return String::new();
     }
-    let after_host = match raw.split_once(':') {
-        Some((head, tail)) if head.contains('@') => tail,
-        _ => raw,
-    };
+    let after_host = strip_host_prefix(raw);
     let after_host = after_host.trim();
     if after_host.is_empty() {
         return String::new();
@@ -94,7 +119,9 @@ pub(crate) fn short_title(raw: &str) -> String {
         (Kind::Relative, path)
     };
 
-    let segments: Vec<&str> = body.split('/').filter(|s| !s.is_empty()).collect();
+    // Both separators: Windows shells report `C:\Users\…` while git and the
+    // terminal integration use `/`, and a path must be cut on either one.
+    let segments: Vec<&str> = body.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
     if segments.is_empty() {
         return match kind {
             Kind::Home => "~",
@@ -104,21 +131,297 @@ pub(crate) fn short_title(raw: &str) -> String {
         .to_string();
     }
 
+    let sep = path_separator(path);
     let depth = segments.len() + usize::from(matches!(kind, Kind::Home));
     let mut label = if depth > KEEP_SEGMENTS {
         let tail = &segments[segments.len() - KEEP_SEGMENTS..];
-        format!("…/{}", tail.join("/"))
+        format!("…{sep}{}", join_segments(tail, sep))
     } else {
         match kind {
-            Kind::Home => format!("~/{}", segments.join("/")),
-            Kind::Absolute => format!("/{}", segments.join("/")),
-            Kind::Relative => segments.join("/"),
+            Kind::Home => format!("~{sep}{}", join_segments(&segments, sep)),
+            Kind::Absolute => format!("/{}", join_segments(&segments, sep)),
+            Kind::Relative => join_segments(&segments, sep),
         }
     };
-    if label.chars().count() > 40 {
-        label = format!("{}…", label.chars().take(40).collect::<String>());
+    // Clamped on cluster boundaries, or a label ending in an emoji comes back
+    // holding half of one.
+    let cells = clusters(&label);
+    if cells.len() > 40 {
+        label = format!("{}…", cells[..40].concat());
     }
     label
+}
+
+/// Width of `text` shaped in `font` at `size`, in pixels.
+///
+/// The window's text system caches shaped runs, so measuring the same labels
+/// across frames is cheap. The sidebar elides against real glyph widths
+/// instead of guessing at character counts — that is the only way a mixed
+/// CJK/Latin label can be squeezed without tearing mid-token.
+pub(crate) fn measure_text(
+    text_system: &gpui::WindowTextSystem,
+    font: &gpui::Font,
+    size: f32,
+    text: &str,
+) -> f32 {
+    text_system
+        .shape_line(
+            SharedString::from(text),
+            px(size),
+            &[gpui::TextRun {
+                len: text.len(),
+                font: font.clone(),
+                color: gpui::Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        )
+        .width
+        .as_f32()
+}
+
+/// Elides a path from the front when it cannot fit `max_width`, keeping the
+/// root marker (drive letter, `~`, or the leading slash) and every trailing
+/// segment that fits.
+///
+/// The tail is what a user identifies a tab by — the file or directory they
+/// are actually working on — so it is never torn: whole segments drop off the
+/// front first (a half-eaten directory name reads as noise), and when even
+/// the last segment is too wide, only that segment is elided character by
+/// character, still tail-first.
+pub(crate) fn elide_path_keep_tail(
+    text_system: &gpui::WindowTextSystem,
+    font: &gpui::Font,
+    size: f32,
+    path: &str,
+    max_width: f32,
+) -> SharedString {
+    let path = path.trim();
+    if path.is_empty() || measure_text(text_system, font, size, path) <= max_width {
+        return SharedString::from(path);
+    }
+    let sep = path_separator(path);
+    let segments: Vec<&str> = path.split(['/', '\\']).collect();
+    // A leading slash splits into an empty first segment; `~` and drive
+    // letters (`E:`) carry the same "where this tree lives" weight, and a
+    // leading `…` means `short_title` already elided once — that marker is
+    // replaced by the new elision instead of stacking two ellipses. Keep
+    // whichever marker there is so the result never reads as a bare
+    // relative path.
+    let root: &str = match segments.first() {
+        Some(&"") => "/",
+        Some(&"~") => "~",
+        Some(&"…") => "",
+        Some(head) if head.ends_with(':') => head,
+        _ => "",
+    };
+    let root_kept = segments
+        .first()
+        .is_some_and(|s| s.is_empty() || *s == "~" || *s == "…" || s.ends_with(':'));
+    let prefix = if root.is_empty() {
+        format!("…{sep}")
+    } else if root == "/" {
+        // The absolute-path root is already the slash itself.
+        format!("/…{sep}")
+    } else {
+        format!("{root}{sep}…{sep}")
+    };
+    // Drop whole segments from the front until the remaining tail fits. The
+    // width only shrinks as segments leave, so the first fit is the widest
+    // one — greedy is optimal here.
+    //
+    // With a root marker, `head = 1` would spell the root, the ellipsis, and
+    // then every remaining segment — strictly wider than the original that
+    // already failed to fit — so that candidate is skipped rather than
+    // measured.
+    let mut head = if root_kept { 2 } else { 0 };
+    while head < segments.len() {
+        let candidate = if head == 0 {
+            join_segments(&segments, sep)
+        } else {
+            format!("{prefix}{}", join_segments(&segments[head..], sep))
+        };
+        if measure_text(text_system, font, size, &candidate) <= max_width {
+            return SharedString::from(candidate);
+        }
+        if head + 1 >= segments.len() {
+            break;
+        }
+        head += 1;
+    }
+    // Even the last segment alone is too wide: keep its tail after the
+    // ellipsis, with no slash so the reader sees the segment was torn.
+    elide_tail_clusters(
+        text_system,
+        font,
+        size,
+        segments[segments.len() - 1],
+        max_width,
+    )
+}
+
+/// Characters a token is allowed to break on. Space is in the set because
+/// this also elides labels a human typed — `Backend server logs` — not just
+/// branch names, and a word boundary is the cut a reader forgives.
+const TOKEN_BREAKS: [char; 5] = ['-', '_', '/', '.', ' '];
+
+/// Splits `text` into grapheme clusters — what a reader counts as one
+/// character, and the only place a label may be cut.
+///
+/// Slicing by `char` passes every width check and still tears the result:
+/// `👨‍👩‍👧` loses the joiner holding it together, `❤️` loses the variation
+/// selector that makes it an emoji (and the orphan then attaches itself to the
+/// ellipsis), and `🇨🇳` leaves behind a lone regional indicator that renders
+/// as a bare letter.
+fn clusters(text: &str) -> Vec<&str> {
+    text.graphemes(true).collect()
+}
+
+/// The head this token would rather keep: six clusters, extended to just past
+/// the next break so the cut lands on a boundary (`window-…` rather than
+/// `window…`). When no break is within reach the plain six is kept — running
+/// on to the cap would spend the whole budget on a prefix and leave the tail,
+/// which is what identifies the token, with nothing.
+fn preferred_head(clusters: &[&str]) -> usize {
+    let base = clusters.len().min(6);
+    let cap = clusters.len().min(12);
+    if base >= cap {
+        return base;
+    }
+    match clusters[base..cap]
+        .iter()
+        .position(|c| c.chars().next().is_some_and(|c| TOKEN_BREAKS.contains(&c)))
+    {
+        Some(offset) => base + offset + 1,
+        None => base,
+    }
+}
+
+/// Elides the middle of a single token (a branch name, a shell name, a label
+/// the user typed) so both its head and its identifying tail survive:
+/// `window-transparency-backdrop` reads `window-…backdrop` in a narrow
+/// sidebar instead of losing its tail to a trailing ellipsis.
+///
+/// A head that fits but leaves no room for a tail is worse than no head at
+/// all, so the preferred head is given up for a shorter one when that is what
+/// it takes to keep a few trailing clusters; only when even a three-cluster
+/// head cannot buy a tail does this fall back to a tail-only elision.
+pub(crate) fn elide_keep_edges(
+    text_system: &gpui::WindowTextSystem,
+    font: &gpui::Font,
+    size: f32,
+    text: &str,
+    max_width: f32,
+) -> SharedString {
+    let text = text.trim();
+    if text.is_empty() || measure_text(text_system, font, size, text) <= max_width {
+        return SharedString::from(text);
+    }
+    let cells = clusters(text);
+    let shaped = |head_n: usize, tail_n: usize| -> f32 {
+        let mut s = cells[..head_n].concat();
+        s.push('…');
+        s.push_str(&cells[cells.len() - tail_n..].concat());
+        measure_text(text_system, font, size, &s)
+    };
+    // Width is monotone in the tail length, so a binary search finds the
+    // longest tail that still fits behind a given head.
+    let longest_tail = |head_n: usize| -> usize {
+        let (mut lo, mut hi) = (0usize, cells.len() - head_n);
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if shaped(head_n, mid) <= max_width {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    };
+    /// Enough trailing clusters to tell two sibling branches apart.
+    const MIN_TAIL: usize = 3;
+    let preferred = preferred_head(&cells);
+    let mut candidates = vec![preferred, 6, 3];
+    candidates.retain(|&h| h > 0 && h <= cells.len());
+    candidates.dedup();
+    let mut best: Option<(usize, usize)> = None;
+    for head_n in candidates {
+        if shaped(head_n, 0) > max_width {
+            continue;
+        }
+        let tail = longest_tail(head_n);
+        if tail >= MIN_TAIL.min(cells.len() - head_n) {
+            best = Some((head_n, tail));
+            break;
+        }
+        if best.is_none_or(|(_, best_tail)| tail > best_tail) {
+            best = Some((head_n, tail));
+        }
+    }
+    let Some((head, tail)) = best.filter(|&(_, tail)| tail > 0) else {
+        // No head buys a tail worth showing; a bare tail says more.
+        return elide_tail_clusters(text_system, font, size, text, max_width);
+    };
+    let mut out = cells[..head].concat();
+    out.push('…');
+    out.push_str(&cells[cells.len() - tail..].concat());
+    SharedString::from(out)
+}
+
+/// Elides a row label. A path keeps its tail — the file or directory being
+/// worked on — while anything else keeps both edges.
+///
+/// A shell title is not always a path: `npm run dev`, `man git-log`, or a name
+/// the user typed into the rename box. Running those through the path rule
+/// drops their head, which is the part that names them, and `… server logs`
+/// says less than the CSS truncation this replaced.
+pub(crate) fn elide_label(
+    text_system: &gpui::WindowTextSystem,
+    font: &gpui::Font,
+    size: f32,
+    text: &str,
+    max_width: f32,
+) -> SharedString {
+    if text.contains('/') || text.contains('\\') {
+        elide_path_keep_tail(text_system, font, size, text, max_width)
+    } else {
+        elide_keep_edges(text_system, font, size, text, max_width)
+    }
+}
+
+/// Keeps the longest tail of `text` that fits after a bare ellipsis. Shared
+/// by the path and token elisions as their last resort.
+fn elide_tail_clusters(
+    text_system: &gpui::WindowTextSystem,
+    font: &gpui::Font,
+    size: f32,
+    text: &str,
+    max_width: f32,
+) -> SharedString {
+    let budget = max_width - measure_text(text_system, font, size, "…");
+    if budget <= 0. {
+        return SharedString::from("…");
+    }
+    let cells = clusters(text);
+    let (mut lo, mut hi) = (0usize, cells.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let s = cells[cells.len() - mid..].concat();
+        if measure_text(text_system, font, size, &s) <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if lo == 0 {
+        return SharedString::from("…");
+    }
+    let mut out = String::with_capacity(1 + text.len());
+    out.push('…');
+    out.push_str(&cells[cells.len() - lo..].concat());
+    SharedString::from(out)
 }
 
 #[derive(Clone)]
@@ -130,13 +433,13 @@ impl Render for DragTab {
     }
 }
 
-/// Says what the workspace head does, with its shortcut. The name alone was
-/// redundant — it is already the button's label.
-fn switcher_hint(cx: &gpui::App) -> String {
-    let what = t(L10nKey::HomeSwitchWorkspace);
-    match crate::ui::home::key_hint("ToggleSwitcher", cx) {
-        Some(keys) => format!("{what}  {keys}"),
-        None => what.to_string(),
+/// What a chrome tile says on hover: what it does, then the chord that does it.
+/// The tile's own name is no use as a tooltip — the workspace head already
+/// wears it as its label.
+pub(crate) fn chord_hint(what: &str, action: &str, cx: &gpui::App) -> SharedString {
+    match crate::ui::home::key_hint(action, cx) {
+        Some(keys) => SharedString::from(format!("{what}  {keys}")),
+        None => SharedString::from(what.to_string()),
     }
 }
 
@@ -152,11 +455,46 @@ pub(crate) fn chrome_tile_variant_for(selected: bool, cx: &gpui::App) -> ButtonC
         } else {
             cx.theme().sidebar_foreground
         })
-        .hover(cx.theme().sidebar_accent)
+        // `sidebar_accent` is the surface's *selected* step, and it was handed
+        // to hover as well — so a hovered tile wore the fill of a selected one
+        // and, with the right panel open, two tiles read as current at once.
+        // Hover takes the step the palette derives for it. (A selected button
+        // never renders the hover style, so this only reaches the rest.)
+        .hover(gpui::rgb(cx.global::<crate::ui::presets::Surfaces>().sidebar.hover).into())
         .active(cx.theme().sidebar_accent)
 }
 
 pub(crate) const BUTTON_ICON_SCALE: f32 = 0.75;
+
+/// WCAG 2.2 SC 2.5.8 puts the desktop floor for a pointer target at 24×24, and
+/// gpui-component renders an icon-only `.xsmall()` button as a 20×20 box (18×18
+/// where the chrome overrode it). Grow only the box: the glyph keeps its size,
+/// so the chrome looks unchanged and simply stops being fiddly to hit.
+pub(crate) const MIN_TARGET: f32 = 24.;
+
+pub(crate) fn hit_target(button: Button) -> Button {
+    button.w(px(MIN_TARGET)).h(px(MIN_TARGET))
+}
+
+/// The narrowest a chip gets: its `min_w`, which flex-shrink cannot go under.
+const CHIP_MIN_W: f32 = 100.;
+
+/// The run of chips to draw when they cannot all fit.
+///
+/// The row clips what overflows, so past a certain tab count the chips at the
+/// end simply were not drawn — including, right after ⌘T, the tab that was
+/// just opened and made active. Slide the run instead: keep it anchored at the
+/// first tab until the active one would fall off the right edge, then move it
+/// by as little as it takes to hold the active chip.
+fn visible_chips(order: &[usize], active: usize, avail: f32) -> Vec<usize> {
+    let fits = ((avail / (CHIP_MIN_W + CHIP_GAP)).floor() as usize).max(1);
+    if order.len() <= fits {
+        return order.to_vec();
+    }
+    let at = order.iter().position(|&i| i == active).unwrap_or(0);
+    let start = at.saturating_sub(fits - 1).min(order.len() - fits);
+    order[start..start + fits].to_vec()
+}
 
 pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> Button {
     chrome_tile_sized(button, TILE_SIZE, TILE_GLYPH, selected, cx)
@@ -175,6 +513,19 @@ pub(crate) fn chrome_tile_sized(
         .with_size(px(glyph / BUTTON_ICON_SCALE))
         .w(px(tile))
         .h(px(tile))
+}
+
+/// The words behind the status dot's colour.
+pub(crate) fn agent_status_label(
+    status: Option<crate::core::cli_agent::AgentStatus>,
+) -> Option<&'static str> {
+    use crate::core::cli_agent::AgentStatus;
+    match status? {
+        AgentStatus::Idle => None,
+        AgentStatus::Working => Some(t(L10nKey::AgentStatusWorking)),
+        AgentStatus::Waiting => Some(t(L10nKey::AgentStatusWaiting)),
+        AgentStatus::Done => Some(t(L10nKey::AgentStatusDone)),
+    }
 }
 
 pub(crate) const LIVE_DOT: u32 = 0x22C55E;
@@ -217,7 +568,7 @@ pub(crate) fn workspace_avatar(
                 .child(initial)
                 .when(!current, |disc| disc.opacity(0.55)),
         )
-        .children(dot.map(|rgb| Tty7App::status_dot(rgb, 0, size, cx.theme().popover)))
+        .children(dot.map(|rgb| Tty7App::status_dot(rgb, 0, size, cx.theme().popover, false)))
 }
 
 pub(crate) fn select_workspace_action(index: usize) -> Option<Box<dyn gpui::Action>> {
@@ -315,7 +666,11 @@ impl Tty7App {
                     .w_full()
                     .h(px(30.))
                     .rounded_md()
-                    .tooltip(SharedString::from(switcher_hint(cx)))
+                    .tooltip(chord_hint(
+                        t(L10nKey::HomeSwitchWorkspace),
+                        "ToggleSwitcher",
+                        cx,
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_switcher(window, cx);
                     })),
@@ -375,11 +730,14 @@ impl Tty7App {
                         cx,
                     )
                     .rounded_lg()
-                    .tooltip(if panel_open {
-                        t(L10nKey::TabTooltipHideDetailPanel)
-                    } else {
-                        t(L10nKey::TabTooltipShowDetailPanel)
-                    })
+                    .tooltip(chord_hint(
+                        match panel_open {
+                            true => t(L10nKey::TabTooltipHideDetailPanel),
+                            false => t(L10nKey::TabTooltipShowDetailPanel),
+                        },
+                        "ToggleRightPanel",
+                        cx,
+                    ))
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.toggle_right_panel(cx);
                     })),
@@ -445,7 +803,17 @@ impl Tty7App {
         .collect()
     }
 
-    fn status_dot(rgb: u32, unread: usize, size: f32, ring: gpui::Hsla) -> gpui::AnyElement {
+    /// Working and Done differ only in hue (blue vs green), and Waiting vs Done
+    /// — the pair that actually decides whether you go and look — is amber vs
+    /// green, the pair red-green colour vision separates worst. Give Waiting a
+    /// hole so it is a different *shape*, not just a different colour.
+    fn status_dot(
+        rgb: u32,
+        unread: usize,
+        size: f32,
+        ring: gpui::Hsla,
+        hollow: bool,
+    ) -> gpui::AnyElement {
         let d = (size * 0.42).max(7.);
         let bg = ring;
         if unread > 0 {
@@ -478,12 +846,19 @@ impl Tty7App {
                 .border_2()
                 .border_color(bg)
                 .bg(gpui::rgb(rgb))
+                .when(hollow, |dot| {
+                    dot.flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().size(px((d * 0.36).max(2.5))).rounded_full().bg(bg))
+                })
                 .into_any_element()
         }
     }
 
     pub(crate) fn tab_avatar(
         &self,
+        id: impl Into<gpui::ElementId>,
         agent: Option<crate::core::cli_agent::CLIAgent>,
         status: Option<crate::core::cli_agent::AgentStatus>,
         unread: usize,
@@ -492,6 +867,7 @@ impl Tty7App {
         cx: &App,
     ) -> gpui::AnyElement {
         let base = div()
+            .id(id)
             .flex_shrink_0()
             .size(px(size))
             .flex()
@@ -499,12 +875,26 @@ impl Tty7App {
             .justify_center();
         match agent {
             Some(agent) => {
+                let hollow = status == Some(crate::core::cli_agent::AgentStatus::Waiting);
                 let dot = status
                     .and_then(|s| s.dot_rgb())
-                    .map(|rgb| Self::status_dot(rgb, unread, size, cx.theme().background));
+                    .map(|rgb| Self::status_dot(rgb, unread, size, cx.theme().background, hollow));
+                // Which agent this is, and what it wants, were carried entirely
+                // by a brand hue and a nine-pixel dot. Say it in words too.
+                let tip = match agent_status_label(status) {
+                    Some(state) => format!("{} — {state}", agent.display_name()),
+                    None => agent.display_name().to_string(),
+                };
                 base.relative()
                     .rounded_full()
                     .bg(gpui::rgb(agent.accent_rgb()))
+                    // Codex and Grok are both pure black, which is the window
+                    // fill on a dark theme — the disc dissolves and leaves the
+                    // glyph floating. A hairline keeps it a disc in any theme.
+                    .when(
+                        crate::ui::presets::needs_edge(agent.accent_rgb(), cx.theme().background),
+                        |d| d.border_1().border_color(cx.theme().border),
+                    )
                     .child(
                         gpui::svg()
                             .path(agent.icon_path())
@@ -512,6 +902,9 @@ impl Tty7App {
                             .text_color(gpui::white()),
                     )
                     .when_some(dot, |b, dot| b.child(dot))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                    })
                     .into_any_element()
             }
             None => base
@@ -525,10 +918,35 @@ impl Tty7App {
                         .text_color(cx.theme().foreground.opacity(0.65)),
                 )
                 .when_some(ssh, |b, rgb| {
-                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background))
+                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background, false))
                 })
                 .into_any_element(),
         }
+    }
+
+    /// The full title behind a shortened one, for the row to name on hover.
+    ///
+    /// `tab_label` hands back a path elided to its last three segments and then
+    /// capped, and the chip truncates whatever is left over — so a tab could
+    /// read `…/a/b/c` with no way to find out which `a` that was. `None` when
+    /// nothing was dropped, so tabs that already show their whole name stay
+    /// quiet under the pointer.
+    pub(crate) fn tab_title_tooltip(
+        &self,
+        tab: &Tab,
+        index: usize,
+        window: Option<&Window>,
+        cx: &App,
+    ) -> Option<SharedString> {
+        if tab.name.as_ref().is_some_and(|n| !n.trim().is_empty()) {
+            return None;
+        }
+        let raw = tab.leaf_title(window, cx);
+        let raw = raw.trim();
+        if raw.is_empty() || raw == self.tab_label(tab, index, window, cx) {
+            return None;
+        }
+        Some(SharedString::from(abbreviate_home(raw).into_owned()))
     }
 
     pub(crate) fn tab_label(
@@ -564,6 +982,10 @@ impl Tty7App {
         let shells = self.shells.shells.clone();
         let default_name = self.default_shell_label(cx);
         let app = cx.entity().downgrade();
+        // Every other tile in this row names itself on hover — Switch
+        // Workspace, More, Hide Sidebar. The three New Tab buttons that come
+        // through here were the ones left silent.
+        let button = button.tooltip(chord_hint(t(L10nKey::AppMenuNewTab), "NewTab", cx));
         button.dropdown_menu(move |menu, _window, _cx| {
             let mut menu = menu.min_w(px(220.));
             for shell in &shells {
@@ -626,12 +1048,22 @@ impl Tty7App {
         let has_cwd = cwd.is_some();
         let mut menu = menu.min_w(px(200.));
 
-        menu = menu.item(PopupMenuItem::new(t(L10nKey::AppMenuRenameTab)).on_click({
-            let app = app.clone();
-            move |_, window, cx| {
-                let _ = app.update(cx, |this, cx| this.start_rename(index, window, cx));
-            }
-        }));
+        // Every item here acts on *this* tab, so the work is done by the click
+        // handler and the action is carried only so `PopupMenu` can look its
+        // chord up and print it. The handler wins when both are set. Without
+        // this the tab menu was the one context menu in the app that taught no
+        // shortcuts — right-clicking a pane offered "Split Right ⌘D" while
+        // right-clicking its tab offered a bare "Split Right".
+        menu = menu.item(
+            PopupMenuItem::new(t(L10nKey::AppMenuRenameTab))
+                .action(Box::new(RenameTab))
+                .on_click({
+                    let app = app.clone();
+                    move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| this.start_rename(index, window, cx));
+                    }
+                }),
+        );
 
         let tab = this.tabs.get(index);
         if tab.is_some_and(|t| t.agent(cx).is_some()) {
@@ -639,6 +1071,7 @@ impl Tty7App {
                 == Some(crate::core::cli_agent::AgentStatus::Done);
             menu = menu.item(
                 PopupMenuItem::new(t(L10nKey::TabContextMarkUnread))
+                    .action(Box::new(MarkTabUnread))
                     .disabled(!done)
                     .on_click({
                         let app = app.clone();
@@ -652,12 +1085,15 @@ impl Tty7App {
         let in_repo = this.tab_is_in_repo(index, window, cx);
         if in_repo {
             menu = menu.separator().item(
-                PopupMenuItem::new(t(L10nKey::AppMenuNewWorktreeTab)).on_click({
-                    let app = app.clone();
-                    move |_, window, cx| {
-                        let _ = app.update(cx, |this, cx| this.new_worktree_tab(index, window, cx));
-                    }
-                }),
+                PopupMenuItem::new(t(L10nKey::AppMenuNewWorktreeTab))
+                    .action(Box::new(NewWorktreeTab))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ =
+                                app.update(cx, |this, cx| this.new_worktree_tab(index, window, cx));
+                        }
+                    }),
             );
         }
 
@@ -669,47 +1105,61 @@ impl Tty7App {
                 menu = menu.separator();
             }
             let forkable = session.forkable();
-            menu = menu.item(PopupMenuItem::new(label).disabled(!forkable).on_click({
-                let app = app.clone();
-                let source = source.clone();
-                move |_, window, cx| {
-                    let source = source.clone();
-                    let _ = app.update(cx, |this, cx| {
-                        this.fork_agent_session(
-                            index,
-                            source,
-                            crate::ui::app::ForkPlacement::NewTab,
-                            window,
-                            cx,
-                        )
-                    });
-                }
-            }));
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .action(Box::new(ForkAgentSession))
+                    .disabled(!forkable)
+                    .on_click({
+                        let app = app.clone();
+                        let source = source.clone();
+                        move |_, window, cx| {
+                            let source = source.clone();
+                            let _ = app.update(cx, |this, cx| {
+                                this.fork_agent_session(
+                                    index,
+                                    source,
+                                    crate::ui::app::ForkPlacement::NewTab,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                    }),
+            );
         }
 
         menu = menu
             .separator()
-            .item(PopupMenuItem::new(t(L10nKey::AppMenuSplitRight)).on_click({
-                let app = app.clone();
-                move |_, window, cx| {
-                    let _ = app.update(cx, |this, cx| {
-                        this.activate(index, window, cx);
-                        this.split(Axis::Horizontal, window, cx);
-                    });
-                }
-            }))
-            .item(PopupMenuItem::new(t(L10nKey::AppMenuSplitDown)).on_click({
-                let app = app.clone();
-                move |_, window, cx| {
-                    let _ = app.update(cx, |this, cx| {
-                        this.activate(index, window, cx);
-                        this.split(Axis::Vertical, window, cx);
-                    });
-                }
-            }));
+            .item(
+                PopupMenuItem::new(t(L10nKey::AppMenuSplitRight))
+                    .action(Box::new(SplitRight))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.activate(index, window, cx);
+                                this.split(Axis::Horizontal, window, cx);
+                            });
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(t(L10nKey::AppMenuSplitDown))
+                    .action(Box::new(SplitDown))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.activate(index, window, cx);
+                                this.split(Axis::Vertical, window, cx);
+                            });
+                        }
+                    }),
+            );
 
         menu = menu.separator().item(
             PopupMenuItem::new(t(L10nKey::AppMenuCopyWorkingDirectory))
+                .action(Box::new(CopyWorkingDirectory))
                 .disabled(!has_cwd)
                 .on_click(move |_, _window, cx| {
                     if let Some(cwd) = cwd.as_ref() {
@@ -723,6 +1173,7 @@ impl Tty7App {
         if let Some(session_id) = agent_session.map(|(_, s)| s.session_id) {
             menu = menu.item(
                 PopupMenuItem::new(t(L10nKey::AppMenuCopySessionId))
+                    .action(Box::new(CopyAgentSessionId))
                     .disabled(session_id.is_none())
                     .on_click(move |_, _window, cx| {
                         if let Some(id) = session_id.as_ref() {
@@ -734,15 +1185,18 @@ impl Tty7App {
 
         menu.separator()
             .item(
-                PopupMenuItem::new(t(L10nKey::TabContextCloseTab)).on_click({
-                    let app = app.clone();
-                    move |_, window, cx| {
-                        let _ = app.update(cx, |this, cx| this.close_tab(index, window, cx));
-                    }
-                }),
+                PopupMenuItem::new(t(L10nKey::TabContextCloseTab))
+                    .action(Box::new(CloseActiveTab))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| this.close_tab(index, window, cx));
+                        }
+                    }),
             )
             .item(
                 PopupMenuItem::new(t(L10nKey::AppMenuCloseOtherTabs))
+                    .action(Box::new(CloseOtherTabs))
                     .disabled(tab_count <= 1)
                     .on_click({
                         let app = app.clone();
@@ -758,6 +1212,7 @@ impl Tty7App {
                 } else {
                     t(L10nKey::AppMenuCloseTabsRight)
                 })
+                .action(Box::new(CloseTabsToTheRight))
                 .disabled(index + 1 >= tab_count)
                 .on_click({
                     let app = app.clone();
@@ -777,22 +1232,38 @@ impl Tty7App {
     ) -> impl IntoElement + use<> {
         let active = self.active;
         let show_badges = self.mod_hint_badges;
+        // On macOS an open detail panel draws its own chrome in the title bar,
+        // so the strip stops at the panel's edge rather than running the width
+        // of the window. Sizing it to the whole viewport made it overrun that
+        // edge, and what got pushed out past it was the New Tab button.
+        let panel_w = match cfg!(target_os = "macos") && self.right_panel_open(cx) {
+            true => self.right_panel_px(window, cx),
+            false => 0.,
+        };
         let strip_w = if cfg!(target_os = "macos") {
-            (window.viewport_size().width - px(80.)).max(px(160.))
+            (window.viewport_size().width - px(80. + panel_w)).max(px(160.))
         } else {
             (window.viewport_size().width - px(114.)).max(px(140.))
         };
         let chrome_band_w = (!cfg!(target_os = "macos") && self.right_panel_open(cx)).then(|| {
             (self.right_panel_px(window, cx) - crate::ui::app::WINDOW_CONTROLS_W - 1.).max(0.)
         });
-        let corner_w = chrome_band_w.unwrap_or_else(|| {
-            let trailing_pad = if cfg!(target_os = "macos") {
-                tile_trailing_inset()
-            } else {
-                4.
-            };
-            trailing_pad + crate::ui::app::TILE_SIZE + 2. + crate::ui::app::TILE_SIZE
-        });
+        // `corner_w` reserves the trailing window chrome. With the panel open on
+        // macOS that chrome belongs to the panel's own header, which the strip
+        // now stops short of, so reserving for it here would charge the chips
+        // for it twice.
+        let corner_w = if panel_w > 0. {
+            0.
+        } else {
+            chrome_band_w.unwrap_or_else(|| {
+                let trailing_pad = if cfg!(target_os = "macos") {
+                    tile_trailing_inset()
+                } else {
+                    4.
+                };
+                trailing_pad + crate::ui::app::TILE_SIZE + 2. + crate::ui::app::TILE_SIZE
+            })
+        };
         let fixed_w = 3. * CHIP_GAP + crate::ui::app::TILE_SIZE + corner_w;
         let chips_avail = (strip_w - px(fixed_w + GRAB_HANDLE_W)).max(px(80.));
         let mut chips = h_flex()
@@ -817,6 +1288,7 @@ impl Tty7App {
             }
             None => (0..self.tabs.len()).collect(),
         };
+        let display = visible_chips(&display, active, f32::from(chips_avail));
 
         for i in display {
             if !show_chips {
@@ -826,6 +1298,7 @@ impl Tty7App {
             let tab = &self.tabs[i];
             let is_active = i == active;
             let label = self.tab_label(tab, i, Some(window), cx);
+            let full_title = self.tab_title_tooltip(tab, i, Some(window), cx);
             let ssh_dot = self.tab_ssh_dot(tab, cx);
             let agent = tab.agent(cx);
             let agent_status = tab.agent_status(cx);
@@ -851,6 +1324,11 @@ impl Tty7App {
                     .truncate()
                     .text_sm()
                     .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
+                    .when_some(full_title, |d, title| {
+                        d.tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(title.clone()).build(window, cx)
+                        })
+                    })
                     .child(label)
                     .into_any_element(),
             };
@@ -880,7 +1358,7 @@ impl Tty7App {
                 .justify_between()
                 .gap_1p5()
                 .h(px(30.))
-                .min_w(px(100.))
+                .min_w(px(CHIP_MIN_W))
                 .flex_shrink(1.)
                 .pl_3()
                 .pr_1p5()
@@ -930,6 +1408,7 @@ impl Tty7App {
                 })
                 .when_some(agent, |chip, agent| {
                     chip.child(self.tab_avatar(
+                        ("tab-avatar", i),
                         Some(agent),
                         agent_status,
                         agent_unread,
@@ -968,26 +1447,32 @@ impl Tty7App {
                     chip.child(
                         h_flex()
                             .absolute()
-                            .top(px(5.))
+                            // 3 + MIN_TARGET + 3 centres the button in the 30px chip.
+                            .top(px(3.))
                             .right(px(6.))
                             .opacity(0.)
                             .group_hover(SharedString::from(format!("tab-chip-{i}")), |s| {
                                 s.opacity(1.)
                             })
-                            .child(div().w(px(10.)).h(px(20.)).bg(linear_gradient(
+                            .child(div().w(px(10.)).h(px(MIN_TARGET)).bg(linear_gradient(
                                 90.,
                                 linear_color_stop(fade_from, 0.),
                                 linear_color_stop(backing, 1.),
                             )))
                             .child(
                                 div().bg(backing).child(
-                                    Button::new(("tab-close", i))
-                                        .icon(IconName::Close)
-                                        .ghost()
-                                        .xsmall()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                    hit_target(
+                                        Button::new(("tab-close", i))
+                                            .icon(IconName::Close)
+                                            .ghost()
+                                            .xsmall(),
+                                    )
+                                    .tooltip(t(L10nKey::TabContextCloseTab))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
                                             this.close_tab(i, window, cx);
-                                        })),
+                                        },
+                                    )),
                                 ),
                             ),
                     )
@@ -1072,7 +1557,11 @@ impl Tty7App {
                             cx,
                         )
                         .rounded_lg()
-                        .tooltip(t(L10nKey::TabTooltipShowSidebar))
+                        .tooltip(chord_hint(
+                            t(L10nKey::TabTooltipShowSidebar),
+                            "ToggleLeftPanel",
+                            cx,
+                        ))
                         .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
                     ),
                 )
@@ -1111,6 +1600,51 @@ impl Tty7App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn every_visible_agent_state_has_words_for_it() {
+        use crate::core::cli_agent::AgentStatus;
+        crate::ui::i18n::set_locale("en");
+        // Idle draws no dot, so it has nothing to name.
+        assert_eq!(agent_status_label(None), None);
+        assert_eq!(agent_status_label(Some(AgentStatus::Idle)), None);
+        // Every state that does draw a dot can be read out loud.
+        for status in [
+            AgentStatus::Working,
+            AgentStatus::Waiting,
+            AgentStatus::Done,
+        ] {
+            assert!(status.dot_rgb().is_some());
+            assert!(
+                agent_status_label(Some(status)).is_some_and(|s| !s.is_empty()),
+                "{status:?} paints a dot with no words behind it"
+            );
+        }
+        // Waiting is the state worth acting on; it must not read as Done.
+        assert_ne!(
+            agent_status_label(Some(AgentStatus::Waiting)),
+            agent_status_label(Some(AgentStatus::Done))
+        );
+    }
+
+    #[test]
+    fn a_brand_disc_that_matches_the_window_gets_an_edge() {
+        use crate::ui::presets::needs_edge;
+        let dark: gpui::Hsla = gpui::rgb(0x111111).into();
+        let light: gpui::Hsla = gpui::rgb(0xffffff).into();
+        let codex = crate::core::cli_agent::CLIAgent::Codex.accent_rgb();
+        let claude = crate::core::cli_agent::CLIAgent::Claude.accent_rgb();
+
+        assert_eq!(codex, 0x000000, "Codex's disc is pure black");
+        assert!(
+            needs_edge(codex, dark),
+            "a black disc on a dark window is not a disc"
+        );
+        assert!(!needs_edge(codex, light));
+        assert!(!needs_edge(claude, dark) && !needs_edge(claude, light));
+    }
 
     #[test]
     fn short_title_strips_user_host_and_shows_shallow_path_in_full() {
@@ -1140,6 +1674,394 @@ mod tests {
         let out = short_title(&long);
         assert_eq!(out.chars().count(), 41);
         assert!(out.ends_with('…'));
+    }
+
+    /// `TestAppContext` shapes through gpui's `NoopTextSystem`, where every
+    /// glyph is exactly one em — weight-agnostic and, more to the point,
+    /// CJK-agnostic. That keeps these tests identical on all three CI targets,
+    /// but it also means they cannot speak to the proportional and mixed-script
+    /// widths the elision exists for: what they pin is the contract — which
+    /// parts of a label must survive, and that the result fits its budget.
+    fn elide_setup(cx: &mut TestAppContext) -> (gpui::WindowTextSystem, gpui::Font, f32) {
+        let size = 14.;
+        (
+            gpui::WindowTextSystem::new(cx.text_system().clone()),
+            gpui::Font::default(),
+            size,
+        )
+    }
+
+    #[gpui::test]
+    fn elide_path_fits_shallow_paths_untouched(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let path = "~/tty7";
+        let max = measure_text(&ts, &font, size, path) + 1.;
+        assert_eq!(elide_path_keep_tail(&ts, &font, size, path, max), "~/tty7");
+    }
+
+    #[gpui::test]
+    fn elide_path_shows_the_whole_deep_path_when_the_budget_allows(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        // A wide sidebar must not elide a deep path: only the width may
+        // decide, never a fixed segment cap.
+        let path = "E:/work/toolbox/crates/tty7-core/src/client";
+        let max = measure_text(&ts, &font, size, path) + 1.;
+        assert_eq!(elide_path_keep_tail(&ts, &font, size, path, max), path);
+    }
+
+    #[gpui::test]
+    fn elide_path_keeps_drive_tail_and_budget(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let path = "E:/work/toolbox/src/ui/tab_sidebar.rs";
+        let max = 200.;
+        assert!(
+            measure_text(&ts, &font, size, path) > max,
+            "the fixture has to be wider than the budget to exercise elision"
+        );
+        let out = elide_path_keep_tail(&ts, &font, size, path, max);
+        assert!(out.starts_with("E:/…/"), "drive letter survives: {out}");
+        assert!(
+            out.ends_with("tab_sidebar.rs"),
+            "the file name always survives: {out}"
+        );
+        assert!(
+            measure_text(&ts, &font, size, &out) <= max,
+            "the elided label fits the budget"
+        );
+    }
+
+    #[gpui::test]
+    fn elide_path_keeps_tilde_and_leading_slash(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let home = "~/projects/toolbox/src/ui/tab_sidebar.rs";
+        assert!(
+            measure_text(&ts, &font, size, home) > 200.,
+            "the fixture has to be wider than the budget to exercise elision"
+        );
+        let out = elide_path_keep_tail(&ts, &font, size, home, 200.);
+        assert!(out.starts_with("~/…/"), "tilde root survives: {out}");
+        assert!(out.ends_with("tab_sidebar.rs"));
+
+        let abs = "/usr/local/share/man/man1/git.1";
+        assert!(
+            measure_text(&ts, &font, size, abs) > 120.,
+            "the fixture has to be wider than the budget to exercise elision"
+        );
+        let out = elide_path_keep_tail(&ts, &font, size, abs, 120.);
+        assert!(out.starts_with("/…/"), "absolute root survives: {out}");
+        assert!(out.ends_with("git.1"));
+    }
+
+    #[gpui::test]
+    fn elide_path_tears_only_the_last_segment_as_a_last_resort(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let path = "E:/supercalifragilisticexpialidocious";
+        let max = 60.;
+        assert!(measure_text(&ts, &font, size, path) > max);
+        let out = elide_path_keep_tail(&ts, &font, size, path, max);
+        assert!(out.starts_with('…'), "a torn segment reads as torn: {out}");
+        assert!(
+            out.chars().nth(1) != Some('/'),
+            "no slash after a torn segment: {out}"
+        );
+        assert!(out.ends_with('s'), "the word's tail survives: {out}");
+        assert!(measure_text(&ts, &font, size, &out) <= max);
+    }
+
+    #[gpui::test]
+    fn elide_edges_keeps_both_ends_of_a_branch(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let branch = "window-transparency-backdrop";
+        let max = 140.;
+        assert!(measure_text(&ts, &font, size, branch) > max);
+        let out = elide_keep_edges(&ts, &font, size, branch, max);
+        assert!(out.starts_with("window-"), "head survives: {out}");
+        assert!(out.ends_with("backdrop"), "tail survives: {out}");
+        assert!(out.contains('…'));
+        assert!(measure_text(&ts, &font, size, &out) <= max);
+        assert!(out.chars().count() < branch.chars().count());
+    }
+
+    #[gpui::test]
+    fn elide_edges_leaves_short_branches_alone(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let branch = "main";
+        let max = measure_text(&ts, &font, size, branch) + 1.;
+        assert_eq!(elide_keep_edges(&ts, &font, size, branch, max), "main");
+    }
+
+    #[gpui::test]
+    fn elide_edges_falls_back_to_a_tail_sliver_when_the_head_cannot_fit(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let branch = "window-transparency-backdrop";
+        let out = elide_keep_edges(&ts, &font, size, branch, 30.);
+        assert!(out.starts_with('…'));
+        assert!(measure_text(&ts, &font, size, &out) <= 30.);
+    }
+
+    #[gpui::test]
+    fn elide_path_cuts_windows_backslash_paths_on_segments(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let path = r"C:\Users\dev\AppData\Local\Temp\verify-build";
+        let max = 200.;
+        assert!(measure_text(&ts, &font, size, path) > max);
+        let out = elide_path_keep_tail(&ts, &font, size, path, max);
+        assert!(out.starts_with(r"C:\…\"), "drive letter survives: {out}");
+        assert!(
+            out.ends_with("verify-build"),
+            "the leaf segment survives: {out}"
+        );
+        assert!(measure_text(&ts, &font, size, &out) <= max);
+    }
+
+    /// One tab must not spell its location two ways depending on how wide the
+    /// sidebar happens to be.
+    #[gpui::test]
+    fn elide_path_keeps_the_separator_the_path_arrived_with(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let windows = r"C:\Users\dev\projects\toolbox\src\ui\app.rs";
+        let wide = measure_text(&ts, &font, size, windows) + 1.;
+        assert_eq!(
+            elide_path_keep_tail(&ts, &font, size, windows, wide),
+            windows,
+            "a path that fits is left exactly as it arrived"
+        );
+        let out = elide_path_keep_tail(&ts, &font, size, windows, 120.);
+        assert!(!out.contains('/'), "no forward slash creeps in: {out}");
+
+        let unix = "/home/dev/projects/toolbox/src/ui/app.rs";
+        let out = elide_path_keep_tail(&ts, &font, size, unix, 120.);
+        assert!(!out.contains('\\'), "no backslash creeps in: {out}");
+    }
+
+    /// A branch with no `-`, `_`, `/` or `.` in reach used to lose its head
+    /// entirely, which is the one thing this function promises not to do.
+    #[gpui::test]
+    fn elide_edges_keeps_a_head_on_a_separatorless_token(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let branch = "verylongbranchnamewithoutseps";
+        for max in [60., 80., 100., 120.] {
+            let out = elide_keep_edges(&ts, &font, size, branch, max);
+            assert!(
+                out.starts_with('v'),
+                "head survives at {max}px: {out}",
+                max = max
+            );
+            assert!(out.ends_with('s'), "tail survives at {max}px: {out}");
+            assert!(measure_text(&ts, &font, size, &out) <= max);
+        }
+    }
+
+    /// A head that fits but leaves nothing behind the ellipsis says less than
+    /// a shorter head that keeps the identifying tail.
+    #[gpui::test]
+    fn elide_edges_gives_up_head_room_to_keep_a_tail(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let branch = "feature/some-really-long-thing";
+        let max = 80.;
+        assert!(measure_text(&ts, &font, size, branch) > max);
+        let out = elide_keep_edges(&ts, &font, size, branch, max);
+        assert!(
+            !out.ends_with('…'),
+            "the tail is never traded away for a longer head: {out}"
+        );
+        assert!(out.ends_with('g'), "the identifying tail survives: {out}");
+        assert!(measure_text(&ts, &font, size, &out) <= max);
+    }
+
+    /// The sidebar title is not always a path. `elide_label` has to notice,
+    /// because the path rule drops the head — and for a command line or a name
+    /// the user typed, the head is the part that names it.
+    #[gpui::test]
+    fn elide_label_keeps_the_head_of_a_non_path(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        for text in ["Backend server logs", "npm run dev -- --watch"] {
+            let max = 90.;
+            assert!(measure_text(&ts, &font, size, text) > max);
+            let out = elide_label(&ts, &font, size, text, max);
+            let first = text.chars().next().unwrap();
+            assert!(
+                out.starts_with(first),
+                "a non-path keeps its head: {out} (from {text})"
+            );
+            assert!(measure_text(&ts, &font, size, &out) <= max);
+        }
+    }
+
+    /// …while a path still gets the tail-first treatment through the same
+    /// entry point.
+    #[gpui::test]
+    fn elide_label_still_keeps_the_tail_of_a_path(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let path = "~/projects/toolbox/src/ui/tab_sidebar.rs";
+        let out = elide_label(&ts, &font, size, path, 200.);
+        assert!(out.starts_with("~/…/"), "root survives: {out}");
+        assert!(out.ends_with("tab_sidebar.rs"), "leaf survives: {out}");
+    }
+
+    #[test]
+    fn short_title_cuts_windows_paths_on_backslashes() {
+        assert_eq!(
+            short_title(r"C:\Users\dev\projects\app"),
+            r"…\dev\projects\app"
+        );
+        assert_eq!(
+            short_title(r"C:\Users\dev\repo\deep\path\src\ui"),
+            r"…\path\src\ui"
+        );
+        // A shallow Windows path keeps its drive and its backslashes.
+        assert_eq!(short_title(r"C:\Users\app"), r"C:\Users\app");
+    }
+
+    /// Every way of slicing `text` that lands on a grapheme-cluster boundary.
+    fn cluster_prefixes(text: &str) -> Vec<String> {
+        let clusters: Vec<&str> = text.graphemes(true).collect();
+        (0..=clusters.len())
+            .map(|n| clusters[..n].concat())
+            .collect()
+    }
+
+    fn cluster_suffixes(text: &str) -> Vec<String> {
+        let clusters: Vec<&str> = text.graphemes(true).collect();
+        (0..=clusters.len())
+            .map(|n| clusters[clusters.len() - n..].concat())
+            .collect()
+    }
+
+    /// An elision may only drop whole grapheme clusters, so whatever survives
+    /// on either side of the ellipsis has to be a cluster-aligned prefix and
+    /// suffix of what went in. Slicing by `char` instead passes every width
+    /// check and still tears `👨‍👩‍👧` into a dangling joiner, strips the
+    /// variation selector off `❤️`, or leaves half of `🇨🇳` to render as a
+    /// bare letter.
+    #[track_caller]
+    fn assert_cut_on_cluster_boundaries(input: &str, out: &str, max: f32) {
+        let Some((head, tail)) = out.split_once('…') else {
+            assert_eq!(out, input, "an unelided label comes back verbatim");
+            return;
+        };
+        assert!(
+            cluster_prefixes(input).iter().any(|p| p == head),
+            "head {head:?} is not a cluster-aligned prefix of {input:?} (@{max}px)"
+        );
+        assert!(
+            cluster_suffixes(input).iter().any(|s| s == tail),
+            "tail {tail:?} is not a cluster-aligned suffix of {input:?} (@{max}px)"
+        );
+    }
+
+    /// Fixtures whose clusters are wider than one `char`, placed so that a
+    /// `char`-indexed cut lands inside one at some width.
+    const CLUSTER_FIXTURES: [&str; 7] = [
+        "ab\u{1F468}\u{200d}\u{1F469}\u{200d}\u{1F467}cdefghijklmnop",
+        "release-notes-final-ab\u{1F468}\u{200d}\u{1F469}\u{200d}\u{1F467}",
+        "abcdef\u{2764}\u{fe0f}ghijklmnopqr",
+        "long-branch-name-x\u{2764}\u{fe0f}",
+        "abcdef\u{1F1E8}\u{1F1F3}ghijklmnopqr",
+        "abcde\u{301}fghijklmnopqrst",
+        "review-\u{1F44D}\u{1F3FD}-approved-changes",
+    ];
+
+    #[gpui::test]
+    fn elide_edges_cuts_only_on_cluster_boundaries(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        for text in CLUSTER_FIXTURES {
+            let mut max = 30.;
+            while max <= 200. {
+                let out = elide_keep_edges(&ts, &font, size, text, max);
+                assert_cut_on_cluster_boundaries(text, &out, max);
+                assert!(
+                    measure_text(&ts, &font, size, &out) <= max,
+                    "{out:?} still has to fit its budget (@{max}px)"
+                );
+                max += 2.;
+            }
+        }
+    }
+
+    /// The path elision tears its last segment character by character as a
+    /// last resort; that resort has to respect clusters too.
+    #[gpui::test]
+    fn elide_path_tears_its_last_segment_on_cluster_boundaries(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        for leaf in CLUSTER_FIXTURES {
+            let path = format!("~/projects/toolbox/{leaf}");
+            let mut max = 30.;
+            while max <= 120. {
+                let out = elide_path_keep_tail(&ts, &font, size, &path, max);
+                // Whatever it settled on, the tail after the ellipsis has to
+                // be cluster-aligned against the path it came from.
+                if let Some((_, tail)) = out.split_once('…') {
+                    let tail = tail.trim_start_matches('/');
+                    assert!(
+                        cluster_suffixes(&path).iter().any(|s| s == tail),
+                        "tail {tail:?} is not a cluster-aligned suffix of {path:?} (@{max}px)"
+                    );
+                }
+                max += 2.;
+            }
+        }
+    }
+
+    /// `short_title`'s 40-glyph clamp is the other `char`-indexed cut.
+    #[test]
+    fn short_title_clamps_on_cluster_boundaries() {
+        for tail in ["\u{1F1E8}\u{1F1F3}-suffix", "\u{2764}\u{fe0f}-suffix"] {
+            for pad in 37..=41 {
+                let name = format!("{}{tail}", "a".repeat(pad));
+                let out = short_title(&name);
+                let Some(body) = out.strip_suffix('…') else {
+                    continue;
+                };
+                assert!(
+                    cluster_prefixes(&name).iter().any(|p| p == body),
+                    "clamped to {body:?}, not a cluster-aligned prefix of {name:?}"
+                );
+            }
+        }
+    }
+
+    /// One chip is 100 wide plus a 6 gap, so this is "room for exactly four".
+    const FOUR_CHIPS: f32 = 4. * (CHIP_MIN_W + CHIP_GAP);
+
+    #[test]
+    fn every_chip_is_drawn_while_they_all_fit() {
+        let order: Vec<usize> = (0..4).collect();
+        assert_eq!(visible_chips(&order, 0, FOUR_CHIPS), order);
+        assert_eq!(visible_chips(&order, 3, FOUR_CHIPS), order);
+        assert_eq!(visible_chips(&[0, 1], 1, FOUR_CHIPS), vec![0, 1]);
+    }
+
+    #[test]
+    fn the_run_stays_put_until_the_active_chip_would_fall_off() {
+        let order: Vec<usize> = (0..9).collect();
+        // Anchored at the first tab for as long as the active one is inside it.
+        assert_eq!(visible_chips(&order, 0, FOUR_CHIPS), vec![0, 1, 2, 3]);
+        assert_eq!(visible_chips(&order, 3, FOUR_CHIPS), vec![0, 1, 2, 3]);
+        // Then it slides by exactly as much as it has to.
+        assert_eq!(visible_chips(&order, 4, FOUR_CHIPS), vec![1, 2, 3, 4]);
+        assert_eq!(visible_chips(&order, 8, FOUR_CHIPS), vec![5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn the_active_chip_is_always_among_the_drawn_ones() {
+        let order: Vec<usize> = (0..40).collect();
+        for active in 0..40 {
+            for avail in [0., 1., 80., FOUR_CHIPS, 4000.] {
+                let shown = visible_chips(&order, active, avail);
+                assert!(
+                    shown.contains(&active),
+                    "active {active} missing at {avail}px: {shown:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reordered_run_is_sliced_in_its_own_order() {
+        // Mid-drag the strip renders `preview.order`, not 0..n.
+        let order = vec![3, 0, 1, 2, 4, 5];
+        assert_eq!(visible_chips(&order, 5, FOUR_CHIPS), vec![1, 2, 4, 5]);
     }
 
     #[test]

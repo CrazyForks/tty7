@@ -197,40 +197,52 @@ impl Theme {
         }
     }
 
-    /// One entry of the palette as a packed `0xRRGGBB`.
-    fn ansi(&self, i: usize) -> u32 {
-        let (r, g, b) = self.ansi16[i];
+    fn ansi_seed(&self, index: usize) -> u32 {
+        let (r, g, b) = self.ansi16[index];
         (r as u32) << 16 | (g as u32) << 8 | b as u32
+    }
+
+    /// Clears a seed colour for use as ink on any of tty7's neutral fills.
+    ///
+    /// An error line lands on a popover or a sidebar row as often as on the
+    /// window, and both of those fills sit a step toward the foreground. Clear
+    /// the floor on every surface the ink can be painted on, not just on the
+    /// darkest one.
+    fn clear_ink(&self, seed: u32, floor: f32) -> u32 {
+        let bg = self.background_color();
+        let fg = legible_foreground(bg, self.foreground);
+        [bg, mix(bg, fg, 0.03), mix(bg, fg, 0.05)]
+            .into_iter()
+            .fold(seed, |ink, surface| legible_ink(surface, ink, floor))
+    }
+
+    /// One entry of the theme's own ANSI ramp, legible as chrome text.
+    ///
+    /// The ramp is authored for terminal cells, where a colour only has to
+    /// stand on the background. Chrome draws the same hues on the sidebar and
+    /// popover fills too, so they go through the same floor the semantic inks
+    /// do.
+    pub fn ansi_ink(&self, index: usize) -> u32 {
+        self.clear_ink(self.ansi_seed(index), TEXT_FLOOR)
     }
 
     pub fn semantics(&self) -> Semantics {
         let bg = self.background_color();
         let fg = legible_foreground(bg, self.foreground);
-        let ansi = |i: usize| self.ansi(i);
-        // An error line lands on a popover or a sidebar row as often as on the
-        // window, and both of those fills sit a step toward the foreground.
-        // Clear the floor on every surface the ink can be painted on, not just
-        // on the darkest one.
-        let surfaces = [bg, mix(bg, fg, 0.03), mix(bg, fg, 0.05)];
-        let clear = |seed: u32, floor: f32| {
-            surfaces
-                .iter()
-                .fold(seed, |ink, surface| legible_ink(*surface, ink, floor))
-        };
         let build = |seed: u32| {
-            let fill = clear(seed, ACCENT_FLOOR);
+            let fill = self.clear_ink(seed, ACCENT_FLOOR);
             Semantic {
-                ink: clear(seed, TEXT_FLOOR),
+                ink: self.clear_ink(seed, TEXT_FLOOR),
                 fill,
                 on_fill: ink_on(fill, fg, TEXT_FLOOR),
             }
         };
         Semantics {
-            danger: build(ansi(1)),
-            success: build(ansi(2)),
-            warning: build(ansi(3)),
-            info: build(ansi(6)),
-            link: build(ansi(6)),
+            danger: build(self.ansi_seed(1)),
+            success: build(self.ansi_seed(2)),
+            warning: build(self.ansi_seed(3)),
+            info: build(self.ansi_seed(6)),
+            link: build(self.ansi_seed(6)),
         }
     }
 
@@ -253,18 +265,12 @@ impl Theme {
         const SEEDS: [usize; LANE_SLOTS] = [4, 3, 5, 2, 6, 1];
         let bg = self.background_color();
         let fg = legible_foreground(bg, self.foreground);
-        // Same three surfaces as `semantics`: the graph draws on the window in
-        // a floating panel, on the sidebar when the panel is docked, and on a
-        // popover in the commit detail view.
-        let surfaces = [bg, mix(bg, fg, 0.03), mix(bg, fg, 0.05)];
-        let clear = |seed: u32| {
-            surfaces.iter().fold(seed, |ink, surface| {
-                legible_ink(*surface, ink, ACCENT_FLOOR)
-            })
-        };
+        // Through `clear_ink`, the same three surfaces `semantics` clears on:
+        // the graph draws on the window in a floating panel, on the sidebar
+        // when the panel is docked, and on a popover in the detail view.
         let mut ink = [0u32; LANE_SLOTS];
         for (slot, seed) in SEEDS.iter().enumerate() {
-            ink[slot] = clear(self.ansi(*seed));
+            ink[slot] = self.clear_ink(self.ansi_seed(*seed), ACCENT_FLOOR);
         }
         Lanes {
             ink,
@@ -406,6 +412,32 @@ fn ink_on(fill: u32, fg: u32, target: f32) -> u32 {
     }
 }
 
+/// The colour a glyph is redrawn in once an opaque block caret sits under it.
+/// The terminal's own background is the conventional choice and wins in every
+/// shipped theme; the foreground is the fallback for a caret close enough to
+/// the background to swallow it.
+pub(crate) fn caret_ink(caret: Hsla, background: Hsla, foreground: Hsla) -> Hsla {
+    let pack = |c: Hsla| {
+        let rgb = crate::terminal::palette::hsla_to_rgb(c);
+        (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32
+    };
+    let (caret, bg, fg) = (pack(caret), pack(background), pack(foreground));
+    if contrast(caret, bg) >= contrast(caret, fg) {
+        background
+    } else {
+        foreground
+    }
+}
+
+/// Whether a filled shape needs a hairline to stay a shape. A brand colour is a
+/// fixed value; a theme background is not, and pure black on a dark window is
+/// no shape at all.
+pub(crate) fn needs_edge(fill: u32, surface: Hsla) -> bool {
+    let rgb = crate::terminal::palette::hsla_to_rgb(surface);
+    let packed = (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32;
+    contrast(fill, packed) < 1.25
+}
+
 pub(crate) fn mix(a: u32, b: u32, t: f32) -> u32 {
     let (ar, ag, ab) = (a >> 16 & 0xff, a >> 8 & 0xff, a & 0xff);
     let (br, bg, bb) = (b >> 16 & 0xff, b >> 8 & 0xff, b & 0xff);
@@ -454,6 +486,40 @@ pub(crate) fn is_lighter(a: u32, b: u32) -> bool {
 }
 
 const ACCENT_FLOOR: f32 = 3.0;
+
+/// How far a search match's wash has to stand off the background it sits on,
+/// and how much further the one you are looking at has to stand off the rest.
+///
+/// These are non-text ratios: enough to spot a block at a glance without
+/// drowning the glyph on top of it.
+pub(crate) const MATCH_WASH: f32 = 1.45;
+pub(crate) const CURRENT_MATCH_WASH: f32 = 2.1;
+
+/// The opacity at which `tint` over `surface` first reaches `target` contrast,
+/// as a blended colour.
+///
+/// A fixed alpha does not survive a theme swap: the terminal's selection tint
+/// is `mix(bg, fg, 0.24)`, so painting it at 0.32 is a 7% shift away from the
+/// background in *every* theme — invisible on a white one, and barely there on
+/// a dark one. Solving for the ratio instead keeps the same wash weight
+/// whatever the two colours happen to be.
+pub(crate) fn wash(surface: u32, tint: u32, target: f32) -> u32 {
+    if contrast(mix(surface, tint, 1.0), surface) < target {
+        // The tint cannot get there on its own — a theme whose selection colour
+        // is nearly its background. Fall back to the ink that reads on it.
+        return legible_ink(surface, tint, target);
+    }
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..16 {
+        let mid = (lo + hi) / 2.0;
+        if contrast(mix(surface, tint, mid), surface) >= target {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    mix(surface, tint, hi)
+}
 
 const TEXT_FLOOR: f32 = 4.5;
 
@@ -518,14 +584,31 @@ pub struct Themes(pub Vec<Theme>);
 
 impl Global for Themes {}
 
+/// Files in the themes folder that could not be read, and why. A malformed
+/// theme used to log a warning and then simply not be in the list — the folder
+/// is one the user opens and drops files into, so "it isn't there" needs a
+/// reason attached to it.
+#[derive(Default)]
+pub struct RejectedThemes(pub Vec<(String, String)>);
+
+impl Global for RejectedThemes {}
+
 pub fn load_registry(cx: &mut App) {
-    cx.set_global(Themes(load_all()));
+    let (themes, rejected) = load_all();
+    cx.set_global(Themes(themes));
+    cx.set_global(RejectedThemes(rejected));
 }
 
 pub fn all(cx: &App) -> Vec<Theme> {
     cx.try_global::<Themes>()
         .map(|t| t.0.clone())
         .unwrap_or_else(builtins)
+}
+
+pub fn rejected(cx: &App) -> Vec<(String, String)> {
+    cx.try_global::<RejectedThemes>()
+        .map(|r| r.0.clone())
+        .unwrap_or_default()
 }
 
 pub fn by_id(cx: &App, id: &str) -> Theme {
@@ -633,11 +716,12 @@ pub fn write_theme_file(t: &Theme) -> std::io::Result<()> {
     crate::core::config::write_atomic(&path, to_yaml(t).as_bytes())
 }
 
-fn load_all() -> Vec<Theme> {
+fn load_all() -> (Vec<Theme>, Vec<(String, String)>) {
     let mut themes = builtins();
-    themes.extend(load_user_themes());
+    let (user, rejected) = load_user_themes();
+    themes.extend(user);
     dedupe_ids(&mut themes);
-    themes
+    (themes, rejected)
 }
 
 fn dedupe_ids(themes: &mut [Theme]) {
@@ -662,14 +746,15 @@ pub fn themes_dir() -> Option<PathBuf> {
     crate::core::config::config_path("themes")
 }
 
-fn load_user_themes() -> Vec<Theme> {
+fn load_user_themes() -> (Vec<Theme>, Vec<(String, String)>) {
     let Some(dir) = themes_dir() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut out = Vec::new();
+    let mut rejected = Vec::new();
     let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     paths.sort_by_key(|p| p.to_string_lossy().to_lowercase());
     for path in paths {
@@ -684,10 +769,17 @@ fn load_user_themes() -> Vec<Theme> {
         };
         match parsed {
             Ok(theme) => out.push(theme),
-            Err(e) => log::warn!("skipping theme {}: {e}", path.display()),
+            Err(e) => {
+                log::warn!("skipping theme {}: {e}", path.display());
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                rejected.push((name, e));
+            }
         }
     }
-    out
+    (out, rejected)
 }
 
 fn id_and_name(path: &std::path::Path) -> (String, String) {
@@ -1748,6 +1840,41 @@ mod tests {
             .find(|t| t.id == "rose_pine")
             .unwrap();
         assert_eq!(rose.neutrals().accent, rose.accent);
+    }
+
+    #[test]
+    fn a_match_wash_is_visible_on_a_white_theme_and_a_black_one() {
+        // The old fixed alpha: 0.32 of a tint 24% off the background.
+        let faint = |bg: u32, fg: u32| {
+            let tint = mix(bg, fg, 0.24);
+            contrast(mix(bg, tint, 0.32), bg)
+        };
+        for (bg, fg) in [(0xffffff, 0x111111), (0x111111, 0xffffff)] {
+            assert!(
+                faint(bg, fg) < 1.25,
+                "the old wash was {:.2}:1 on {bg:06x} — that is what made it vanish",
+                faint(bg, fg)
+            );
+            let tint = mix(bg, fg, 0.24);
+            let w = wash(bg, tint, MATCH_WASH);
+            assert!(
+                contrast(w, bg) >= MATCH_WASH - 0.02,
+                "{:.2}:1 on {bg:06x}",
+                contrast(w, bg)
+            );
+            let cur = wash(bg, tint, CURRENT_MATCH_WASH);
+            assert!(
+                contrast(cur, bg) > contrast(w, bg),
+                "the current match has to stand out from the rest"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wash_whose_tint_cannot_reach_the_target_still_lands_on_something_legible() {
+        // A theme whose selection colour is its background: no alpha gets there.
+        let w = wash(0xffffff, 0xfefefe, MATCH_WASH);
+        assert!(contrast(w, 0xffffff) >= MATCH_WASH - 0.02, "{w:06x}");
     }
 
     #[test]

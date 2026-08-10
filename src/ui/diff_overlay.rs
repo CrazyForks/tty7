@@ -289,10 +289,28 @@ impl Tty7App {
         snap: Option<Arc<DiffSnapshot>>,
         cx: &mut Context<Self>,
     ) {
+        // A diff read is a fresher answer to the question the sidebar's
+        // +N −N asks, and it is the one the reader is looking at. Hand the
+        // numbers back before anything renders, or the row can disagree with
+        // the overlay it just opened.
+        //
+        // A read that failed is not an answer at all: its totals are whatever
+        // got parsed before git gave up, usually zero. Publishing those wipes
+        // the counts the sidebar already had right — the overlay says so in
+        // words a few lines below, and the row would silently disagree.
+        let mut landed = if let Some(snap) = snap.as_ref().filter(|s| !s.read_failed) {
+            let (added, removed) = snap.totals();
+            let root = snap.root.clone();
+            cx.default_global::<crate::terminal::git_status::GitStatusCache>();
+            cx.update_global::<crate::terminal::git_status::GitStatusCache, _>(|cache, _| {
+                cache.note_counts(host, &root, added, removed)
+            })
+        } else {
+            false
+        };
         // Only wanted by an overlay whose first probe could not know the root,
         // and so could not read its own epoch before dispatching.
         let landing_epoch = snap.as_ref().map(|s| scm_epoch(cx, host, &s.root));
-        let mut landed = false;
         for tab in self.tabs.iter_mut() {
             let Some(overlay) = tab
                 .diff_overlay
@@ -795,6 +813,9 @@ impl Tty7App {
         if focused.is_none() && !snap.untracked.is_empty() {
             list = list.child(self.diff_untracked_section(snap, cx));
         }
+        // A whole working tree can scroll past here with nothing to say how
+        // far it runs or where in it you are — the one long document in the
+        // app without the bar every other scroll area has.
         crate::ui::scrollbar::with_vertical_scrollbar(
             "diff-overlay-scrollbar",
             div()

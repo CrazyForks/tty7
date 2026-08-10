@@ -22,9 +22,9 @@ use crate::core::osc::OscTokenizer;
 use crate::daemon::protocol::{
     AuthPromptKind, AuthResponse, ClientMsg, DaemonMsg, KnownHostEntry, KnownHostId,
     LoopbackForward, LoopbackForwardId, LoopbackForwardInfo, LoopbackForwardRequest,
-    ManagedForward, NativeSshSpec, PaneProcs, RemoteContext, SftpEntry, SftpJobProgress, SftpOp,
-    SftpOpResult, SftpTransferSpec, ShellSpec, SshForwardRule, SshPhase, WinSize, WorkspaceOp,
-    WorkspaceRequest,
+    ManagedForward, NativeSshSpec, PaneProcs, RemoteContext, RestoreFrom, SftpEntry,
+    SftpJobProgress, SftpOp, SftpOpResult, SftpTransferSpec, ShellSpec, SshForwardRule, SshPhase,
+    WinSize, WorkspaceOp, WorkspaceRequest,
 };
 use crate::daemon::transport::{self, Stream};
 use gpui::EntityId;
@@ -74,6 +74,7 @@ struct ReaderSignals {
     child_exited: Arc<AtomicBool>,
     zle_reading: Arc<AtomicBool>,
     shell_vi_mode: Arc<AtomicBool>,
+    running_command: Arc<Mutex<String>>,
     auth: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>>,
     phase: Arc<Mutex<Option<SshPhase>>>,
     /// Kitty-graphics images the daemon lifted out of the stream (issue #213),
@@ -168,6 +169,13 @@ pub struct RemoteTerminal {
     child_exited: Arc<AtomicBool>,
     zle_reading: Arc<AtomicBool>,
     shell_vi_mode: Arc<AtomicBool>,
+    /// The line the shell said it is running, from the OSC 133;C mark, still
+    /// percent-escaped as the integration sent it. Empty while at a prompt.
+    ///
+    /// This is the only place the *text* of a running command exists on the
+    /// client: the frame the daemon sends says a command runs, not which one.
+    /// The close confirmation has to name what it is about to end.
+    running_command: Arc<Mutex<String>>,
     auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>>,
     ssh_phase: Arc<Mutex<Option<SshPhase>>>,
     ssh_endpoint: Option<(String, u16)>,
@@ -215,7 +223,16 @@ impl RemoteTerminal {
         cwd: Option<PathBuf>,
         shell: Option<ShellSpec>,
     ) -> anyhow::Result<(Self, u64)> {
-        Self::spawn_on(&PaneRoute::Local, size, cell_w, cell_h, cwd, shell, None)
+        Self::spawn_on(
+            &PaneRoute::Local,
+            size,
+            cell_w,
+            cell_h,
+            cwd,
+            shell,
+            None,
+            None,
+        )
     }
 
     pub fn spawn_on(
@@ -226,11 +243,13 @@ impl RemoteTerminal {
         cwd: Option<PathBuf>,
         shell: Option<ShellSpec>,
         owner: Option<String>,
+        restore: Option<RestoreFrom>,
     ) -> anyhow::Result<(Self, u64)> {
         let retry_cwd = cwd.clone();
         let retry_shell = shell.clone();
         let retry_owner = owner.clone();
-        match Self::spawn_once(route, size, cell_w, cell_h, cwd, shell, owner) {
+        let retry_restore = restore.clone();
+        match Self::spawn_once(route, size, cell_w, cell_h, cwd, shell, owner, restore) {
             Ok(term) => Ok(term),
             Err(first_err) if daemon_not_listening(&first_err) => {
                 if let Err(start_err) = crate::daemon::spawn::ensure_running() {
@@ -238,7 +257,7 @@ impl RemoteTerminal {
                         "daemon not running ({first_err}); starting one failed: {start_err}"
                     ));
                 }
-                Self::spawn_once(route, size, cell_w, cell_h, retry_cwd, retry_shell, retry_owner)
+                Self::spawn_once(route, size, cell_w, cell_h, retry_cwd, retry_shell, retry_owner, retry_restore)
                     .map_err(|second_err| {
                         anyhow::anyhow!(
                             "daemon not running ({first_err}); started one but Spawn still failed: {second_err}"
@@ -253,7 +272,7 @@ impl RemoteTerminal {
                         "daemon disconnected before Spawn reply ({first_err}); restart failed: {restart_err}"
                     ));
                 }
-                Self::spawn_once(route, size, cell_w, cell_h, retry_cwd, retry_shell, retry_owner).map_err(|second_err| {
+                Self::spawn_once(route, size, cell_w, cell_h, retry_cwd, retry_shell, retry_owner, retry_restore).map_err(|second_err| {
                     anyhow::anyhow!(
                         "daemon disconnected before Spawn reply ({first_err}); restarted daemon but Spawn still failed: {second_err}"
                     )
@@ -263,6 +282,7 @@ impl RemoteTerminal {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_once(
         route: &PaneRoute,
         size: TermSize,
@@ -271,6 +291,7 @@ impl RemoteTerminal {
         cwd: Option<PathBuf>,
         shell: Option<ShellSpec>,
         owner: Option<String>,
+        restore: Option<RestoreFrom>,
     ) -> anyhow::Result<(Self, u64)> {
         let mut stream = connect_routed(route)?;
         let win = win_size(size, cell_w, cell_h);
@@ -285,19 +306,32 @@ impl RemoteTerminal {
                 )
         });
 
+        // Only the local daemon's feature list is known here; a routed spawn
+        // reaches a server whose build we have not asked about, and one that
+        // predates the field would silently drop it. Sending it anyway would
+        // cost nothing but would make the log claim a restore that never
+        // happened, so the local case is the only one that asks.
+        let restore = restore.filter(|_| {
+            route.is_local()
+                && crate::daemon::spawn::local_daemon_supports(
+                    crate::daemon::protocol::FEATURE_RESTORE_SCROLLBACK,
+                )
+        });
+
         ClientMsg::Spawn {
             cwd,
             size: win,
             shell,
             owner,
             workspace,
+            restore,
         }
         .encode(&mut stream)?;
         let pane_id = match DaemonMsg::read(&mut stream)? {
             DaemonMsg::Spawned { pane_id } => pane_id,
-            DaemonMsg::Error(msg) => {
-                return Err(anyhow::anyhow!("daemon refused Spawn: {msg}"));
-            }
+            // Passed through, not wrapped: the caller already logs which
+            // spawn this was, and the window shows only this text.
+            DaemonMsg::Error(msg) => return Err(anyhow::anyhow!(msg)),
             other => {
                 return Err(anyhow::anyhow!(
                     "unexpected daemon reply to Spawn: {other:?}"
@@ -404,6 +438,7 @@ impl RemoteTerminal {
                 child_exited: self.child_exited.clone(),
                 zle_reading: self.zle_reading.clone(),
                 shell_vi_mode: self.shell_vi_mode.clone(),
+                running_command: self.running_command.clone(),
                 auth: self.auth_prompts.clone(),
                 phase: self.ssh_phase.clone(),
                 images: self.images.clone(),
@@ -452,6 +487,7 @@ impl RemoteTerminal {
         let child_exited = Arc::new(AtomicBool::new(false));
         let zle_reading = Arc::new(AtomicBool::new(false));
         let shell_vi_mode = Arc::new(AtomicBool::new(false));
+        let running_command: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let ssh_phase: Arc<Mutex<Option<SshPhase>>> = Arc::new(Mutex::new(None));
@@ -474,6 +510,7 @@ impl RemoteTerminal {
                 child_exited: child_exited.clone(),
                 zle_reading: zle_reading.clone(),
                 shell_vi_mode: shell_vi_mode.clone(),
+                running_command: running_command.clone(),
                 auth: auth_prompts.clone(),
                 phase: ssh_phase.clone(),
                 images: images.clone(),
@@ -496,6 +533,7 @@ impl RemoteTerminal {
             child_exited,
             zle_reading,
             shell_vi_mode,
+            running_command,
             auth_prompts,
             ssh_phase,
             ssh_endpoint: None,
@@ -541,6 +579,17 @@ impl RemoteTerminal {
         term.set_options(terminal_config_from_user(user_config));
     }
 
+    /// Whether this build puts back the cursor a repaint parked — see
+    /// [`crate::terminal::parked_cursor`].
+    ///
+    /// Only conhost parks one, so like `conpty_resize` the repair is Windows'
+    /// alone. On a raw pty the application owns the cursor and is free to end a
+    /// repaint on the text it just wrote and then echo the next keystroke
+    /// straight after it, with no positioning of its own: vim opens its command
+    /// line that way, and putting the cursor back on the cell the repaint hid it
+    /// on drops the `wq!` typed next onto the row being edited (#430).
+    const REPAIR_PARKED_CURSOR: bool = cfg!(windows);
+
     fn spawn_reader(
         term: Arc<FairMutex<Term<EventProxy>>>,
         proxy: EventProxy,
@@ -562,6 +611,7 @@ impl RemoteTerminal {
                     child_exited,
                     zle_reading,
                     shell_vi_mode,
+                    running_command,
                     auth,
                     phase,
                     images,
@@ -624,7 +674,9 @@ impl RemoteTerminal {
                                 // emulator to the cut, act on the state that
                                 // sequence left behind, carry on.
                                 let mut cuts: Vec<(usize, CursorCut)> = Vec::new();
-                                cursor_scan.feed(&out_batch, |off, c| cuts.push((off, c)));
+                                if Self::REPAIR_PARKED_CURSOR {
+                                    cursor_scan.feed(&out_batch, |off, c| cuts.push((off, c)));
+                                }
                                 {
                                     let t0 = trace.then(std::time::Instant::now);
                                     let mut term = term.lock();
@@ -665,7 +717,14 @@ impl RemoteTerminal {
                                     if let Some(mark) = payload.strip_prefix(b"133;") {
                                         match mark.first() {
                                             Some(b'B') => {
-                                                zle_reading.store(true, Ordering::Relaxed)
+                                                zle_reading.store(true, Ordering::Relaxed);
+                                                // Back at a prompt: whatever
+                                                // ran is over, so the name of
+                                                // it must not outlive it into
+                                                // the next close question.
+                                                if let Ok(mut cmd) = running_command.lock() {
+                                                    cmd.clear();
+                                                }
                                             }
                                             Some(b'V') => {
                                                 shell_vi_mode.store(
@@ -673,6 +732,22 @@ impl RemoteTerminal {
                                                         .is_some_and(|v| v.first() == Some(&b'1')),
                                                     Ordering::Relaxed,
                                                 );
+                                            }
+                                            Some(b'C') => {
+                                                zle_reading.store(false, Ordering::Relaxed);
+                                                // `C` alone is a command start
+                                                // with no line to report — the
+                                                // PowerShell path sends that —
+                                                // and leaves the field empty
+                                                // rather than holding a stale
+                                                // one.
+                                                let line = mark
+                                                    .strip_prefix(b"C;")
+                                                    .map(|c| String::from_utf8_lossy(c).into_owned())
+                                                    .unwrap_or_default();
+                                                if let Ok(mut cmd) = running_command.lock() {
+                                                    *cmd = line;
+                                                }
                                             }
                                             _ => zle_reading.store(false, Ordering::Relaxed),
                                         }
@@ -1107,6 +1182,16 @@ impl RemoteTerminal {
 
     pub fn shell_vi_mode(&self) -> bool {
         self.shell_vi_mode.load(Ordering::Relaxed)
+    }
+
+    /// The line the shell reported running, still percent-escaped. Empty at a
+    /// prompt, and empty for a shell whose integration marks the start of a
+    /// command without naming it.
+    pub fn running_command(&self) -> String {
+        self.running_command
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default()
     }
 
     pub fn size(&self) -> TermSize {
@@ -3021,6 +3106,7 @@ mod tests {
     /// Feeds one conhost-shaped repaint and reports the cell the cursor ends on,
     /// waiting for the `X` the frame paints so the reader is known to be done.
     fn cursor_after_conpty_frame(frame: &[u8]) -> (i32, usize) {
+        crate::core::config::pin_test_config_dir();
         let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
         let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
 
@@ -3051,14 +3137,24 @@ mod tests {
 
     #[test]
     fn a_conpty_frame_that_shows_the_cursor_over_an_erase_keeps_the_cell_it_hid_on() {
-        assert_eq!(
-            cursor_after_conpty_frame(
-                b"\x1b[?25l\x1b[20;2HX\x1b[K\x1b[m\x1b[22;42H\x1b[K\x1b[?25h"
-            ),
-            (5, 3),
-            "conhost parked the cursor on the cell it erased last; the cursor \
-             belongs where it was when the repaint hid it"
+        let got = cursor_after_conpty_frame(
+            b"\x1b[?25l\x1b[20;2HX\x1b[K\x1b[m\x1b[22;42H\x1b[K\x1b[?25h",
         );
+        if RemoteTerminal::REPAIR_PARKED_CURSOR {
+            assert_eq!(
+                got,
+                (5, 3),
+                "conhost parked the cursor on the cell it erased last; the cursor \
+                 belongs where it was when the repaint hid it"
+            );
+        } else {
+            assert_eq!(
+                got,
+                (21, 41),
+                "with no conhost in between the stream is the application's own, \
+                 and the cell it left the cursor on is the cell it meant"
+            );
+        }
     }
 
     #[test]
@@ -3069,6 +3165,70 @@ mod tests {
             ),
             (8, 8),
             "the frame painted the cursor somewhere on purpose"
+        );
+    }
+
+    /// Issue #430. Vim opens its command line with exactly the shape the parked
+    /// -cursor scanner calls parked — hide, move around to paint, end on the `:`
+    /// it wrote — and then echoes every following keystroke as a bare byte at
+    /// wherever that left the cursor. Putting the cursor back on a raw pty
+    /// therefore does not straighten out a stray caret, it drops `wq!` onto the
+    /// row vim was editing. Bytes below are a capture of vim 9 on a 20x11 pty.
+    #[test]
+    fn a_raw_pty_repaint_keeps_the_cursor_the_frame_left_so_the_echo_lands_on_it() {
+        crate::core::config::pin_test_config_dir();
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(20, 11)).unwrap();
+
+        let mut stream: Vec<u8> = Vec::new();
+        // `vim test.md`: the alternate screen, the file, cursor home.
+        stream.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[1;1H123456789\x1b[1;1H");
+        // Esc, then `:` — two bracketed repaints, the second ending on the `:`
+        // vim wrote at the head of the command line.
+        stream.extend_from_slice(b"\x1b[?25l\x1b[m\x1b[11;10H^[\x1b[1;1H\x1b[?25h");
+        stream.extend_from_slice(b"\x1b[?25l\x1b[11;10H  \x1b[1;1H\x07\x1b[?25h");
+        stream.extend_from_slice(
+            b"\x1b[?25l\x1b[11;10H:\x1b[1;1H\x1b[11;1H\x1b[K\x1b[11;1H:\x1b[?25h",
+        );
+        // `w`, `q`, `!`: vim echoes them with no positioning of their own.
+        stream.extend_from_slice(b"wq!");
+        DaemonMsg::Output(stream).encode(&mut daemon_side).unwrap();
+        daemon_side.flush().unwrap();
+
+        let row = |t: &Term<EventProxy>, line: i32| -> String {
+            (0..20)
+                .map(|col| {
+                    t.grid()[alacritty_terminal::index::Line(line)]
+                        [alacritty_terminal::index::Column(col)]
+                    .c
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
+        // The whole batch is applied under one lock, so the `:` landing on the
+        // command line means every byte after it landed too.
+        let mut command_line = String::new();
+        let mut edited = String::new();
+        for _ in 0..600 {
+            {
+                let t = term.term.lock();
+                command_line = row(&t, 10);
+                edited = row(&t, 0);
+            }
+            if command_line.starts_with(':') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            command_line, ":wq!",
+            "the keystrokes belong after the `:` the repaint ended on"
+        );
+        assert_eq!(
+            edited, "123456789",
+            "and nothing of them belongs on the row vim was editing"
         );
     }
 
@@ -3432,6 +3592,56 @@ mod tests {
             .unwrap();
         daemon_side.flush().unwrap();
         assert!(poll(false), "C (command start) should disarm zle_reading");
+    }
+
+    #[test]
+    fn the_running_command_is_the_line_the_shell_marked_and_ends_with_it() {
+        crate::core::config::pin_test_config_dir();
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let poll = |want: &str| {
+            for _ in 0..200 {
+                if term.running_command() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+        assert_eq!(term.running_command(), "", "nothing runs before a mark");
+
+        // The escaping is the integration's; this side stores it verbatim and
+        // the reader of the field undoes it.
+        DaemonMsg::Output(b"\x1b]133;C;printf '100%25'\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(
+            poll("printf '100%25'"),
+            "C should record the line it carried, got {:?}",
+            term.running_command()
+        );
+
+        // Back at a prompt the command is over — holding the name would make
+        // the next close question ask about something that already finished.
+        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(""), "a new prompt clears the running command");
+
+        // A bare `C` starts a command without naming it (the PowerShell path).
+        // It must not leave the previous name standing.
+        DaemonMsg::Output(b"\x1b]133;C;cargo build\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll("cargo build"));
+        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(""), "an unnamed command start does not inherit a name");
     }
 
     #[test]

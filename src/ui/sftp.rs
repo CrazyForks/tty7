@@ -4,13 +4,14 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, Div, ExternalPaths, FontWeight, PathPromptOptions, SharedString,
-    Stateful, Subscription, Window, div, prelude::*, px,
+    Stateful, Subscription, Window, div, prelude::*, px, rems,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _, Sizable as _,
+    h_flex, v_flex,
 };
 
 use crate::daemon::protocol::{
@@ -21,6 +22,7 @@ use crate::daemon::ssh::sftp::{remote_basename, remote_join, remote_parent, safe
 use crate::terminal::RemoteTerminal;
 use crate::ui::app::{CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
+use crate::ui::right_panel::{META, TEXT};
 
 #[derive(Clone, Copy)]
 enum SftpMenuAction {
@@ -141,16 +143,28 @@ pub(crate) struct SftpPanelState {
     pub(crate) filter_input: gpui::Entity<InputState>,
     pub(crate) error: Option<String>,
     pub(crate) jobs: Vec<SftpJobProgress>,
+    /// Uploads this panel started whose landing it has not listed yet.
+    ///
+    /// An upload is written to `<name>.tty7-upload-<hex>` and renamed into
+    /// place at the very end, so any listing taken while one is in flight
+    /// shows the temporary name. These are the jobs a listing is owed to.
+    uploads_awaiting_listing: HashSet<u64>,
+    /// Local names handed to a download that has not created its file yet.
+    /// Two quick downloads of the same remote file would otherwise both find
+    /// the name free and the second would write over the first.
+    claimed_downloads: HashSet<PathBuf>,
     dismissed_jobs: HashSet<u64>,
     show_history: bool,
     tray_expanded: bool,
     pub(crate) loading: bool,
     nav_gen: u64,
     pub(crate) editing: Option<SftpEdit>,
+    editing_sub: Vec<Subscription>,
     pub(crate) editing_path: Option<gpui::Entity<InputState>>,
     editing_path_sub: Vec<Subscription>,
     pub(crate) poll_gen: u64,
     scroll: gpui::ScrollHandle,
+    transfers_scroll: gpui::ScrollHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -158,7 +172,7 @@ impl SftpPanelState {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Tty7App>) -> Self {
         let filter_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Search))
+                .placeholder(crate::ui::i18n::t(crate::ui::i18n::L10nKey::SearchFiles))
         });
         let sub = cx.subscribe_in(&filter_input, window, |_this, _input, ev, _w, cx| {
             if matches!(ev, gpui_component::input::InputEvent::Change) {
@@ -174,19 +188,39 @@ impl SftpPanelState {
             filter_input,
             error: None,
             jobs: Vec::new(),
+            uploads_awaiting_listing: HashSet::new(),
+            claimed_downloads: HashSet::new(),
             dismissed_jobs: HashSet::new(),
             show_history: false,
             tray_expanded: false,
             loading: false,
             nav_gen: 0,
             editing: None,
+            editing_sub: Vec::new(),
             editing_path: None,
             editing_path_sub: Vec::new(),
             poll_gen: 0,
             scroll: gpui::ScrollHandle::new(),
+            transfers_scroll: gpui::ScrollHandle::new(),
             _subs: vec![sub],
         }
     }
+}
+
+/// Of the uploads a listing is owed to, the ones that are still writing.
+///
+/// A job that has dropped off the list entirely counts as done: whether it
+/// finished, failed or was trimmed from the history, it is not going to rename
+/// anything into place later.
+fn uploads_still_running(owed: &HashSet<u64>, jobs: &[SftpJobProgress]) -> HashSet<u64> {
+    owed.iter()
+        .copied()
+        .filter(|id| {
+            jobs.iter()
+                .find(|job| job.job_id == *id)
+                .is_some_and(|job| job.state == SftpJobState::Running)
+        })
+        .collect()
 }
 
 fn is_dir_like(e: &SftpEntry) -> bool {
@@ -265,6 +299,33 @@ fn local_download_dir() -> PathBuf {
     local_home().join("Downloads")
 }
 
+/// `dir/name`, or the first `dir/name (n)` that is not taken. A dotfile keeps
+/// its leading dot and gets the number on the end, the way the OS numbers one.
+///
+/// `claimed` names the downloads already in flight: their files do not exist
+/// yet, so the filesystem alone would hand the same name out twice. `None`
+/// means every name in range is spoken for — better to say so than to return
+/// one of them and quietly overwrite it.
+fn free_local_path(dir: &Path, name: &str, claimed: &HashSet<PathBuf>) -> Option<PathBuf> {
+    let taken = |p: &PathBuf| p.exists() || claimed.contains(p);
+    let first = dir.join(name);
+    if !taken(&first) {
+        return Some(first);
+    }
+    let path = Path::new(name);
+    let ext = path.extension().map(|e| e.to_string_lossy().to_string());
+    let stem = path
+        .file_stem()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string());
+    (2..1000u32)
+        .map(|n| match &ext {
+            Some(ext) => dir.join(format!("{stem} ({n}).{ext}")),
+            None => dir.join(format!("{stem} ({n})")),
+        })
+        .find(|candidate| !taken(candidate))
+}
+
 impl Tty7App {
     pub(crate) fn toggle_sftp(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         use crate::core::config::RightPanelTab;
@@ -297,7 +358,7 @@ impl Tty7App {
         self.sftp_panel.open_pane_id = None;
         self.sftp_panel.entries.clear();
         self.sftp_panel.error = None;
-        self.sftp_panel.editing = None;
+        self.sftp_close_edit();
         self.sftp_panel.editing_path = None;
         self.sftp_panel.editing_path_sub.clear();
         self.sftp_panel.jobs.clear();
@@ -333,7 +394,7 @@ impl Tty7App {
         self.sftp_panel.open_workspace = self.pane_workspace(pane_id, window, cx);
         self.sftp_panel.entries.clear();
         self.sftp_panel.error = None;
-        self.sftp_panel.editing = None;
+        self.sftp_close_edit();
         self.sftp_panel.editing_path = None;
         self.sftp_panel.editing_path_sub.clear();
         self.sftp_panel.show_history = false;
@@ -446,7 +507,7 @@ impl Tty7App {
             return;
         }
         let cwd = self.sftp_panel.cwd.clone();
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(cwd));
+        let input = crate::ui::prefill::filled_box(cwd, window, cx);
         input.update(cx, |s, cx| s.focus(window, cx));
         let sub = cx.subscribe_in(
             &input,
@@ -488,13 +549,12 @@ impl Tty7App {
         cx.notify();
     }
 
-    pub(crate) fn sftp_enter_dir(&mut self, entry: SftpEntry, cx: &mut Context<Self>) {
-        if is_dir_like(&entry) {
-            let target = remote_join(&self.sftp_panel.cwd, &entry.name);
-            self.sftp_navigate(target, cx);
-        }
-    }
-
+    /// The double-click gesture and the row menu's first item both land here.
+    /// They used to differ: double-click ran a directory-only handler, so
+    /// double-clicking a file — the gesture every file browser answers by
+    /// opening it — did nothing at all, with no cursor change or message to
+    /// say why. A download is visible in the transfers tray and cancellable
+    /// from it, so the worst case is a click you can take back.
     pub(crate) fn sftp_open_entry(&mut self, entry: SftpEntry, cx: &mut Context<Self>) {
         let target = remote_join(&self.sftp_panel.cwd, &entry.name);
         if is_dir_like(&entry) {
@@ -517,7 +577,27 @@ impl Tty7App {
             return;
         }
         let remote = remote_join(&self.sftp_panel.cwd, &entry.name);
-        let local = local_download_dir().join(&entry.name);
+        // Downloading twice used to write over the first copy without a word.
+        // Browsers answer this by numbering the second one; that keeps the
+        // gesture one click and still cannot lose a file.
+        //
+        // A claim outlives its transfer only until the file lands, at which
+        // point `exists()` speaks for it and re-downloading something the user
+        // has since deleted starts again from the plain name.
+        self.sftp_panel.claimed_downloads.retain(|p| !p.exists());
+        let Some(local) = free_local_path(
+            &local_download_dir(),
+            &entry.name,
+            &self.sftp_panel.claimed_downloads,
+        ) else {
+            self.sftp_panel.error = Some(t_fmt(
+                L10nKey::SftpErrorNoFreeLocalName,
+                &[("name", &entry.name)],
+            ));
+            cx.notify();
+            return;
+        };
+        self.sftp_panel.claimed_downloads.insert(local.clone());
         let recursive = matches!(entry.kind, SftpEntryKind::Dir);
         let spec = SftpTransferSpec {
             pane_id,
@@ -534,17 +614,51 @@ impl Tty7App {
         self.sftp_start_polling(cx);
     }
 
-    pub(crate) fn sftp_delete_entry(&mut self, entry: SftpEntry, cx: &mut Context<Self>) {
+    pub(crate) fn sftp_delete_entry(
+        &mut self,
+        entry: SftpEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(pane_id) = self.sftp_panel.open_pane_id else {
             return;
         };
         let path = remote_join(&self.sftp_panel.cwd, &entry.name);
-        let op = if matches!(entry.kind, SftpEntryKind::Dir) {
-            SftpOp::RemoveDir { path }
-        } else {
-            SftpOp::RemoveFile { path }
-        };
-        self.sftp_run_op(pane_id, op, cx);
+        let is_dir = matches!(entry.kind, SftpEntryKind::Dir);
+        // The local file tree asks before it deletes. This is the same red
+        // Delete in the same shape of menu, on a machine the user cannot walk
+        // over to, and it used to go straight through.
+        let host = self
+            .remote_files_host(window, cx)
+            .unwrap_or_else(|| t(L10nKey::AppLocalServerName).to_string());
+        let body = t_fmt(
+            match is_dir {
+                true => L10nKey::SftpDeleteFolderBody,
+                false => L10nKey::SftpDeleteFileBody,
+            },
+            &[("host", &host)],
+        );
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &t_fmt(L10nKey::FileTreeDeleteTitle, &[("name", &entry.name)]),
+            Some(&body),
+            &crate::ui::confirm_answers(t(L10nKey::Delete), t(L10nKey::Cancel)),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(0) = answer.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                if this.sftp_panel.open_pane_id != Some(pane_id) {
+                    return;
+                }
+                let op = match is_dir {
+                    true => SftpOp::RemoveDir { path },
+                    false => SftpOp::RemoveFile { path },
+                };
+                this.sftp_run_op(pane_id, op, cx);
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn sftp_follow_symlink(&mut self, entry: SftpEntry, cx: &mut Context<Self>) {
@@ -601,7 +715,7 @@ impl Tty7App {
                         cx.notify();
                     }
                     _ => {
-                        this.sftp_panel.editing = None;
+                        this.sftp_close_edit();
                         this.sftp_refresh(cx);
                     }
                 }
@@ -610,13 +724,41 @@ impl Tty7App {
         .detach();
     }
 
+    /// Puts one of the four edit forms up, ready to type into.
+    ///
+    /// Every other box in the app opens focused and answers Return; these four
+    /// opened cold, so naming a new folder meant clicking into the field
+    /// first, and Return did nothing once you had.
+    fn sftp_open_edit(
+        &mut self,
+        input: gpui::Entity<InputState>,
+        edit: SftpEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        input.update(cx, |s, cx| s.focus(window, cx));
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, ev: &InputEvent, _window, cx| match ev {
+                InputEvent::PressEnter { .. } => this.sftp_commit_edit(cx),
+                // OK is disabled while the box is empty, so the form has to
+                // redraw as the name is typed.
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            },
+        );
+        self.sftp_panel.editing = Some(edit);
+        self.sftp_panel.editing_sub = vec![sub];
+        cx.notify();
+    }
+
     pub(crate) fn sftp_begin_new_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(crate::ui::i18n::t(crate::ui::i18n::L10nKey::NewFolderName))
         });
-        self.sftp_panel.editing = Some(SftpEdit::NewFolder(input));
-        cx.notify();
+        self.sftp_open_edit(input.clone(), SftpEdit::NewFolder(input), window, cx);
     }
 
     pub(crate) fn sftp_begin_new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -624,8 +766,7 @@ impl Tty7App {
             InputState::new(window, cx)
                 .placeholder(crate::ui::i18n::t(crate::ui::i18n::L10nKey::NewFileName))
         });
-        self.sftp_panel.editing = Some(SftpEdit::NewFile(input));
-        cx.notify();
+        self.sftp_open_edit(input.clone(), SftpEdit::NewFile(input), window, cx);
     }
 
     pub(crate) fn sftp_begin_rename(
@@ -634,12 +775,12 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(name.clone()));
-        self.sftp_panel.editing = Some(SftpEdit::Rename {
+        let input = crate::ui::prefill::filled_box(name.clone(), window, cx);
+        let edit = SftpEdit::Rename {
             original: name,
-            input,
-        });
-        cx.notify();
+            input: input.clone(),
+        };
+        self.sftp_open_edit(input, edit, window, cx);
     }
 
     pub(crate) fn sftp_begin_chmod(
@@ -651,17 +792,25 @@ impl Tty7App {
         let octal = format!("{:o}", entry.permissions & 0o777);
         let readable = mode_string(entry.permissions);
         let path = remote_join(&self.sftp_panel.cwd, &entry.name);
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(octal));
-        self.sftp_panel.editing = Some(SftpEdit::Chmod {
+        let input = crate::ui::prefill::filled_box(octal, window, cx);
+        let edit = SftpEdit::Chmod {
             path,
             readable,
-            input,
-        });
-        cx.notify();
+            input: input.clone(),
+        };
+        self.sftp_open_edit(input, edit, window, cx);
+    }
+
+    /// Takes the form down and drops the subscription that was listening to
+    /// its box. The two travel together — a live subscription on a box nothing
+    /// is showing would answer Return for a form that is gone.
+    fn sftp_close_edit(&mut self) {
+        self.sftp_panel.editing = None;
+        self.sftp_panel.editing_sub.clear();
     }
 
     pub(crate) fn sftp_cancel_edit(&mut self, cx: &mut Context<Self>) {
-        self.sftp_panel.editing = None;
+        self.sftp_close_edit();
         cx.notify();
     }
 
@@ -691,7 +840,7 @@ impl Tty7App {
             Some(SftpEdit::Rename { original, input }) => {
                 let name = input.read(cx).value().trim().to_string();
                 if name.is_empty() || name == *original {
-                    self.sftp_panel.editing = None;
+                    self.sftp_close_edit();
                     cx.notify();
                     return;
                 }
@@ -721,7 +870,7 @@ impl Tty7App {
         }
     }
 
-    pub(crate) fn sftp_pick_upload(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn sftp_pick_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sftp_panel.open_pane_id.is_none() {
             return;
         }
@@ -731,15 +880,58 @@ impl Tty7App {
             multiple: true,
             prompt: None,
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
-                let _ = this.update(cx, |this, cx| this.sftp_upload_paths(paths, cx));
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.sftp_upload_paths(paths, window, cx)
+                });
             }
         })
         .detach();
     }
 
-    pub(crate) fn sftp_upload_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    pub(crate) fn sftp_upload_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Uploading into the directory on screen used to overwrite whatever was
+        // already there without a word. The listing being shown is the answer —
+        // no extra round trip to the far side to find out.
+        let clashes: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .filter(|name| self.sftp_panel.entries.iter().any(|e| &e.name == name))
+            .collect();
+        if clashes.is_empty() {
+            self.sftp_upload_paths_confirmed(paths, cx);
+            return;
+        }
+        let names = match clashes.len() {
+            1..=3 => clashes.join(", "),
+            _ => format!("{}, …", clashes[..3].join(", ")),
+        };
+        let body = crate::ui::i18n::t_plural(
+            L10nKey::SftpReplaceBody,
+            clashes.len(),
+            &[("names", &names)],
+        );
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            t(L10nKey::SftpReplaceTitle),
+            Some(&body),
+            &crate::ui::confirm_answers(t(L10nKey::Replace), t(L10nKey::Cancel)),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(0) = answer.await else { return };
+            let _ = this.update(cx, |this, cx| this.sftp_upload_paths_confirmed(paths, cx));
+        })
+        .detach();
+    }
+
+    fn sftp_upload_paths_confirmed(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let Some(pane_id) = self.sftp_panel.open_pane_id else {
             return;
         };
@@ -760,13 +952,18 @@ impl Tty7App {
                 remote: remote_join(&cwd, &name),
                 recursive,
             };
-            if let Err(e) = self.sftp_route().transfer_start(spec) {
-                self.sftp_panel.error = Some(e);
+            match self.sftp_route().transfer_start(spec) {
+                Ok(job_id) => {
+                    self.sftp_panel.uploads_awaiting_listing.insert(job_id);
+                }
+                Err(e) => self.sftp_panel.error = Some(e),
             }
         }
         self.sftp_poll_jobs(cx);
         self.sftp_start_polling(cx);
-        self.sftp_refresh(cx);
+        // No listing here on purpose. The upload has only just been handed to
+        // the daemon, so a listing taken now catches the temporary name it
+        // writes under; the one owed for it is taken when it settles.
     }
 
     pub(crate) fn sftp_cancel_job(&mut self, job_id: u64, cx: &mut Context<Self>) {
@@ -797,8 +994,28 @@ impl Tty7App {
 
     fn sftp_poll_jobs(&mut self, cx: &mut Context<Self>) {
         if self.sftp_panel.open_pane_id.is_some() {
-            self.sftp_panel.jobs = self.sftp_route().transfer_list();
-            cx.notify();
+            let jobs = self.sftp_route().transfer_list();
+            self.sftp_apply_jobs(jobs, cx);
+        }
+    }
+
+    /// Take a fresh job list, and list the directory again once the uploads
+    /// that were running have stopped running.
+    ///
+    /// Nothing used to ask for that listing. An upload lands under
+    /// `<name>.tty7-upload-<hex>` and is renamed into place at the end, so the
+    /// listing on screen was the one taken while the temporary name existed —
+    /// and it stayed, so a finished upload read as a file with a hash glued to
+    /// its name.
+    fn sftp_apply_jobs(&mut self, jobs: Vec<SftpJobProgress>, cx: &mut Context<Self>) {
+        let owed = &self.sftp_panel.uploads_awaiting_listing;
+        let still_running = uploads_still_running(owed, &jobs);
+        let settled = still_running.len() != owed.len();
+        self.sftp_panel.uploads_awaiting_listing = still_running;
+        self.sftp_panel.jobs = jobs;
+        cx.notify();
+        if settled {
+            self.sftp_refresh(cx);
         }
     }
 
@@ -835,8 +1052,7 @@ impl Tty7App {
                         if this.sftp_panel.poll_gen != generation {
                             return false;
                         }
-                        this.sftp_panel.jobs = jobs;
-                        cx.notify();
+                        this.sftp_apply_jobs(jobs, cx);
                         true
                     })
                     .unwrap_or(false);
@@ -887,8 +1103,8 @@ impl Tty7App {
                 list,
                 &self.sftp_panel.scroll,
             ))
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
-                this.sftp_upload_paths(paths.paths().to_vec(), cx);
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.sftp_upload_paths(paths.paths().to_vec(), window, cx);
             }))
             .into_any_element()
     }
@@ -993,7 +1209,7 @@ impl Tty7App {
         match action {
             SftpMenuAction::NewFolder => self.sftp_begin_new_folder(window, cx),
             SftpMenuAction::NewFile => self.sftp_begin_new_file(window, cx),
-            SftpMenuAction::Upload => self.sftp_pick_upload(cx),
+            SftpMenuAction::Upload => self.sftp_pick_upload(window, cx),
             SftpMenuAction::GotoShellCwd => {
                 if let Some(pane_id) = self.sftp_panel.open_pane_id
                     && let Some(cwd) = self.pane_shell_cwd(pane_id, window, cx)
@@ -1063,7 +1279,7 @@ impl Tty7App {
         row.child(div().flex_1().min_w(px(20.)).h(px(16.)))
     }
 
-    fn render_sftp_edit_form(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn render_sftp_edit_form(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let secondary = cx.theme().secondary;
         let border = cx.theme().border;
         let foreground = cx.theme().foreground;
@@ -1078,8 +1294,13 @@ impl Tty7App {
                 input,
             ),
         };
+        // An empty box names nothing to create, rename to, or set. Committing
+        // one returned in silence, so OK read as broken rather than as not yet
+        // applicable — the same thing the worktree prompt's Create used to do.
+        let can_commit = !input.read(cx).value().trim().is_empty();
         Some(
             v_flex()
+                .id("panel-sftp-edit")
                 .gap(px(5.))
                 .mx(px(CONTENT_INSET - 4.))
                 .mb(px(4.))
@@ -1088,6 +1309,13 @@ impl Tty7App {
                 .border_1()
                 .border_color(border)
                 .rounded_md()
+                // Escape backs out of the form, the way it backs out of the
+                // path editor above it and every sheet the app puts up.
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
+                    if ev.keystroke.key == "escape" {
+                        this.sftp_cancel_edit(cx);
+                    }
+                }))
                 .child(
                     div()
                         .text_xs()
@@ -1112,6 +1340,7 @@ impl Tty7App {
                                 .label(t(L10nKey::Ok))
                                 .xsmall()
                                 .primary()
+                                .disabled(!can_commit)
                                 .on_click(cx.listener(|this, _, _w, cx| this.sftp_commit_edit(cx))),
                         ),
                 ),
@@ -1134,7 +1363,7 @@ impl Tty7App {
             div()
                 .px(px(6.))
                 .py(px(4.))
-                .text_size(px(12.))
+                .text_size(rems(TEXT))
                 .text_color(color)
                 .child(text)
         };
@@ -1149,8 +1378,13 @@ impl Tty7App {
         let show_go_up = self.sftp_panel.cwd != "/" && filter.trim().is_empty();
 
         if entries.is_empty() && !show_go_up {
+            // A filter that matched nothing is not an empty directory, and
+            // saying so about a machine you cannot see is worse than saying
+            // nothing. The local file tree already draws this distinction.
             let text: gpui::SharedString = if self.sftp_panel.loading {
                 t(L10nKey::SftpLoading).into()
+            } else if !filter.trim().is_empty() {
+                t_fmt(L10nKey::SettingsNothingMatches, &[("query", filter.trim())]).into()
             } else {
                 t(L10nKey::SftpEmptyDirectory).into()
             };
@@ -1230,7 +1464,7 @@ impl Tty7App {
             .cursor_pointer()
             .hover(|s| s.bg(list_hover))
             .on_double_click(
-                cx.listener(move |this, _, _w, cx| this.sftp_enter_dir(open_entry.clone(), cx)),
+                cx.listener(move |this, _, _w, cx| this.sftp_open_entry(open_entry.clone(), cx)),
             )
             .child(
                 Icon::new(icon)
@@ -1317,9 +1551,9 @@ impl Tty7App {
             .on_click({
                 let app = app.clone();
                 let entry = entry.clone();
-                move |_, _window, cx| {
+                move |_, window, cx| {
                     let entry = entry.clone();
-                    let _ = app.update(cx, |this, cx| this.sftp_delete_entry(entry, cx));
+                    let _ = app.update(cx, |this, cx| this.sftp_delete_entry(entry, window, cx));
                 }
             }),
         )
@@ -1395,7 +1629,7 @@ impl Tty7App {
             .on_click(cx.listener(|this, _, _w, cx| this.sftp_toggle_tray(cx)))
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(rems(META))
                     .text_color(muted)
                     .child(if expanded { "⌄" } else { "›" }),
             )
@@ -1404,7 +1638,7 @@ impl Tty7App {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(11.5))
+                    .text_size(rems(META))
                     .text_color(summary_color)
                     .child(summary),
             )
@@ -1420,8 +1654,8 @@ impl Tty7App {
                             false,
                             cx,
                         )
-                        .w(px(18.))
-                        .h(px(18.))
+                        .w(px(crate::ui::tab_strip::MIN_TARGET))
+                        .h(px(crate::ui::tab_strip::MIN_TARGET))
                         .rounded(px(4.))
                         .tooltip(t(L10nKey::Dismiss))
                         .on_click(cx.listener(|this, _, _w, cx| this.sftp_dismiss_tray(cx))),
@@ -1441,7 +1675,7 @@ impl Tty7App {
                     div()
                         .px(px(CONTENT_INSET))
                         .py(px(3.))
-                        .text_size(px(11.5))
+                        .text_size(rems(META))
                         .text_color(muted)
                         .child(t(L10nKey::SftpNoTransfers)),
                 )
@@ -1452,11 +1686,19 @@ impl Tty7App {
                 }
                 list
             };
-            div()
-                .id("sftp-transfers-list")
-                .max_h(px(200.))
-                .overflow_y_scroll()
-                .child(inner)
+            // The list caps at 200px and scrolls past it; it was the last
+            // scroll area in the app with nothing to say so. This wrapper only
+            // overlays the bar, so the box keeps the height it already had.
+            crate::ui::scrollbar::over_vertical_scroll(
+                "sftp-transfers-scrollbar",
+                div()
+                    .id("sftp-transfers-list")
+                    .max_h(px(200.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.sftp_panel.transfers_scroll)
+                    .child(inner),
+                &self.sftp_panel.transfers_scroll,
+            )
         });
 
         Some(
@@ -1542,25 +1784,32 @@ impl Tty7App {
                     )
                     .when(done_download, |this| {
                         this.child(
-                            Button::new(("sftp-reveal-job", job_id as usize))
-                                .icon(IconName::FolderOpen)
-                                .xsmall()
-                                .ghost()
-                                .tooltip(crate::ui::right_panel::reveal_label())
-                                .on_click(cx.listener(move |this, _, _w, cx| {
-                                    this.sftp_reveal_download(local.clone(), cx)
-                                })),
+                            crate::ui::tab_strip::hit_target(
+                                Button::new(("sftp-reveal-job", job_id as usize))
+                                    .icon(IconName::FolderOpen)
+                                    .xsmall()
+                                    .ghost(),
+                            )
+                            .tooltip(crate::ui::right_panel::reveal_label())
+                            .on_click(cx.listener(
+                                move |this, _, _w, cx| this.sftp_reveal_download(local.clone(), cx),
+                            )),
                         )
                     })
                     .when(running, |this| {
                         this.child(
-                            Button::new(("sftp-cancel-job", job_id as usize))
-                                .label("✕")
-                                .xsmall()
-                                .ghost()
-                                .on_click(cx.listener(move |this, _, _w, cx| {
+                            crate::ui::tab_strip::hit_target(
+                                Button::new(("sftp-cancel-job", job_id as usize))
+                                    .icon(IconName::Close)
+                                    .xsmall()
+                                    .ghost(),
+                            )
+                            .tooltip(t(L10nKey::Cancel))
+                            .on_click(
+                                cx.listener(move |this, _, _w, cx| {
                                     this.sftp_cancel_job(job_id, cx)
-                                })),
+                                }),
+                            ),
                         )
                     }),
             )
@@ -1580,6 +1829,138 @@ impl Tty7App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn upload(job_id: u64, state: SftpJobState) -> SftpJobProgress {
+        SftpJobProgress {
+            job_id,
+            pane_id: 1,
+            kind: SftpTransferKind::Upload,
+            state,
+            current: String::new(),
+            bytes_done: 0,
+            bytes_total: 0,
+            error: None,
+            local: "/here/note.txt".into(),
+            remote: "/there/note.txt".into(),
+        }
+    }
+
+    #[test]
+    fn an_upload_owes_a_listing_until_it_stops_running() {
+        let owed = HashSet::from([7]);
+        let running = uploads_still_running(&owed, &[upload(7, SftpJobState::Running)]);
+        assert_eq!(
+            running, owed,
+            "a listing taken now shows the temporary name"
+        );
+
+        for done in [
+            SftpJobState::Done,
+            SftpJobState::Error,
+            SftpJobState::Cancelled,
+        ] {
+            let running = uploads_still_running(&owed, &[upload(7, done)]);
+            assert!(running.is_empty(), "{done:?} still owes the listing");
+        }
+    }
+
+    #[test]
+    fn a_job_that_falls_off_the_list_is_not_waited_on_forever() {
+        let owed = HashSet::from([7]);
+        assert!(uploads_still_running(&owed, &[]).is_empty());
+    }
+
+    #[test]
+    fn one_upload_finishing_does_not_settle_the_one_beside_it() {
+        let owed = HashSet::from([7, 8]);
+        let running = uploads_still_running(
+            &owed,
+            &[
+                upload(7, SftpJobState::Done),
+                upload(8, SftpJobState::Running),
+            ],
+        );
+        assert_eq!(running, HashSet::from([8]));
+    }
+
+    #[test]
+    fn a_second_download_is_numbered_rather_than_written_over_the_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let free = HashSet::new();
+
+        // Nothing there: the plain name.
+        assert_eq!(
+            free_local_path(d, "notes.txt", &free),
+            Some(d.join("notes.txt"))
+        );
+
+        std::fs::write(d.join("notes.txt"), b"first").expect("write");
+        assert_eq!(
+            free_local_path(d, "notes.txt", &free),
+            Some(d.join("notes (2).txt"))
+        );
+        std::fs::write(d.join("notes (2).txt"), b"second").expect("write");
+        assert_eq!(
+            free_local_path(d, "notes.txt", &free),
+            Some(d.join("notes (3).txt"))
+        );
+
+        // Extensionless and dotfiles keep their shape.
+        std::fs::write(d.join("Makefile"), b"x").expect("write");
+        assert_eq!(
+            free_local_path(d, "Makefile", &free),
+            Some(d.join("Makefile (2)"))
+        );
+        std::fs::write(d.join(".env"), b"x").expect("write");
+        assert_eq!(free_local_path(d, ".env", &free), Some(d.join(".env (2)")));
+
+        // And the first file is still the first file.
+        assert_eq!(
+            std::fs::read(d.join("notes.txt")).expect("read"),
+            b"first".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_download_still_in_flight_holds_its_name_before_the_file_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+
+        // The first download has been handed a name but has written nothing
+        // yet, so `exists()` cannot see it. A second one must not take it.
+        let claimed: HashSet<PathBuf> = [d.join("notes.txt")].into_iter().collect();
+        assert_eq!(
+            free_local_path(d, "notes.txt", &claimed),
+            Some(d.join("notes (2).txt"))
+        );
+    }
+
+    #[test]
+    fn every_name_taken_reports_rather_than_overwriting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let mut claimed: HashSet<PathBuf> = HashSet::new();
+        claimed.insert(d.join("notes.txt"));
+        for n in 2..1000u32 {
+            claimed.insert(d.join(format!("notes ({n}).txt")));
+        }
+        assert_eq!(free_local_path(d, "notes.txt", &claimed), None);
+    }
+
+    #[test]
+    fn the_overwrite_question_counts_correctly_in_every_locale() {
+        use crate::ui::i18n::{L10nKey, t_plural};
+        for locale in ["en", "zh-CN", "ja-JP"] {
+            crate::ui::i18n::set_locale(locale);
+            for n in [1usize, 2, 7] {
+                let body = t_plural(L10nKey::SftpReplaceBody, n, &[("names", "a.txt")]);
+                assert!(body.contains("a.txt"), "{locale}/{n}: {body}");
+                assert!(!body.contains("{names}"), "{locale}/{n}: {body}");
+            }
+        }
+        crate::ui::i18n::set_locale("en");
+    }
 
     fn entry(name: &str, kind: SftpEntryKind, target_is_dir: bool) -> SftpEntry {
         SftpEntry {

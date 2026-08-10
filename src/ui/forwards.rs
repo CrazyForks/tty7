@@ -1,4 +1,4 @@
-use gpui::{AnyElement, Context, Div, Entity, FontWeight, Stateful, div, prelude::*, px};
+use gpui::{AnyElement, Context, Div, Entity, FontWeight, Stateful, div, prelude::*, px, rems};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -7,6 +7,12 @@ use crate::daemon::protocol::{ForwardStatus, ManagedForward, SshForwardKind};
 use crate::terminal::view::TerminalView;
 use crate::ui::app::{CONTENT_INSET, TILE_GLYPH_SM, TILE_SIZE_SM, Tty7App};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
+use crate::ui::right_panel::{META, TEXT, TEXT_MONO};
+
+/// How far a forward's target endpoint fades when the rule is Dynamic and has
+/// no target to name. The rules editor in Settings and the live Forwards panel
+/// draw the same row, so they fade it by the same amount.
+pub(crate) const NO_TARGET_FADE: f32 = 0.4;
 
 impl Tty7App {
     pub(crate) fn render_ssh_status_strip(
@@ -25,6 +31,22 @@ impl Tty7App {
             .map(|(h, _)| h)
             .or_else(|| view.remote_context().map(|c| c.target))
             .unwrap_or_default();
+
+        // Why it ended. The strip used to say only that it *had* ended, so a
+        // rejected key and a dropped network read identically — and the reason
+        // scrolled away with the pane's own output.
+        let reason = match view.ssh_phase() {
+            Some(crate::daemon::protocol::SshPhase::Failed { reason }) if !reason.is_empty() => {
+                Some(reason)
+            }
+            _ => None,
+        };
+        // A saved connection is editable; a one-off `user@host` is not, and
+        // offering to edit one would open an empty page.
+        let profile = view
+            .ssh_spec()
+            .and_then(|s| s.profile_id.clone())
+            .and_then(|id| uuid::Uuid::parse_str(&id).ok());
 
         let theme = cx.theme();
 
@@ -55,7 +77,31 @@ impl Tty7App {
                         t_fmt(L10nKey::ForwardDisconnectedFrom, &[("host", &host)])
                     }),
             )
-            .child(div().child("· ⌘⇧R"))
+            .children(reason.map(|reason| {
+                // The reason is whatever ssh said, and it runs past 360px more
+                // often than not — a truncated "…" was the only account of a
+                // rejected key the pane had left, its own output having
+                // scrolled away. Hovering gives the whole sentence back.
+                let full = reason.clone();
+                div()
+                    .id("ssh-strip-reason")
+                    .max_w(px(360.))
+                    .truncate()
+                    .text_color(theme.danger)
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(full.clone()).build(window, cx)
+                    })
+                    .child(reason)
+            }))
+            // The chord was spelled "⌘⇧R" here. That is one platform's
+            // rendering of one default: off macOS it names a modifier the
+            // keyboard does not have, and either way it kept saying ⌘⇧R after
+            // the user had rebound Reconnect to something else. Ask the keymap,
+            // and say nothing at all when the action carries no binding.
+            .children(
+                crate::ui::home::key_hint("RestartSshSession", cx)
+                    .map(|keys| div().child(format!("· {keys}"))),
+            )
             .child(
                 Button::new("ssh-reconnect")
                     .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Reconnect))
@@ -64,7 +110,16 @@ impl Tty7App {
                     .on_click(
                         cx.listener(|this, _, window, cx| this.restart_ssh_session(window, cx)),
                     ),
-            );
+            )
+            .children(profile.map(|id| {
+                Button::new("ssh-edit-profile")
+                    .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::SshEditProfile))
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_ssh_profile_in_settings(id, window, cx)
+                    }))
+            }));
         Some(
             div()
                 .absolute()
@@ -74,71 +129,6 @@ impl Tty7App {
                 .flex()
                 .justify_center()
                 .child(bar)
-                .into_any_element(),
-        )
-    }
-
-    pub(crate) fn render_ssh_close_confirm_overlay(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        self.ssh_close_confirm?;
-        let theme = cx.theme();
-        // A modal card centred over the window, not panel furniture: it keeps
-        // gpui's own defaults (a 16px title over a `text_sm` body) because a
-        // dialog is read on its own, with nothing beside it to be out of step
-        // with. The panel's ramp deliberately stops at the panel.
-        let card = v_flex()
-            .w(px(360.))
-            .gap_3()
-            .p_4()
-            .bg(theme.popover)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_lg()
-            .shadow_lg()
-            .occlude()
-            .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(t(crate::ui::i18n::L10nKey::CloseSshConnectionTitle)),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(t(crate::ui::i18n::L10nKey::CloseSshConnectionBody)),
-            )
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("ssh-close-cancel")
-                            .label(t(crate::ui::i18n::L10nKey::Keep))
-                            .small()
-                            .on_click(
-                                cx.listener(|this, _, _window, cx| this.cancel_ssh_close(cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("ssh-close-confirm")
-                            .label(t(crate::ui::i18n::L10nKey::Close))
-                            .primary()
-                            .small()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.confirm_ssh_close(window, cx)
-                            })),
-                    ),
-            );
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(card)
                 .into_any_element(),
         )
     }
@@ -198,7 +188,7 @@ impl Tty7App {
                         div()
                             .px(px(CONTENT_INSET))
                             .py(px(2.))
-                            .text_size(px(12.))
+                            .text_size(rems(TEXT))
                             .text_color(cx.theme().muted_foreground)
                             .child(crate::ui::i18n::t(crate::ui::i18n::L10nKey::None)),
                     )
@@ -279,7 +269,7 @@ impl Tty7App {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(12.))
+                                    .text_size(rems(TEXT_MONO))
                                     .font_family(mono.clone())
                                     .text_color(if errored { theme.danger } else { muted })
                                     .child(tail),
@@ -289,7 +279,7 @@ impl Tty7App {
                         this.child(
                             div()
                                 .truncate()
-                                .text_size(px(11.))
+                                .text_size(rems(META))
                                 .text_color(muted)
                                 .child(desc),
                         )
@@ -309,8 +299,8 @@ impl Tty7App {
                             false,
                             cx,
                         )
-                        .w(px(18.))
-                        .h(px(18.))
+                        .w(px(crate::ui::tab_strip::MIN_TARGET))
+                        .h(px(crate::ui::tab_strip::MIN_TARGET))
                         .rounded(px(4.))
                         .tooltip(t(L10nKey::ForwardTooltipRemove))
                         .on_click(cx.listener(
@@ -345,12 +335,12 @@ impl Tty7App {
                     div()
                         .flex_none()
                         .w(px(30.))
-                        .text_size(px(11.))
+                        .text_size(rems(META))
                         .text_color(muted)
                         .child(label),
                 )
                 .child(div().flex_1().min_w_0().child(Input::new(host).xsmall()))
-                .child(div().text_size(px(11.)).text_color(muted).child(":"))
+                .child(div().text_size(rems(META)).text_color(muted).child(":"))
                 .child(div().w(px(52.)).child(Input::new(port).xsmall()))
         };
 
@@ -385,7 +375,7 @@ impl Tty7App {
             ))
             .child(
                 div()
-                    .opacity(if needs_target { 1.0 } else { 0.4 })
+                    .opacity(if needs_target { 1.0 } else { NO_TARGET_FADE })
                     .child(pair(
                         if needs_target {
                             t(L10nKey::ForwardToLabel)

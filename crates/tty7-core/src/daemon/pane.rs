@@ -113,6 +113,34 @@ struct SpawnConfig {
     remote: Option<RemoteContext>,
 }
 
+/// Why a configured shell cannot be run, in one sentence, before anything
+/// tries. Without it a missing program arrives at the window wrapped four
+/// deep — "daemon refused Spawn: spawn failed: Unable to spawn … (ENOENT: No
+/// such file or directory)" — and the one fact that matters is buried in it.
+///
+/// Only a program given as a path can be checked here; a bare name is resolved
+/// through PATH by the OS, and guessing at that would be worse than silence.
+fn shell_program_problem(program: &str) -> Option<String> {
+    let path = std::path::Path::new(program);
+    if path.components().count() < 2 {
+        return None;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Some(format!("no such shell on this machine: {program}"));
+    };
+    if meta.is_dir() {
+        return Some(format!("the configured shell is a directory: {program}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Some(format!("the configured shell is not executable: {program}"));
+        }
+    }
+    None
+}
+
 fn build_spawn_config(
     pane: u64,
     cwd: Option<PathBuf>,
@@ -121,6 +149,12 @@ fn build_spawn_config(
 ) -> anyhow::Result<SpawnConfig> {
     let initial_cwd = initial_working_directory(cwd);
     let configured = choose_shell(shell, crate::core::config::shell_command());
+    if let Some(problem) = configured
+        .as_ref()
+        .and_then(|c| shell_program_problem(&c.program))
+    {
+        anyhow::bail!(problem);
+    }
     let remote = wsl_remote_context(configured.as_ref());
     let (cmd, integration_dir) = build_shell_command(configured, &initial_cwd, pane, workspace)?;
     Ok(SpawnConfig {
@@ -427,6 +461,11 @@ fn pane_environment(
     if let Some(dir) = config_dir_env() {
         env.push((TTY7_CONFIG_DIR_ENV.to_string(), dir));
     }
+    // Names the pane's own history file; the integration snippet is what
+    // decides to use it, once the user's rc has said where their history was.
+    if let Some((key, value)) = crate::daemon::history::env_for(pane, shell) {
+        env.push((key, value));
+    }
     // Windows is deliberately left out. `SHELL` is not a native concept there —
     // neither cmd nor PowerShell reads it — and the tools that do read it are
     // the POSIX emulations: MSYS/Git Bash, Cygwin, and WSL, which take `WSLENV`
@@ -726,6 +765,17 @@ struct PtyBackend {
     integration_dir: Option<PathBuf>,
 }
 
+/// The pty half of a pane, before it is wired up: opened and spawned into by
+/// [`DaemonPane::spawn`], inherited across an `exec` by [`DaemonPane::adopt`].
+struct PtyParts {
+    master: Box<dyn MasterPty + Send>,
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    shell_pid: Option<u32>,
+    integration_dir: Option<PathBuf>,
+    reader_handle: Box<dyn Read + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
 struct NativeSshBackend {
     handle: Arc<crate::daemon::ssh::SshSessionHandle>,
     connection: crate::daemon::ssh::SharedConnection,
@@ -887,6 +937,278 @@ fn push_image_frame(frames: &mut Vec<GraphicsFrame>, frame: Vec<u8>) {
     }
 }
 
+/// A live pane, reduced to what survives an `exec` plus what has to be written
+/// down because it does not.
+///
+/// The descriptor number and the child pid are the half the kernel keeps for
+/// us. Everything else here was in memory, and memory is exactly what `exec`
+/// replaces — so a pane's screen, its cwd, its prompt state and its agent are
+/// carried across by hand or not at all. See `daemon::handoff`.
+#[cfg(unix)]
+pub struct Carried {
+    pub id: u64,
+    pub owner: Option<String>,
+    pub master_fd: std::os::fd::RawFd,
+    pub child_pid: u32,
+    pub integration_dir: Option<PathBuf>,
+    pub size: WinSize,
+    pub ring: Vec<crate::daemon::scrollback::Segment>,
+    pub cwd: Option<PathBuf>,
+    pub shell_active: bool,
+    pub at_prompt: bool,
+    pub last_exit: Option<i32>,
+    pub remote: Option<RemoteContext>,
+    pub agent: Option<crate::core::cli_agent::CLIAgent>,
+    pub agent_argv: Option<Vec<String>>,
+    pub agent_session: Option<crate::core::cli_agent::AgentSessionState>,
+}
+
+/// A pty master this process inherited from its own previous image.
+///
+/// `portable-pty` can only hand out a master it opened, and after an `exec`
+/// there is nothing left of the one it opened except the descriptor number. The
+/// operations a pane actually performs on a master are few enough — resize, ask
+/// the size, clone a reader, take a writer, ask which process group is in the
+/// foreground — and all of them are ioctls on that descriptor.
+#[cfg(unix)]
+struct AdoptedMaster {
+    fd: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl AdoptedMaster {
+    fn from_fd(fd: std::os::fd::RawFd) -> anyhow::Result<Self> {
+        use std::os::fd::FromRawFd as _;
+
+        // A descriptor that no longer refers to a terminal is one the previous
+        // image did not really hold — a number reused after a close, or a blob
+        // that named the wrong one. Adopting it would produce a pane whose
+        // every ioctl fails in a different way; refusing produces a pane that
+        // is simply gone, which is a thing the client already handles.
+        if unsafe { libc::isatty(fd) } != 1 {
+            anyhow::bail!("descriptor {fd} is not a terminal");
+        }
+        // Crossing the exec required stripping close-on-exec; being across is
+        // when it goes back on. Children this daemon spawns from here — shells,
+        // `lsof`, ssh transports — must not inherit another pane's master: a
+        // child holding one keeps the pty open after this pane closes it, and
+        // the hangup the shell should see never comes.
+        if let Err(e) = crate::daemon::handoff::close_on_exec_again(fd) {
+            log::warn!("could not restore close-on-exec on adopted pty {fd}: {e}");
+        }
+        Ok(Self {
+            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+        })
+    }
+
+    fn dup(&self) -> std::io::Result<std::fs::File> {
+        Ok(std::fs::File::from(self.fd.try_clone()?))
+    }
+}
+
+#[cfg(unix)]
+impl MasterPty for AdoptedMaster {
+    fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        let ws = libc::winsize {
+            ws_row: size.rows,
+            ws_col: size.cols,
+            ws_xpixel: size.pixel_width,
+            ws_ypixel: size.pixel_height,
+        };
+        if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCSWINSZ, &ws as *const _) } != 0 {
+            anyhow::bail!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn get_size(&self) -> anyhow::Result<PtySize> {
+        use std::os::fd::AsRawFd as _;
+
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCGWINSZ, &mut ws as *mut _) } != 0 {
+            anyhow::bail!("TIOCGWINSZ failed: {}", std::io::Error::last_os_error());
+        }
+        Ok(PtySize {
+            rows: ws.ws_row,
+            cols: ws.ws_col,
+            pixel_width: ws.ws_xpixel,
+            pixel_height: ws.ws_ypixel,
+        })
+    }
+
+    fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(self.dup()?))
+    }
+
+    /// Deliberately a plain `File`, unlike the writer `portable-pty` hands out:
+    /// that one sends EOF to the shell when it is dropped. Correct for a pty
+    /// whose pane is being closed, wrong for one whose pane is only changing
+    /// which program serves it.
+    fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+        Ok(Box::new(self.dup()?))
+    }
+
+    fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd as _;
+        Some(self.fd.as_raw_fd())
+    }
+
+    fn process_group_leader(&self) -> Option<libc::pid_t> {
+        use std::os::fd::AsRawFd as _;
+        match unsafe { libc::tcgetpgrp(self.fd.as_raw_fd()) } {
+            pid if pid > 0 => Some(pid),
+            _ => None,
+        }
+    }
+}
+
+/// A child this process inherited from its own previous image.
+///
+/// Still genuinely our child — `exec` keeps the process, so the kernel's
+/// parent-child bookkeeping is untouched and `waitpid` works. What was lost is
+/// the `Child` value that knew how to ask.
+#[cfg(unix)]
+#[derive(Debug)]
+struct AdoptedChild {
+    pid: libc::pid_t,
+    exited: Option<portable_pty::ExitStatus>,
+}
+
+#[cfg(unix)]
+impl AdoptedChild {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid: pid as libc::pid_t,
+            exited: None,
+        }
+    }
+
+    fn reap(&mut self, flags: libc::c_int) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        if let Some(status) = &self.exited {
+            return Ok(Some(status.clone()));
+        }
+        let mut raw: libc::c_int = 0;
+        let seen = unsafe { libc::waitpid(self.pid, &mut raw, flags) };
+        if seen == 0 {
+            return Ok(None);
+        }
+        if seen < 0 {
+            let e = std::io::Error::last_os_error();
+            // ECHILD means someone already reaped it, or it was never ours.
+            // Either way there is no status left to collect and no point in
+            // asking again — reporting an exit of zero is what an unknown but
+            // finished child amounts to.
+            if e.raw_os_error() == Some(libc::ECHILD) {
+                let status = portable_pty::ExitStatus::with_exit_code(0);
+                self.exited = Some(status.clone());
+                return Ok(Some(status));
+            }
+            return Err(e);
+        }
+        let code = if libc::WIFEXITED(raw) {
+            libc::WEXITSTATUS(raw) as u32
+        } else if libc::WIFSIGNALED(raw) {
+            128 + libc::WTERMSIG(raw) as u32
+        } else {
+            0
+        };
+        let status = portable_pty::ExitStatus::with_exit_code(code);
+        self.exited = Some(status.clone());
+        Ok(Some(status))
+    }
+}
+
+#[cfg(unix)]
+impl portable_pty::Child for AdoptedChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        self.reap(libc::WNOHANG)
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        loop {
+            if let Some(status) = self.reap(0)? {
+                return Ok(status);
+            }
+        }
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        Some(self.pid as u32)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct AdoptedKiller {
+    pid: libc::pid_t,
+}
+
+#[cfg(unix)]
+impl portable_pty::ChildKiller for AdoptedChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        AdoptedKiller { pid: self.pid }.kill()
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(AdoptedKiller { pid: self.pid })
+    }
+}
+
+#[cfg(unix)]
+impl portable_pty::ChildKiller for AdoptedKiller {
+    fn kill(&mut self) -> std::io::Result<()> {
+        if unsafe { libc::kill(self.pid, libc::SIGKILL) } != 0 {
+            let e = std::io::Error::last_os_error();
+            // Already gone is the outcome kill was asked for.
+            if e.raw_os_error() != Some(libc::ESRCH) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(AdoptedKiller { pid: self.pid })
+    }
+}
+
+/// The screen a restored pane opens with.
+///
+/// `segments` is what some earlier pane — the one this one replaces after a
+/// daemon died without handing off — last had on it. `banner` is the sentence
+/// that says so, supplied by the client because the daemon has no locale of its
+/// own. Both are decoration over a shell that is unambiguously new: nothing
+/// here revives a process.
+pub struct Restore {
+    pub segments: Vec<crate::daemon::scrollback::Segment>,
+    pub banner: Option<String>,
+}
+
+/// The bytes that separate restored output from the new shell's own.
+///
+/// The resets are not cosmetic. A snapshot is trimmed at the front, so it can
+/// begin in the middle of anything: an SGR run whose reset was cut, a hidden
+/// cursor, a disabled autowrap, an alternate screen whose `?1049h` survived but
+/// whose `?1049l` never came because the daemon died while `vim` was open.
+/// Replaying that leaves the emulator in a state the incoming shell did not ask
+/// for and cannot see. Leaving the alternate screen also does the useful thing
+/// in the common case: the primary buffer still holds the pre-`vim` scrollback
+/// from earlier in the same snapshot.
+fn restore_preamble(banner: Option<&str>) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[0m");
+    if let Some(banner) = banner.map(str::trim).filter(|b| !b.is_empty()) {
+        out.extend_from_slice(b"\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 ");
+        // A newline inside the banner would be a client writing multiple lines
+        // through a one-line hole; the rest of the sequence assumes one line.
+        out.extend_from_slice(banner.replace(['\r', '\n'], " ").as_bytes());
+        out.extend_from_slice(b" \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n");
+    }
+    out
+}
+
 impl DaemonPane {
     pub fn spawn(
         id: u64,
@@ -895,6 +1217,7 @@ impl DaemonPane {
         shell: Option<ShellSpec>,
         owner: Option<String>,
         workspace: Option<String>,
+        restore: Option<Restore>,
         on_dead: impl FnOnce() + Send + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         let pty_size = pty_size(size);
@@ -911,26 +1234,72 @@ impl DaemonPane {
         let reader_handle = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
 
-        let state = Arc::new(Mutex::new(PaneState {
-            id,
-            ring: ReplayRing::new(size),
-            subscriber: None,
-            subscriber_epoch: 0,
-            observers: Vec::new(),
-            observer_seq: 0,
-            cwd: spawn.initial_cwd,
-            shell: ShellState::default(),
-            remote: spawn.remote.clone(),
-            agent: None,
-            agent_session: None,
-            agent_argv: None,
-            alive: true,
-            exit_code: None,
-        }));
+        let ring = match restore {
+            Some(restore) => {
+                let mut ring = ReplayRing::seeded(restore.segments, size);
+                ring.append(&restore_preamble(restore.banner.as_deref()));
+                ring
+            }
+            None => ReplayRing::new(size),
+        };
+
+        Ok(Self::over_pty(
+            PtyParts {
+                master: pair.master,
+                child,
+                shell_pid,
+                integration_dir: spawn.integration_dir,
+                reader_handle,
+                writer,
+            },
+            PaneState {
+                id,
+                ring,
+                subscriber: None,
+                subscriber_epoch: 0,
+                observers: Vec::new(),
+                observer_seq: 0,
+                cwd: spawn.initial_cwd,
+                shell: ShellState::default(),
+                remote: spawn.remote.clone(),
+                agent: None,
+                agent_session: None,
+                agent_argv: None,
+                alive: true,
+                exit_code: None,
+            },
+            owner,
+            on_dead,
+        ))
+    }
+
+    /// Wire a pty, a child and a starting state into a running pane.
+    ///
+    /// Shared by the two ways a pty-backed pane comes to exist — one that opens
+    /// a pty and starts a shell in it, and one that inherits both from the
+    /// image it replaced. Everything below this line is identical for them, and
+    /// it is the part where getting it subtly wrong shows up as a pane that
+    /// never reports its death or never sees its own output.
+    fn over_pty(
+        parts: PtyParts,
+        state: PaneState,
+        owner: Option<String>,
+        on_dead: impl FnOnce() + Send + 'static,
+    ) -> Arc<Self> {
+        let PtyParts {
+            master,
+            child,
+            shell_pid,
+            integration_dir,
+            reader_handle,
+            writer,
+        } = parts;
+
+        let id = state.id;
+        let state = Arc::new(Mutex::new(state));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(OutputGate::new());
-
-        let master = Arc::new(Mutex::new(Some(pair.master)));
+        let master = Arc::new(Mutex::new(Some(master)));
 
         let pane = Arc::new(Self {
             id,
@@ -939,7 +1308,7 @@ impl DaemonPane {
                 master: master.clone(),
                 child: child.clone(),
                 shell_pid,
-                integration_dir: spawn.integration_dir,
+                integration_dir,
             }),
             writer: writer.clone(),
             shutting_down: shutting_down.clone(),
@@ -1005,7 +1374,118 @@ impl DaemonPane {
         );
         *pane.reader.lock().unwrap() = Some(reader);
 
-        Ok(pane)
+        pane
+    }
+
+    /// Reduce a live pane to what can be handed to another program image.
+    ///
+    /// Nothing is taken: the descriptor number is copied out, not the
+    /// descriptor, and the pane keeps serving exactly as before. That is what
+    /// lets the caller stage a whole handoff and then abandon it — an `exec`
+    /// that fails costs a log line, not a machine's worth of shells.
+    ///
+    /// `None` for a native-SSH pane. Its session lives in this process's
+    /// memory, not in a descriptor, and no amount of copying descriptor numbers
+    /// would let the new image speak on the wire the old one had encrypted.
+    #[cfg(unix)]
+    pub fn carry(&self) -> Option<crate::daemon::pane::Carried> {
+        let PaneBackend::Pty(pty) = &self.backend else {
+            return None;
+        };
+        let master_fd = pty
+            .master
+            .lock()
+            .ok()?
+            .as_ref()
+            .and_then(|master| master.as_raw_fd())?;
+        let st = self.state.lock().unwrap();
+        Some(Carried {
+            id: self.id,
+            owner: self.owner.clone(),
+            master_fd,
+            child_pid: pty.shell_pid?,
+            integration_dir: pty.integration_dir.clone(),
+            size: st.ring.tail_size(),
+            ring: st.ring.snapshot(),
+            cwd: st.cwd.clone(),
+            shell_active: st.shell.active,
+            at_prompt: st.shell.at_prompt,
+            last_exit: st.shell.last_exit_code,
+            remote: st.remote.clone(),
+            agent: st.agent,
+            agent_argv: st.agent_argv.clone(),
+            agent_session: st.agent_session.clone(),
+        })
+    }
+
+    /// Rebuild a pane around a pty this process already holds.
+    ///
+    /// The descriptor and the child pid came through an `exec`, so both are
+    /// still ours in the only sense that matters: the kernel still has us down
+    /// as the pty's owner and the shell's parent. What is gone is everything
+    /// that was in memory, which is why the ring and the pane's status come
+    /// back from the handoff blob rather than from the shell.
+    #[cfg(unix)]
+    pub fn adopt(
+        carried: crate::daemon::pane::Carried,
+        on_dead: impl FnOnce() + Send + 'static,
+    ) -> anyhow::Result<Arc<Self>> {
+        let master = AdoptedMaster::from_fd(carried.master_fd)?;
+        let reader_handle = master.try_clone_reader()?;
+        let writer = Arc::new(Mutex::new(master.take_writer()?));
+        let shell_pid = carried.child_pid;
+        // The size the pty is actually at is the kernel's to answer, and it is
+        // the truth: nobody resized it while we were not running. The carried
+        // size only says where the ring's tail was cut.
+        let size = master
+            .get_size()
+            .map(|s| WinSize {
+                cols: s.cols,
+                rows: s.rows,
+                cell_w: carried.size.cell_w,
+                cell_h: carried.size.cell_h,
+            })
+            .unwrap_or(carried.size);
+
+        let mut ring = ReplayRing::seeded(carried.ring, size);
+        // Not a restore banner: nothing was lost, so there is nothing to
+        // announce and nothing to reset. The shell below these bytes is the
+        // same shell that wrote them.
+        ring.resize(size);
+
+        Ok(Self::over_pty(
+            PtyParts {
+                master: Box::new(master),
+                child: Arc::new(Mutex::new(Box::new(AdoptedChild::new(shell_pid)))),
+                shell_pid: Some(shell_pid),
+                integration_dir: carried.integration_dir,
+                reader_handle,
+                writer,
+            },
+            PaneState {
+                id: carried.id,
+                ring,
+                subscriber: None,
+                subscriber_epoch: 0,
+                observers: Vec::new(),
+                observer_seq: 0,
+                cwd: carried.cwd,
+                shell: ShellState {
+                    active: carried.shell_active,
+                    at_prompt: carried.at_prompt,
+                    last_exit_code: carried.last_exit,
+                    command: None,
+                },
+                remote: carried.remote,
+                agent: carried.agent,
+                agent_session: carried.agent_session,
+                agent_argv: carried.agent_argv,
+                alive: true,
+                exit_code: None,
+            },
+            carried.owner,
+            on_dead,
+        ))
     }
 
     pub fn spawn_native_ssh(
@@ -1451,6 +1931,31 @@ impl DaemonPane {
         cached.or_else(|| self.foreground_remote_context())
     }
 
+    /// The pane's screen, capped for storage, with the mark that says how much
+    /// output it had produced when the copy was taken.
+    ///
+    /// Both come from one acquisition of the state lock. Reading them apart
+    /// would let output land in between, and the writer would then record a
+    /// mark that claims to cover bytes its snapshot does not have — a pane
+    /// that stopped producing at that moment would keep the stale copy for
+    /// good, because its mark would never move again.
+    /// The mark alone, for deciding whether a snapshot is worth taking:
+    /// [`scrollback_snapshot`](Self::scrollback_snapshot) clones the whole
+    /// ring under the state lock, which is a lot to pay every tick for the
+    /// answer "nothing changed". A pane that moves between this read and the
+    /// snapshot is fine — the snapshot returns its own mark, and that pair is
+    /// what gets recorded.
+    pub fn scrollback_mark(&self) -> u64 {
+        self.state.lock().unwrap().ring.appended
+    }
+
+    pub fn scrollback_snapshot(&self) -> (Vec<crate::daemon::scrollback::Segment>, u64) {
+        let st = self.state.lock().unwrap();
+        let mut segments = st.ring.snapshot();
+        crate::daemon::scrollback::trim_to(&mut segments, crate::daemon::scrollback::SNAPSHOT_CAP);
+        (segments, st.ring.appended)
+    }
+
     pub fn kill(&self) {
         self.hangup();
     }
@@ -1607,6 +2112,12 @@ impl Drop for DaemonPane {
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
+        // The pane is over — by a kill, by the shell exiting, or by the daemon
+        // shutting down — so whatever it typed goes back to the history file it
+        // was seeded from. A handoff does not come through here: nothing is
+        // dropped across an `exec`, which is exactly right, because the pane on
+        // the other side is the same pane and still owns its file.
+        crate::daemon::history::retire(self.id);
     }
 }
 
@@ -1637,6 +2148,12 @@ fn pty_size(size: WinSize) -> PtySize {
 struct ReplayRing {
     segments: VecDeque<RingSegment>,
     len: usize,
+    /// Bytes ever appended, never reset — the mark the scrollback writer uses to
+    /// tell a ring that has moved from one that has not. Comparing lengths would
+    /// not do it: a ring at its cap stays exactly `RING_CAP` long no matter how
+    /// much output flows through it, which is precisely the busy pane whose
+    /// snapshot is most stale.
+    appended: u64,
 }
 
 struct RingSegment {
@@ -1666,7 +2183,55 @@ impl ReplayRing {
         Self {
             segments: VecDeque::from([RingSegment::empty(size)]),
             len: 0,
+            appended: 0,
         }
+    }
+
+    /// A ring that starts with output some earlier pane produced.
+    ///
+    /// Used when a pane is restored from disk: the saved segments go in ahead
+    /// of anything the new shell writes, so a client attaching sees the screen
+    /// it lost and then the new prompt below it. The seeded bytes are counted
+    /// into `len` — they are subject to the same cap as live output, and the
+    /// cap is far above what a snapshot can hold — but not into `appended`,
+    /// which exists to answer "has this pane produced anything since the last
+    /// snapshot?" and would otherwise answer yes for a pane that never ran.
+    fn seeded(segments: Vec<crate::daemon::scrollback::Segment>, size: WinSize) -> Self {
+        let mut ring = Self::new(size);
+        if segments.is_empty() {
+            return ring;
+        }
+        ring.segments.clear();
+        for seg in segments {
+            ring.len += seg.bytes.len();
+            ring.segments.push_back(RingSegment {
+                size: seg.size,
+                bytes: seg.bytes.into(),
+            });
+        }
+        // Whatever the shell writes from here was written at *this* pane's
+        // size, which is not necessarily the size the snapshot was taken at.
+        ring.resize(size);
+        ring
+    }
+
+    /// The geometry new output would be recorded at.
+    fn tail_size(&self) -> WinSize {
+        self.segments
+            .back()
+            .map(|seg| seg.size)
+            .expect("ring always has a tail")
+    }
+
+    fn snapshot(&self) -> Vec<crate::daemon::scrollback::Segment> {
+        self.segments
+            .iter()
+            .filter(|seg| !seg.bytes.is_empty())
+            .map(|seg| crate::daemon::scrollback::Segment {
+                size: seg.size,
+                bytes: seg.to_vec(),
+            })
+            .collect()
     }
 
     fn tail(&mut self) -> &mut RingSegment {
@@ -1693,6 +2258,7 @@ impl ReplayRing {
     }
 
     fn append(&mut self, bytes: &[u8]) {
+        self.appended = self.appended.saturating_add(bytes.len() as u64);
         if bytes.len() >= RING_CAP {
             let size = self.tail().size;
             self.segments.clear();
@@ -2319,6 +2885,51 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn a_shell_that_cannot_run_is_named_once_not_wrapped_four_deep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not-a-shell");
+        let problem = shell_program_problem(&missing.to_string_lossy()).expect("a problem");
+        assert!(problem.contains("no such shell"), "{problem}");
+        assert!(problem.contains("not-a-shell"), "{problem}");
+        // One sentence: none of the layers this used to arrive wrapped in.
+        assert!(!problem.contains("ENOENT"), "{problem}");
+        assert!(!problem.contains("Unable to spawn"), "{problem}");
+
+        // A directory is a different mistake and says so.
+        let as_dir = dir.path().to_string_lossy().to_string();
+        assert!(
+            shell_program_problem(&as_dir)
+                .expect("a problem")
+                .contains("directory")
+        );
+
+        // A bare name goes through PATH; guessing at it here would be worse
+        // than saying nothing.
+        assert_eq!(shell_program_problem("zsh"), None);
+
+        // Something real passes. The test binary is the one path guaranteed
+        // to exist and carry the execute bit on every platform this runs on —
+        // `/bin/sh` named a file that is simply absent on Windows, so the
+        // check meant to prove a good shell passes proved the opposite there.
+        let real = std::env::current_exe().expect("the running test binary");
+        assert_eq!(shell_program_problem(&real.to_string_lossy()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_without_the_execute_bit_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("not-executable");
+        std::fs::write(&path, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let problem = shell_program_problem(&path.to_string_lossy()).expect("a problem");
+        assert!(problem.contains("not executable"), "{problem}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(shell_program_problem(&path.to_string_lossy()), None);
+    }
+
+    #[test]
     fn initial_working_directory_skips_paths_that_are_not_directories() {
         let real = std::env::temp_dir();
         assert!(real.is_dir(), "temp dir should exist");
@@ -2365,6 +2976,7 @@ mod tests {
                 args: vec!["-c".into(), "cd /usr && exec cat".into()],
                 args_are_tty7_defaults: false,
             }),
+            None,
             None,
             None,
             || {},
@@ -2738,6 +3350,151 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(80, 24)));
         assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"narrow bytes"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_seeded_ring_replays_the_old_screen_at_the_size_it_was_written() {
+        use crate::daemon::scrollback::Segment;
+
+        let mut ring = ReplayRing::seeded(
+            vec![Segment {
+                size: ws(100, 24),
+                bytes: b"what the dead pane had on it".to_vec(),
+            }],
+            ws(80, 30),
+        );
+        ring.append(b"the new shell's prompt");
+
+        let (tx, rx) = mpsc::channel();
+        ring.replay(&tx);
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(100, 24)));
+        assert!(
+            matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"what the dead pane had on it"),
+            "restored output has to be replayed at the width it was produced at, or the client \
+             rewraps it to whatever the window happens to be now"
+        );
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(s)) if s == ws(80, 30)));
+        assert!(
+            matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"the new shell's prompt")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn seeding_does_not_make_an_untouched_pane_look_like_it_produced_output() {
+        use crate::daemon::scrollback::Segment;
+
+        let ring = ReplayRing::seeded(
+            vec![Segment {
+                size: ws(80, 24),
+                bytes: b"restored".to_vec(),
+            }],
+            ws(80, 24),
+        );
+        assert_eq!(
+            ring.appended, 0,
+            "the mark answers 'has this pane written anything since the last snapshot', and \
+             bytes it was handed at birth are not an answer of yes"
+        );
+    }
+
+    #[test]
+    fn an_empty_seed_leaves_an_ordinary_ring() {
+        let mut ring = ReplayRing::seeded(Vec::new(), ws(80, 24));
+        ring.append(b"output");
+        assert_eq!(
+            ring.segments.len(),
+            1,
+            "the ring always has exactly one tail"
+        );
+        assert_eq!(ring.flatten(), b"output");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descriptor_that_is_not_a_terminal_is_refused_rather_than_adopted() {
+        use std::os::fd::AsRawFd as _;
+
+        let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let err = AdoptedMaster::from_fd(file.as_raw_fd())
+            .err()
+            .expect("a plain file is not a pty");
+        assert!(
+            err.to_string().contains("not a terminal"),
+            "the refusal was {err}"
+        );
+        // Refused means not taken: the caller still owns what it passed, and
+        // dropping `file` here is what closes it. Adopting first and failing
+        // later would have closed a descriptor belonging to someone else.
+        drop(file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_adopted_master_goes_back_to_close_on_exec() {
+        let pair = native_pty_system()
+            .openpty(PtySize::default())
+            .expect("open a pty");
+        let fd = pair
+            .master
+            .as_raw_fd()
+            .expect("a fresh master has a descriptor");
+        // What crossing the exec leaves behind: `dup` hands out a descriptor
+        // with close-on-exec clear, exactly like one that was deliberately
+        // stripped to survive.
+        let inherited = unsafe { libc::dup(fd) };
+        assert!(inherited >= 0, "dup the master");
+        let master = AdoptedMaster::from_fd(inherited).expect("a pty is adoptable");
+        let flags = unsafe { libc::fcntl(inherited, libc::F_GETFD) };
+        assert!(
+            flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+            "an adopted master left inheritable ends up in every child this daemon spawns, \
+             and a child holding it keeps the pty from ever hanging up"
+        );
+        drop(master);
+    }
+
+    #[test]
+    fn the_restore_preamble_hands_the_new_shell_a_terminal_it_can_use() {
+        let bytes = restore_preamble(Some("this shell is new"));
+        let text = String::from_utf8(bytes).expect("the preamble is text");
+        // A snapshot is cut at the front, so it can begin inside anything: an
+        // unterminated SGR run, a hidden cursor, an alternate screen whose exit
+        // never came because the daemon died while a full-screen app was up.
+        assert!(text.contains("\x1b[?1049l"), "leave any alternate screen");
+        assert!(text.contains("\x1b[?25h"), "give the cursor back");
+        assert!(text.contains("\x1b[?7h"), "put autowrap back");
+        assert!(text.contains("\x1b[0m"), "drop any colour left mid-run");
+        assert!(text.contains("this shell is new"));
+    }
+
+    #[test]
+    fn a_banner_cannot_smuggle_extra_lines_into_the_pane() {
+        let text = String::from_utf8(restore_preamble(Some("first\r\nsecond"))).unwrap();
+        assert!(
+            text.contains("first  second"),
+            "the rule is drawn as one line, so the words placed in it stay on one line"
+        );
+        assert_eq!(
+            text.matches("\r\n").count(),
+            2,
+            "one break before the rule and one after it, and no others"
+        );
+    }
+
+    #[test]
+    fn a_pane_with_nothing_to_say_still_gets_the_resets() {
+        for banner in [None, Some(""), Some("   ")] {
+            let text = String::from_utf8(restore_preamble(banner)).unwrap();
+            assert!(
+                text.starts_with("\x1b[?1049l"),
+                "the terminal still has to be handed back in a usable state"
+            );
+            assert!(
+                !text.contains('\n'),
+                "with no words there is no rule to draw, so no line is spent on one"
+            );
+        }
     }
 
     #[test]

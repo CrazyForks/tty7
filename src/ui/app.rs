@@ -28,7 +28,7 @@ use crate::daemon::protocol::{RemoteContext, ShellSpec, ssh_option_takes_value};
 use crate::daemon::spawn::DaemonMismatch;
 use crate::terminal::view::{ChildExited, TerminalView};
 use crate::ui::host_registry::HostId;
-use crate::ui::i18n::{L10nKey, set_locale, t, t_fmt};
+use crate::ui::i18n::{L10nKey, set_locale, t, t_fmt, t_plural};
 use crate::ui::palette::{
     ChromeState, Command, CommandGroup, CommandKind, PaletteEvent, PaletteView,
 };
@@ -50,6 +50,41 @@ pub(crate) enum ThemeEdit {
     Ansi(usize),
 }
 
+/// The 16 ANSI slots in the order a terminal numbers them: 0-7, then their
+/// bright twins. A theme author needs to know that slot 9 is what `\e[91m`
+/// paints — "Color 9" does not say that, and "Bright red" does.
+const ANSI_COLOR_LABELS: [L10nKey; 16] = [
+    L10nKey::AppThemeAnsiBlack,
+    L10nKey::AppThemeAnsiRed,
+    L10nKey::AppThemeAnsiGreen,
+    L10nKey::AppThemeAnsiYellow,
+    L10nKey::AppThemeAnsiBlue,
+    L10nKey::AppThemeAnsiMagenta,
+    L10nKey::AppThemeAnsiCyan,
+    L10nKey::AppThemeAnsiWhite,
+    L10nKey::AppThemeAnsiBrightBlack,
+    L10nKey::AppThemeAnsiBrightRed,
+    L10nKey::AppThemeAnsiBrightGreen,
+    L10nKey::AppThemeAnsiBrightYellow,
+    L10nKey::AppThemeAnsiBrightBlue,
+    L10nKey::AppThemeAnsiBrightMagenta,
+    L10nKey::AppThemeAnsiBrightCyan,
+    L10nKey::AppThemeAnsiBrightWhite,
+];
+
+/// Looked up at render time, never stored: the editor outlives a language
+/// change, and a label cached when it opened would stay in the old language.
+pub(crate) fn theme_edit_label(edit: ThemeEdit) -> &'static str {
+    t(match edit {
+        ThemeEdit::Background => L10nKey::AppThemeColorBackground,
+        ThemeEdit::Foreground => L10nKey::AppThemeColorForeground,
+        ThemeEdit::Accent => L10nKey::AppThemeColorAccent,
+        ThemeEdit::Cursor => L10nKey::AppThemeColorCursor,
+        ThemeEdit::Selection => L10nKey::AppThemeColorSelection,
+        ThemeEdit::Ansi(i) => ANSI_COLOR_LABELS[i.min(15)],
+    })
+}
+
 fn hsla_to_u32(color: gpui::Hsla) -> u32 {
     let rgba: gpui::Rgba = color.into();
     let to = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -60,6 +95,8 @@ const FONT_SIZE_MIN: f32 = 6.0;
 const FONT_SIZE_MAX: f32 = 48.0;
 pub(crate) const FONT_SIZE_STEP: f32 = 1.0;
 
+pub(crate) const UI_FONT_SIZE_STEP: f32 = 1.0;
+
 const LINE_HEIGHT_MIN: f32 = 1.0;
 const LINE_HEIGHT_MAX: f32 = 2.0;
 pub(crate) const LINE_HEIGHT_STEP: f32 = 0.05;
@@ -68,19 +105,18 @@ const MAX_CLOSED_TABS: usize = 20;
 
 const RESIZE_STEP: f32 = 0.05;
 
-const RECORD_COMMIT_DELAY_MS: u64 = 650;
+pub(crate) const RECORD_COMMIT_DELAY_MS: u64 = 650;
 
 pub(crate) const TITLE_BAR_HEIGHT: f32 = 40.;
 
 pub(crate) const TILE_SIZE: f32 = 32.;
 pub(crate) const TILE_GLYPH: f32 = 13.;
+/// A tile that sits in a body row rather than in chrome: the box shrinks to
+/// the minimum hit target, but the glyph keeps the chrome size. An 11px glyph
+/// here read as a disabled ornament next to 14px text, and put a second,
+/// smaller folder in the same column as the panel's folder tab.
 pub(crate) const TILE_SIZE_SM: f32 = 24.;
-/// The small tile is both a smaller box and a smaller glyph than
-/// [`TILE_GLYPH`]: it lives beside the right panel's 12px rows, where a 13px
-/// glyph would out-weigh the text it sits next to. The padding below is
-/// derived from it, so the glyph's optical edge still lands at `CONTENT_INSET`
-/// and rows keep their alignment.
-pub(crate) const TILE_GLYPH_SM: f32 = 11.;
+pub(crate) const TILE_GLYPH_SM: f32 = TILE_GLYPH;
 
 /// The tile that lives *inside* a list row rather than beside one, for the
 /// buttons a row reveals on hover.
@@ -389,13 +425,17 @@ pub struct Tty7App {
     _appearance_watch: Subscription,
     palette: Option<Entity<PaletteView>>,
     palette_sub: Option<Subscription>,
+    /// Preset that was live when the palette's theme picker started previewing.
+    /// `Some` means the theme on screen is a preview that was never written to
+    /// disk, and closing the palette without confirming puts this one back.
+    theme_preview_restore: Option<String>,
     pub(crate) closed: Vec<SessionTab>,
     pub(crate) renaming: Option<Renaming>,
     pub(crate) worktree_prompt: Option<crate::ui::worktree_prompt::WorktreePrompt>,
     pub(crate) maximized: Option<Entity<TerminalView>>,
     pub(crate) mod_hint_badges: bool,
     pub(crate) mod_hint_gen: u64,
-    record_gen: u64,
+    pub(crate) record_gen: u64,
     pub(crate) home_focus: gpui::FocusHandle,
     pub(crate) shells: ShellInventory,
     pub(crate) shells_host: HostId,
@@ -411,6 +451,19 @@ pub struct Tty7App {
     pub(crate) editor: crate::ui::code_editor::EditorPanelState,
     pub(crate) sidebar_width: Rc<Cell<f32>>,
     pub(crate) sidebar_dragging: Rc<Cell<bool>>,
+    /// How much width a settings row will actually get, measured once per
+    /// render. `settings_row` is called from page builders that never see the
+    /// window, and the answer differs per page — the SSH page spends a host
+    /// list on top of the nav before the row gets anything.
+    pub(crate) settings_row_width: Cell<f32>,
+    /// The window width the settings chrome sized itself against, measured in
+    /// the same pass. The pages that render their own chrome — the SSH host
+    /// list, the theme panel — are as blind to the window as `settings_row` is.
+    pub(crate) settings_viewport_w: Cell<f32>,
+    /// Cleared at the top of every settings render, then set by the first row
+    /// the live search matched, so exactly one row per page carries the anchor
+    /// the page scrolls to.
+    pub(crate) settings_hit_anchored: Cell<bool>,
     pub(crate) right_panel_width: Rc<Cell<f32>>,
     pub(crate) right_panel_dragging: Rc<Cell<bool>>,
     pub(crate) right_panel_visible: bool,
@@ -418,13 +471,22 @@ pub struct Tty7App {
     pub(crate) sidebar_collapsed: bool,
     pub(crate) sidebar_scroll: gpui::ScrollHandle,
     pub(crate) reorder: Rc<RefCell<Option<crate::ui::reorder::Reorder>>>,
+    /// The pane the pointer is over, so only that one offers its drag handle.
+    pub(crate) pane_hover: Rc<Cell<Option<gpui::EntityId>>>,
+    pub(crate) pane_drag: crate::ui::pane_drag::PaneDragState,
+    /// Where the active tab's panes were last drawn, which is the frame of
+    /// reference a drag's landing is worked out in.
+    pub(crate) pane_area: Rc<Cell<Option<Bounds<Pixels>>>>,
     pub(crate) sidebar_search: Entity<InputState>,
     pub(crate) file_search: Entity<InputState>,
     _sidebar_search_sub: Subscription,
     _file_search_sub: Subscription,
     settings: Option<SettingsState>,
     pub(crate) ssh_prompt: crate::ui::ssh_prompt::SshPromptState,
-    pub(crate) ssh_close_confirm: Option<SshCloseKind>,
+    /// A close question is on screen. It carries no target: the answer acts on
+    /// the tab or pane captured when the question was raised, not on whatever
+    /// the app happens to be pointing at by the time it is answered.
+    close_prompt_open: bool,
     window_bounds: Bounds<Pixels>,
     pub(crate) workspace: WorkspaceId,
     pub(crate) workspace_rename: Option<WorkspaceRename>,
@@ -438,12 +500,51 @@ pub struct Tty7App {
     /// Errors reported for a remote host that should be shown inside that host's
     /// switcher group instead of as a global modal or toast.
     pub(crate) remote_host_errors: std::collections::HashMap<String, String>,
+    /// Why the window opened with no terminal in it. Shown on the home screen,
+    /// which is otherwise indistinguishable from having closed everything.
+    pub(crate) startup_error: Option<gpui::SharedString>,
 }
 
+/// What a raised close question is about. Tabs are named by their id, not their
+/// index: a tab that exits on its own while the question is on screen shifts
+/// every index after it, and answering "Close" must not then end a bystander.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SshCloseKind {
-    Tab(usize),
+pub(crate) enum CloseTarget {
+    Tab(tty7_core::core::machine::TabId),
     Pane,
+}
+
+/// Why closing needs a question first. Closing a tab is the highest-frequency
+/// destructive key in any terminal, and the product's headline claim is that
+/// shells outlive the app — so the one action that permanently ends one has to
+/// name what it is about to end.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum CloseReason {
+    LiveSsh,
+    Busy(crate::terminal::view::PaneBusy),
+}
+
+/// The question to put to the user before ending work that is still going on.
+fn close_prompt(ends_the_tab: bool, reason: &CloseReason) -> (String, String) {
+    use crate::terminal::view::PaneBusy;
+    use crate::ui::i18n::L10nKey;
+    match reason {
+        CloseReason::LiveSsh => (
+            t(L10nKey::CloseSshConnectionTitle).to_string(),
+            t(L10nKey::CloseSshConnectionBody).to_string(),
+        ),
+        CloseReason::Busy(busy) => {
+            let title = match ends_the_tab {
+                true => t(L10nKey::CloseTabBusyTitle),
+                false => t(L10nKey::ClosePaneBusyTitle),
+            };
+            let body = match busy {
+                PaneBusy::Command(what) => t_fmt(L10nKey::CloseBusyCommandBody, &[("what", what)]),
+                PaneBusy::Agent(name) => t_fmt(L10nKey::CloseBusyAgentBody, &[("agent", name)]),
+            };
+            (title.to_string(), body)
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -654,12 +755,12 @@ impl Tty7App {
                 ],
             ),
         };
-        // Quit first, like every other destructive prompt here. NSAlert and
-        // TaskDialog both give the first button Return, and this one arrives
-        // unasked at launch — the moment a stray Return is most likely — so the
-        // key that lands by reflex has to be the one that destroys nothing.
-        // Restarting is a click or an arrow key away, and it is the same shape
-        // as `restart_daemon` below: safe first, act on the second.
+        // The one prompt here that does not use `confirm_answers`, because
+        // neither answer is "leave it alone" — the app cannot carry on beside a
+        // server it cannot speak to. With nothing safe to give Escape, this
+        // keeps Quit at index 0 where Return lands: it arrives unasked at
+        // launch, the moment a stray Return is most likely, and quitting loses
+        // no sessions while restarting the server ends every one of them.
         let answer = window.prompt(
             PromptLevel::Warning,
             t(L10nKey::AppRestartServerTitle),
@@ -786,6 +887,7 @@ impl Tty7App {
         });
         apply_theme(Some(window), cx);
         set_menus(cx);
+        let mut startup_error: Option<gpui::SharedString> = None;
         let (tabs, active) = match session {
             None => match new_terminal(
                 pane_ws.clone(),
@@ -800,10 +902,29 @@ impl Tty7App {
                 Ok(first) => (vec![Tab::new(Pane::leaf(first))], 0),
                 Err(e) => {
                     log::error!("first terminal failed to start: {e}");
+                    // The home screen is what a user sees when they have closed
+                    // everything, and it used to be what they saw when tty7
+                    // could not open anything — silently, on the very first
+                    // launch, with the cause only in a log file.
+                    startup_error = Some(gpui::SharedString::from(t_fmt(
+                        L10nKey::AppOpenTerminalFailed,
+                        &[("error", &e.to_string())],
+                    )));
                     (Vec::new(), 0)
                 }
             },
-            some => tabs_from_session(pane_ws.as_ref(), workspace, some, font_size, window, cx),
+            some => {
+                let (tabs, active, dropped) =
+                    tabs_from_session(pane_ws.as_ref(), workspace, some, font_size, window, cx);
+                if dropped > 0 {
+                    startup_error = Some(gpui::SharedString::from(t_plural(
+                        L10nKey::AppTabsNotRestored,
+                        dropped,
+                        &[],
+                    )));
+                }
+                (tabs, active)
+            }
         };
         let sidebar_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t(crate::ui::i18n::L10nKey::SearchTabs))
@@ -843,6 +964,7 @@ impl Tty7App {
             _appearance_watch: appearance_watch,
             palette: None,
             palette_sub: None,
+            theme_preview_restore: None,
             closed: Vec::new(),
             renaming: None,
             worktree_prompt: None,
@@ -879,6 +1001,9 @@ impl Tty7App {
             editor,
             sidebar_width: Rc::new(Cell::new(sidebar_width)),
             sidebar_dragging: Rc::new(Cell::new(false)),
+            settings_row_width: Cell::new(f32::MAX),
+            settings_viewport_w: Cell::new(f32::MAX),
+            settings_hit_anchored: Cell::new(false),
             right_panel_width: Rc::new(Cell::new(right_panel_width)),
             right_panel_dragging: Rc::new(Cell::new(false)),
             right_panel_visible,
@@ -886,13 +1011,16 @@ impl Tty7App {
             sidebar_collapsed,
             sidebar_scroll: gpui::ScrollHandle::new(),
             reorder: Rc::new(RefCell::new(None)),
+            pane_hover: Rc::new(Cell::new(None)),
+            pane_drag: Rc::new(RefCell::new(None)),
+            pane_area: Rc::new(Cell::new(None)),
             sidebar_search,
             _sidebar_search_sub: sidebar_search_sub,
             file_search,
             _file_search_sub: file_search_sub,
             settings: None,
             ssh_prompt: crate::ui::ssh_prompt::SshPromptState::new(cx),
-            ssh_close_confirm: None,
+            close_prompt_open: false,
             window_bounds: window.window_bounds().get_bounds(),
             workspace,
             workspace_rename: None,
@@ -901,6 +1029,7 @@ impl Tty7App {
             switcher: None,
             host_snapshots: std::collections::HashMap::new(),
             remote_host_errors: std::collections::HashMap::new(),
+            startup_error,
         };
         if !cfg!(test) && crate::ui::windows::WindowRegistry::count(cx) == 0 {
             crate::ui::tray::init(cx);
@@ -1099,7 +1228,7 @@ impl Tty7App {
         self.refresh_shells(cx);
         let font_size = self.font_size;
         let pane_ws = self.window_workspace(cx);
-        let (tabs, active) = tabs_from_session(
+        let (tabs, active, dropped) = tabs_from_session(
             pane_ws.as_ref(),
             self.workspace,
             Some(session),
@@ -1107,6 +1236,9 @@ impl Tty7App {
             window,
             cx,
         );
+        if dropped > 0 {
+            window.push_notification(t_plural(L10nKey::AppTabsNotRestored, dropped, &[]), cx);
+        }
         self.tabs = tabs;
         self.active = active;
         self.maximized = None;
@@ -1263,14 +1395,14 @@ impl Tty7App {
             PromptLevel::Warning,
             t(crate::ui::i18n::L10nKey::QuitStopServerTitle),
             Some(t(crate::ui::i18n::L10nKey::QuitStopServerBody)),
-            &[
-                t(crate::ui::i18n::L10nKey::Cancel),
+            &crate::ui::confirm_answers(
                 t(crate::ui::i18n::L10nKey::QuitAndStop),
-            ],
+                t(crate::ui::i18n::L10nKey::Cancel),
+            ),
             cx,
         );
         cx.spawn(async move |_this, cx| {
-            if !matches!(answer.await, Ok(1)) {
+            if !matches!(answer.await, Ok(0)) {
                 return;
             }
             cx.background_spawn(async { crate::daemon::spawn::stop() })
@@ -1298,15 +1430,29 @@ impl Tty7App {
     }
 
     pub(crate) fn restart_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Two different actions wearing one name. Where the service can rewrite
+        // itself in place, nothing in a pane is interrupted and promising the
+        // user a bloodbath would be a lie that costs them the feature; where it
+        // cannot, every running command really does end, and that is the one
+        // thing they need to be told before they agree.
+        let in_place =
+            crate::daemon::spawn::local_daemon_supports(crate::daemon::protocol::FEATURE_HANDOFF);
         let answer = window.prompt(
             PromptLevel::Warning,
             t(L10nKey::AppRestartServerTitle),
-            Some(t(L10nKey::AppRestartServerBody)),
-            &[t(crate::ui::i18n::L10nKey::Cancel), t(L10nKey::AppRestart)],
+            Some(t(if in_place {
+                L10nKey::AppRestartServerBodyInPlace
+            } else {
+                L10nKey::AppRestartServerBody
+            })),
+            &crate::ui::confirm_answers(
+                t(L10nKey::AppRestart),
+                t(crate::ui::i18n::L10nKey::Cancel),
+            ),
             cx,
         );
         cx.spawn(async move |this, cx| {
-            if !matches!(answer.await, Ok(1)) {
+            if !matches!(answer.await, Ok(0)) {
                 return;
             }
             let _ = this.update_in(cx, |this, _window, cx| this.restart_daemon_confirmed(cx));
@@ -1329,7 +1475,23 @@ impl Tty7App {
                 return;
             }
             let restarted = cx
-                .background_spawn(async move { crate::daemon::spawn::restart() })
+                .background_spawn(async move {
+                    // The same test that chose the dialog's copy chooses the
+                    // action, because the copy is a promise. A daemon that
+                    // advertises the handoff was described as replacing itself
+                    // with nothing interrupted — if that fails, the failure is
+                    // shown, not silently traded for the restart that kills
+                    // every pane the user was just told would live. The
+                    // stop-and-start path is only taken where its bloodbath is
+                    // what the dialog actually said.
+                    if crate::daemon::spawn::local_daemon_supports(
+                        crate::daemon::protocol::FEATURE_HANDOFF,
+                    ) {
+                        crate::daemon::spawn::hand_off()
+                    } else {
+                        crate::daemon::spawn::restart()
+                    }
+                })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match &restarted {
@@ -1341,7 +1503,14 @@ impl Tty7App {
                         crate::ui::tree_sync::resync_window_from_tree(cx, this.workspace);
                     }
                     Err(e) => {
+                        // The user asked for this and lands on an empty home
+                        // page; without a reason there it looks like the
+                        // restart worked and took everything with it.
                         log::error!("restart background service failed, staying on home page: {e}");
+                        this.startup_error = Some(gpui::SharedString::from(t_fmt(
+                            L10nKey::AppRestartServerFailed,
+                            &[("error", &e.to_string())],
+                        )));
                     }
                 }
                 this.focus_active(window, cx);
@@ -1377,6 +1546,34 @@ impl Tty7App {
         self.set_font_size(Config::default().font_size, cx);
     }
 
+    fn set_ui_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        use crate::core::config::{UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN};
+        let size = size.clamp(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX);
+        let cfg = cx.global_mut::<Config>();
+        if cfg.ui_font_size == size {
+            return;
+        }
+        cfg.ui_font_size = size;
+        cfg.save();
+        // Unlike the settings that only redraw the window they were changed
+        // in, this one re-lays-out every open window, and each reads the new
+        // rem from the global on its own next frame.
+        cx.refresh_windows();
+        cx.notify();
+    }
+
+    pub(crate) fn ui_font_size(&self, cx: &gpui::App) -> f32 {
+        cx.global::<Config>().ui_font_size
+    }
+
+    pub(crate) fn change_ui_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.set_ui_font_size(self.ui_font_size(cx) + delta, cx);
+    }
+
+    pub(crate) fn reset_ui_font_size(&mut self, cx: &mut Context<Self>) {
+        self.set_ui_font_size(Config::default().ui_font_size, cx);
+    }
+
     fn set_line_height(&mut self, mul: f32, cx: &mut Context<Self>) {
         let mul = mul.clamp(LINE_HEIGHT_MIN, LINE_HEIGHT_MAX);
         self.line_height = mul;
@@ -1403,6 +1600,14 @@ impl Tty7App {
     }
 
     pub(crate) fn set_preset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A confirmed pick ends any preview: there is nothing left to roll back.
+        self.theme_preview_restore = None;
+        self.write_preset(id, cx);
+        self.after_theme_change(window, cx);
+    }
+
+    /// Points whichever preset slot is live at `id`, in memory only.
+    fn write_preset(&mut self, id: &str, cx: &mut Context<Self>) {
         let dark_now = crate::ui::theme::system_dark(cx);
         let cfg = cx.global_mut::<Config>();
         if !cfg.theme_follow_system {
@@ -1412,7 +1617,27 @@ impl Tty7App {
         } else {
             cfg.theme_preset_light = id.to_string();
         }
-        self.after_theme_change(window, cx);
+    }
+
+    /// Shows a preset for as long as the palette's theme picker is open, so
+    /// arrowing through the list is how you find out what a theme looks like.
+    /// Nothing is written to `config.json` until the pick is confirmed.
+    pub(crate) fn preview_preset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.theme_preview_restore.is_none() {
+            self.theme_preview_restore = Some(crate::ui::theme::effective_preset_id(cx));
+        }
+        self.write_preset(id, cx);
+        self.apply_theme_change(false, window, cx);
+    }
+
+    /// Puts back the preset that was live before the preview started. A no-op
+    /// when nothing is being previewed.
+    pub(crate) fn cancel_preset_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.theme_preview_restore.take() else {
+            return;
+        };
+        self.write_preset(&id, cx);
+        self.apply_theme_change(false, window, cx);
     }
 
     pub(crate) fn set_slot_preset(
@@ -1479,42 +1704,94 @@ impl Tty7App {
     }
 
     fn after_theme_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_theme_change(true, window, cx);
+    }
+
+    /// Repaints everything a theme change touches. `persist` is false for a
+    /// palette preview, which repaints on every arrow key and must not turn
+    /// each of those keystrokes into a `config.json` write.
+    fn apply_theme_change(&mut self, persist: bool, window: &mut Window, cx: &mut Context<Self>) {
         apply_theme(Some(window), cx);
         set_menus(cx);
-        cx.global::<Config>().save();
+        if persist {
+            cx.global::<Config>().save();
+        }
         self.rebuild_theme_editor(window, cx);
         self.sync_window_opacity_slider(window, cx);
         cx.notify();
     }
 
+    /// Opens or closes the theme picker, and moves the caret with it.
+    ///
+    /// The panel leads with a search box, and it opened unfocused — so the
+    /// first thing typed at a panel whose whole job is picking one of nine
+    /// themes went nowhere. Closing hands the caret back to the settings
+    /// search rather than leaving it on a box that is no longer drawn.
     pub(crate) fn toggle_theme_panel(
         &mut self,
         slot: crate::ui::settings::ThemeSlot,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(s) = self.active_settings_mut() {
-            if s.theme_panel_open && s.theme_panel_slot == slot {
+        let opened = match self.active_settings_mut() {
+            Some(s) if s.theme_panel_open && s.theme_panel_slot == slot => {
                 s.theme_panel_open = false;
-            } else {
+                false
+            }
+            Some(s) => {
                 s.theme_panel_open = true;
                 s.theme_panel_slot = slot;
+                true
             }
-            cx.notify();
-        }
+            None => return,
+        };
+        self.focus_theme_panel(opened, window, cx);
+        cx.notify();
     }
 
-    pub(crate) fn close_theme_panel(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_theme_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_settings_mut().is_none() {
+            return;
+        }
         if let Some(s) = self.active_settings_mut() {
             s.theme_panel_open = false;
-            cx.notify();
+        }
+        self.focus_theme_panel(false, window, cx);
+        cx.notify();
+    }
+
+    fn focus_theme_panel(&mut self, opened: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.settings.as_ref().map(|s| match opened {
+            true => s.theme_search.read(cx).focus_handle(cx),
+            false => s.search.read(cx).focus_handle(cx),
+        });
+        if let Some(handle) = handle {
+            window.focus(&handle, cx);
         }
     }
 
-    pub(crate) fn open_themes_folder(&self, cx: &mut Context<Self>) {
-        if let Some(dir) = crate::ui::presets::themes_dir() {
-            let _ = std::fs::create_dir_all(&dir);
-            cx.open_with_system(&dir);
+    pub(crate) fn open_themes_folder(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = crate::ui::presets::themes_dir() else {
+            log::warn!("no config directory, so no themes folder to open");
+            return;
+        };
+        // The folder is created on demand, so the first click on a fresh
+        // install is also the one that can fail. Handing an absent path to the
+        // file manager just opens nothing.
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!("could not create {}: {e}", dir.display());
+            crate::ui::host_ops::HostOps::notify_err(
+                window,
+                cx,
+                &t_fmt(
+                    L10nKey::OpenInFileManagerFailed,
+                    &[("path", &dir.display().to_string())],
+                ),
+                &e,
+            );
+            return;
         }
+        cx.open_with_system(&dir);
     }
 
     pub(crate) fn fork_active_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1525,7 +1802,17 @@ impl Tty7App {
                 crate::ui::presets::load_registry(cx);
                 self.set_preset(&new_id, window, cx);
             }
-            Err(e) => log::warn!("failed to duplicate theme: {e}"),
+            // A button that does nothing is the worst kind of failure: there
+            // is no way to tell it from "I clicked the wrong thing".
+            Err(e) => {
+                log::warn!("failed to duplicate theme: {e}");
+                crate::ui::host_ops::HostOps::notify_err(
+                    window,
+                    cx,
+                    t(L10nKey::ThemeDuplicateFailed),
+                    &e,
+                );
+            }
         }
     }
 
@@ -1542,7 +1829,10 @@ impl Tty7App {
         }
         mutate(&mut theme);
         if let Err(e) = crate::ui::presets::write_theme_file(&theme) {
+            // Every colour edit runs through here. Without this the picker
+            // moves, the theme does not, and nothing says why.
             log::warn!("failed to write theme file: {e}");
+            crate::ui::host_ops::HostOps::notify_err(window, cx, t(L10nKey::ThemeSaveFailed), &e);
             return;
         }
         crate::ui::presets::load_registry(cx);
@@ -1739,32 +2029,12 @@ impl Tty7App {
         }
 
         let neutrals = theme.neutrals();
-        let seed_specs: [(ThemeEdit, &str, u32); 5] = [
-            (
-                ThemeEdit::Background,
-                t(L10nKey::AppThemeColorBackground),
-                theme.background_color(),
-            ),
-            (
-                ThemeEdit::Foreground,
-                t(L10nKey::AppThemeColorForeground),
-                theme.foreground,
-            ),
-            (
-                ThemeEdit::Accent,
-                t(L10nKey::AppThemeColorAccent),
-                theme.accent,
-            ),
-            (
-                ThemeEdit::Cursor,
-                t(L10nKey::AppThemeColorCursor),
-                theme.caret.unwrap_or(theme.accent),
-            ),
-            (
-                ThemeEdit::Selection,
-                t(L10nKey::AppThemeColorSelection),
-                neutrals.selection,
-            ),
+        let seed_specs: [(ThemeEdit, u32); 5] = [
+            (ThemeEdit::Background, theme.background_color()),
+            (ThemeEdit::Foreground, theme.foreground),
+            (ThemeEdit::Accent, theme.accent),
+            (ThemeEdit::Cursor, theme.caret.unwrap_or(theme.accent)),
+            (ThemeEdit::Selection, neutrals.selection),
         ];
 
         let mut subs = Vec::new();
@@ -1787,9 +2057,7 @@ impl Tty7App {
 
         let seed = seed_specs
             .iter()
-            .map(|&(edit, label, value)| {
-                (edit, label.to_string(), make(edit, value, &mut subs, cx))
-            })
+            .map(|&(edit, value)| (edit, make(edit, value, &mut subs, cx)))
             .collect();
         let ansi = (0..16)
             .map(|i| {
@@ -1797,7 +2065,6 @@ impl Tty7App {
                 let value = (r as u32) << 16 | (g as u32) << 8 | b as u32;
                 (
                     ThemeEdit::Ansi(i),
-                    format!("Color {i}"),
                     make(ThemeEdit::Ansi(i), value, &mut subs, cx),
                 )
             })
@@ -2272,6 +2539,20 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.restore_session = on);
     }
 
+    /// The daemon reads this from the config file on its own — it is the one
+    /// holding the output — so there is nothing to tell it here. Turning it off
+    /// also removes what was already stored, which the daemon does on its next
+    /// pass rather than leaving the bytes behind.
+    pub(crate) fn set_persist_scrollback(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.persist_scrollback = on);
+    }
+
+    /// Takes effect on the next pane: a shell is told where its history lives
+    /// when it starts, and nothing can move it afterwards.
+    pub(crate) fn set_per_pane_history(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.per_pane_history = on);
+    }
+
     pub(crate) fn set_show_tray_icon(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.show_tray_icon = on);
     }
@@ -2510,13 +2791,17 @@ impl Tty7App {
             Ok(view) => view,
             Err(e) => {
                 log::error!("new tab spawn failed: {e}");
-                window.push_notification(
-                    t_fmt(L10nKey::AppOpenTerminalFailed, &[("error", &e.to_string())]),
-                    cx,
-                );
+                let text = t_fmt(L10nKey::AppOpenTerminalFailed, &[("error", &e.to_string())]);
+                // A retry from the home screen fails the same way; keep the
+                // reason on screen rather than only in a toast that leaves.
+                self.startup_error = Some(gpui::SharedString::from(text.clone()));
+                window.push_notification(text, cx);
+                cx.notify();
                 return;
             }
         };
+        // Something opened, so whatever the last failure was is stale.
+        self.startup_error = None;
         self.remember_active_pane(window, cx);
         self.maximized = None;
         let insert_at = self.new_tab_insert_at(cx);
@@ -2666,12 +2951,17 @@ impl Tty7App {
     }
 
     fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ssh_close_confirm.is_none() && self.focused_pane_is_warn_ssh(window, cx) {
-            self.ssh_close_confirm = Some(SshCloseKind::Pane);
-            cx.notify();
+        self.close_pane_inner(false, window, cx);
+    }
+
+    /// `confirmed` is set only by the answer to this pane's own close question,
+    /// so it travels with the close rather than being read back off shared
+    /// state a second, unrelated close could have overwritten.
+    fn close_pane_inner(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !confirmed && let Some(reason) = self.focused_pane_close_reason(window, cx) {
+            self.ask_before_closing(CloseTarget::Pane, reason, window, cx);
             return;
         }
-        self.ssh_close_confirm = None;
         self.maximized = None;
         let focused = self.tabs.get(self.active).and_then(|tab| {
             tab.pane
@@ -2685,8 +2975,11 @@ impl Tty7App {
             None => return,
         };
         match outcome {
+            // The last pane takes its tab with it. The question was already
+            // asked about this very pane, so carry the answer across rather
+            // than letting the tab re-derive the same reason and ask again.
             CloseOutcome::RemoveSelf => {
-                self.close_tab(self.active, window, cx);
+                self.close_tab_inner(self.active, confirmed, window, cx);
             }
             CloseOutcome::NotFound => {
                 let single = self
@@ -2694,7 +2987,7 @@ impl Tty7App {
                     .get(self.active)
                     .is_some_and(|tab| tab.pane.leaves().len() <= 1);
                 if single {
-                    self.close_tab(self.active, window, cx);
+                    self.close_tab_inner(self.active, confirmed, window, cx);
                 }
             }
             CloseOutcome::Collapsed => {
@@ -2811,6 +3104,76 @@ impl Tty7App {
         }
     }
 
+    /// The patch of the layout a pane being dragged would land on, lit up.
+    ///
+    /// Also records that landing as the one a drop would take, so the drop and
+    /// the highlight can never disagree: a zone the tree refuses to carry out
+    /// is neither drawn nor remembered, and releasing over it does nothing.
+    fn pane_landing(&self, window: &Window, cx: &App) -> Option<gpui::AnyElement> {
+        use crate::ui::pane_drag;
+
+        let from = pane_drag::lifted(&self.pane_drag)?;
+        let area = self.pane_area.get()?;
+        let tab = self.tabs.get(self.active)?;
+        let leaves = tab.pane.leaves();
+        let slot = leaves.iter().find(|l| l.entity_id() == from)?;
+        let bounds = pane_drag::leaf_bounds(&tab.pane, area);
+        let zone = pane_drag::zone_at(area, &bounds, window.mouse_position())?;
+        // The zone comes back naming its target by position, which only means
+        // anything against this frame's leaves. Drawn against the panes here,
+        // and remembered as the panes so the drop that reads it back a frame
+        // later is looking for the same ones.
+        let here = zone.map(|i| leaves.get(i).cloned())?;
+        let pinned = zone.map(|i| leaves.get(i).map(|l| l.entity_id()))?;
+        let rect = pane_drag::landing(&tab.pane, slot, here, area)?;
+        pane_drag::set_landing(&self.pane_drag, pinned);
+
+        let accent = cx.theme().drag_border;
+        Some(
+            div()
+                .absolute()
+                .left(rect.origin.x - area.origin.x)
+                .top(rect.origin.y - area.origin.y)
+                .w(rect.size.width)
+                .h(rect.size.height)
+                .rounded(px(6.))
+                .border_2()
+                .border_color(accent)
+                .bg(accent.opacity(0.15))
+                .into_any_element(),
+        )
+    }
+
+    /// Puts a dragged pane down where the last painted frame said it would go.
+    ///
+    /// Both ends of the drop are named by pane rather than by position, so a
+    /// pane that closed between the frame that offered the landing and this one
+    /// leaves the drop with nothing to land against, and it is refused.
+    fn drop_pane(
+        &mut self,
+        from: gpui::EntityId,
+        zone: crate::ui::pane_drag::DropZone<gpui::EntityId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pane_hover.set(None);
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let leaves = tab.pane.leaves();
+        let here = |id| leaves.iter().find(|l| l.entity_id() == id).cloned();
+        let (Some(moved), Some(zone)) = (here(from), zone.map(here)) else {
+            return;
+        };
+        if !crate::ui::pane_drag::apply(&mut tab.pane, &moved, zone) {
+            return;
+        }
+        self.maximized = None;
+        self.focus_leaf(&moved, window, cx);
+        self.save_session(cx);
+        cx.notify();
+    }
+
     /// Activates the tab carrying `id`. A workspace this window just switched
     /// to hydrates its tabs asynchronously, so when the tab is not here yet the
     /// request is parked and claimed on the frame it arrives.
@@ -2914,16 +3277,25 @@ impl Tty7App {
     }
 
     pub(crate) fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab_inner(index, false, window, cx);
+    }
+
+    /// See [`Self::close_pane_inner`] for what `confirmed` carries.
+    fn close_tab_inner(
+        &mut self,
+        index: usize,
+        confirmed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index >= self.tabs.len() {
             return;
         }
-        let already_confirming = self.ssh_close_confirm == Some(SshCloseKind::Tab(index));
-        if !already_confirming && self.tab_has_warn_ssh(index, cx) {
-            self.ssh_close_confirm = Some(SshCloseKind::Tab(index));
-            cx.notify();
+        if !confirmed && let Some(reason) = self.tab_close_reason(index, cx) {
+            let id = self.tabs[index].tree_id.get();
+            self.ask_before_closing(CloseTarget::Tab(id), reason, window, cx);
             return;
         }
-        self.ssh_close_confirm = None;
         self.maximized = None;
         self.renaming = None;
         let worktree_cwd = self.tab_host_cwd(index, window, cx);
@@ -2998,13 +3370,13 @@ impl Tty7App {
                             level,
                             &title,
                             Some(&detail),
-                            &[t(L10nKey::AppWorktreeKeep), remove_label],
+                            &crate::ui::confirm_answers(remove_label, t(L10nKey::AppWorktreeKeep)),
                             cx,
                         )
                     }) else {
                         return;
                     };
-                    if !matches!(answer.await, Ok(1)) {
+                    if !matches!(answer.await, Ok(0)) {
                         return;
                     }
                     let force = wt.dirty;
@@ -3045,11 +3417,17 @@ impl Tty7App {
         if index >= self.tabs.len() {
             return;
         }
+        // A bulk close skips the tabs whose profile asked to be warned about,
+        // and closes the rest outright — one dialog per tab is not a question
+        // anyone can answer, and only the first would ever get asked. It
+        // deliberately does *not* skip merely busy tabs: on a working window
+        // that is most of them, and a menu item that quietly closes nothing is
+        // worse than one that closes what it says.
         for i in (0..self.tabs.len()).rev() {
             if i == index || self.tab_has_warn_ssh(i, cx) {
                 continue;
             }
-            self.close_tab(i, window, cx);
+            self.close_tab_inner(i, true, window, cx);
         }
     }
 
@@ -3059,11 +3437,12 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Same bargain as `close_other_tabs`.
         for i in ((index + 1)..self.tabs.len()).rev() {
             if self.tab_has_warn_ssh(i, cx) {
                 continue;
             }
-            self.close_tab(i, window, cx);
+            self.close_tab_inner(i, true, window, cx);
         }
     }
 
@@ -3394,6 +3773,18 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// Opens a rename box on the current name, selected and focused, so the
+    /// first thing typed replaces it.
+    pub(crate) fn rename_box(
+        current: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        let input = crate::ui::prefill::filled_box(current, window, cx);
+        input.update(cx, |state, cx| state.focus(window, cx));
+        input
+    }
+
     pub(crate) fn start_rename(
         &mut self,
         index: usize,
@@ -3404,8 +3795,7 @@ impl Tty7App {
             return;
         }
         let current = self.tab_label(&self.tabs[index], index, Some(&*window), cx);
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
-        input.update(cx, |state, cx| state.focus(window, cx));
+        let input = Self::rename_box(current, window, cx);
         let subs = vec![cx.subscribe_in(
             &input,
             window,
@@ -3425,8 +3815,7 @@ impl Tty7App {
     pub(crate) fn start_workspace_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current =
             crate::ui::machine_mirror::display_name_for(cx, self.workspace).unwrap_or_default();
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
-        input.update(cx, |state, cx| state.focus(window, cx));
+        let input = Self::rename_box(current, window, cx);
         let subs = vec![cx.subscribe_in(
             &input,
             window,
@@ -3548,16 +3937,30 @@ impl Tty7App {
         match ev {
             PaletteEvent::Confirm(kind) => {
                 let kind = kind.clone();
+                // The picker is already showing this theme; keep it through the
+                // close instead of reverting and re-applying it.
+                if matches!(kind, CommandKind::SetTheme(_)) {
+                    self.theme_preview_restore = None;
+                }
                 self.close_palette(window, cx);
                 self.run_command(kind, window, cx);
             }
             PaletteEvent::Dismiss => self.close_palette(window, cx),
+            PaletteEvent::PreviewTheme(i) => {
+                if let Some(id) = crate::ui::presets::all(cx).get(*i).map(|t| t.id.clone()) {
+                    self.preview_preset(&id, window, cx);
+                }
+            }
+            PaletteEvent::CancelThemePreview => self.cancel_preset_preview(window, cx),
         }
     }
 
     pub(crate) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = None;
         self.palette_sub = None;
+        // A previewed theme was never persisted: closing the palette any way
+        // other than confirming the pick puts the old one back.
+        self.cancel_preset_preview(window, cx);
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -3808,7 +4211,7 @@ impl Tty7App {
 
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.is_some() {
-            self.close_settings(window, cx);
+            self.close_settings_checked(window, cx);
             return;
         }
         self.remember_active_pane(window, cx);
@@ -3842,6 +4245,9 @@ impl Tty7App {
             cx.subscribe_in(&settings_search, window, |this, _i, ev, _w, cx| {
                 if matches!(ev, InputEvent::Change) {
                     this.autoselect_settings_search(cx);
+                    if let Some(s) = this.active_settings_mut() {
+                        s.reveal_first_hit.set(true);
+                    }
                     cx.notify();
                 }
             }),
@@ -3869,10 +4275,19 @@ impl Tty7App {
             }),
         );
 
+        let content_scroll = gpui::ScrollHandle::new();
+        let search_anchor = gpui::ScrollAnchor::for_handle(content_scroll.clone());
+
         self.settings = Some(SettingsState {
             focus_handle: focus_handle.clone(),
             section: SettingsSection::Appearance,
             search: settings_search,
+            content_scroll,
+            ssh_master_scroll: gpui::ScrollHandle::new(),
+            ssh_detail_scroll: gpui::ScrollHandle::new(),
+            theme_list_scroll: gpui::ScrollHandle::new(),
+            search_anchor,
+            reveal_first_hit: Cell::new(false),
             font_select,
             font_bold_select,
             font_italic_select,
@@ -4114,6 +4529,11 @@ impl Tty7App {
             state.set_placeholder(t(L10nKey::SearchTabs), window, cx)
         });
         self.file_search.update(cx, |state, cx| {
+            state.set_placeholder(t(L10nKey::SearchFiles), window, cx)
+        });
+        // The remote Files panel is built once with the app, so its placeholder
+        // is the one input that would otherwise keep the old language.
+        self.sftp_panel.filter_input.update(cx, |state, cx| {
             state.set_placeholder(t(L10nKey::SearchFiles), window, cx)
         });
         if let Some(s) = self.active_settings() {
@@ -4587,6 +5007,16 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// Saves the shell after the detected-shell menu wrote into the field.
+    ///
+    /// The field itself only commits on Enter or blur, and picking from a menu
+    /// is neither — without this the choice would sit in the box unsaved until
+    /// the user happened to click into it and out again.
+    pub(crate) fn commit_shell_from_picker(&mut self, cx: &mut Context<Self>) {
+        self.commit_shell(cx);
+        cx.notify();
+    }
+
     fn commit_shell(&mut self, cx: &mut Context<Self>) {
         let Some(settings) = self.active_settings() else {
             return;
@@ -4702,37 +5132,99 @@ impl Tty7App {
         per_profile.unwrap_or(cfg.ssh_warn_on_close)
     }
 
-    pub(crate) fn tab_has_warn_ssh(&self, index: usize, cx: &App) -> bool {
-        self.tabs
-            .get(index)
-            .map(|t| {
-                t.pane
-                    .terminals()
-                    .iter()
-                    .any(|l| self.leaf_is_warn_ssh(l, cx))
-            })
-            .unwrap_or(false)
-    }
-
-    pub(crate) fn focused_pane_is_warn_ssh(&self, window: &Window, cx: &App) -> bool {
-        self.tabs
-            .get(self.active)
-            .and_then(|t| t.pane.focused_or_first(window, cx))
-            .map(|l| self.leaf_is_warn_ssh(&l, cx))
-            .unwrap_or(false)
-    }
-
-    pub(crate) fn confirm_ssh_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.ssh_close_confirm {
-            Some(SshCloseKind::Tab(i)) => self.close_tab(i, window, cx),
-            Some(SshCloseKind::Pane) => self.close_pane(window, cx),
-            None => {}
+    /// The app asks every other question of this class through the platform's
+    /// own dialog. This one used to be a bespoke in-app card with no scrim, no
+    /// Escape and no click-outside — the two buttons were the only way out.
+    fn ask_before_closing(
+        &mut self,
+        target: CloseTarget,
+        reason: CloseReason,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.close_prompt_open {
+            return;
         }
+        self.close_prompt_open = true;
+        // ⌘W closes a pane, but when it is the only one in its tab the tab goes
+        // with it — the question has to name what actually disappears.
+        let ends_the_tab = matches!(target, CloseTarget::Tab(_))
+            || self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| tab.pane.leaves().len() <= 1);
+        let (title, body) = close_prompt(ends_the_tab, &reason);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(&body),
+            &crate::ui::confirm_answers(
+                t(crate::ui::i18n::L10nKey::Close),
+                t(crate::ui::i18n::L10nKey::Keep),
+            ),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let close = matches!(answer.await, Ok(0));
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.close_prompt_open = false;
+                // Cancelled, or the window went away with the question open:
+                // either way the work carries on.
+                if !close {
+                    cx.notify();
+                    return;
+                }
+                match target {
+                    // The tab may have moved, or gone, while the question was
+                    // up; find it by id and let it be if it is already closed.
+                    CloseTarget::Tab(id) => {
+                        if let Some(i) = this.tabs.iter().position(|t| t.tree_id.get() == id) {
+                            this.close_tab_inner(i, true, window, cx);
+                        }
+                    }
+                    CloseTarget::Pane => this.close_pane_inner(true, window, cx),
+                }
+            });
+        })
+        .detach();
     }
 
-    pub(crate) fn cancel_ssh_close(&mut self, cx: &mut Context<Self>) {
-        self.ssh_close_confirm = None;
-        cx.notify();
+    /// The first reason this pane should not simply vanish.
+    fn leaf_close_reason(&self, leaf: &Entity<TerminalView>, cx: &App) -> Option<CloseReason> {
+        if self.leaf_is_warn_ssh(leaf, cx) {
+            return Some(CloseReason::LiveSsh);
+        }
+        leaf.read(cx).busy().map(CloseReason::Busy)
+    }
+
+    /// Whether closing this tab would drop a connection the user asked to be
+    /// warned about. Narrower than [`Self::tab_close_reason`] on purpose — see
+    /// the bulk closes, which skip these and only these.
+    fn tab_has_warn_ssh(&self, index: usize, cx: &App) -> bool {
+        self.tabs.get(index).is_some_and(|tab| {
+            tab.pane
+                .terminals()
+                .iter()
+                .any(|l| self.leaf_is_warn_ssh(l, cx))
+        })
+    }
+
+    fn tab_close_reason(&self, index: usize, cx: &App) -> Option<CloseReason> {
+        self.tabs
+            .get(index)?
+            .pane
+            .terminals()
+            .iter()
+            .find_map(|l| self.leaf_close_reason(l, cx))
+    }
+
+    fn focused_pane_close_reason(&self, window: &Window, cx: &App) -> Option<CloseReason> {
+        let leaf = self
+            .tabs
+            .get(self.active)?
+            .pane
+            .focused_or_first(window, cx)?;
+        self.leaf_close_reason(&leaf, cx)
     }
 
     pub(crate) fn active_ssh_pane(
@@ -4774,8 +5266,14 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         if let Some(s) = self.settings.as_mut() {
+            let moved = s.section != target;
             s.section = target;
             s.recording = None;
+            // Arriving on a page with a query live means arriving to look for
+            // what the nav badge counted, so take the page to it.
+            if moved {
+                s.reveal_first_hit.set(true);
+            }
             if target == SettingsSection::Agents {
                 s.agent_hooks_states = crate::ui::settings::AgentHooksView::Loading;
             }
@@ -4939,6 +5437,28 @@ impl Tty7App {
         self.run_agent_hooks_action(agent, false, cx);
     }
 
+    /// Words a hook install or removal for the note in Settings.
+    ///
+    /// `agent_hooks` returns what it did rather than a sentence, because it
+    /// lives in `tty7-core` and cannot reach `src/ui/i18n` — it used to hand
+    /// back English prose, which a Chinese or Japanese UI then showed as-is.
+    fn agent_hooks_outcome_msg(outcome: &crate::core::agent_hooks::HookOutcome) -> String {
+        use crate::core::agent_hooks::HookOutcome as O;
+        match outcome {
+            O::Installed => t(L10nKey::AppAgentHooksInstalled).to_string(),
+            O::InstalledEnableCodexThere => {
+                t(L10nKey::AppAgentHooksInstalledEnableCodexThere).to_string()
+            }
+            O::InstalledCodexEnableFailed(e) => t_fmt(
+                L10nKey::AppAgentHooksInstalledCodexEnableFailed,
+                &[("error", e)],
+            ),
+            O::Removed => t(L10nKey::AppAgentHooksRemoved).to_string(),
+            O::NothingInstalled => t(L10nKey::AppAgentHooksNothingInstalled).to_string(),
+            O::NoTty7Hooks => t(L10nKey::AppAgentHooksNoTty7Hooks).to_string(),
+        }
+    }
+
     fn run_agent_hooks_action(
         &mut self,
         agent: crate::core::agent_hooks::HookAgent,
@@ -4982,10 +5502,18 @@ impl Tty7App {
                     s.agent_hooks_note = Some((
                         agent,
                         match result {
-                            Ok(summary) => summary,
-                            Err(e) => {
-                                t_fmt(L10nKey::AppAgentHooksOpFailed, &[("error", &e.to_string())])
-                            }
+                            Ok(outcome) => Self::agent_hooks_outcome_msg(&outcome),
+                            // Every sibling error names its action; this one
+                            // said only "Failed:", leaving the note that
+                            // reports it silent about which half of the
+                            // toggle had not happened.
+                            Err(e) => t_fmt(
+                                match install {
+                                    true => L10nKey::AppAgentHooksInstallFailed,
+                                    false => L10nKey::AppAgentHooksRemoveFailed,
+                                },
+                                &[("error", &e.to_string())],
+                            ),
                         },
                     ));
                 }
@@ -5128,12 +5656,22 @@ impl Tty7App {
             .chain(crate::ui::keymap::extra_bindings(cx))
             .find(|(a, k)| *k == spec && *a != action)
             .map(|(a, _)| a);
+        // A trailing "…" on an action name marks a command that opens
+        // something; it is not punctuation, and inside a sentence it reads as
+        // the sentence trailing off — "Rename Tab… took the shortcut from".
+        let in_prose = |name: &str| name.trim_end_matches('…').to_string();
         let note = displaced.as_ref().map(|other| {
             t_fmt(
                 L10nKey::AppKeybindingDisplacedNote,
                 &[
-                    ("action", &humanize_action(&action)),
-                    ("previous", &humanize_action(other)),
+                    (
+                        "action",
+                        &in_prose(&crate::ui::keymap::action_entry(&action).1),
+                    ),
+                    (
+                        "previous",
+                        &in_prose(&crate::ui::keymap::action_entry(other).1),
+                    ),
                 ],
             )
         });
@@ -5162,7 +5700,36 @@ impl Tty7App {
         cx.notify();
     }
 
-    pub(crate) fn restore_default_keybindings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn restore_default_keybindings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Nothing here is recoverable: the overrides are dropped from config
+        // and the only record of them was the config.
+        if cx.global::<Config>().keybindings.is_empty() {
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaults),
+            Some(t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaultsBody)),
+            &crate::ui::confirm_answers(
+                t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaults),
+                t(crate::ui::i18n::L10nKey::Cancel),
+            ),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(0) = answer.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.restore_default_keybindings_confirmed(cx)
+            });
+        })
+        .detach();
+    }
+
+    fn restore_default_keybindings_confirmed(&mut self, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.keybindings.clear());
         crate::ui::keymap::rebind(cx);
         if let Some(s) = self.active_settings_mut() {
@@ -5410,18 +5977,37 @@ impl Render for Tty7App {
         #[cfg(test)]
         render_probe::record();
         let prof = crate::ui::perf::enabled().then(std::time::Instant::now);
+        // Every window's root is this view, so setting the rem here is what
+        // makes `ui_font_size` reach the whole interface — the rem ladder
+        // (`text_sm`, `text_xs`, `rems(..)`) resolves against it, and the
+        // terminal grid, sized in absolute px from `font_size`, does not move.
+        window.set_rem_size(px(cx.global::<Config>().ui_font_size));
         self.claim_pending_tab(window, cx);
         self.touch_active_tab();
         self.scm_sync_watchers(window, cx);
         if cx.has_active_drag() {
             crate::ui::reorder::clear_pending(&self.reorder);
-        } else if let Some(order) = crate::ui::reorder::take_pending(&self.reorder) {
-            self.apply_tab_order(&order, cx);
+            crate::ui::pane_drag::clear_landing(&self.pane_drag);
+        } else {
+            if let Some(order) = crate::ui::reorder::take_pending(&self.reorder) {
+                self.apply_tab_order(&order, cx);
+            }
+            if let Some((from, zone)) = crate::ui::pane_drag::take_landing(&self.pane_drag) {
+                self.drop_pane(from, zone, window, cx);
+            }
         }
-        if self.reorder.borrow().is_some()
-            && cx.active_drag_cursor_style() != Some(gpui::CursorStyle::ClosedHand)
+        // Windows has no closed-hand cursor and gpui answers `ClosedHand` with
+        // the plain arrow there, which would drop the grip's pointing hand the
+        // instant the drag it advertised began.
+        let held = if cfg!(target_os = "windows") {
+            gpui::CursorStyle::PointingHand
+        } else {
+            gpui::CursorStyle::ClosedHand
+        };
+        if (self.reorder.borrow().is_some() || self.pane_drag.borrow().is_some())
+            && cx.active_drag_cursor_style() != Some(held)
         {
-            cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
+            cx.set_active_drag_cursor_style(held, window);
         }
         let vertical = matches!(cx.global::<Config>().tab_bar_position, TabBarPosition::Left)
             && !self.tabs.is_empty();
@@ -5450,9 +6036,15 @@ impl Render for Tty7App {
                         .child(leaf.clone())
                         .into_any_element(),
                     None => {
-                        let dim_inactive = active_tab.pane.leaves().len() > 1
-                            && cx.global::<Config>().dim_inactive_panes;
-                        active_tab.pane.render(dim_inactive, window, cx)
+                        let several = active_tab.pane.leaves().len() > 1;
+                        let chrome = crate::ui::pane::PaneChrome {
+                            dim_inactive: several && cx.global::<Config>().dim_inactive_panes,
+                            rearrangeable: several,
+                            hovered: self.pane_hover.clone(),
+                            lifted: crate::ui::pane_drag::lifted(&self.pane_drag),
+                            drag: self.pane_drag.clone(),
+                        };
+                        active_tab.pane.render(&chrome, window, cx)
                     }
                 }
             }
@@ -5467,7 +6059,19 @@ impl Render for Tty7App {
             .flex_1()
             .relative()
             .overflow_hidden()
+            .child(
+                gpui::canvas(
+                    {
+                        let area = self.pane_area.clone();
+                        move |bounds, _window, _cx| area.set(Some(bounds))
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
             .child(body)
+            .when_some(self.pane_landing(window, cx), |this, el| this.child(el))
             .when_some(self.render_ssh_prompt_overlay(window, cx), |this, el| {
                 this.child(el)
             })
@@ -5476,9 +6080,6 @@ impl Render for Tty7App {
                 this.child(el)
             })
             .when_some(self.render_remote_input_notice(cx), |this, el| {
-                this.child(el)
-            })
-            .when_some(self.render_ssh_close_confirm_overlay(cx), |this, el| {
                 this.child(el)
             })
             .when_some(self.render_worktree_prompt_overlay(cx), |this, el| {
@@ -5904,7 +6505,7 @@ impl Render for Tty7App {
                 .children(bg_image)
                 .child(main_layout)
                 .when_some(settings_overlay, |this, overlay| this.child(overlay))
-                .children(self.render_switcher(cx))
+                .children(self.render_switcher(window, cx))
                 .when_some(self.palette.clone(), |this, palette| this.child(palette))
                 .children(gpui_component::Root::render_notification_layer(window, cx));
 
@@ -6049,7 +6650,15 @@ fn pane_attachable(
         None => false,
         Some(None) => true,
         Some(Some(recorded)) => {
-            let ours = *recorded == owner.to_string();
+            // Only a workspace id is a claim. Anything else is a client
+            // stamping its own name — `tty7` before this release wrote a
+            // literal "tty7-cli" — and refusing on it strands every pane the
+            // CLI ever made, respawning over a live shell the tree just told
+            // us belongs here.
+            let Ok(recorded) = recorded.parse::<crate::core::session::WorkspaceId>() else {
+                return true;
+            };
+            let ours = recorded == owner;
             if !ours {
                 log::warn!(
                     "restore: pane {id} is owned by workspace {recorded}, not {owner}; \
@@ -6068,12 +6677,13 @@ fn tabs_from_session(
     font_size: f32,
     window: &mut Window,
     cx: &mut Context<Tty7App>,
-) -> (Vec<Tab>, usize) {
+) -> (Vec<Tab>, usize, usize) {
     let Some(session) = session.filter(|s| !s.tabs.is_empty()) else {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, 0);
     };
     let alive = alive_panes_on(&crate::terminal::PaneRoute::for_workspace(workspace));
     let mut tabs: Vec<Tab> = Vec::with_capacity(session.tabs.len());
+    let mut dropped = 0usize;
     for st in &session.tabs {
         let Some(pane) = session_to_pane(
             workspace,
@@ -6084,7 +6694,10 @@ fn tabs_from_session(
             window,
             cx,
         ) else {
+            // The layout coming back is the product's headline claim, so a tab
+            // that quietly does not is worth a sentence rather than a log line.
             log::error!("dropping a restored tab: no pane in it could be started");
+            dropped += 1;
             continue;
         };
         tabs.push(Tab {
@@ -6103,7 +6716,7 @@ fn tabs_from_session(
         });
     }
     let active = session.active.min(tabs.len().saturating_sub(1));
-    (tabs, active)
+    (tabs, active, dropped)
 }
 
 fn leaf_shares_the_window_daemon(window_is_remote: bool, leaf_is_native_ssh: bool) -> bool {
@@ -6748,9 +7361,53 @@ mod window_drag_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        TabAgentSession, clear_window_override_values, leaf_shares_the_window_daemon, mru_order,
-        pane_attachable, parse_ssh_connect_input, parse_ssh_option_words,
+        CloseReason, TabAgentSession, clear_window_override_values, close_prompt,
+        leaf_shares_the_window_daemon, mru_order, pane_attachable, parse_ssh_connect_input,
+        parse_ssh_option_words,
     };
+
+    #[test]
+    fn the_close_question_names_what_it_is_about_to_end() {
+        use crate::terminal::view::PaneBusy;
+        crate::ui::i18n::set_locale("en");
+
+        let build = CloseReason::Busy(PaneBusy::Command("cargo build".into()));
+        // The command is in the body, not a generic "are you sure".
+        let (title, body) = close_prompt(true, &build);
+        assert!(body.contains("cargo build"), "{body}");
+        assert!(!body.contains("{what}"), "the placeholder leaked: {body}");
+        assert!(title.contains("tab"), "{title}");
+        // Same reason, but the pane has siblings: the tab survives, so the
+        // question must not claim otherwise.
+        let (pane_title, _) = close_prompt(false, &build);
+        assert!(pane_title.contains("pane"), "{pane_title}");
+        assert_ne!(title, pane_title);
+
+        let agent = CloseReason::Busy(PaneBusy::Agent("Claude Code"));
+        let (_, body) = close_prompt(true, &agent);
+        assert!(body.contains("Claude Code"), "{body}");
+        assert!(!body.contains("{agent}"), "the placeholder leaked: {body}");
+
+        // A live SSH connection keeps its own wording rather than being folded
+        // into the busy copy.
+        let (ssh_title, ssh_body) = close_prompt(true, &CloseReason::LiveSsh);
+        assert_ne!(ssh_title, title);
+        assert!(!ssh_body.is_empty());
+    }
+
+    #[test]
+    fn a_layout_that_came_back_short_says_how_short() {
+        crate::ui::i18n::set_locale("en");
+        for n in [1usize, 2, 9] {
+            let text =
+                crate::ui::i18n::t_plural(crate::ui::i18n::L10nKey::AppTabsNotRestored, n, &[]);
+            assert!(text.contains(&n.to_string()), "{n}: {text}");
+            assert!(!text.contains("{count}"), "the placeholder leaked: {text}");
+        }
+        // Singular is not "1 tabs".
+        let one = crate::ui::i18n::t_plural(crate::ui::i18n::L10nKey::AppTabsNotRestored, 1, &[]);
+        assert!(one.contains("1 tab "), "{one}");
+    }
 
     #[test]
     fn non_windows_reset_preserves_the_synced_windows_backdrop() {
@@ -6812,6 +7469,7 @@ mod tests {
             (1, Some(ours.to_string())),
             (2, Some(theirs.to_string())),
             (3, None),
+            (5, Some("tty7-cli".to_string())),
         ]
         .into_iter()
         .collect();
@@ -6827,6 +7485,11 @@ mod tests {
         assert!(
             pane_attachable(Some(&alive), 3, ours),
             "an unowned pane is legacy"
+        );
+        assert!(
+            pane_attachable(Some(&alive), 5, ours),
+            "an owner that names no workspace is not a rival's claim: older CLIs \
+             wrote their own name there, and respawning strands the live pane"
         );
         assert!(
             !pane_attachable(Some(&alive), 4, ours),
@@ -7400,6 +8063,41 @@ mod shell_menu_gpui_tests {
                 app.shells.shells.is_empty(),
                 "a remote window must not offer this computer's shells: {:?}",
                 app.shells.shells
+            );
+        });
+    }
+}
+
+// `harness_with_tabs` hands back the panes' `UnixStream`s, so it exists only
+// on unix — same as `ssh_rebuild_gpui_tests` below it.
+#[cfg(all(test, unix))]
+mod rename_gpui_tests {
+    use gpui::TestAppContext;
+
+    use crate::ui::app::test_window::harness_with_tabs;
+
+    #[gpui::test]
+    fn a_rename_box_opens_with_the_caret_after_the_name(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+
+        app.update_in(&mut vcx, |app, window, cx| app.start_rename(0, window, cx));
+        vcx.background_executor.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            let input = app
+                .renaming
+                .as_ref()
+                .expect("the rename box is up")
+                .input
+                .clone();
+            let state = input.read(cx);
+            let value = state.value().to_string();
+            assert!(!value.is_empty(), "the box starts on the current name");
+            let end = value.len();
+            assert_eq!(
+                state.selected_range(),
+                end..end,
+                "typing has to continue {value:?}, not land in front of it"
             );
         });
     }

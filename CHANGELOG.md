@@ -5,9 +5,37 @@ All notable changes to tty7 are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [26.8.2] - 2026-08-09
+## [Unreleased]
 
 ### Added
+
+- **Drop files into the Files panel to copy them in** — the panel has always
+  been a drag *source*; it now takes a drop as well. Files dragged in from the
+  desktop land in the folder under the cursor: a folder row takes them itself,
+  a file row stands in for the folder holding it, and the space below the tree
+  belongs to the top of it. The landing is highlighted while the drag is in
+  flight. Folders come in whole, the executable bit survives the copy, and a
+  name already taken is asked about rather than silently replaced — a "no"
+  leaves every file in the drop untouched. It works over a remote workspace
+  too, reading here and writing there, up to the size one control frame can
+  carry; past that the panel says to use SFTP.
+
+- **Rearrange splits by dragging a pane** — hovering a pane now floats a small
+  grip along its top edge; dragging it moves that pane elsewhere in the tab.
+  A drop on a pane's **side** goes in beside it: facing a neighbour in the same
+  row or column it joins that row and takes an equal share of it, and only
+  facing across the layout — where there is no row to join — does it split that
+  pane in half. A drop on its **middle** trades the two panes' places, and a
+  drop in the band past a pane's **outer side** — the one facing the window
+  rather than another pane — puts it beside everything else as a full-width or
+  full-height band, sized to an even share of what that side already holds — so
+  a pane in the middle of a 2×2 becomes a full-height *third* column in a
+  single drag rather than taking half the window. The landing is highlighted
+  while the drag is in flight, and is only offered when the drop would actually
+  change the layout. A pane dropped beside another is now reconciled with the
+  machine tree as one `PaneMove` instead of a close-and-rebuild; a drop that
+  lands beside a whole group of panes rather than beside a single one still
+  takes the rebuild, which is all `PaneMove` can name.
 
 - **Native Windows backdrop materials** — Settings → Appearance now offers a
   **Background material** picker on Windows (**Auto / Blur / Mica / Mica Alt /
@@ -19,6 +47,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sidebar and right detail panel follow the window opacity so the material
   shows through the whole workspace, and the settings panel stays opaque.
   macOS and Linux keep the existing blur toggle.
+
+### Fixed
+
+- **An SFTP upload no longer sits in the browser under its temporary name** —
+  an upload is written as `<name>.tty7-upload-<hex>` and renamed into place at
+  the end, and the browser listed the directory the moment the transfer
+  started, catching exactly that name. Nothing listed again afterwards, so a
+  finished upload read as a file with a hash glued to its name until the
+  directory was navigated by hand. The premature listing is gone and the
+  directory is listed once the upload stops running — finished, failed or
+  cancelled.
+
+- **Drag cursors on Windows** — the grip on a pane's top edge, and a sidebar
+  group being dragged, now change the pointer on Windows too. Win32 ships no
+  open- or closed-hand cursor and gpui answers both with the plain arrow, so
+  the grip read as ordinary background and a drag in flight gave the pointer
+  nothing to say; both now use the pointing hand there, and hovering the grip
+  no longer hands the cursor back to the arrow the moment the drag it
+  advertised begins.
+
+## [26.8.2] - 2026-08-09
+
+### Added
 
 - **Update tty7 without leaving the app** — the launch check and
   **Settings → About → Check Now** now offer **Update and Relaunch** instead of

@@ -13,6 +13,7 @@ use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_f
 use tty7_core::core::machine::TabId;
 use tty7_core::core::session::{RemoteTarget, WorkspaceId};
 
+use crate::core::actions::{SwitcherAcross, SwitcherAcrossBack};
 use crate::core::session::WorkspaceStore;
 use crate::daemon::install::InstallPhase;
 use crate::terminal::pane_liveness::Liveness;
@@ -26,6 +27,11 @@ const CARD_W: f32 = 840.0;
 const LEFT_W: f32 = 340.0;
 
 const CARD_TOP: f32 = 120.0;
+
+/// Breathing room the card keeps from the window edge, and the height its own
+/// search row and footer take on top of the body.
+const CARD_MARGIN: f32 = 24.0;
+const CARD_CHROME_H: f32 = 84.0;
 
 const BODY_H: f32 = 420.0;
 
@@ -143,6 +149,13 @@ pub(crate) struct Switcher {
     hold: Option<gpui::Modifiers>,
     left_scroll: gpui::ScrollHandle,
     right_scroll: gpui::ScrollHandle,
+    /// Anchors on the two scrolls, worn by whichever row is selected. Both
+    /// columns hold their rows inside one child element, and `scroll_to_item`
+    /// indexes a scroll's *direct* children — so it could only ever find item
+    /// 0, and walking the list with the arrows quietly left the selection off
+    /// the bottom of the column.
+    left_anchor: gpui::ScrollAnchor,
+    right_anchor: gpui::ScrollAnchor,
     _subs: Vec<Subscription>,
 }
 
@@ -241,6 +254,7 @@ impl Tty7App {
                 }
             },
         )];
+        let (left_scroll, right_scroll) = (gpui::ScrollHandle::new(), gpui::ScrollHandle::new());
         self.switcher = Some(Switcher {
             query,
             collapsed: HashSet::new(),
@@ -251,8 +265,10 @@ impl Tty7App {
             right_sel: 0,
             mru,
             hold,
-            left_scroll: gpui::ScrollHandle::new(),
-            right_scroll: gpui::ScrollHandle::new(),
+            left_scroll: left_scroll.clone(),
+            right_scroll: right_scroll.clone(),
+            left_anchor: gpui::ScrollAnchor::for_handle(left_scroll),
+            right_anchor: gpui::ScrollAnchor::for_handle(right_scroll),
             _subs: subs,
         });
         // Park the left cursor on this window's own workspace so the tab column
@@ -284,7 +300,7 @@ impl Tty7App {
     ) {
         if self.switcher.is_some() {
             let layout = self.switcher_layout(cx);
-            self.switcher_step_right(&layout, forward, cx);
+            self.switcher_step_right(&layout, forward, window, cx);
             return;
         }
         let n = self.tabs.len();
@@ -791,8 +807,7 @@ impl Tty7App {
 
     fn switcher_rename(&mut self, id: WorkspaceId, window: &mut Window, cx: &mut Context<Self>) {
         let current = crate::ui::machine_mirror::display_name_for(cx, id).unwrap_or_default();
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
-        input.update(cx, |state, cx| state.focus(window, cx));
+        let input = Self::rename_box(current, window, cx);
         let sub = cx.subscribe_in(
             &input,
             window,
@@ -890,8 +905,8 @@ impl Tty7App {
             Key::Step(forward) => {
                 cx.stop_propagation();
                 match column {
-                    Column::Left => self.switcher_step_left(&layout, forward, cx),
-                    Column::Right => self.switcher_step_right(&layout, forward, cx),
+                    Column::Left => self.switcher_step_left(&layout, forward, window, cx),
+                    Column::Right => self.switcher_step_right(&layout, forward, window, cx),
                 }
             }
             // Once there is a query, left and right belong to the caret in the
@@ -912,13 +927,23 @@ impl Tty7App {
             Key::ToColumn(_) => {}
             Key::Tab(forward) => {
                 cx.stop_propagation();
-                self.switcher_step_right(&layout, forward, cx);
+                self.switcher_step_right(&layout, forward, window, cx);
             }
             Key::Confirm(new_window) => {
                 cx.stop_propagation();
                 self.switcher_confirm(&layout, new_window, window, cx);
             }
         }
+    }
+
+    /// The anchor a row wears while it is the selected one, so stepping the
+    /// cursor with the keyboard carries the column to it.
+    fn switcher_anchor(&self, column: Column, picked: bool) -> Option<gpui::ScrollAnchor> {
+        let sw = self.switcher.as_ref()?;
+        picked.then(|| match column {
+            Column::Left => sw.left_anchor.clone(),
+            Column::Right => sw.right_anchor.clone(),
+        })
     }
 
     /// Moves the left cursor to a clicked row so the tab column follows it.
@@ -953,7 +978,13 @@ impl Tty7App {
         cx.notify();
     }
 
-    fn switcher_step_left(&mut self, layout: &Layout, forward: bool, cx: &mut Context<Self>) {
+    fn switcher_step_left(
+        &mut self,
+        layout: &Layout,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let n = layout.nav.len();
         let Some(sw) = self.switcher.as_mut() else {
             return;
@@ -965,11 +996,18 @@ impl Tty7App {
         sw.left_sel = step(sw.left_sel.min(n - 1), n, forward);
         // A different workspace means a different tab column.
         sw.right_sel = 0;
-        sw.left_scroll.scroll_to_item(sw.left_sel);
+        let anchor = sw.left_anchor.clone();
+        anchor.scroll_to(window, cx);
         cx.notify();
     }
 
-    fn switcher_step_right(&mut self, layout: &Layout, forward: bool, cx: &mut Context<Self>) {
+    fn switcher_step_right(
+        &mut self,
+        layout: &Layout,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let sel = self.switcher.as_ref().map(|sw| sw.left_sel).unwrap_or(0);
         let query = self
             .switcher
@@ -988,7 +1026,8 @@ impl Tty7App {
         }
         sw.column = Column::Right;
         sw.right_sel = step(sw.right_sel.min(n - 1), n, forward);
-        sw.right_scroll.scroll_to_item(sw.right_sel);
+        let anchor = sw.right_anchor.clone();
+        anchor.scroll_to(window, cx);
         cx.notify();
     }
 
@@ -1072,7 +1111,11 @@ impl Tty7App {
         self.activate_tree_tab(tab, window, cx);
     }
 
-    pub(crate) fn render_switcher(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_switcher(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let sw = self.switcher.as_ref()?;
         let (sel, column) = (sw.left_sel, sw.column);
         let (left_scroll, right_scroll) = (sw.left_scroll.clone(), sw.right_scroll.clone());
@@ -1109,36 +1152,61 @@ impl Tty7App {
         // Fixed height, not fit-to-content: the tab column changes length every
         // time the left cursor moves, and a card that resizes under the pointer
         // is unusable.
+        // The card is fixed-size by design — a panel that resizes under the
+        // pointer is unusable — but it still has to fit the window it floats
+        // over. Below its natural size it takes what there is.
+        let viewport = window.viewport_size();
+        let card_w = CARD_W
+            .min(viewport.width.as_f32() - 2. * CARD_MARGIN)
+            .max(320.);
+        let body_h = BODY_H
+            .min(viewport.height.as_f32() - CARD_TOP - CARD_CHROME_H - CARD_MARGIN)
+            .max(120.);
         let body = div()
             .flex()
             .flex_row()
             .items_stretch()
-            .h(px(BODY_H))
+            .h(px(body_h))
+            // Both columns scroll once the lists outrun the card, and neither
+            // said so. The border moves out to the column so it stays put
+            // while the rows underneath it move.
             .child(
-                div()
-                    .id("switcher-workspaces")
-                    .track_scroll(&left_scroll)
-                    .w(px(LEFT_W))
+                v_flex()
+                    .w(px(LEFT_W.min(card_w * 0.5)))
                     .flex_shrink_0()
-                    .overflow_y_scroll()
                     .border_r_1()
                     .border_color(border)
-                    .p(px(6.))
-                    .child(list),
+                    .child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "switcher-workspaces-scrollbar",
+                        div()
+                            .id("switcher-workspaces")
+                            .track_scroll(&left_scroll)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .p(px(6.))
+                            .child(list),
+                        &left_scroll,
+                    )),
             )
             .child(
-                div()
-                    .id("switcher-tabs")
-                    .track_scroll(&right_scroll)
+                v_flex()
                     .flex_1()
                     .min_w_0()
-                    .overflow_y_scroll()
-                    .p(px(6.))
-                    .child(self.render_tabs(&layout, sel, column, cx)),
+                    .child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "switcher-tabs-scrollbar",
+                        div()
+                            .id("switcher-tabs")
+                            .track_scroll(&right_scroll)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .p(px(6.))
+                            .child(self.render_tabs(&layout, sel, column, cx)),
+                        &right_scroll,
+                    )),
             );
 
         let card = v_flex()
-            .w(px(CARD_W))
+            .w(px(card_w))
             .bg(card_bg)
             .border_1()
             .border_color(border)
@@ -1158,6 +1226,15 @@ impl Tty7App {
                 .justify_center()
                 .pt(px(CARD_TOP))
                 .bg(scrim)
+                .key_context("Switcher")
+                .on_action(cx.listener(|this, _: &SwitcherAcross, window, cx| {
+                    let layout = this.switcher_layout(cx);
+                    this.switcher_step_right(&layout, true, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &SwitcherAcrossBack, window, cx| {
+                    let layout = this.switcher_layout(cx);
+                    this.switcher_step_right(&layout, false, window, cx);
+                }))
                 .on_key_down(cx.listener(Self::on_switcher_key))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1201,6 +1278,13 @@ impl Tty7App {
         );
         let hover = hover_fill(cx);
         let holding = self.switcher.as_ref().is_some_and(|sw| sw.hold.is_some());
+        // With a query in the box, ← and → belong to the caret and Tab becomes
+        // the way across. That remap is deliberate, and until now it was also
+        // silent: arrows simply stopped working with nothing said.
+        let filtering = self
+            .switcher
+            .as_ref()
+            .is_some_and(|sw| !sw.text(cx).trim().is_empty());
         h_flex()
             .items_center()
             .justify_between()
@@ -1240,7 +1324,10 @@ impl Tty7App {
                     .pr(px(ROW_PAD))
                     .text_xs()
                     .text_color(dim)
-                    .when(!holding, |hint| {
+                    .when(!holding && filtering, |hint| {
+                        hint.child(t(L10nKey::SwitcherTabToCrossColumns))
+                    })
+                    .when(!holding && !filtering, |hint| {
                         hint.child(
                             div()
                                 .px(px(5.))
@@ -1307,7 +1394,7 @@ impl Tty7App {
                         .py(px(8.))
                         .rounded(px(6.))
                         .border_1()
-                        .border_color(theme.danger.opacity(0.35))
+                        .border_color(theme.danger.opacity(0.4))
                         .child(
                             div()
                                 .text_xs()
@@ -1490,7 +1577,7 @@ impl Tty7App {
         let (fg, muted, dim) = (
             theme.foreground,
             theme.muted_foreground,
-            theme.muted_foreground.opacity(0.75),
+            theme.muted_foreground.opacity(0.7),
         );
         let hover = hover_fill(cx);
         let gref = GroupRef::of(group);
@@ -1547,6 +1634,7 @@ impl Tty7App {
             .overflow_hidden()
             .cursor_pointer()
             .when(picked, |r| r.bg(gpui::rgb(rungs(cx).pressed)))
+            .anchor_scroll(self.switcher_anchor(Column::Left, picked))
             .hover(move |r| r.bg(hover))
             .child(glyph_col(
                 GUTTER,
@@ -1599,13 +1687,16 @@ impl Tty7App {
                     .flex_shrink_0()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
-                        Button::new(gpui::SharedString::from(format!(
-                            "switcher-host-more:{}",
-                            group.key
-                        )))
-                        .icon(IconName::Ellipsis)
-                        .ghost()
-                        .xsmall()
+                        crate::ui::tab_strip::hit_target(
+                            Button::new(gpui::SharedString::from(format!(
+                                "switcher-host-more:{}",
+                                group.key
+                            )))
+                            .icon(IconName::Ellipsis)
+                            .ghost()
+                            .xsmall(),
+                        )
+                        .tooltip(t(L10nKey::TabTooltipMore))
                         .dropdown_menu(move |menu, _window, _cx| {
                             group_menu(menu, &menu_ref, app.clone())
                         }),
@@ -1718,6 +1809,7 @@ impl Tty7App {
             .overflow_hidden()
             .cursor_pointer()
             .when(picked, |r| r.bg(gpui::rgb(sf.pressed)))
+            .anchor_scroll(self.switcher_anchor(Column::Left, picked))
             .hover(move |r| r.bg(hover))
             .child(crate::ui::tab_strip::workspace_avatar(
                 &row.name,
@@ -1761,13 +1853,16 @@ impl Tty7App {
                     .group_hover("switcher-row", |x| x.visible())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
-                        Button::new(("switcher-row-more", key))
-                            .icon(IconName::Ellipsis)
-                            .ghost()
-                            .xsmall()
-                            .dropdown_menu(move |menu, _window, _cx| {
-                                row_menu(menu, &menu_ref, app.clone())
-                            }),
+                        crate::ui::tab_strip::hit_target(
+                            Button::new(("switcher-row-more", key))
+                                .icon(IconName::Ellipsis)
+                                .ghost()
+                                .xsmall(),
+                        )
+                        .tooltip(t(L10nKey::TabTooltipMore))
+                        .dropdown_menu(move |menu, _window, _cx| {
+                            row_menu(menu, &menu_ref, app.clone())
+                        }),
                     ),
             )
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
@@ -1831,6 +1926,7 @@ impl Tty7App {
                 .rounded(px(6.))
                 .cursor_pointer()
                 .when(at(Nav::OthersHeader), |r| r.bg(picked))
+                .anchor_scroll(self.switcher_anchor(Column::Left, at(Nav::OthersHeader)))
                 .hover(move |r| r.bg(hover))
                 .child(glyph_col(
                     GUTTER,
@@ -1882,6 +1978,7 @@ impl Tty7App {
                         .overflow_hidden()
                         .cursor_pointer()
                         .when(at(Nav::Other(i)), |r| r.bg(picked))
+                        .anchor_scroll(self.switcher_anchor(Column::Left, at(Nav::Other(i))))
                         .hover(move |r| r.bg(hover))
                         .child(glyph_col(
                             ROW_AVATAR,
@@ -1960,7 +2057,7 @@ impl Tty7App {
             .unwrap_or_default();
         let hits = visible_tabs(row, &query);
         if hits.is_empty() {
-            return note(t(L10nKey::SwitcherNoMatch).to_string());
+            return note(t(L10nKey::SwitcherNoTabMatch).to_string());
         }
 
         let sf = rungs(cx);
@@ -2053,10 +2150,17 @@ impl Tty7App {
                     .overflow_hidden()
                     .cursor_pointer()
                     .when(picked, |r| r.bg(picked_bg))
+                    .anchor_scroll(self.switcher_anchor(Column::Right, picked))
                     .hover(move |r| r.bg(hover))
-                    .child(
-                        self.tab_avatar(tab.agent, tab.status, tab.unread, tab.ssh, ROW_AVATAR, cx),
-                    )
+                    .child(self.tab_avatar(
+                        ("switcher-avatar", index),
+                        tab.agent,
+                        tab.status,
+                        tab.unread,
+                        tab.ssh,
+                        ROW_AVATAR,
+                        cx,
+                    ))
                     .child(
                         v_flex()
                             .flex_1()
@@ -2257,6 +2361,21 @@ impl RowRef {
     }
 }
 
+/// Whether a machine's menu would open with every verb greyed out.
+///
+/// New Workspace needs the machine's home directory, which only a link that
+/// has come up once supplies; Disconnect needs a live link; Restart Server is
+/// offered to SSH alone. A WSL or stdio machine that has never connected fails
+/// all three, and the menu opened with every row greyed and nothing to say for
+/// itself. One line about the link beats three dead verbs.
+fn group_menu_is_empty_handed(group: &GroupRef) -> bool {
+    let Some(target) = group.target.as_ref() else {
+        // A local machine can always take a new workspace.
+        return false;
+    };
+    group.home.is_none() && group.link != Link::Connected && !target.is_ssh()
+}
+
 fn group_menu(
     menu: gpui_component::menu::PopupMenu,
     group: &GroupRef,
@@ -2265,6 +2384,9 @@ fn group_menu(
     let (a1, a2, a3) = (app.clone(), app.clone(), app);
     let gref = group.clone();
     let can_create = group.target.is_none() || group.home.is_some();
+    if group_menu_is_empty_handed(group) {
+        return menu.item(PopupMenuItem::label(t(L10nKey::SwitcherConnectToUse)));
+    }
     let menu = menu.item(
         PopupMenuItem::new(t(L10nKey::AppMenuNewWorkspace))
             .disabled(!can_create)
@@ -2305,27 +2427,31 @@ fn row_menu(
     let (a1, a2, a3, a4) = (app.clone(), app.clone(), app.clone(), app);
     let (id, adopt) = (row.id, row.adopt.is_some());
     let stoppable = row.live;
+    // Every verb below addresses a workspace by its local id, and a remote
+    // this client has never adopted has none yet. That greyed all four out at
+    // once: the menu opened with nothing to press and no word about why, which
+    // reads as broken rather than as not-yet. Say what would make them work,
+    // the way the tab pane already says it for the same rows.
+    if adopt {
+        return menu.item(PopupMenuItem::label(t(L10nKey::SwitcherOpenToManage)));
+    }
     menu.item(
-        PopupMenuItem::new(t(L10nKey::SwitcherRename))
-            .disabled(adopt)
-            .on_click(move |_, window, cx| {
-                let _ = a1.update(cx, |this, cx| this.switcher_rename(id, window, cx));
-            }),
+        PopupMenuItem::new(t(L10nKey::SwitcherRename)).on_click(move |_, window, cx| {
+            let _ = a1.update(cx, |this, cx| this.switcher_rename(id, window, cx));
+        }),
     )
     .item(
-        PopupMenuItem::new(t(L10nKey::SwitcherOpenInNewWindow))
-            .disabled(adopt)
-            .on_click(move |_, window, cx| {
-                let _ = a2.update(cx, |this, cx| {
-                    this.close_switcher(window, cx);
-                    crate::ui::windows::open(cx, Some(id));
-                });
-            }),
+        PopupMenuItem::new(t(L10nKey::SwitcherOpenInNewWindow)).on_click(move |_, window, cx| {
+            let _ = a2.update(cx, |this, cx| {
+                this.close_switcher(window, cx);
+                crate::ui::windows::open(cx, Some(id));
+            });
+        }),
     )
     .separator()
     .item(
         PopupMenuItem::new(t(L10nKey::AppMenuStopWorkspace))
-            .disabled(adopt || !stoppable)
+            .disabled(!stoppable)
             .on_click(move |_, window, cx| {
                 let _ = a3.update(cx, |this, cx| {
                     this.close_switcher(window, cx);
@@ -2334,14 +2460,12 @@ fn row_menu(
             }),
     )
     .item(
-        PopupMenuItem::new(t(L10nKey::AppMenuDeleteWorkspace))
-            .disabled(adopt)
-            .on_click(move |_, window, cx| {
-                let _ = a4.update(cx, |this, cx| {
-                    this.close_switcher(window, cx);
-                    this.delete_workspace(id, window, cx);
-                });
-            }),
+        PopupMenuItem::new(t(L10nKey::AppMenuDeleteWorkspace)).on_click(move |_, window, cx| {
+            let _ = a4.update(cx, |this, cx| {
+                this.close_switcher(window, cx);
+                this.delete_workspace(id, window, cx);
+            });
+        }),
     )
 }
 
@@ -2429,6 +2553,66 @@ fn glyph_col(w: f32, child: impl IntoElement) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn group_ref(target: Option<RemoteTarget>, home: Option<&str>, link: Link) -> GroupRef {
+        GroupRef {
+            key: "k".into(),
+            label: "l".into(),
+            target,
+            home: home.map(PathBuf::from),
+            link,
+        }
+    }
+
+    /// A menu that opens with every row greyed and no word about why reads as
+    /// broken rather than as not-yet, so the one state that reaches it has to
+    /// stay pinned as the verbs and their conditions move around.
+    #[test]
+    fn only_an_unconnected_non_ssh_machine_has_nothing_to_offer() {
+        let wsl = || {
+            Some(RemoteTarget::Wsl {
+                distro: "Ubuntu".into(),
+            })
+        };
+        let ssh = || RemoteTarget::direct("me", "host", 22);
+
+        // The case: never connected, so no home, and not SSH, so no restart.
+        assert!(group_menu_is_empty_handed(&group_ref(
+            wsl(),
+            None,
+            Link::Offline
+        )));
+        assert!(group_menu_is_empty_handed(&group_ref(
+            wsl(),
+            None,
+            Link::Failed
+        )));
+
+        // A home from an earlier link still allows a new workspace.
+        assert!(!group_menu_is_empty_handed(&group_ref(
+            wsl(),
+            Some("/home/me"),
+            Link::Offline
+        )));
+        // A live link still allows Disconnect.
+        assert!(!group_menu_is_empty_handed(&group_ref(
+            wsl(),
+            None,
+            Link::Connected
+        )));
+        // SSH always keeps Restart Server.
+        assert!(!group_menu_is_empty_handed(&group_ref(
+            Some(ssh()),
+            None,
+            Link::Offline
+        )));
+        // This machine is never short of verbs.
+        assert!(!group_menu_is_empty_handed(&group_ref(
+            None,
+            None,
+            Link::Local
+        )));
+    }
 
     fn tab(label: &str, path: &str) -> TabRow {
         TabRow {

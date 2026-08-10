@@ -29,9 +29,14 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let name = cx.new(|cx| InputState::new(window, cx).default_value(defaults.name.clone()));
-        let branch = cx.new(|cx| InputState::new(window, cx).default_value(defaults.name));
-        let base = cx.new(|cx| InputState::new(window, cx).default_value(defaults.base));
+        // All three open on a suggestion, which is a value to accept or type
+        // over — not a prefix. `default_value` parked the caret in front of it,
+        // so naming a worktree "login" over the suggested "feature" produced
+        // "loginfeature".
+        let prefill = crate::ui::prefill::filled_box;
+        let name = prefill(defaults.name.clone(), window, cx);
+        let branch = prefill(defaults.name, window, cx);
+        let base = prefill(defaults.base, window, cx);
         name.update(cx, |state, cx| state.focus(window, cx));
         let subs = [&name, &branch, &base]
             .into_iter()
@@ -137,12 +142,24 @@ impl Tty7App {
                 .child(Input::new(input).small())
         };
         let name_now = p.name.read(cx).value().trim().to_string();
+        let branch_now = p.branch.read(cx).value().trim().to_string();
+        // Submitting falls back from one field to the other, so either alone
+        // is enough; only both blank has nothing to name a worktree after.
+        // Offering Create there is offering a click that can only fail.
+        let nothing_to_name = name_now.is_empty() && branch_now.is_empty();
+        // Preview what submitting would actually make, which is the same
+        // fallback: with only a branch typed, the worktree takes its name, and
+        // showing "…" there described a path that would never be created.
+        let effective = match name_now.is_empty() {
+            true => branch_now.as_str(),
+            false => name_now.as_str(),
+        };
         let preview = p
             .dir
-            .join(if name_now.is_empty() {
+            .join(if effective.is_empty() {
                 "…"
             } else {
-                &name_now
+                effective
             })
             .display()
             .to_string();
@@ -180,7 +197,16 @@ impl Tty7App {
             .child(field(t(L10nKey::WorktreePromptBase), &p.base))
             .child(
                 h_flex()
+                    .justify_end()
                     .gap_2()
+                    .child(
+                        Button::new("worktree-cancel")
+                            .label(t(L10nKey::Cancel))
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel_worktree_prompt(window, cx)
+                            })),
+                    )
                     .child(
                         Button::new("worktree-create")
                             .label(if p.busy {
@@ -190,17 +216,9 @@ impl Tty7App {
                             })
                             .small()
                             .primary()
-                            .disabled(p.busy)
+                            .disabled(p.busy || nothing_to_name)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submit_worktree_prompt(window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("worktree-cancel")
-                            .label(t(L10nKey::Cancel))
-                            .small()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.cancel_worktree_prompt(window, cx)
                             })),
                     ),
             );
@@ -209,6 +227,17 @@ impl Tty7App {
             div()
                 .absolute()
                 .inset_0()
+                // The backdrop already swallowed every click in the window; it
+                // just did not look like it did. A scrim says the app is
+                // waiting, and clicking it backs out — the same gesture the
+                // palette and the switcher already answer to.
+                .bg(crate::ui::presets::scrim_fill(cx))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                        this.cancel_worktree_prompt(window, cx)
+                    }),
+                )
                 .flex()
                 .flex_col()
                 .items_center()

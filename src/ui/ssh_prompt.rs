@@ -489,6 +489,15 @@ impl Tty7App {
                 self.on_auth_prompt_ready(view, window, cx);
             }
         }
+        if self.ssh_prompt.model.is_none() {
+            // Nothing else is asking, so the sheet stops rendering and the
+            // focus it held goes with it. Every other overlay hands focus back
+            // on the way out; this one left it on an element that was no
+            // longer there, and `submit_ssh_prompt` comes through here too —
+            // so after a successful login, with the pane connected and
+            // waiting, the next keystroke went nowhere until the user clicked.
+            self.focus_active(window, cx);
+        }
         cx.notify();
     }
 
@@ -507,7 +516,13 @@ impl Tty7App {
                 }
             }
             KeychainWrite::DeletePassword { user, host, port } => {
-                let _ = store.delete_password(&user, &host, port);
+                // The other three arms say when the keychain refuses them. A
+                // delete that keeps failing leaves the rejected password in
+                // place, so the same wrong secret is offered next connect and
+                // nothing anywhere records why.
+                if let Err(e) = store.delete_password(&user, &host, port) {
+                    log::warn!("could not forget password in keychain: {e}");
+                }
             }
             KeychainWrite::SetKeyPassphrase { key_path, secret } => {
                 let path = crate::core::ssh_profile::expand_tilde(&key_path);
@@ -555,6 +570,11 @@ impl Tty7App {
             div()
                 .absolute()
                 .inset_0()
+                // This is the one modal that must not be dismissed by a stray
+                // click — a mis-aimed click would abandon an authentication
+                // attempt mid-handshake. It gets the scrim, so it reads as
+                // modal, and Escape stays the only way out.
+                .bg(crate::ui::presets::scrim_fill(cx))
                 .flex()
                 .flex_col()
                 .items_center()
@@ -720,7 +740,16 @@ impl Tty7App {
                 )
                 .child(
                     h_flex()
+                        .justify_end()
                         .gap_2()
+                        .child(
+                            Button::new("ssh-hk-abort")
+                                .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Abort))
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.cancel_ssh_prompt(window, cx)
+                                })),
+                        )
                         .child(
                             Button::new("ssh-hk-trust")
                                 .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Trust))
@@ -728,14 +757,6 @@ impl Tty7App {
                                 .primary()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.trust_ssh_host_key(window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("ssh-hk-abort")
-                                .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Abort))
-                                .small()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.cancel_ssh_prompt(window, cx)
                                 })),
                         ),
                 ),
@@ -775,7 +796,19 @@ impl Tty7App {
                 .child(self.render_ssh_input(0))
                 .child(
                     h_flex()
+                        .justify_end()
                         .gap_2()
+                        // Abort stays the emphasized one and now also sits
+                        // where the eye lands last: a changed host key is the
+                        // one prompt where the safe answer wants both.
+                        .child(
+                            Button::new("ssh-hkc-override")
+                                .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Override))
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_ssh_prompt(window, cx)
+                                })),
+                        )
                         .child(
                             Button::new("ssh-hkc-abort")
                                 .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Abort))
@@ -783,14 +816,6 @@ impl Tty7App {
                                 .primary()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.cancel_ssh_prompt(window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("ssh-hkc-override")
-                                .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Override))
-                                .small()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.submit_ssh_prompt(window, cx)
                                 })),
                         ),
                 ),
@@ -819,10 +844,23 @@ impl Tty7App {
             .into_any_element()
     }
 
+    /// The action sits on the right, backing out on its left.
+    ///
+    /// `ui::confirm_answers` settled that arrangement for every native alert
+    /// the app raises; a sheet the app draws itself has no reason to mirror it.
     fn render_ssh_actions(&self, submit_label: &str, cx: &mut Context<Self>) -> AnyElement {
         let submit_label = submit_label.to_string();
         h_flex()
+            .justify_end()
             .gap_2()
+            .child(
+                Button::new("ssh-cancel")
+                    .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Cancel))
+                    .small()
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.cancel_ssh_prompt(window, cx)),
+                    ),
+            )
             .child(
                 Button::new("ssh-submit")
                     .label(submit_label)
@@ -830,14 +868,6 @@ impl Tty7App {
                     .primary()
                     .on_click(
                         cx.listener(|this, _, window, cx| this.submit_ssh_prompt(window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("ssh-cancel")
-                    .label(crate::ui::i18n::t(crate::ui::i18n::L10nKey::Cancel))
-                    .small()
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.cancel_ssh_prompt(window, cx)),
                     ),
             )
             .into_any_element()
@@ -992,6 +1022,83 @@ mod tests {
                 accept: true,
                 remember: true
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    use crate::core::config::Config;
+    use crate::core::session::Session;
+    use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+
+    fn harness(cx: &mut TestAppContext) -> (WindowHandle<Tty7App>, VisualTestContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(Config::default());
+        });
+        let window = cx.add_window(|window, cx| {
+            Tty7App::with_session(None, Some(Session::default()), window, cx)
+        });
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.background_executor.run_until_parked();
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        (window, vcx)
+    }
+
+    /// The sheet takes focus into an input it owns, and dismissing it drops
+    /// that input. Every other overlay in the app hands focus back on the way
+    /// out; this one left it on a handle whose element had stopped rendering.
+    /// `submit_ssh_prompt` shares the path, so the same thing happened after a
+    /// *successful* login, where the pane is alive and waiting — and the next
+    /// keystroke went nowhere until the user clicked.
+    #[gpui::test]
+    fn dismissing_the_last_prompt_hands_focus_back(cx: &mut TestAppContext) {
+        let (window, _vcx) = harness(cx);
+
+        let pane_focus = window
+            .update(cx, |app, window, cx| {
+                // The host-key sheet is the one model with no text fields, so
+                // it stands in for a raised sheet without needing an
+                // `InputState` — which this harness cannot build, its window
+                // root being the app rather than gpui-component's `Root`.
+                app.ssh_prompt.model = Some(PromptModel::HostKeyUnknown {
+                    host: "example".into(),
+                    port: 22,
+                    algorithm: "ssh-ed25519".into(),
+                    fingerprint: "SHA256:zzz".into(),
+                });
+                window.focus(&app.ssh_prompt.focus_handle, cx);
+                // A headless harness has no live pane, so `focus_active`
+                // falls through to the home screen's handle. Which target it
+                // picks is not what is under test — that it picks one is.
+                app.home_focus.clone()
+            })
+            .expect("the app window stays open");
+        cx.background_executor.run_until_parked();
+
+        // Sanity: the sheet holds focus while it is up.
+        assert!(
+            !window
+                .update(cx, |_, window, _| pane_focus.is_focused(window))
+                .unwrap(),
+            "the sheet should hold focus while it is up"
+        );
+
+        window
+            .update(cx, |app, window, cx| app.cancel_ssh_prompt(window, cx))
+            .expect("the app window stays open");
+        cx.background_executor.run_until_parked();
+
+        assert!(
+            window
+                .update(cx, |_, window, _| pane_focus.is_focused(window))
+                .unwrap(),
+            "dismissing the last prompt must hand focus back to the app"
         );
     }
 }

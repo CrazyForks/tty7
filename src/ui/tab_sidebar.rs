@@ -16,18 +16,61 @@ use crate::core::config::{Config, SidebarGrouping};
 use crate::terminal::git_status::GitStatusCache;
 use crate::ui::app::{TITLE_BAR_HEIGHT, Tty7App};
 use crate::ui::hints::tab_badge_label;
-use crate::ui::i18n::{L10nKey, t};
+use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::reorder::{self, Reorder, Surface};
-use crate::ui::tab_strip::{DragTab, REORDER_SLIDE_MS};
+use crate::ui::right_panel::RESIZE_HANDLE_WIDTH;
+use crate::ui::tab_strip::{
+    DragTab, REORDER_SLIDE_MS, abbreviate_home, elide_keep_edges, elide_label,
+    elide_path_keep_tail, measure_text, strip_host_prefix,
+};
 
 const MIN_SIDEBAR_WIDTH: f32 = 180.;
 
 const GRAB_HANDLE_W: f32 = 48.;
 const MAX_SIDEBAR_WIDTH_RATIO: f32 = 0.5;
 
-const RESIZE_HANDLE_WIDTH: f32 = 8.;
-
 const ROW_GAP: f32 = 2.;
+
+/// The row chrome the text budget has to be measured around. These are the
+/// numbers the layout below is built from, not a second guess at it — a row
+/// that elides against a budget wider than it really has falls back to CSS
+/// truncation, which drops the tail this whole module exists to keep.
+mod row_metrics {
+    /// `border_r_1` on the sidebar itself.
+    pub(super) const BORDER: f32 = 1.;
+    /// `px_1` on the scrolling list that holds the rows.
+    pub(super) const LIST_PAD: f32 = 4.;
+    /// `pl_2` + `pr_2` on the row.
+    pub(super) const ROW_PAD: f32 = 8.;
+    /// The avatar handed to `tab_avatar`.
+    pub(super) const AVATAR: f32 = 22.;
+    /// `gap_2` between the row's children.
+    pub(super) const GAP: f32 = 8.;
+    /// The ⌘N badge, when one is shown.
+    pub(super) const BADGE: f32 = 20.;
+    /// `gap_1p5`, between the branch icon and its text and before the counts.
+    pub(super) const META_GAP: f32 = 6.;
+    /// The branch icon.
+    pub(super) const BRANCH_ICON: f32 = 11.;
+
+    /// What a row can spend on text, before the badge is taken out.
+    pub(super) const fn text_budget(width: f32) -> f32 {
+        width - BORDER - 2. * LIST_PAD - 2. * ROW_PAD - AVATAR - GAP
+    }
+}
+
+/// What a sidebar row rendered, next to what it had to leave out, so the
+/// hover card can be built by comparison instead of deriving the same strings
+/// a second time — the two derivations have to agree, and the shortest way to
+/// guarantee that is to only ever have one.
+struct SidebarRowShown {
+    /// The elided title, and the full string it came from. `None` when the
+    /// row is showing a placeholder (`Shell 3`) rather than a real title,
+    /// which nothing can expand.
+    title: Option<(SharedString, SharedString)>,
+    branch: Option<(SharedString, SharedString, u32, u32)>,
+    cwd: Option<(SharedString, SharedString)>,
+}
 
 #[derive(Clone)]
 pub(crate) struct DragGroup;
@@ -36,6 +79,21 @@ impl Render for DragGroup {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
     }
+}
+
+/// Every detail a sidebar row could not fit, collected so the hover card can
+/// be rendered from cloneable data (an `AnyElement` cannot be cloned, but the
+/// tooltip closure has to rebuild its content on every hover).
+#[derive(Clone)]
+struct SidebarInfo {
+    /// Full path, when the row's title was elided.
+    title: Option<SharedString>,
+    /// Full branch plus diff counts, when the row's branch was elided.
+    branch: Option<(SharedString, u32, u32)>,
+    /// Full working directory, when the row's second line was elided.
+    cwd: Option<SharedString>,
+    /// Remote host, when the avatar only shows a dot for it.
+    host: Option<SharedString>,
 }
 
 impl Tty7App {
@@ -51,6 +109,9 @@ impl Tty7App {
             .max(MIN_SIDEBAR_WIDTH);
         let width = self.sidebar_width.get().clamp(MIN_SIDEBAR_WIDTH, max_width);
         let query = self.sidebar_search.read(cx).value().trim().to_lowercase();
+        // Every group drops itself when its rows filter out, so a query that
+        // matches nothing left the sidebar showing only its own search box.
+        let mut any_rows = false;
 
         let mut list = v_flex()
             .id("tab-sidebar-list")
@@ -65,26 +126,68 @@ impl Tty7App {
         let keys: Rc<Vec<Option<PathBuf>>> = Rc::new(self.sidebar_group_keys(cx));
         let sections = sidebar_sections(&keys);
 
+        // ⌘N runs ActivateTabN, which goes through `activate_visual` — the
+        // Nth row as the sidebar lays it out, not the Nth tab in `self.tabs`.
+        // The badge has to be read off the same order or it names a chord that
+        // opens a different tab, so take it from `visual_tab_order` rather than
+        // flattening `sections` a second time here.
         let badge_pos: Vec<usize> = {
             let mut pos = vec![0usize; self.tabs.len()];
-            for (n, i) in sections.iter().flat_map(|s| s.tabs.iter()).enumerate() {
-                pos[*i] = n;
+            for (n, i) in self.visual_tab_order(cx).into_iter().enumerate() {
+                pos[i] = n;
             }
             pos
         };
 
-        let visible_by_section: Vec<Vec<(usize, String)>> = sections
+        // The row shows an elided title and a branch; the filter used to read
+        // only the elided title, so typing the branch you can see, or the part
+        // of the path the row dropped, matched nothing. The label is built
+        // here only when there is a query to match it against — the rows
+        // themselves elide against measured width and no longer need it.
+        let visible_by_section: Vec<Vec<usize>> = sections
             .iter()
             .map(|s| {
                 s.tabs
                     .iter()
-                    .map(|&i| (i, self.tab_label(&self.tabs[i], i, Some(window), cx)))
-                    .filter(|(_, label)| query.is_empty() || label.to_lowercase().contains(&query))
+                    .copied()
+                    .filter(|&i| {
+                        query.is_empty()
+                            || self
+                                .tab_label(&self.tabs[i], i, Some(window), cx)
+                                .to_lowercase()
+                                .contains(&query)
+                            || self.tabs[i]
+                                .leaf_title(Some(window), cx)
+                                .to_lowercase()
+                                .contains(&query)
+                            || self.tabs[i]
+                                .git_status(Some(window), cx)
+                                .is_some_and(|g| g.branch.to_lowercase().contains(&query))
+                    })
                     .collect()
             })
             .collect();
 
         let pointer = window.mouse_position();
+        // The row text is measured against real glyphs before it is elided:
+        // `text_sm` is 0.875rem and `text_xs` 0.75rem, resolved here so the
+        // measurement and the render use the same sizes and family.
+        let font = gpui::Font {
+            family: cx.theme().font_family.clone(),
+            features: Default::default(),
+            fallbacks: None,
+            weight: Default::default(),
+            style: Default::default(),
+        };
+        // The active row renders its title at `FontWeight::MEDIUM`, which is
+        // wider than the regular weight in any proportional face. Measuring
+        // it as regular would let the one row the user is looking at overflow
+        // into the truncation this is here to avoid.
+        let title_font_active = gpui::Font {
+            weight: FontWeight::MEDIUM,
+            ..font.clone()
+        };
+        let rem = window.rem_size().as_f32();
         let rendered = |ix: &usize| !visible_by_section[*ix].is_empty();
         let repo_slots: Vec<usize> = (0..sections.len())
             .filter(|&ix| sections[ix].key.is_some())
@@ -126,7 +229,7 @@ impl Tty7App {
             let group_key = section.key.clone();
             let mut rows: Vec<ContextMenu<Stateful<Div>>> = Vec::new();
             let visible = visible_by_section[group_ix].clone();
-            let visible_tabs: Vec<usize> = visible.iter().map(|(i, _)| *i).collect();
+            let visible_tabs: Vec<usize> = visible.clone();
             let row_slots: Rc<RefCell<Vec<Bounds<Pixels>>>> =
                 Rc::new(RefCell::new(vec![Bounds::default(); visible.len()]));
             let row_preview = reorder::preview(
@@ -135,7 +238,7 @@ impl Tty7App {
                 visible.len(),
                 pointer,
             );
-            for (slot, (i, label)) in visible.into_iter().enumerate() {
+            for (slot, i) in visible.into_iter().enumerate() {
                 let badge_pos = badge_pos[i];
                 let tab = &self.tabs[i];
                 let is_active = i == active;
@@ -151,6 +254,65 @@ impl Tty7App {
                         Some((view.host_id(), cwd))
                     }),
                 );
+                let badge_extra = if show_badges && badge_pos < 9 {
+                    row_metrics::BADGE + row_metrics::GAP
+                } else {
+                    0.
+                };
+                // Elision is measured against this budget so the label and
+                // branch never wrap or overflow into CSS truncation.
+                let label_avail = (row_metrics::text_budget(width) - badge_extra).max(48.);
+                let title_size = 0.875 * rem;
+                let meta_size = 0.75 * rem;
+                let title_font = if is_active { &title_font_active } else { &font };
+                // Title: elide the *full* label against the row budget, so a
+                // wide sidebar shows the whole thing and a narrow one keeps
+                // whichever end identifies it — the tail for a path, both
+                // edges for anything else. A fixed segment cap
+                // (`short_title`) would elide even when the row has room, so
+                // only the width may decide here.
+                //
+                // `full_title` is the unelided string the card can expand
+                // back to; `None` means the row is showing a placeholder that
+                // no card can improve on.
+                let (shown_title, full_title) =
+                    if let Some(name) = tab.name.as_ref().filter(|n| !n.trim().is_empty()) {
+                        // A renamed tab is elided like anything else — and so
+                        // the card has to be able to spell the name back out.
+                        let full = SharedString::from(name.trim().to_string());
+                        let shown = elide_label(
+                            &window.text_system(),
+                            title_font,
+                            title_size,
+                            &full,
+                            label_avail,
+                        );
+                        (shown, Some(full))
+                    } else {
+                        let raw_title = tab.leaf_title(Some(window), cx);
+                        let raw = abbreviate_home(strip_host_prefix(raw_title.trim()));
+                        if raw.trim().is_empty() {
+                            // Nothing to expand: the row is naming an unnamed
+                            // shell, not hiding a title behind an ellipsis.
+                            let placeholder = SharedString::from(t_fmt(
+                                L10nKey::TabUnnamedShell,
+                                &[("n", &((i + 1).to_string()))],
+                            ));
+                            (placeholder, None)
+                        } else {
+                            let full = SharedString::from(raw.as_ref());
+                            let shown = elide_label(
+                                &window.text_system(),
+                                title_font,
+                                title_size,
+                                &full,
+                                label_avail,
+                            );
+                            (shown, Some(full))
+                        }
+                    };
+                let mut branch_shown: Option<(SharedString, SharedString, u32, u32)> = None;
+                let mut cwd_shown: Option<(SharedString, SharedString)> = None;
                 let git_line = tab.git_status(Some(window), cx).map(|g| {
                     let mut line = h_flex()
                         .id(("sidebar-git", i))
@@ -163,10 +325,58 @@ impl Tty7App {
                             gpui::svg()
                                 .path("icons/git-branch.svg")
                                 .flex_shrink_0()
-                                .size(px(11.))
+                                .size(px(row_metrics::BRANCH_ICON))
                                 .text_color(cx.theme().muted_foreground),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child(g.branch.clone()));
+                        );
+                    // The diff counts are measured against real glyphs so the
+                    // branch can be elided to exactly the space they leave;
+                    // the counts themselves never wrap or shrink. They render
+                    // as two children of a `gap_1p5` row, so the gap between
+                    // them is measured rather than a space that stands in for
+                    // it.
+                    let mut counts_w = 0.;
+                    if g.added > 0 {
+                        counts_w += measure_text(
+                            &window.text_system(),
+                            &font,
+                            meta_size,
+                            &format!("+{}", g.added),
+                        );
+                    }
+                    if g.removed > 0 {
+                        counts_w += measure_text(
+                            &window.text_system(),
+                            &font,
+                            meta_size,
+                            &format!("−{}", g.removed),
+                        );
+                    }
+                    if g.added > 0 && g.removed > 0 {
+                        counts_w += row_metrics::META_GAP;
+                    }
+                    if counts_w > 0. {
+                        // The gap between the branch and the counts.
+                        counts_w += row_metrics::META_GAP;
+                    }
+                    // Branch: keep both ends (`window-…backdrop`) so its
+                    // identifying tail survives a narrow sidebar.
+                    let branch_avail =
+                        (label_avail - row_metrics::BRANCH_ICON - row_metrics::META_GAP - counts_w)
+                            .max(0.);
+                    let shown = elide_keep_edges(
+                        &window.text_system(),
+                        &font,
+                        meta_size,
+                        &g.branch,
+                        branch_avail,
+                    );
+                    branch_shown = Some((
+                        shown.clone(),
+                        SharedString::from(g.branch.clone()),
+                        g.added,
+                        g.removed,
+                    ));
+                    line = line.child(div().flex_1().min_w_0().truncate().child(shown));
                     if g.added > 0 || g.removed > 0 {
                         let mut counts = h_flex()
                             .id(("sidebar-diff", i))
@@ -174,13 +384,21 @@ impl Tty7App {
                             .items_center()
                             .gap_1p5()
                             .when_some(git_cwd, |counts, (host, cwd)| {
-                                counts.cursor_pointer().on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_diff_overlay(host, cwd.clone(), window, cx);
-                                    }),
-                                )
+                                // A click target inside a click target: the row
+                                // highlights as a whole, which says nothing
+                                // about the counts being their own button. The
+                                // underline the SFTP breadcrumb uses for
+                                // clickable text says where this one starts.
+                                counts
+                                    .cursor_pointer()
+                                    .hover(|s| s.underline())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_diff_overlay(host, cwd.clone(), window, cx);
+                                        }),
+                                    )
                             });
                         if g.added > 0 {
                             counts = counts.child(
@@ -200,11 +418,53 @@ impl Tty7App {
                     }
                     line
                 });
+                // Outside a repo there is no branch line; the second line then
+                // carries the compressed cwd with its root marker, so a tab
+                // whose title is just a shell name still says where it lives.
+                if git_line.is_none() {
+                    cwd_shown = tab
+                        .pane
+                        .focused_or_first(window, cx)
+                        .and_then(|leaf| {
+                            let view = leaf.read(cx);
+                            view.git_status_cwd()
+                                .map(|p| p.to_path_buf())
+                                .or_else(|| view.cwd())
+                        })
+                        .map(|cwd| {
+                            let full = SharedString::from(
+                                abbreviate_home(&cwd.display().to_string()).into_owned(),
+                            );
+                            let shown = elide_path_keep_tail(
+                                &window.text_system(),
+                                &font,
+                                meta_size,
+                                &full,
+                                label_avail,
+                            );
+                            (shown, full)
+                        })
+                        // The title already carries the whole path; a second
+                        // copy adds noise, not information.
+                        .filter(|(shown, _)| shown.as_ref() != shown_title.as_ref());
+                }
                 let rename_input = self
                     .renaming
                     .as_ref()
                     .filter(|r| r.index == i)
                     .map(|r| r.input.clone());
+
+                let shown = SidebarRowShown {
+                    title: full_title.map(|full| (shown_title.clone(), full)),
+                    branch: branch_shown.clone(),
+                    cwd: cwd_shown.clone(),
+                };
+                let info = self.sidebar_info(tab, window, cx, &shown);
+                // Colors are captured by value so the tooltip builder (which
+                // borrows no app state) can style the card on its own.
+                let muted = cx.theme().muted_foreground;
+                let success = cx.theme().success;
+                let danger = cx.theme().danger;
 
                 let label_region = match rename_input {
                     Some(input) => div()
@@ -219,15 +479,113 @@ impl Tty7App {
                         .flex_1()
                         .min_w_0()
                         .gap(px(2.))
+                        .when_some(info, |col, info| {
+                            col.tooltip(move |window, cx| {
+                                // `Tooltip::element` rebuilds its content on
+                                // every hover, so the captured info is cloned
+                                // per call instead of being moved out.
+                                let info = info.clone();
+                                gpui_component::tooltip::Tooltip::element(move |_window, _cx| {
+                                    let card = v_flex()
+                                        .gap_1()
+                                        // The card is the one place that
+                                        // promised the whole string, so a long
+                                        // path wraps here rather than being
+                                        // truncated a second time.
+                                        .when_some(info.title.clone(), |c, title| {
+                                            c.child(
+                                                div()
+                                                    .max_w(px(420.))
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .child(title),
+                                            )
+                                        })
+                                        .when_some(
+                                            info.branch.clone(),
+                                            |c, (branch, added, removed)| {
+                                                let mut line = h_flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(
+                                                        gpui::svg()
+                                                            .path("icons/git-branch.svg")
+                                                            .flex_shrink_0()
+                                                            .size(px(11.))
+                                                            .text_color(muted),
+                                                    )
+                                                    .child(div().child(branch));
+                                                if added > 0 {
+                                                    line = line.child(
+                                                        div()
+                                                            .text_color(success)
+                                                            .child(format!("+{added}")),
+                                                    );
+                                                }
+                                                if removed > 0 {
+                                                    line = line.child(
+                                                        div()
+                                                            .text_color(danger)
+                                                            .child(format!("−{removed}")),
+                                                    );
+                                                }
+                                                c.child(line)
+                                            },
+                                        )
+                                        .when_some(info.cwd.clone(), |c, cwd| {
+                                            c.child(
+                                                div()
+                                                    .max_w(px(420.))
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(cwd),
+                                            )
+                                        })
+                                        .when_some(info.host.clone(), |c, host| {
+                                            c.child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(
+                                                        gpui::svg()
+                                                            .path("icons/machine-remote.svg")
+                                                            .flex_shrink_0()
+                                                            .size(px(11.))
+                                                            .text_color(muted),
+                                                    )
+                                                    .child(div().truncate().child(host)),
+                                            )
+                                        });
+                                    card
+                                })
+                                .build(window, cx)
+                            })
+                        })
                         .child(
                             div()
                                 .w_full()
                                 .truncate()
                                 .text_sm()
                                 .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
-                                .child(label),
+                                .child(shown_title),
                         )
                         .children(git_line)
+                        .when_some(cwd_shown, |col, (cwd, _)| {
+                            col.child(
+                                h_flex()
+                                    .id(("sidebar-cwd", i))
+                                    .w_full()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground.opacity(0.8))
+                                    .child(div().flex_1().min_w_0().truncate().child(cwd)),
+                            )
+                        })
                         .into_any_element(),
                 };
 
@@ -293,7 +651,15 @@ impl Tty7App {
                             this.activate(i, window, cx);
                         }),
                     )
-                    .child(self.tab_avatar(agent, agent_status, agent_unread, ssh_dot, 22., cx))
+                    .child(self.tab_avatar(
+                        ("sidebar-avatar", i),
+                        agent,
+                        agent_status,
+                        agent_unread,
+                        ssh_dot,
+                        22.,
+                        cx,
+                    ))
                     .child(label_region)
                     .when(show_badges && badge_pos < 9, |row| {
                         row.child(
@@ -330,20 +696,27 @@ impl Tty7App {
                                 .group_hover(SharedString::from(format!("tab-row-{i}")), |s| {
                                     s.opacity(1.)
                                 })
-                                .child(div().w(px(10.)).h(px(20.)).bg(linear_gradient(
-                                    90.,
-                                    linear_color_stop(fade_from, 0.),
-                                    linear_color_stop(backing, 1.),
-                                )))
+                                .child(div().w(px(10.)).h(px(crate::ui::tab_strip::MIN_TARGET)).bg(
+                                    linear_gradient(
+                                        90.,
+                                        linear_color_stop(fade_from, 0.),
+                                        linear_color_stop(backing, 1.),
+                                    ),
+                                ))
                                 .child(
                                     div().bg(backing).child(
-                                        Button::new(("sidebar-close", i))
-                                            .icon(IconName::Close)
-                                            .ghost()
-                                            .xsmall()
-                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                        crate::ui::tab_strip::hit_target(
+                                            Button::new(("sidebar-close", i))
+                                                .icon(IconName::Close)
+                                                .ghost()
+                                                .xsmall(),
+                                        )
+                                        .tooltip(t(L10nKey::TabContextCloseTab))
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
                                                 this.close_tab(i, window, cx);
-                                            })),
+                                            }),
+                                        ),
                                     ),
                                 ),
                         )
@@ -424,12 +797,7 @@ impl Tty7App {
                     .text_size(px(11.))
                     .text_color(cx.theme().muted_foreground)
                     .when_some(group_slot, |header, slot| {
-                        let header = if cfg!(target_os = "windows") {
-                            header.cursor_pointer()
-                        } else {
-                            header.cursor_grab()
-                        };
-                        header.on_drag(DragGroup, {
+                        crate::ui::reorder::cursor_grab(header).on_drag(DragGroup, {
                             let state = self.reorder.clone();
                             let slots = group_slots.clone();
                             move |_drag, grab, _window, cx| {
@@ -491,6 +859,7 @@ impl Tty7App {
                     )
                 });
 
+            any_rows = true;
             list = list.child(match (&group_preview, group_slot) {
                 (Some(p), Some(slot)) if p.from == slot => {
                     deferred(block.relative().top(p.held)).into_any_element()
@@ -511,6 +880,20 @@ impl Tty7App {
                 }
                 _ => block.into_any_element(),
             });
+        }
+
+        if !any_rows && !query.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_3()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(crate::ui::i18n::t_fmt(
+                        crate::ui::i18n::L10nKey::SettingsNothingMatches,
+                        &[("query", &query)],
+                    )),
+            );
         }
 
         let controls = h_flex()
@@ -555,7 +938,11 @@ impl Tty7App {
                         cx,
                     )
                     .rounded_lg()
-                    .tooltip(t(L10nKey::TabTooltipHideSidebar))
+                    .tooltip(crate::ui::tab_strip::chord_hint(
+                        t(L10nKey::TabTooltipHideSidebar),
+                        "ToggleLeftPanel",
+                        cx,
+                    ))
                     .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
                 ),
             );
@@ -701,6 +1088,56 @@ impl Tty7App {
                     )),
             )
             .child(handle)
+    }
+
+    /// What the sidebar row hid: the full title, the full branch and diff
+    /// counts, the working directory, and the remote host the avatar only
+    /// dots. `None` when the row showed everything — a card would add noise,
+    /// not information. The host is included even for an untruncated row,
+    /// because the title strips the `user@host:` prefix the avatar cannot
+    /// spell out.
+    ///
+    /// Every line is decided by comparing what the row rendered against the
+    /// string it was elided from. Both come from the row itself: deriving
+    /// them here a second time is how a renamed tab ended up with a name the
+    /// row shortened and the card refused to expand.
+    fn sidebar_info(
+        &self,
+        tab: &crate::ui::app::Tab,
+        window: &mut Window,
+        cx: &gpui::App,
+        shown: &SidebarRowShown,
+    ) -> Option<SidebarInfo> {
+        let elided = |pair: &Option<(SharedString, SharedString)>| {
+            pair.as_ref()
+                .filter(|(shown, full)| shown != full)
+                .map(|(_, full)| full.clone())
+        };
+        let mut info = SidebarInfo {
+            title: elided(&shown.title),
+            branch: shown
+                .branch
+                .as_ref()
+                .filter(|(shown, full, _, _)| shown != full)
+                .map(|(_, full, added, removed)| (full.clone(), *added, *removed)),
+            // The cwd only earns a card line when it was rendered *and*
+            // elided: a repo row already shows the full path as its title, so
+            // repeating the cwd under it would be noise, not information.
+            cwd: elided(&shown.cwd),
+            host: None,
+        };
+        // The host is read off the same leaf the title and cwd came from; a
+        // split tab whose panes sit on different machines would otherwise
+        // name whichever one happens to be first.
+        if let Some(target) = tab.pane.focused_or_first(window, cx).and_then(|leaf| {
+            leaf.read(cx)
+                .remote_context()
+                .map(|r| SharedString::from(r.target.clone()))
+        }) {
+            info.host = Some(target);
+        }
+        (info.title.is_some() || info.branch.is_some() || info.cwd.is_some() || info.host.is_some())
+            .then_some(info)
     }
 
     fn sidebar_group_keys(&self, cx: &gpui::App) -> Vec<Option<PathBuf>> {
@@ -969,6 +1406,40 @@ mod tests {
         assert_eq!(flat.len(), 1);
         assert_eq!(flat[0].name, None);
         assert_eq!(flat[0].tabs, vec![0, 1]);
+    }
+
+    /// The badge on a row and the tab ⌘N opens are two readings of one order,
+    /// taken in two places. Grouping makes them diverge from `self.tabs`
+    /// order — tab 3 sits in the second row here — so if they are ever read
+    /// off different things, the badge names a chord that opens another tab.
+    #[test]
+    fn a_row_badge_names_the_chord_that_opens_that_row() {
+        let keys = vec![
+            Some(p("/w/beta")),
+            None,
+            Some(p("/w/alpha")),
+            Some(p("/w/beta")),
+        ];
+        // What `visual_tab_order` returns for a left tab bar.
+        let order: Vec<usize> = sidebar_sections(&keys)
+            .into_iter()
+            .flat_map(|s| s.tabs)
+            .collect();
+        assert_eq!(order, vec![0, 3, 2, 1]);
+
+        let mut badge_pos = vec![0usize; keys.len()];
+        for (n, i) in order.iter().copied().enumerate() {
+            badge_pos[i] = n;
+        }
+        for (row, tab) in order.iter().copied().enumerate() {
+            // ActivateTabN → activate_visual(N - 1) → order[N - 1].
+            let chord = tab_badge_label(badge_pos[tab]);
+            let opens = order[badge_pos[tab]];
+            assert_eq!(
+                opens, tab,
+                "row {row} badges ⌘{chord}, which opens tab {opens}"
+            );
+        }
     }
 
     #[test]

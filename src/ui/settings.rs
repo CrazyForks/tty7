@@ -1,7 +1,7 @@
 use gpui::{
-    AnyElement, App, Background, Context, Div, Entity, FontWeight, Image, ImageFormat,
-    KeyDownEvent, MouseButton, SharedString, Stateful, Subscription, Window, div, img, prelude::*,
-    px, relative, rgb,
+    Animation, AnimationExt as _, AnyElement, App, Background, Context, Div, Entity, FontWeight,
+    Image, ImageFormat, KeyDownEvent, MouseButton, SharedString, Stateful, Subscription, Window,
+    div, img, prelude::*, px, relative, rgb,
 };
 use gpui_component::InteractiveElementExt as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -16,13 +16,14 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex,
     v_flex,
 };
+use std::cell::Cell;
 use std::sync::Arc;
 
 use uuid::Uuid;
 
 use crate::core::config::{
-    BellMode, Config, CursorStyle, NewTabPosition, NotifyMode, TabBarPosition, UpdateChannel,
-    WindowBackdrop,
+    BellMode, Config, CursorStyle, NewTabPosition, NotifyMode, TabBarPosition,
+    UI_FONT_SIZE_DEFAULT, UpdateChannel, WindowBackdrop,
 };
 use crate::core::keychain::CredentialRef;
 use crate::core::ssh_profile::{
@@ -30,7 +31,7 @@ use crate::core::ssh_profile::{
 };
 use crate::ui::app::{
     FONT_SIZE_STEP, LINE_HEIGHT_STEP, TILE_GLYPH_LINE, TILE_SIZE, TITLE_BAR_HEIGHT, ThemeEdit,
-    Tty7App,
+    Tty7App, UI_FONT_SIZE_STEP,
 };
 use crate::ui::host_ops::HostId;
 use crate::ui::i18n::{L10nKey, t, t_fmt, t_plural};
@@ -38,8 +39,198 @@ use crate::ui::presets;
 use crate::ui::rounding;
 use crate::ui::rounding::RoundedCorners as _;
 
+/// The settings nav, the SSH host list, the theme panel, and the padding each
+/// page sets — the chrome a row has to share the window with.
+const NAV_W: f32 = 220.;
+const SSH_LIST_W: f32 = 280.;
+const THEME_PANEL_W: f32 = 300.;
+const SSH_DETAIL_PAD: f32 = 64.;
+const PAGE_PAD: f32 = 80.;
+
+/// The narrowest window these numbers have to hold for.
+///
+/// `ui::windows::MIN_SIZE` declares 720, but the settings window in the report
+/// this file was fixed for measured 641pt: `window_min_size` governs dragging,
+/// not the bounds a window opens with, so a remembered bound walked straight
+/// under it. `ui::windows::at_least_min_size` now closes that path, and this
+/// stays below it deliberately — a declared minimum is a claim about the code,
+/// and this file would rather be laid out for the window that turns up.
+const NARROWEST_WINDOW: f32 = 640.;
+
+/// The narrowest each list is still itself: a nav item that still shows a label
+/// beside its icon (40 of icon, gap and padding, then the longest label), a
+/// host row that still shows a name, a theme card that is still a recognisable
+/// picture of a theme.
+///
+/// The nav floor is sized for the longest nav label in *any* locale, not the
+/// one the developer happens to be reading. `SidebarMenuItem` clips its label
+/// rather than eliding it, so a floor that fits English cuts a glyph in half in
+/// Chinese and Japanese: at 140 the zh-CN "窗口与标签页" lost the right half of
+/// its last character. The widest is ja-JP "ウィンドウとタブ" — 8 full-width
+/// kana beside the icon, which is 36 more than the 6-glyph Chinese label needs.
+const NAV_W_MIN: f32 = 176.;
+const SSH_LIST_W_MIN: f32 = 180.;
+const THEME_PANEL_W_MIN: f32 = 240.;
+
+/// The reading column every scrolled page caps itself at. Wider than this and
+/// a description stops being a paragraph and becomes a line to scan across.
+const READING_COLUMN: f32 = 640.;
+
+/// What the page gets before any list does, and the floor it may be pushed to
+/// when even that cannot be had — the numbers this file did not have.
+///
+/// Every list beside the page was a fixed width that never gave anything back,
+/// so the page absorbed the entire shortfall. On a half-width window with the
+/// theme panel open that ran all the way down: a Chinese description came out
+/// one character per line, twenty-five lines tall, and the theme cards under it
+/// were slivers clipped by the window edge.
+///
+/// `CONTENT_W` holds a stacked row's widest control — the 260px text fields —
+/// with a description beside it that still reads as a paragraph. `CONTENT_MIN_W`
+/// is not chosen at all: it is what the narrowest window in the wild leaves the
+/// SSH page, the one that spends a second list, once both lists are standing on
+/// their own floors. A control wider than it has to be able to shrink, which is
+/// what `max_w_full` on the wrappers below is for.
+const CONTENT_W: f32 = 420.;
+const CONTENT_MIN_W: f32 = NARROWEST_WINDOW - NAV_W_MIN - SSH_LIST_W_MIN - SSH_DETAIL_PAD;
+
+/// What the settings page is made of at a given window width.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct SettingsColumns {
+    nav: f32,
+    /// Zero off the SSH page.
+    ssh_list: f32,
+    /// The width to *draw* the theme panel at, whether it is taking a column or
+    /// covering one — zero only when it is closed.
+    theme_panel: f32,
+    /// The panel no longer fits beside the page, so it lays itself over the
+    /// page instead of taking width from it. The panel is a temporary layer
+    /// over one choice; the page underneath is what the window is for.
+    panel_overlays: bool,
+}
+
+/// Hand every list its full width, then take the shortfall back from all of
+/// them at once — each in proportion to what it has to spare — until the page
+/// between them reaches `CONTENT_W`. Once every list is standing on its own
+/// floor the page takes whatever is left, which from `NARROWEST_WINDOW` up is
+/// never less than `CONTENT_MIN_W`. The theme panel leaves the row altogether
+/// rather than let it come to that.
+///
+/// Every width here is one this row can actually have, so the columns always
+/// add up to the window. That is deliberate: the fix for a page squeezed to
+/// nothing is not a `min_w` the row cannot honour — a floor a flex row cannot
+/// meet does not push back, it overflows, and overflow here means content
+/// painted off the edge of the window, which is the other half of this bug.
+fn settings_columns(
+    section: SettingsSection,
+    theme_panel_open: bool,
+    viewport: f32,
+) -> SettingsColumns {
+    let ssh = matches!(section, SettingsSection::Ssh);
+    // The panel belongs to Appearance; a stale open flag on any other page is
+    // not a column, the same way `render_settings` does not draw one.
+    let theme_panel_open = theme_panel_open && matches!(section, SettingsSection::Appearance);
+    let pad = if ssh { SSH_DETAIL_PAD } else { PAGE_PAD };
+    let page = CONTENT_W + pad;
+
+    // Even with the nav and the panel both at their floors there has to be a
+    // readable page left between them. Below that width the panel stops being a
+    // column — this is the one place the *floor* is the test, because the panel
+    // leaving the row is what buys the page its preferred width back.
+    let panel_overlays =
+        theme_panel_open && viewport - NAV_W_MIN - THEME_PANEL_W_MIN - PAGE_PAD < CONTENT_MIN_W;
+    let beside = theme_panel_open && !panel_overlays;
+
+    let mut nav = NAV_W;
+    let mut ssh_list = only_when(ssh, SSH_LIST_W);
+    let mut theme_panel = only_when(beside, THEME_PANEL_W);
+    let (nav_slack, list_slack, panel_slack) = (
+        NAV_W - NAV_W_MIN,
+        only_when(ssh, SSH_LIST_W - SSH_LIST_W_MIN),
+        only_when(beside, THEME_PANEL_W - THEME_PANEL_W_MIN),
+    );
+    let slack = nav_slack + list_slack + panel_slack;
+    let short = (nav + ssh_list + theme_panel + page - viewport).max(0.);
+    if short > 0. && slack > 0. {
+        let give = (short / slack).min(1.);
+        nav -= nav_slack * give;
+        ssh_list -= list_slack * give;
+        theme_panel -= panel_slack * give;
+    }
+    if panel_overlays {
+        // Covering the page, not replacing it: leave a strip of the page in
+        // view so the panel reads as something laid on top and dismissible.
+        theme_panel = THEME_PANEL_W
+            .min(viewport - nav - CONTENT_MIN_W / 2.)
+            .max(THEME_PANEL_W_MIN);
+    }
+    SettingsColumns {
+        nav: nav.round(),
+        ssh_list: ssh_list.round(),
+        theme_panel: theme_panel.round(),
+        panel_overlays,
+    }
+}
+
+/// What a row on this page really has to lay out in.
+///
+/// The nav is always in front of it; the SSH page puts its host list there too,
+/// the theme panel takes another slice of Appearance for as long as it is open
+/// *and* still fits beside it, and only the scrolled pages cap the reading
+/// column.
+fn settings_row_width(
+    section: SettingsSection,
+    theme_panel_open: bool,
+    viewport: f32,
+    ui_scale: f32,
+) -> f32 {
+    let cols = settings_columns(section, theme_panel_open, viewport);
+    let panel = only_when(!cols.panel_overlays, cols.theme_panel);
+    match section {
+        SettingsSection::Ssh => (viewport - cols.nav - cols.ssh_list - SSH_DETAIL_PAD).max(0.),
+        _ => (viewport - cols.nav - panel - PAGE_PAD).clamp(0., READING_COLUMN * ui_scale),
+    }
+}
+
+fn only_when(on: bool, w: f32) -> f32 {
+    if on { w } else { 0. }
+}
+
+/// How much wider every piece of text on this page is than the px thresholds
+/// below assume.
+///
+/// Those thresholds are widths a *label* needs, measured at the default
+/// interface font. The interface has a font size of its own and it goes up to
+/// 24 — half as wide again — while a slider or a text field beside that label
+/// stays the px width it was built at. Without this the row that has to stack
+/// first is the one that never does.
+fn ui_scale(cx: &App) -> f32 {
+    cx.global::<Config>().ui_font_size / UI_FONT_SIZE_DEFAULT
+}
+
+/// Width a settings row needs before its label and its control fit side by
+/// side: a 260px control, the `gap_8` between them, and enough left for a
+/// description to read as prose rather than as a column of words.
+const STACK_ROW_BELOW: f32 = 500.;
+
+/// Width a port-forwarding rule needs before its kind switch, its two host:port
+/// pairs, its description and its remove button all fit on one line: about 580
+/// with every field at its floor, rounded up. Past this the rule takes two
+/// lines instead of running off the page.
+const SPLIT_FORWARD_ROW_BELOW: f32 = 620.;
+
+/// And the width below which even `bind → target` is more than one line holds:
+/// two host fields at their narrow floor, two ports and the arrow come to about
+/// 310, which is more than `CONTENT_MIN_W`. The SSH page reaches this on the
+/// window the report came from, so the two ends take a line each.
+const STACK_FORWARD_ENDS_BELOW: f32 = 340.;
+
 fn settings_row_id(label: &str, _desc: &str) -> SharedString {
     SharedString::from(format!("settings-row-{label}"))
+}
+
+fn settings_header_id(title: &str) -> SharedString {
+    SharedString::from(format!("settings-header-{title}"))
 }
 
 /// Whether the reset control has any effective override to clear on this
@@ -193,6 +384,16 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             keywords: SettingsSearchAnsiColorsKeywords,
         },
         SearchEntry {
+            section: Appearance,
+            title: SettingsBackgroundImage,
+            keywords: SettingsSearchBackgroundImageKeywords,
+        },
+        SearchEntry {
+            section: Appearance,
+            title: SettingsImageOpacity,
+            keywords: SettingsSearchImageOpacityKeywords,
+        },
+        SearchEntry {
             section: Terminal,
             title: SettingsProgram,
             keywords: SettingsSearchProgramKeywords,
@@ -216,6 +417,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             section: Terminal,
             title: SettingsScrollSpeed,
             keywords: SettingsSearchScrollSpeedKeywords,
+        },
+        SearchEntry {
+            section: Terminal,
+            title: SettingsSmoothScroll,
+            keywords: SettingsSearchSmoothScrollKeywords,
         },
         SearchEntry {
             section: Terminal,
@@ -408,8 +614,23 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             keywords: SettingsSearchHowShellsWorkKeywords,
         },
         SearchEntry {
+            section: About,
+            title: SettingsUpdateChannel,
+            keywords: SettingsSearchUpdateChannelKeywords,
+        },
+        SearchEntry {
+            section: About,
+            title: SettingsCheckUpdatesOnLaunch,
+            keywords: SettingsSearchCheckUpdatesOnLaunchKeywords,
+        },
+        SearchEntry {
+            section: About,
+            title: SettingsAutoDownload,
+            keywords: SettingsSearchAutoDownloadKeywords,
+        },
+        SearchEntry {
             section: Agents,
-            title: SettingsSearchCommandLineToolTitle,
+            title: SettingsInstallCliOnPath,
             keywords: SettingsSearchCommandLineToolKeywords,
         },
     ]
@@ -427,6 +648,29 @@ pub(crate) fn section_match_count(section: SettingsSection, query: &str) -> usiz
         .count()
 }
 
+/// Whether a rendered row is one of the ones the section's `(n)` badge counted.
+/// A row can match on its own label, or through the keyword list the search
+/// index carries for it — "persist" finds "How shells work" and nothing on that
+/// page contains the word.
+fn row_matches_query(section: SettingsSection, label: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    if label.to_lowercase().contains(query) {
+        return true;
+    }
+    settings_search_entries()
+        .iter()
+        .any(|e| e.section == section && t(e.title) == label && entry_matches(e, query))
+}
+
+pub(crate) fn total_match_count(query: &str) -> usize {
+    SettingsSection::ALL
+        .into_iter()
+        .map(|s| section_match_count(s, query))
+        .sum()
+}
+
 pub(crate) fn best_matching_section(query: &str) -> Option<SettingsSection> {
     SettingsSection::ALL
         .into_iter()
@@ -439,8 +683,8 @@ pub(crate) fn best_matching_section(query: &str) -> Option<SettingsSection> {
 pub(crate) struct ThemeEditor {
     #[allow(dead_code)]
     pub(crate) for_id: String,
-    pub(crate) seed: Vec<(ThemeEdit, String, Entity<ColorPickerState>)>,
-    pub(crate) ansi: Vec<(ThemeEdit, String, Entity<ColorPickerState>)>,
+    pub(crate) seed: Vec<(ThemeEdit, Entity<ColorPickerState>)>,
+    pub(crate) ansi: Vec<(ThemeEdit, Entity<ColorPickerState>)>,
     pub(crate) image_opacity_slider: Option<Entity<SliderState>>,
     pub(crate) _subs: Vec<Subscription>,
 }
@@ -449,6 +693,17 @@ pub(crate) struct SettingsState {
     pub(crate) focus_handle: gpui::FocusHandle,
     pub(crate) section: SettingsSection,
     pub(crate) search: Entity<InputState>,
+    /// The page's own scroll, and an anchor on it that the first matching row
+    /// claims. Searching tells you "Appearance (2)"; these are what carry you
+    /// to the two, which on a long page start well below the fold.
+    pub(crate) content_scroll: gpui::ScrollHandle,
+    pub(crate) ssh_master_scroll: gpui::ScrollHandle,
+    pub(crate) ssh_detail_scroll: gpui::ScrollHandle,
+    pub(crate) theme_list_scroll: gpui::ScrollHandle,
+    pub(crate) search_anchor: gpui::ScrollAnchor,
+    /// Set when the query or the section changes, and spent by the next render
+    /// that has somewhere to go. A `Cell` because that render only holds `&self`.
+    pub(crate) reveal_first_hit: Cell<bool>,
     pub(crate) font_select: Entity<SelectState<SearchableVec<String>>>,
     pub(crate) font_bold_select: Entity<SelectState<SearchableVec<String>>>,
     pub(crate) font_italic_select: Entity<SelectState<SearchableVec<String>>>,
@@ -767,6 +1022,7 @@ impl Tty7App {
         // settings is open.
         let background_layers = crate::ui::app::overlay_surface_layers(cx);
         let (foreground, header_muted) = (theme.foreground, theme.muted_foreground);
+        let note_bg = theme.secondary.opacity(0.5);
 
         let (focus_handle, section, theme_panel_open, search) = match self.active_settings() {
             Some(s) => (
@@ -779,6 +1035,38 @@ impl Tty7App {
         };
         let query = search.read(cx).value().trim().to_lowercase();
         let show_theme_panel = theme_panel_open && section == SettingsSection::Appearance;
+
+        let viewport_w = window.viewport_size().width.as_f32();
+        let ui_scale = ui_scale(cx);
+        self.settings_viewport_w.set(viewport_w);
+        let cols = settings_columns(section, show_theme_panel, viewport_w);
+        self.settings_row_width.set(settings_row_width(
+            section,
+            show_theme_panel,
+            viewport_w,
+            ui_scale,
+        ));
+        self.settings_hit_anchored.set(false);
+
+        // A query that matched here has to be reachable, not just counted. The
+        // anchor lands on the first matching row below, and `scroll_to` reads
+        // where it ended up on the frame after this one — by which time this
+        // render has been painted and the anchor knows its own origin.
+        //
+        // A query that matched nowhere has to be reachable too: the note
+        // saying so sits at the top of the page, and a reader who searched
+        // from halfway down would otherwise be left with the untouched page
+        // the note exists to explain.
+        if let Some(s) = self.active_settings()
+            && s.reveal_first_hit.get()
+        {
+            s.reveal_first_hit.set(false);
+            let matched_here = section_match_count(section, &query) > 0;
+            let matched_nowhere = total_match_count(&query) == 0;
+            if !query.is_empty() && (matched_here || matched_nowhere) {
+                s.search_anchor.scroll_to(window, cx);
+            }
+        }
 
         let prof = crate::ui::perf::enabled()
             .then(|| (std::time::Instant::now(), section.profile_label()));
@@ -852,7 +1140,7 @@ impl Tty7App {
 
         let sidebar = Sidebar::new("settings-sidebar")
             .collapsible(SidebarCollapsible::None)
-            .w(px(220.))
+            .w(px(cols.nav))
             .header(
                 v_flex()
                     .w_full()
@@ -898,9 +1186,35 @@ impl Tty7App {
             SettingsSection::About => self.render_settings_about(cx),
         };
 
+        // A query that matches nothing anywhere leaves the nav badge-less and
+        // `autoselect_settings_search` with nowhere to go, so without this the
+        // page just sits there looking like the search did nothing.
+        let no_match_note = (!query.is_empty() && total_match_count(&query) == 0).then(|| {
+            div()
+                .id("settings-no-match")
+                .anchor_scroll(self.active_settings().map(|s| s.search_anchor.clone()))
+                .mb_6()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .bg(note_bg)
+                .text_sm()
+                .text_color(header_muted)
+                .child(t_fmt(
+                    L10nKey::SettingsNothingMatches,
+                    &[("query", query.as_str())],
+                ))
+        });
+
         // No fill of its own: the root already paints the opaque surface and
         // the background image behind it, and repainting here would hide the
         // image again in the one pane that fills most of the panel.
+        //
+        // `min_w_0` and not a `CONTENT_MIN_W` floor: `settings_columns` sized
+        // the chrome so this pane clears it, and a floor a flex row cannot
+        // honour does not push the nav back — it overflows, and overflow here
+        // means content painted off the edge of the window, which is the other
+        // half of the bug this file is fixing.
         let content_pane = if section == SettingsSection::Ssh {
             v_flex()
                 .id("settings-content")
@@ -908,19 +1222,46 @@ impl Tty7App {
                 .min_w_0()
                 .h_full()
                 .child(content)
+                .into_any_element()
         } else {
-            v_flex()
+            let body = v_flex()
                 .id("settings-content")
+                .size_full()
+                .overflow_y_scroll()
+                .when_some(self.active_settings(), |pane, s| {
+                    pane.track_scroll(&s.content_scroll)
+                })
+                .child(
+                    // The padding box needs its own width for the reading
+                    // column's `w_full` to resolve against something definite;
+                    // without it the percentage falls back to the content, and
+                    // `max_w` loses to a row that measures wider — which is how
+                    // the theme card came to run the width of the window on the
+                    // Chinese and Japanese pages while every other row stopped
+                    // at the column.
+                    div().w_full().px_10().py_8().child(
+                        div()
+                            .w_full()
+                            .max_w(px(READING_COLUMN * ui_scale))
+                            .children(no_match_note)
+                            .child(content),
+                    ),
+                );
+            v_flex()
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .overflow_y_scroll()
-                .child(
-                    div()
-                        .px_10()
-                        .py_8()
-                        .child(div().w_full().max_w(px(640.)).child(content)),
-                )
+                // No fill here either: the root paints it, and a second one on
+                // the pane that covers most of the page would hide the theme
+                // image behind it.
+                .when_some(self.active_settings(), |pane, s| {
+                    pane.child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "settings-content-scrollbar",
+                        body,
+                        &s.content_scroll,
+                    ))
+                })
+                .into_any_element()
         };
 
         let root = div()
@@ -931,10 +1272,19 @@ impl Tty7App {
             .bg(background)
             .text_color(foreground)
             .track_focus(&focus_handle)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                if ev.keystroke.key.as_str() == "escape" {
-                    this.close_settings(window, cx);
+            // Escape peels one layer at a time. With the theme picker open that
+            // layer is the picker: closing the whole page instead threw away a
+            // panel the user had opened a moment ago, and left them to walk
+            // back to Appearance to try again.
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.key.as_str() != "escape" {
+                    return;
                 }
+                if show_theme_panel {
+                    this.close_theme_panel(window, cx);
+                    return;
+                }
+                this.close_settings_checked(window, cx);
             }))
             .children(background_layers)
             .child(sidebar)
@@ -954,7 +1304,25 @@ impl Tty7App {
                 )
                 .on_double_click(|_, window, _| window.titlebar_double_click()),
             )
-            .when(show_theme_panel, |r| r.child(self.render_theme_panel(cx)))
+            // Beside the page while there is room for both, over it when there
+            // is not. As a column it was taking its 300px from the page and
+            // from nothing else, which is how a half-width window ended up
+            // rendering a description one character wide.
+            .when(show_theme_panel && !cols.panel_overlays, |r| {
+                r.child(self.render_theme_panel(cx))
+            })
+            .when(show_theme_panel && cols.panel_overlays, |r| {
+                r.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .occlude()
+                        .shadow_lg()
+                        .child(self.render_theme_panel(cx)),
+                )
+            })
             .when(!show_theme_panel, |r| {
                 r.child(
                     div()
@@ -972,8 +1340,9 @@ impl Tty7App {
                                 .w(px(TILE_SIZE))
                                 .h(px(TILE_SIZE))
                                 .rounded_lg()
+                                .tooltip(t(L10nKey::Close))
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.close_settings(window, cx)
+                                    this.close_settings_checked(window, cx)
                                 })),
                         ),
                 )
@@ -985,6 +1354,27 @@ impl Tty7App {
         root
     }
 
+    /// The column widths this render settled on. `settings_columns` is pure and
+    /// cheap, so the two pages that draw chrome of their own work them out
+    /// again rather than have the answer threaded through every builder.
+    fn settings_columns_now(&self) -> SettingsColumns {
+        let (section, panel_open) = match self.active_settings() {
+            Some(s) => (
+                s.section,
+                s.theme_panel_open && s.section == SettingsSection::Appearance,
+            ),
+            None => (SettingsSection::Appearance, false),
+        };
+        settings_columns(section, panel_open, self.settings_viewport_w.get())
+    }
+
+    /// Whether the row measured this render came out narrower than a threshold
+    /// quoted at the default interface font — the only way those px thresholds
+    /// mean anything to a reader who scaled the interface up.
+    fn settings_row_under(&self, at_default_font: f32, cx: &App) -> bool {
+        self.settings_row_width.get() < at_default_font * ui_scale(cx)
+    }
+
     fn header_text(&self, title: &str, cx: &Context<Self>) -> Div {
         div()
             .text_base()
@@ -993,14 +1383,57 @@ impl Tty7App {
             .child(title.to_string())
     }
 
-    pub(crate) fn section_header(&self, title: &str, cx: &Context<Self>) -> Div {
-        self.header_text(title, cx).mb_4()
+    /// A heading *inside* a section — quieter than `section_header`, for
+    /// breaking a long run of rows into groups you can scan.
+    fn subgroup_header(&self, key: L10nKey, cx: &Context<Self>) -> Div {
+        div()
+            .pt_4()
+            .pb_1()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(cx.theme().muted_foreground)
+            .child(t(key))
     }
 
-    fn section_intro(&self, title: &str, desc: impl Into<String>, cx: &Context<Self>) -> Div {
+    /// The scroll anchor for the first thing on the page the query matched,
+    /// whatever kind of element that is. A section header can be the only
+    /// match on its page — "ansi", "how shells work" — and while the dimming
+    /// around it already picks it out, nothing was carrying the page to it:
+    /// search "ansi" from the bottom of Appearance and every row greys out
+    /// with the one answer left above the fold.
+    fn first_hit_anchor(&self, label: &str, cx: &Context<Self>) -> Option<gpui::ScrollAnchor> {
+        let s = self.active_settings()?;
+        let query = s.search.read(cx).value().trim().to_lowercase();
+        if query.is_empty() || section_match_count(s.section, &query) == 0 {
+            return None;
+        }
+        if !row_matches_query(s.section, label, &query) {
+            return None;
+        }
+        match self.settings_hit_anchored.replace(true) {
+            false => Some(s.search_anchor.clone()),
+            true => None,
+        }
+    }
+
+    pub(crate) fn section_header(&self, title: &str, cx: &Context<Self>) -> Stateful<Div> {
+        self.header_text(title, cx)
+            .mb_4()
+            .id(settings_header_id(title))
+            .anchor_scroll(self.first_hit_anchor(title, cx))
+    }
+
+    fn section_intro(
+        &self,
+        title: &str,
+        desc: impl Into<String>,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         v_flex()
             .mb_4()
             .gap_1()
+            .id(settings_header_id(title))
+            .anchor_scroll(self.first_hit_anchor(title, cx))
             .child(self.header_text(title, cx))
             .child(
                 div()
@@ -1027,38 +1460,79 @@ impl Tty7App {
         // Descriptions can contain live status (for example an agent hook target), so they
         // must not participate in the identity that preserves GPUI's hover state.
         let element_id = settings_row_id(&label, &desc);
-        h_flex()
+        // The nav badge says "Appearance (2)"; this is what makes those two
+        // findable once you are on the page. Only mark rows when the section
+        // actually holds a match — otherwise a query that landed elsewhere
+        // would grey out a page the user is simply reading.
+        let (hit, miss) = match self.active_settings() {
+            Some(s) => {
+                let query = s.search.read(cx).value().trim().to_lowercase();
+                match query.is_empty() || section_match_count(s.section, &query) == 0 {
+                    true => (false, false),
+                    false => {
+                        let hit = row_matches_query(s.section, &label, &query);
+                        (hit, !hit)
+                    }
+                }
+            }
+            None => (false, false),
+        };
+        let first_hit_anchor = self.first_hit_anchor(&label, cx);
+        // The control never shrinks, so on a narrow pane it takes the width and
+        // the label column — which must keep `min_w_0` or long descriptions
+        // stop wrapping — is squeezed to a letter per line. Below the width
+        // where both still fit, put the control on its own line instead.
+        // Measured, not `flex_wrap`: wrapping made the label column size to its
+        // description, which then ran out past the row on every wide page.
+        let stacked = self.settings_row_under(STACK_ROW_BELOW, cx);
+        let labels = v_flex()
+            .gap_0p5()
+            .min_w_0()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .when(!desc.is_empty(), |col| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(desc),
+                )
+            });
+        div()
             .id(element_id)
-            .items_center()
-            .justify_between()
-            .gap_8()
+            .flex()
+            .when(stacked, |row| row.flex_col().items_start().gap_2())
+            .when(!stacked, |row| {
+                row.flex_row().items_center().justify_between().gap_8()
+            })
             .py_2()
             .px_2p5()
             .mx_neg_2p5()
             .rounded_lg()
+            .when(hit, |row| row.bg(theme.accent.opacity(0.16)))
+            // Only the first hit on the page carries the anchor: it is the one
+            // the page scrolls to, and a later row claiming it would drag the
+            // view past the matches above.
+            .anchor_scroll(first_hit_anchor)
+            .when(miss, |row| row.opacity(0.45))
             .hover(|h| h.bg(gpui::rgb(cx.global::<presets::Surfaces>().window.hover)))
             .on_hover(cx.listener(|_this, _hovered, _window, cx| cx.notify()))
+            .child(labels)
+            // Stacked, the control column takes the row: that is what gives a
+            // `max_w_full` control a definite width to shrink against, and on
+            // the SSH page the widest of them is 260 in a column that can be
+            // `CONTENT_MIN_W`.
             .child(
-                v_flex()
-                    .gap_0p5()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.foreground)
-                            .child(label),
-                    )
-                    .when(!desc.is_empty(), |col| {
-                        col.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(desc),
-                        )
-                    }),
+                h_flex()
+                    .when(stacked, |c| c.w_full())
+                    .when(!stacked, |c| c.flex_shrink_0())
+                    .child(control),
             )
-            .child(h_flex().flex_shrink_0().child(control))
     }
 
     pub(crate) fn segmented(
@@ -1218,6 +1692,22 @@ impl Tty7App {
                 .on_click(cx.listener(|this, _, _w, cx| this.reset_font_size(cx))),
         );
 
+        let ui_font_size = self.ui_font_size(cx);
+        let ui_font_size_control = stepper_row(
+            step("ui-font-dec", "−", 0).on_click(
+                cx.listener(|this, _, _w, cx| this.change_ui_font_size(-UI_FONT_SIZE_STEP, cx)),
+            ),
+            format!("{ui_font_size:.0}"),
+            step("ui-font-inc", "+", 2).on_click(
+                cx.listener(|this, _, _w, cx| this.change_ui_font_size(UI_FONT_SIZE_STEP, cx)),
+            ),
+            Button::new("ui-font-reset")
+                .label(t(L10nKey::Reset))
+                .ghost()
+                .small()
+                .on_click(cx.listener(|this, _, _w, cx| this.reset_ui_font_size(cx))),
+        );
+
         let line_height = self.line_height;
         let line_height_control = stepper_row(
             step("lh-dec", "−", 0).on_click(
@@ -1308,6 +1798,12 @@ impl Tty7App {
                 cx,
             ))
             .child(self.settings_row(
+                t(L10nKey::SettingsUiFontSize),
+                t(L10nKey::SettingsUiFontSizeDesc),
+                ui_font_size_control,
+                cx,
+            ))
+            .child(self.settings_row(
                 t(L10nKey::SettingsLineHeight),
                 t(L10nKey::SettingsLineHeightDesc),
                 line_height_control,
@@ -1370,6 +1866,7 @@ impl Tty7App {
             .items_center()
             .gap_3()
             .w(px(240.))
+            .max_w_full()
             .child(div().flex_1().child(Slider::new(&slider)))
             .child(
                 div()
@@ -1500,19 +1997,17 @@ impl Tty7App {
         let folder_button = Button::new("open-themes-folder")
             .label(t(L10nKey::SettingsOpenThemesFolder))
             .small()
-            .on_click(cx.listener(|this, _, _w, cx| this.open_themes_folder(cx)));
+            .on_click(cx.listener(|this, _, w, cx| this.open_themes_folder(w, cx)));
 
         if let Some(editor) = editor {
-            let seed: Vec<_> = editor
-                .seed
-                .iter()
-                .map(|(_, label, state)| (label.clone(), state.clone()))
-                .collect();
-            let ansi: Vec<_> = editor
-                .ansi
-                .iter()
-                .map(|(_, label, state)| (label.clone(), state.clone()))
-                .collect();
+            let label_of = |&(edit, ref state): &(ThemeEdit, Entity<ColorPickerState>)| {
+                (
+                    crate::ui::app::theme_edit_label(edit).to_string(),
+                    state.clone(),
+                )
+            };
+            let seed: Vec<_> = editor.seed.iter().map(label_of).collect();
+            let ansi: Vec<_> = editor.ansi.iter().map(label_of).collect();
             let image_opacity_slider = editor.image_opacity_slider.clone();
 
             let theme = presets::by_id(cx, &crate::ui::theme::effective_preset_id(cx));
@@ -1645,39 +2140,58 @@ impl Tty7App {
 
     fn render_settings_ssh(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
+        let Some((master_scroll, detail_scroll)) = self
+            .active_settings()
+            .map(|s| (s.ssh_master_scroll.clone(), s.ssh_detail_scroll.clone()))
+        else {
+            return div().into_any_element();
+        };
+        let master = v_flex()
+            .id("ssh-master")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&master_scroll)
+            .child(self.render_ssh_master(cx));
+        let detail = v_flex()
+            .id("ssh-detail")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&detail_scroll)
+            .child(
+                div()
+                    .pt(px(crate::ui::app::TITLE_BAR_HEIGHT))
+                    .px_8()
+                    .pb_8()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(720.))
+                            .child(self.render_ssh_detail(cx)),
+                    ),
+            );
         h_flex()
             .size_full()
             .items_start()
             .child(
                 v_flex()
-                    .id("ssh-master")
                     .flex_shrink_0()
-                    .w(px(280.))
+                    .w(px(self.settings_columns_now().ssh_list))
                     .h_full()
                     .border_r_1()
                     .border_color(border)
-                    .overflow_y_scroll()
-                    .child(self.render_ssh_master(cx)),
+                    .child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "ssh-master-scrollbar",
+                        master,
+                        &master_scroll,
+                    )),
             )
-            .child(
-                v_flex()
-                    .id("ssh-detail")
-                    .flex_1()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .pt(px(crate::ui::app::TITLE_BAR_HEIGHT))
-                            .px_8()
-                            .pb_8()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .max_w(px(720.))
-                                    .child(self.render_ssh_detail(cx)),
-                            ),
-                    ),
-            )
+            .child(v_flex().flex_1().min_w_0().h_full().child(
+                crate::ui::scrollbar::with_vertical_scrollbar(
+                    "ssh-detail-scrollbar",
+                    detail,
+                    &detail_scroll,
+                ),
+            ))
             .into_any_element()
     }
 
@@ -1725,6 +2239,7 @@ impl Tty7App {
                                     .icon(Icon::new(IconName::Plus))
                                     .ghost()
                                     .small()
+                                    .tooltip(t(L10nKey::SettingsNewHost))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.add_new_profile(window, cx)
                                     })),
@@ -1734,6 +2249,7 @@ impl Tty7App {
                                     .icon(Icon::empty().path("stock/icons/ellipsis.svg"))
                                     .ghost()
                                     .small()
+                                    .tooltip(t(L10nKey::TabTooltipMore))
                                     .dropdown_menu_with_anchor(
                                         gpui::Anchor::TopRight,
                                         move |menu, _window, _cx| {
@@ -1774,6 +2290,10 @@ impl Tty7App {
             list = list.child(
                 div()
                     .py_4()
+                    // px_2 is what `render_ssh_row` insets its title by: a note
+                    // standing in for the rows starts on their column, not on
+                    // the list's own edge.
+                    .px_2()
                     .text_sm()
                     .text_color(muted)
                     .child(t(L10nKey::SettingsNoSavedHosts)),
@@ -1782,6 +2302,7 @@ impl Tty7App {
             list = list.child(
                 div()
                     .py_4()
+                    .px_2()
                     .text_sm()
                     .text_color(muted)
                     .child(t_fmt(L10nKey::SettingsNothingMatches, &[("query", &query)])),
@@ -1869,7 +2390,10 @@ impl Tty7App {
             .w_full()
             .mt_2()
             .py_1()
-            .px_1p5()
+            // 8 + 10 + 4 puts the group name on the same column as a host
+            // title, which sits 8 + 6 + 8 past the list edge — and it hands
+            // the header the same 8px inset the rows hover with.
+            .px_2()
             .rounded_md()
             .cursor_pointer()
             .text_xs()
@@ -1972,16 +2496,20 @@ impl Tty7App {
                 cx.stop_propagation();
                 on_select(ev, window, cx);
             })
-            .when_some(dot, |row, live| {
-                row.child(
-                    div()
-                        .flex_shrink_0()
-                        .size(px(6.))
-                        .rounded_full()
-                        .when(live, |d| d.bg(success))
-                        .when(!live, |d| d.border_1().border_color(border)),
-                )
-            })
+            // The gutter is here on every row, dot or no dot. Only hosts carry
+            // a liveness dot, and skipping the space on the rows that don't —
+            // Defaults, and nothing else — started their title 14px left of
+            // every host title under them.
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .size(px(6.))
+                    .when_some(dot, |d, live| {
+                        d.rounded_full()
+                            .when(live, |d| d.bg(success))
+                            .when(!live, |d| d.border_1().border_color(border))
+                    }),
+            )
             .child(
                 v_flex()
                     .min_w_0()
@@ -2025,6 +2553,7 @@ impl Tty7App {
                         .icon(Icon::empty().path("stock/icons/ellipsis.svg"))
                         .ghost()
                         .small()
+                        .tooltip(t(L10nKey::TabTooltipMore))
                         .dropdown_menu_with_anchor(
                             gpui::Anchor::TopRight,
                             move |menu, _window, cx| {
@@ -2150,7 +2679,12 @@ impl Tty7App {
                 h_flex()
                     .mt_3()
                     .gap_2()
-                    .child(div().w(px(320.)).child(Input::new(&input).small()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .max_w(px(320.))
+                            .child(Input::new(&input).small()),
+                    )
                     .child(
                         Button::new("ssh-quick-connect")
                             .label(t(L10nKey::Connect))
@@ -2318,8 +2852,8 @@ impl Tty7App {
             })
             .on_click({
                 let app = app.clone();
-                move |_, _window, cx| {
-                    let _ = app.update(cx, |this, cx| this.delete_profile(id, cx));
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| this.delete_profile(id, window, cx));
                 }
             }),
         )
@@ -2584,6 +3118,44 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// Whether the SSH profile form on screen holds edits that were never
+    /// saved. Save is enabled off exactly this, so closing on it is the same
+    /// question the button already answers.
+    pub(crate) fn ssh_form_dirty(&self, cx: &App) -> bool {
+        let Some(form) = self.active_settings().and_then(|s| s.ssh_form.as_ref()) else {
+            return false;
+        };
+        let saved = cx
+            .global::<Config>()
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == form.editing)
+            .cloned();
+        self.ssh_form_collect(cx) != saved
+    }
+
+    /// Closing from Escape or the X is the user leaving; every other caller
+    /// closes as the tail of something they explicitly chose, and has already
+    /// saved or does not care.
+    pub(crate) fn close_settings_checked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ssh_form_dirty(cx) {
+            self.close_settings(window, cx);
+            return;
+        }
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            t(L10nKey::SettingsDiscardChangesTitle),
+            Some(t(L10nKey::SettingsDiscardChangesBody)),
+            &crate::ui::confirm_answers(t(L10nKey::EditorDiscard), t(L10nKey::SettingsKeepEditing)),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(0) = answer.await else { return };
+            let _ = this.update_in(cx, |this, window, cx| this.close_settings(window, cx));
+        })
+        .detach();
+    }
+
     pub(crate) fn save_and_connect_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.save_editing_profile(cx) {
             self.close_settings(window, cx);
@@ -2617,7 +3189,50 @@ impl Tty7App {
         self.ssh_form_load(&profile, window, cx);
     }
 
-    pub(crate) fn delete_profile(&mut self, id: Uuid, cx: &mut Context<Self>) {
+    pub(crate) fn delete_profile(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = cx
+            .global::<Config>()
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+        else {
+            return;
+        };
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &t_fmt(L10nKey::FileTreeDeleteTitle, &[("name", &name)]),
+            Some(t(L10nKey::SettingsDeleteProfileBody)),
+            &crate::ui::confirm_answers(t(L10nKey::Delete), t(L10nKey::Cancel)),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(0) = answer.await else { return };
+            let _ = this.update(cx, |this, cx| this.delete_profile_confirmed(id, cx));
+        })
+        .detach();
+    }
+
+    fn delete_profile_confirmed(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        // "Forget password" lives on the menu that is about to stop existing,
+        // so deleting the profile used to strand its keychain entry with no UI
+        // left to remove it. Only let go of the secret when nothing else on the
+        // list still points at the same endpoint.
+        let cfg = cx.global::<Config>();
+        let endpoint = cfg
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (p.user.clone(), p.host.clone(), p.port));
+        let shared = endpoint.as_ref().is_some_and(|(user, host, port)| {
+            cfg.ssh_profiles
+                .iter()
+                .any(|p| p.id != id && (&p.user, &p.host, p.port) == (user, host, *port))
+        });
+        if let Some((user, host, port)) = endpoint.filter(|_| !shared) {
+            use crate::core::keychain::{CredentialStore, OsCredentialStore};
+            let _ = OsCredentialStore.delete_password(&user, &host, port);
+        }
         self.update_config(cx, |cfg| {
             cfg.ssh_profiles.retain(|p| p.id != id);
             cfg.ssh_profile_frecency.remove(&id);
@@ -2786,6 +3401,7 @@ impl Tty7App {
                     t(L10nKey::SettingsNameDesc),
                     div()
                         .w(px(260.))
+                        .max_w_full()
                         .child(Input::new(&form.name).small())
                         .into_any_element(),
                     cx,
@@ -2797,8 +3413,19 @@ impl Tty7App {
                     t(L10nKey::SettingsHostDesc),
                     h_flex()
                         .gap_2()
-                        .child(div().w(px(172.)).child(Input::new(&form.host).small()))
-                        .child(div().w(px(80.)).child(Input::new(&form.port).small()))
+                        .max_w_full()
+                        .child(
+                            div()
+                                .w(px(172.))
+                                .min_w_0()
+                                .child(Input::new(&form.host).small()),
+                        )
+                        .child(
+                            div()
+                                .w(px(80.))
+                                .flex_shrink_0()
+                                .child(Input::new(&form.port).small()),
+                        )
                         .into_any_element(),
                     cx,
                 ),
@@ -2809,6 +3436,7 @@ impl Tty7App {
                     t(L10nKey::SettingsUserDesc),
                     div()
                         .w(px(260.))
+                        .max_w_full()
                         .child(Input::new(&form.user).small())
                         .into_any_element(),
                     cx,
@@ -2866,13 +3494,21 @@ impl Tty7App {
         on_toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
+        let sf = cx.global::<presets::Surfaces>().window;
         let caret = if open { "▾" } else { "▸" };
         h_flex()
             .id(id)
             .items_center()
             .gap_2()
             .py_2()
+            // The other collapsible header on this page lights up under the
+            // pointer; this one only changed the cursor, so the two rows a
+            // reader folds and unfolds answered differently to the same move.
+            .px_2p5()
+            .mx_neg_2p5()
+            .rounded_lg()
             .cursor_pointer()
+            .hover(|s| s.bg(gpui::rgb(sf.hover)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _w, cx| on_toggle(this, cx)),
@@ -2920,6 +3556,7 @@ impl Tty7App {
                     t(L10nKey::SettingsJumpHostDesc),
                     div()
                         .w(px(260.))
+                        .max_w_full()
                         .child(Input::new(&form.jump).small())
                         .into_any_element(),
                     cx,
@@ -2941,7 +3578,7 @@ impl Tty7App {
             .filter(|r| r.collect(cx).is_some())
             .count();
         let summary = match count {
-            0 => t(L10nKey::SettingsNoneLower).to_string(),
+            0 => t(L10nKey::SettingsNoneSummary).to_string(),
             _ => t_plural(L10nKey::SettingsRulesOpenedWithConnection, count, &[]),
         };
         let mut section = v_flex().child(self.disclosure_header(
@@ -2979,6 +3616,7 @@ impl Tty7App {
             )
             .child(
                 h_flex()
+                    .flex_wrap()
                     .gap_3()
                     .pt_1()
                     .text_xs()
@@ -3006,64 +3644,108 @@ impl Tty7App {
         };
         let incomplete = row.collect(cx).is_none() && !row.is_blank(cx);
 
+        // Below `SPLIT_FORWARD_ROW_BELOW` the five controls stop fitting on one
+        // line. The kind switch, the description and the remove button keep the
+        // first line; the mapping the rule is actually about takes the second,
+        // where two host fields, two ports and an arrow are what has to fit
+        // inside `CONTENT_MIN_W` — hence the lower floor on the host field.
+        let split = self.settings_row_under(SPLIT_FORWARD_ROW_BELOW, cx);
+        let stack_ends = self.settings_row_under(STACK_FORWARD_ENDS_BELOW, cx);
+        let host_min = if split { 80. } else { 104. };
         let endpoint = |host: &Entity<InputState>, port: &Entity<InputState>| {
             h_flex()
                 .gap_1()
                 .items_center()
-                .child(div().w(px(104.)).child(Input::new(host).xsmall()))
+                // Was pinned at 104px, which does not hold
+                // `ip-10-0-3-217.eu-west-1.compute.internal`. Same floor, but
+                // the field now takes a share of the row's slack instead of
+                // handing all of it to the free-text description beside it.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(host_min))
+                        .child(Input::new(host).xsmall()),
+                )
                 .child(div().text_xs().text_color(muted).child(":"))
                 .child(div().w(px(58.)).child(Input::new(port).xsmall()))
+        };
+        let mapping = |line: Div| {
+            line.child(
+                div()
+                    .flex_1()
+                    .when(stack_ends, |end| end.w_full())
+                    .child(endpoint(&row.bind_host, &row.bind_port)),
+            )
+            .child(div().flex_shrink_0().text_xs().text_color(muted).child("→"))
+            .child(
+                div()
+                    .flex_1()
+                    .opacity(if needs_target {
+                        1.0
+                    } else {
+                        crate::ui::forwards::NO_TARGET_FADE
+                    })
+                    .when(stack_ends, |end| end.w_full())
+                    .child(endpoint(&row.target_host, &row.target_port)),
+            )
+        };
+
+        let kind_switch = div().flex_shrink_0().child(self.segmented(
+            format!("ssh-fwd-kind-{idx}"),
+            &["L", "R", "D"],
+            kind_idx,
+            cx,
+            move |this, ix, _w, cx| {
+                let kind = match ix {
+                    1 => ForwardKind::Remote,
+                    2 => ForwardKind::Dynamic,
+                    _ => ForwardKind::Local,
+                };
+                if let Some(f) = this.ssh_form_mut()
+                    && let Some(r) = f.forwards.get_mut(idx)
+                {
+                    r.kind = kind;
+                    cx.notify();
+                }
+            },
+        ));
+        let description = div()
+            .flex_1()
+            .min_w(px(80.))
+            .child(Input::new(&row.description).xsmall());
+        let remove = crate::ui::tab_strip::hit_target(
+            Button::new(("ssh-fwd-remove", idx))
+                .icon(Icon::new(IconName::Close))
+                .ghost()
+                .xsmall(),
+        )
+        .tooltip(t(L10nKey::SettingsRemoveRule))
+        .on_click(cx.listener(move |this, _, _w, cx| this.remove_forward_rule(idx, cx)));
+
+        let rule = match split {
+            true => v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(kind_switch)
+                        .child(description)
+                        .child(remove),
+                )
+                .child(match stack_ends {
+                    true => mapping(v_flex().gap_1().items_start()),
+                    false => mapping(h_flex().gap_2().items_center()),
+                }),
+            false => mapping(h_flex().gap_2().items_center().child(kind_switch))
+                .child(description)
+                .child(remove),
         };
 
         v_flex()
             .gap_0p5()
             .py_1()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(self.segmented(
-                        format!("ssh-fwd-kind-{idx}"),
-                        &["L", "R", "D"],
-                        kind_idx,
-                        cx,
-                        move |this, ix, _w, cx| {
-                            let kind = match ix {
-                                1 => ForwardKind::Remote,
-                                2 => ForwardKind::Dynamic,
-                                _ => ForwardKind::Local,
-                            };
-                            if let Some(f) = this.ssh_form_mut()
-                                && let Some(r) = f.forwards.get_mut(idx)
-                            {
-                                r.kind = kind;
-                                cx.notify();
-                            }
-                        },
-                    ))
-                    .child(endpoint(&row.bind_host, &row.bind_port))
-                    .child(div().text_xs().text_color(muted).child("→"))
-                    .child(
-                        div()
-                            .opacity(if needs_target { 1.0 } else { 0.35 })
-                            .child(endpoint(&row.target_host, &row.target_port)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(80.))
-                            .child(Input::new(&row.description).xsmall()),
-                    )
-                    .child(
-                        Button::new(("ssh-fwd-remove", idx))
-                            .icon(Icon::new(IconName::Close))
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(move |this, _, _w, cx| {
-                                this.remove_forward_rule(idx, cx)
-                            })),
-                    ),
-            )
+            .child(rule)
             .when(incomplete, |col| {
                 col.child(div().text_xs().text_color(danger).child(if needs_target {
                     t(L10nKey::SettingsFwdNeedsBoth)
@@ -3135,6 +3817,7 @@ impl Tty7App {
                 desc.to_string(),
                 div()
                     .w(px(260.))
+                    .max_w_full()
                     .child(Input::new(input).small())
                     .into_any_element(),
                 cx,
@@ -3162,6 +3845,7 @@ impl Tty7App {
         };
 
         section = section
+            .child(self.subgroup_header(L10nKey::SettingsGroupAuthentication, cx))
             .child(text_row(
                 self,
                 t(L10nKey::SettingsIdentityFiles),
@@ -3185,6 +3869,7 @@ impl Tty7App {
                     cx,
                 ),
             )
+            .child(self.subgroup_header(L10nKey::SettingsGroupProxies, cx))
             .child(text_row(
                 self,
                 t(L10nKey::SettingsProxyCommand),
@@ -3206,6 +3891,7 @@ impl Tty7App {
                 &form.http,
                 cx,
             ))
+            .child(self.subgroup_header(L10nKey::SettingsGroupAlgorithms, cx))
             .child(text_row(
                 self,
                 t(L10nKey::SettingsKexAlgorithms),
@@ -3234,6 +3920,9 @@ impl Tty7App {
                 &form.hostkey,
                 cx,
             ))
+            // Compression here is the algorithm list russh negotiates, not
+            // ssh_config's yes/no switch, so it belongs with the other three
+            // lists rather than under Connection with the keepalives.
             .child(text_row(
                 self,
                 t(L10nKey::SettingsCompression),
@@ -3241,6 +3930,7 @@ impl Tty7App {
                 &form.compression,
                 cx,
             ))
+            .child(self.subgroup_header(L10nKey::SettingsGroupConnection, cx))
             .child(text_row(
                 self,
                 t(L10nKey::SettingsKeepaliveInterval),
@@ -3262,6 +3952,7 @@ impl Tty7App {
                 &form.connect_timeout,
                 cx,
             ))
+            .child(self.subgroup_header(L10nKey::SettingsGroupSession, cx))
             .child(
                 self.settings_row(
                     t(L10nKey::SettingsX11Forwarding),
@@ -3317,6 +4008,7 @@ impl Tty7App {
                     cx,
                 ),
             )
+            .child(self.subgroup_header(L10nKey::SettingsGroupSecurity, cx))
             .child(self.settings_row(
                 t(L10nKey::SettingsVerifyHostKeys),
                 t_fmt(
@@ -3394,12 +4086,68 @@ impl Tty7App {
             t(L10nKey::SettingsShellDefaultLoginShell)
         };
 
+        // tty7 already knows which shells are installed — it lists them on the
+        // new-tab button. Settings asked you to type one from memory instead,
+        // so the same choice was a menu in one place and a blind text field in
+        // the other. The field stays: a shell tty7 did not find still has to be
+        // reachable by path.
+        let shells = self.shells.shells.clone();
+        let current_program = program_input.read(cx).value().trim().to_string();
+        let platform_default_item: SharedString = if cfg!(windows) {
+            "PowerShell".into()
+        } else {
+            t(L10nKey::AppPlaceholderLoginShell).into()
+        };
+        let picker_app = cx.entity().downgrade();
+        let picker_input = program_input.clone();
+        // The chevron rides inside the field rather than beside it: hung on the
+        // outside it would either push the box narrower than the Arguments box
+        // directly below or push past the column every other control ends on.
+        let program_picker = crate::ui::tab_strip::hit_target(
+            Button::new("shell-program-detected")
+                .icon(IconName::ChevronDown)
+                .ghost()
+                .xsmall(),
+        )
+        .disabled(shells.is_empty())
+        .tooltip(t(L10nKey::SettingsShellDetected))
+        .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _window, _cx| {
+            let mut menu = menu.min_w(px(200.));
+            let pick = |program: String| {
+                let app = picker_app.clone();
+                let input = picker_input.clone();
+                move |_: &_, window: &mut Window, cx: &mut App| {
+                    input.update(cx, |state, cx| state.set_value(program.clone(), window, cx));
+                    if let Some(app) = app.upgrade() {
+                        app.update(cx, |this, cx| this.commit_shell_from_picker(cx));
+                    }
+                }
+            };
+            menu = menu.item(
+                PopupMenuItem::new(platform_default_item.clone())
+                    .checked(current_program.is_empty())
+                    .on_click(pick(String::new())),
+            );
+            if !shells.is_empty() {
+                menu = menu.item(PopupMenuItem::separator());
+            }
+            for shell in &shells {
+                menu = menu.item(
+                    PopupMenuItem::new(shell.label.clone())
+                        .checked(current_program == shell.program)
+                        .on_click(pick(shell.program.clone())),
+                );
+            }
+            menu
+        });
         let program_control = div()
             .w(px(260.))
-            .child(Input::new(&program_input).small())
+            .max_w_full()
+            .child(Input::new(&program_input).small().suffix(program_picker))
             .into_any_element();
         let args_control = div()
             .w(px(260.))
+            .max_w_full()
             .child(Input::new(&args_input).small())
             .into_any_element();
 
@@ -3430,6 +4178,7 @@ impl Tty7App {
         let wd_path_control = if wd_strategy == WdStrategy::Custom {
             div()
                 .w(px(260.))
+                .max_w_full()
                 .child(Input::new(&wd_path_input).small())
                 .into_any_element()
         } else {
@@ -3519,6 +4268,7 @@ impl Tty7App {
             .into_any_element();
         let link_file_command_control = div()
             .w(px(300.))
+            .max_w_full()
             .child(Input::new(&link_file_command_input).small())
             .into_any_element();
         let scrollback_radio = self.segmented(
@@ -3581,6 +4331,7 @@ impl Tty7App {
             .items_center()
             .gap_3()
             .w(px(240.))
+            .max_w_full()
             .child(div().flex_1().child(Slider::new(&scroll_slider)))
             .child(
                 div()
@@ -3687,6 +4438,7 @@ impl Tty7App {
         let option_as_alt = cfg.macos_option_as_alt;
         let tab_completion = cfg.tab_completion;
         let history_search = cfg.history_search;
+        let per_pane_history = cfg.per_pane_history;
         let smart_select = cfg.smart_select;
         let copy_on_select = cfg.copy_on_select;
         let clip_trim = cfg.clipboard_trim_trailing_spaces;
@@ -3698,6 +4450,10 @@ impl Tty7App {
         let history_search_switch = crate::ui::theme::switch("term-history-search", cx)
             .checked(history_search)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_history_search(*on, cx)))
+            .into_any_element();
+        let per_pane_history_switch = crate::ui::theme::switch("term-per-pane-history", cx)
+            .checked(per_pane_history)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_per_pane_history(*on, cx)))
             .into_any_element();
         let smart_select_switch = crate::ui::theme::switch("term-smart-select", cx)
             .checked(smart_select)
@@ -3744,6 +4500,12 @@ impl Tty7App {
                 history_search_switch,
                 cx,
             ))
+            .child(self.settings_row(
+                t(L10nKey::SettingsPerPaneHistory),
+                t(L10nKey::SettingsPerPaneHistoryDescription),
+                per_pane_history_switch,
+                cx,
+            ))
             .child(self.section_rule(cx))
             .child(self.section_header(t(L10nKey::SettingsSelectionClipboard), cx))
             .child(self.settings_row(
@@ -3786,6 +4548,7 @@ impl Tty7App {
             ),
             None => (AgentHooksView::Loading, None, HostId::LOCAL),
         };
+        let stacked = self.settings_row_under(STACK_ROW_BELOW, cx);
         let mut page = v_flex().child(self.section_intro(
             t(L10nKey::SettingsAgentsIntro),
             t(L10nKey::SettingsAgentsIntroDesc),
@@ -3830,9 +4593,13 @@ impl Tty7App {
                         .filter(|(for_agent, _)| *for_agent == agent)
                         .map(|(_, text)| text.clone());
 
+                    // Right-aligned beside its label, left-aligned under it —
+                    // `settings_row` gives the control column the whole row
+                    // once it stacks, and buttons flush to the far edge of a
+                    // row whose label starts at the near one read as unrelated.
                     let control = v_flex()
                         .gap_2()
-                        .items_end()
+                        .when(!stacked, |c| c.items_end())
                         .child(
                             h_flex()
                                 .gap_2()
@@ -3866,8 +4633,9 @@ impl Tty7App {
                             col.child(
                                 div()
                                     .max_w_80()
+                                    .max_w_full()
                                     .text_xs()
-                                    .text_right()
+                                    .when(!stacked, |note| note.text_right())
                                     .text_color(muted_fg)
                                     .child(text),
                             )
@@ -3885,44 +4653,24 @@ impl Tty7App {
         }
 
         let install_cli_on_path = cx.global::<Config>().install_cli_on_path;
-        page.child(
-            v_flex()
-                .mt_6()
-                .gap_2()
-                .child(self.section_rule(cx))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(foreground)
-                        .child(t(L10nKey::SettingsCommandLine)),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(muted_fg)
-                        .child(t(L10nKey::SettingsCommandLineDesc)),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            crate::ui::theme::switch("install-cli-on-path", cx)
-                                .checked(install_cli_on_path)
-                                .on_click(cx.listener(|this, on: &bool, _w, cx| {
-                                    this.set_install_cli_on_path(*on, cx)
-                                })),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(foreground)
-                                .child(t(L10nKey::SettingsInstallCliOnPath)),
-                        ),
-                ),
-        )
-        .into_any_element()
+        let cli_switch = crate::ui::theme::switch("install-cli-on-path", cx)
+            .checked(install_cli_on_path)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_install_cli_on_path(*on, cx)));
+        // Built from the same pieces as every other setting in the app: a
+        // section header, then a row whose label and description sit left of
+        // its control. Hand-rolled, this was the one switch that stood to the
+        // left of its own label — and the one row the settings search could
+        // neither highlight nor dim, so a query that counted it in the nav
+        // badge left nothing on the page looking like the match.
+        page.child(self.section_rule(cx))
+            .child(self.section_header(t(L10nKey::SettingsCommandLine), cx))
+            .child(self.settings_row(
+                t(L10nKey::SettingsInstallCliOnPath),
+                t(L10nKey::SettingsCommandLineDesc),
+                cli_switch.into_any_element(),
+                cx,
+            ))
+            .into_any_element()
     }
 
     fn agent_hooks_machine_picker(&self, selected: HostId, cx: &mut Context<Self>) -> Option<Div> {
@@ -3995,6 +4743,7 @@ impl Tty7App {
             NewTabPosition::End => 1,
         };
         let restore_session = cfg.restore_session;
+        let persist_scrollback = cfg.persist_scrollback;
         let remember_window_size = cfg.remember_window_size;
         let show_tray_icon = cfg.show_tray_icon;
         let tab_bar_idx = match cfg.tab_bar_position {
@@ -4054,6 +4803,10 @@ impl Tty7App {
         let restore_switch = crate::ui::theme::switch("wt-restore-session", cx)
             .checked(restore_session)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_restore_session(*on, cx)))
+            .into_any_element();
+        let persist_scrollback_switch = crate::ui::theme::switch("wt-persist-scrollback", cx)
+            .checked(persist_scrollback)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_persist_scrollback(*on, cx)))
             .into_any_element();
         let remember_window_switch = crate::ui::theme::switch("wt-remember-window", cx)
             .checked(remember_window_size)
@@ -4149,6 +4902,12 @@ impl Tty7App {
                 cx,
             ))
             .child(self.settings_row(
+                t(L10nKey::SettingsPersistScrollback),
+                t(L10nKey::SettingsPersistScrollbackDescription),
+                persist_scrollback_switch,
+                cx,
+            ))
+            .child(self.settings_row(
                 t(L10nKey::SettingsShowTrayIcon),
                 t(L10nKey::SettingsShowTrayIconDesc),
                 tray_switch,
@@ -4209,7 +4968,7 @@ impl Tty7App {
         v_flex()
             .w_full()
             .bg(rgb(p.background_color()))
-            .rounded(px(8.))
+            .rounded(rounding::TRACK_RADIUS)
             .overflow_hidden()
             .px_3()
             .py_3()
@@ -4330,10 +5089,18 @@ impl Tty7App {
                 .rounded(px(3.))
                 .bg(rgb(to_u32(active.ansi16[i])))
         }));
-        let preview = self.theme_preview(&active);
+        // Inset inside the card's border, the way the same preview is inset
+        // inside the same card in the theme panel.
+        let preview = self.theme_preview(&active).rounded(rounding::inner_radius(
+            rounding::TRACK_RADIUS,
+            rounding::HAIRLINE,
+        ));
         let open = self
             .active_settings()
             .is_some_and(|s| s.theme_panel_open && s.theme_panel_slot == slot);
+        // The same width a row stacks at: the card is a row too, just one whose
+        // control happens to be a whole preview.
+        let narrow = self.settings_row_under(STACK_ROW_BELOW, cx);
 
         div()
             .id(card_id)
@@ -4341,13 +5108,16 @@ impl Tty7App {
             .mb_2()
             .w_full()
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _w, cx| this.toggle_theme_panel(slot, cx)))
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.toggle_theme_panel(slot, window, cx)),
+            )
             .child(
                 h_flex()
+                    .w_full()
                     .items_center()
                     .gap_4()
                     .p_3()
-                    .rounded_xl()
+                    .rounded(rounding::TRACK_RADIUS)
                     .border_1()
                     .border_color(if open {
                         foreground.opacity(0.35)
@@ -4356,9 +5126,17 @@ impl Tty7App {
                     })
                     .bg(surface)
                     .hover(|h| h.bg(hover_bg))
-                    .child(div().w(px(150.)).flex_shrink_0().child(preview))
+                    // The preview is the first thing to go: it is a picture of a
+                    // choice the two lines beside it already name, and at the
+                    // width where it stops fitting it was pushing the "change
+                    // theme" affordance off the card.
+                    .when(!narrow, |card| {
+                        card.child(div().w(px(150.)).flex_shrink_0().child(preview))
+                    })
                     .child(
                         v_flex()
+                            .flex_1()
+                            .min_w_0()
                             .gap_0p5()
                             .child(div().text_xs().text_color(muted_fg).child(caption))
                             .child(
@@ -4370,9 +5148,9 @@ impl Tty7App {
                             )
                             .child(swatches),
                     )
-                    .child(div().flex_1())
                     .child(
                         h_flex()
+                            .flex_shrink_0()
                             .items_center()
                             .gap_1()
                             .text_sm()
@@ -4399,6 +5177,7 @@ impl Tty7App {
             ),
             None => return div().into_any_element(),
         };
+        let list_scroll = self.active_settings().map(|s| s.theme_list_scroll.clone());
         let config = cx.global::<Config>();
         let slot = match (config.theme_follow_system, slot) {
             (false, _) => ThemeSlot::Manual,
@@ -4436,7 +5215,10 @@ impl Tty7App {
                         .icon(IconName::Close)
                         .ghost()
                         .small()
-                        .on_click(cx.listener(|this, _, _w, cx| this.close_theme_panel(cx))),
+                        .tooltip(t(L10nKey::SettingsThemesCloseTooltip))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.close_theme_panel(window, cx)),
+                        ),
                 ),
             );
 
@@ -4452,7 +5234,7 @@ impl Tty7App {
             });
 
         let search_box = div().px_4().pb_3().child(
-            div().w(px(268.)).child(
+            div().w_full().child(
                 Input::new(&search).small().prefix(
                     Icon::empty()
                         .path("stock/icons/search.svg")
@@ -4462,11 +5244,46 @@ impl Tty7App {
             ),
         );
 
+        // A theme file that fails to parse used to log a warning and then just
+        // not be in the list. This is a folder the user opens and drops files
+        // into; "it isn't there" needs a reason attached to it.
+        let rejected = presets::rejected(cx);
+        let rejected_note = (!rejected.is_empty() && query.is_empty()).then(|| {
+            let mut note = v_flex()
+                .mx_4()
+                .mb_4()
+                .p_3()
+                .gap_1p5()
+                .rounded(rounding::TRACK_RADIUS)
+                .border_1()
+                .border_color(theme.danger.opacity(0.4))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(foreground)
+                        .child(t(L10nKey::SettingsThemesRejected)),
+                );
+            for (name, why) in &rejected {
+                note = note.child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(div().text_xs().text_color(theme.danger).child(name.clone()))
+                        .child(div().text_xs().text_color(muted_fg).child(why.clone())),
+                );
+            }
+            note
+        });
+
         let mut list = v_flex().px_4().pb_4().gap_4();
+        // Filtering every preset out left the panel blank under its own search
+        // box — the one filter in the app that said nothing about it.
+        let mut any_themes = false;
         for p in presets::all(cx) {
             if !query.is_empty() && !p.name.to_lowercase().contains(&query) {
                 continue;
             }
+            any_themes = true;
             let id = p.id.clone();
             let is_active = active_id == id;
             let preview = self.theme_preview(&p).rounded(rounding::inner_radius(
@@ -4481,7 +5298,7 @@ impl Tty7App {
                     .cursor_pointer()
                     .child(
                         div()
-                            .w(px(268.))
+                            .w_full()
                             .rounded(rounding::TRACK_RADIUS)
                             .overflow_hidden()
                             .border_1()
@@ -4500,8 +5317,10 @@ impl Tty7App {
                         h_flex()
                             .items_center()
                             .gap_1p5()
+                            .w_full()
                             .child(
                                 div()
+                                    .truncate()
                                     .text_sm()
                                     .font_weight(if is_active {
                                         FontWeight::SEMIBOLD
@@ -4512,7 +5331,12 @@ impl Tty7App {
                                     .child(p.name.clone()),
                             )
                             .when(is_active, |s| {
-                                s.child(Icon::new(IconName::Check).small().text_color(foreground))
+                                s.child(
+                                    Icon::new(IconName::Check)
+                                        .small()
+                                        .flex_shrink_0()
+                                        .text_color(foreground),
+                                )
                             }),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| match slot {
@@ -4523,8 +5347,15 @@ impl Tty7App {
             );
         }
 
+        if !any_themes {
+            list = list.child(div().py_2().text_sm().text_color(muted_fg).child(t_fmt(
+                L10nKey::SettingsNothingMatches,
+                &[("query", query.as_str())],
+            )));
+        }
+
         v_flex()
-            .w(px(300.))
+            .w(px(self.settings_columns_now().theme_panel))
             .h_full()
             .flex_shrink_0()
             .bg(bg)
@@ -4533,13 +5364,19 @@ impl Tty7App {
             .child(header)
             .child(subtitle)
             .child(search_box)
-            .child(
-                v_flex()
-                    .id("theme-panel-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .child(list),
-            )
+            .when_some(list_scroll, |panel, scroll| {
+                panel.child(crate::ui::scrollbar::with_vertical_scrollbar(
+                    "theme-panel-scrollbar",
+                    v_flex()
+                        .id("theme-panel-list")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&scroll)
+                        .children(rejected_note)
+                        .child(list),
+                    &scroll,
+                ))
+            })
             .into_any_element()
     }
 
@@ -4572,6 +5409,7 @@ impl Tty7App {
             .active_settings()
             .and_then(|s| s.recording.as_ref())
             .map(|r| (r.action.clone(), r.chords.clone()));
+        let record_gen = self.record_gen;
         let note = self
             .active_settings()
             .and_then(|s| s.rebinding_note.clone());
@@ -4612,12 +5450,24 @@ impl Tty7App {
             },
         );
 
-        let preset_row = h_flex()
-            .items_center()
-            .justify_between()
-            .py_2()
+        // The label column has to be allowed to shrink, or its description sets
+        // the row's width and the control it belongs to is pushed off the page.
+        // `settings_row` does this for every other row in Settings; these two
+        // are hand-rolled and were missing it. They take its breakpoint too:
+        // the segmented controls beside them are the widest on the page.
+        let stacked = self.settings_row_under(STACK_ROW_BELOW, cx);
+        let hand_rolled_row = |row: Div| {
+            row.w_full()
+                .flex()
+                .when(stacked, |r| r.flex_col().items_start().gap_2())
+                .when(!stacked, |r| {
+                    r.flex_row().items_center().justify_between().gap_8()
+                })
+        };
+        let preset_row = hand_rolled_row(div().py_2())
             .child(
                 v_flex()
+                    .min_w_0()
                     .gap_0p5()
                     .child(
                         div()
@@ -4635,12 +5485,10 @@ impl Tty7App {
             )
             .child(h_flex().flex_shrink_0().child(preset_control));
 
-        let prefix_row = h_flex()
-            .items_center()
-            .justify_between()
-            .py_2()
+        let prefix_row = hand_rolled_row(div().py_2())
             .child(
                 div()
+                    .min_w_0()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(foreground)
@@ -4648,14 +5496,55 @@ impl Tty7App {
             )
             .child(h_flex().flex_shrink_0().child(prefix_control));
 
-        let count = effective.len();
+        // Eighty-nine undivided rows, in the order the binding table happens to
+        // be written. Read them in the same seven sections the command palette
+        // uses, so a shortcut is found by where it belongs rather than by
+        // scrolling.
+        let mut grouped: Vec<(
+            crate::ui::palette::CommandGroup,
+            Vec<(String, String, String)>,
+        )> = Vec::new();
+        for (action, key) in effective {
+            let (group, label) = crate::ui::keymap::action_entry(&action);
+            let slot = match grouped.iter_mut().find(|(g, _)| *g == group) {
+                Some(slot) => slot,
+                None => {
+                    grouped.push((group, Vec::new()));
+                    grouped.last_mut().expect("just pushed")
+                }
+            };
+            slot.1.push((action, key, label));
+        }
+        grouped.sort_by_key(|(g, _)| {
+            crate::ui::palette::CommandGroup::ORDER
+                .iter()
+                .position(|o| o == g)
+                .unwrap_or(usize::MAX)
+        });
+        let rows: Vec<(String, String, String)> = grouped
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().cloned())
+            .collect();
+        let heading_at: std::collections::HashMap<usize, &'static str> = {
+            let mut map = std::collections::HashMap::new();
+            let mut at = 0usize;
+            for (group, rows) in &grouped {
+                map.insert(at, group.title());
+                at += rows.len();
+            }
+            map
+        };
+        let count = rows.len();
         let mut list = v_flex().mt_2();
-        for (i, (action, key)) in effective.into_iter().enumerate() {
+        for (i, (action, key, label)) in rows.into_iter().enumerate() {
             let is_recording = recording.as_ref().is_some_and(|(a, _)| a == &action);
             let is_overridden = overridden.contains(&action);
 
+            // Wrapping, because a four-chord binding is wider than the column a
+            // narrow window leaves for it, and the alternative to a second line
+            // is a first one that runs off the page.
             let keycaps = |spec: &str| {
-                h_flex().gap_2().children(
+                h_flex().flex_wrap().gap_2().children(
                     crate::ui::keymap::key_chords(spec)
                         .into_iter()
                         .map(|chord| h_flex().gap_1().children(chord.into_iter().map(&keycap))),
@@ -4676,11 +5565,36 @@ impl Tty7App {
                             .child(t(L10nKey::SettingsPressKeys)),
                     )
                 } else {
+                    // The binding commits on a pause, and the pause was
+                    // invisible: the hint asked people to time something they
+                    // could not see. The bar runs the same clock the commit
+                    // does, and restarts with every extra chord.
                     row.child(keycaps(&chords.join(" "))).child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(t(L10nKey::SettingsPauseToSaveEsc)),
+                        v_flex()
+                            .gap(px(3.))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(t(L10nKey::SettingsPauseToSaveEsc)),
+                            )
+                            .child(
+                                div()
+                                    .h(px(2.))
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .rounded_full()
+                                    .bg(border)
+                                    .child(
+                                        div().h_full().rounded_full().bg(accent).with_animation(
+                                            ("kb-record-countdown", record_gen as usize),
+                                            Animation::new(std::time::Duration::from_millis(
+                                                crate::ui::app::RECORD_COMMIT_DELAY_MS,
+                                            )),
+                                            |bar, delta| bar.w(relative(delta)),
+                                        ),
+                                    ),
+                            ),
                     )
                 };
                 row.into_any_element()
@@ -4727,19 +5641,29 @@ impl Tty7App {
                     )
                 });
 
+            if let Some(title) = heading_at.get(&i) {
+                list = list.child(
+                    div()
+                        .pt_5()
+                        .pb_1p5()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(muted)
+                        .child(*title),
+                );
+            }
+            let last_in_group = heading_at.contains_key(&(i + 1)) || i + 1 == count;
             list = list.child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .py_1p5()
-                    .when(i + 1 < count, |s| s.border_b_1().border_color(border))
+                hand_rolled_row(div().py_1p5())
+                    .when(!last_in_group, |s| s.border_b_1().border_color(border))
                     .child(
                         div()
+                            .min_w_0()
                             .text_sm()
                             .text_color(foreground)
-                            .child(humanize_action(&action)),
+                            .child(label),
                     )
-                    .child(right),
+                    .child(right.flex_shrink_0()),
             );
         }
 
@@ -4768,9 +5692,9 @@ impl Tty7App {
                     Button::new("kb-restore-all")
                         .label(t(L10nKey::SettingsRestoreAllDefaults))
                         .small()
-                        .on_click(
-                            cx.listener(|this, _, _w, cx| this.restore_default_keybindings(cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.restore_default_keybindings(window, cx)
+                        })),
                 ),
             )
             .child(list)
@@ -4821,6 +5745,15 @@ impl Tty7App {
         });
         let failure = update_status.failure.clone();
         let stale_daemon = crate::daemon::spawn::local_daemon_stale_build();
+        // Whether picking up the new build costs the user their running panes
+        // decides what this offer is, so it decides what it says.
+        let stale_daemon_note = if crate::daemon::spawn::local_daemon_supports(
+            crate::daemon::protocol::FEATURE_HANDOFF,
+        ) {
+            L10nKey::SettingsDaemonStaleDescInPlace
+        } else {
+            L10nKey::SettingsDaemonStaleDesc
+        };
         let check_for_updates = cx.global::<Config>().check_for_updates;
         let auto_download = cx.global::<Config>().auto_download_updates;
         let channel_idx = match cx.global::<Config>().update_channel {
@@ -4855,6 +5788,7 @@ impl Tty7App {
         let http_proxy_control = v_flex()
             .gap_1()
             .w(px(260.))
+            .max_w_full()
             .child(Input::new(&http_proxy_input).small())
             .when(http_proxy_invalid, |this| {
                 this.child(
@@ -4908,21 +5842,26 @@ impl Tty7App {
                     .text_color(muted_fg)
                     .child(t(L10nKey::SettingsAboutDesc1)),
             )
+            // The search index has promised a "How shells work" entry on this
+            // page since it was written, and it pointed at nothing — the one
+            // thing that makes tty7 different from any other terminal was
+            // never stated in the app.
+            .child(self.section_rule(cx))
+            .child(self.section_header(t(L10nKey::SettingsSearchHowShellsWorkTitle), cx))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .child(t(L10nKey::SettingsHowShellsWorkBody)),
+            )
+            .child(self.section_rule(cx))
+            .child(self.section_header(t(L10nKey::SettingsUpdates), cx))
             .child(
                 v_flex()
-                    .mt_6()
                     // The section can carry several stacked states at once —
                     // a failure, a staged package, a skipped version. At gap_2
                     // they read as one paragraph.
                     .gap_3()
-                    .child(self.section_rule(cx))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(foreground)
-                            .child(t(L10nKey::SettingsUpdates)),
-                    )
                     // A failure the user can act on. Persisted, so it is still
                     // here tomorrow — the old in-memory phase died with the
                     // process and took the only evidence with it.
@@ -5136,37 +6075,7 @@ impl Tty7App {
                                 .into_any_element(),
                             cx,
                         ),
-                    )
-                    // The other half of an in-place update: the app is new, the
-                    // process serving every pane is not. Shown rather than
-                    // prompted — restarting it ends the user's running work,
-                    // which is not a thing to ask for on tty7's initiative.
-                    .when_some(stale_daemon, |this, build| {
-                        this.child(
-                            v_flex()
-                                .gap_1()
-                                .child(div().text_sm().text_color(foreground).child(t_fmt(
-                                    L10nKey::SettingsDaemonStale,
-                                    &[("build", &build)],
-                                )))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted_fg)
-                                        .child(t(L10nKey::SettingsDaemonStaleDesc)),
-                                )
-                                .child(
-                                    h_flex().child(
-                                        Button::new("restart-stale-daemon")
-                                            .label(t(L10nKey::SettingsDaemonStaleRestart))
-                                            .small()
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.restart_daemon(window, cx)
-                                            })),
-                                    ),
-                                ),
-                        )
-                    }),
+                    ),
             )
             .child(self.settings_row(
                 t(L10nKey::SettingsAppHttpProxy),
@@ -5174,23 +6083,35 @@ impl Tty7App {
                 http_proxy_control,
                 cx,
             ))
+            .child(self.section_rule(cx))
+            .child(self.section_header(t(L10nKey::SettingsServer), cx))
             .child(
                 v_flex()
-                    .mt_6()
                     .gap_2()
-                    .child(self.section_rule(cx))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(foreground)
-                            .child(t(L10nKey::SettingsServer)),
-                    )
+                    // The other half of an in-place update: the app is new, the
+                    // process serving every pane is not. Said here rather than
+                    // beside the update controls, so the one button that offers
+                    // to pick the new build up stays the only one on the page.
+                    .when_some(stale_daemon.as_deref(), |this, build| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(foreground)
+                                .child(t_fmt(L10nKey::SettingsDaemonStale, &[("build", build)])),
+                        )
+                    })
                     .child(
                         div()
                             .text_sm()
                             .text_color(muted_fg)
-                            .child(t(L10nKey::SettingsServerDesc)),
+                            // A stale server has a more specific thing to say
+                            // than the section's standing description, and it
+                            // ends with the same button.
+                            .child(t(if stale_daemon.is_some() {
+                                stale_daemon_note
+                            } else {
+                                L10nKey::SettingsServerDesc
+                            })),
                     )
                     .child(
                         h_flex().child(
@@ -5210,6 +6131,228 @@ impl Tty7App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row keeps its side-by-side shape while both halves fit, and stacks
+    /// once they do not. The SSH page reaches that point first — it spends its
+    /// host list before the row gets anything.
+    #[test]
+    fn a_row_stacks_once_its_label_and_control_stop_fitting() {
+        use SettingsSection::*;
+        assert!(settings_row_width(Terminal, false, 1440., 1.) >= STACK_ROW_BELOW);
+        assert!(settings_row_width(Terminal, false, 900., 1.) >= STACK_ROW_BELOW);
+        // At the narrowest window that turns up the page is 420 wide, which is
+        // under the width where a label and a control still share a line.
+        assert!(settings_row_width(Terminal, false, NARROWEST_WINDOW, 1.) < STACK_ROW_BELOW);
+        // Capped at the reading column, so a wider window never widens the row.
+        assert_eq!(
+            settings_row_width(Terminal, false, 4000., 1.),
+            READING_COLUMN
+        );
+        // SSH crosses over while the window is still wide — it is the page that
+        // spends a host list before its rows get anything.
+        assert!(settings_row_width(Ssh, false, 1440., 1.) >= STACK_ROW_BELOW);
+        assert!(settings_row_width(Ssh, false, 900., 1.) < STACK_ROW_BELOW);
+        // And never goes negative on a window narrower than its own chrome.
+        assert_eq!(settings_row_width(Ssh, false, 100., 1.), 0.);
+    }
+
+    /// Every list gives width back before the page does, and no combination of
+    /// page and panel leaves the page below the width it is derived to keep.
+    /// 641pt is the window the report came from — under the declared 720 —- so
+    /// that is the case that has to hold, not the one the manifest promises.
+    #[test]
+    fn the_page_keeps_a_readable_width_at_every_window_that_turns_up() {
+        use SettingsSection::*;
+        for section in SettingsSection::ALL {
+            for panel_open in [false, true] {
+                for viewport in [NARROWEST_WINDOW, 641., 720., 900., 1100., 1440., 2560.] {
+                    let cols = settings_columns(section, panel_open, viewport);
+                    let pad = match section {
+                        Ssh => SSH_DETAIL_PAD,
+                        _ => PAGE_PAD,
+                    };
+                    let panel = only_when(!cols.panel_overlays, cols.theme_panel);
+                    let page = viewport - cols.nav - cols.ssh_list - panel - pad;
+                    assert!(
+                        page >= CONTENT_MIN_W,
+                        "{viewport}px, {panel_open}: page got {page}, floor is {CONTENT_MIN_W}"
+                    );
+                    // And the columns add up to the window rather than past it,
+                    // which is what keeps the rightmost one on screen.
+                    assert!(cols.nav + cols.ssh_list + panel + pad + page <= viewport + 1.);
+                    assert!(cols.nav >= NAV_W_MIN && cols.nav <= NAV_W);
+                }
+            }
+        }
+    }
+
+    /// The three screenshots in the report, by the numbers measured off them.
+    /// Every one of them is the same 641pt window.
+    #[test]
+    fn the_reported_window_lays_out_without_running_off_the_screen() {
+        use SettingsSection::*;
+        const REPORTED: f32 = 641.;
+
+        // Shot 1 — SSH. Nav 220 and host list 280 left the detail 141pt and its
+        // empty state painted ~270 past the window edge. Both lists now stand
+        // on their floors and the detail keeps the rest.
+        let ssh = settings_columns(Ssh, false, REPORTED);
+        assert_eq!((ssh.nav, ssh.ssh_list), (NAV_W_MIN, SSH_LIST_W_MIN));
+        let detail = settings_row_width(Ssh, false, REPORTED, 1.);
+        assert!(detail >= CONTENT_MIN_W, "SSH detail got {detail}");
+
+        // Shot 2 — Appearance, panel closed. The opacity row measured a 78pt
+        // label beside a 240pt slider; at this width the row has to stack.
+        // The page does not reach its preferred `CONTENT_W` here: the nav floor
+        // is sized to show a Japanese nav label whole, and at 641 that costs the
+        // page the difference. Readable and stacked is the property that matters.
+        let page = settings_row_width(Appearance, false, REPORTED, 1.);
+        assert_eq!(page, REPORTED - NAV_W_MIN - PAGE_PAD);
+        assert!(page >= CONTENT_MIN_W, "the page got {page}");
+        assert!(
+            page < STACK_ROW_BELOW,
+            "the opacity row has to stack at 641"
+        );
+
+        // Shot 3 — Appearance with the theme panel. 220 + 300 of chrome left
+        // the page ~125pt, one Chinese character per line. The panel now lifts
+        // off the row entirely and the page is back to shot 2's width.
+        assert!(settings_columns(Appearance, true, REPORTED).panel_overlays);
+        assert_eq!(settings_row_width(Appearance, true, REPORTED, 1.), page);
+    }
+
+    /// The list that has to give the most is the one the window has the least
+    /// room for, and no list is ever asked for more than it has to spare.
+    #[test]
+    fn the_lists_shrink_together_and_stop_at_their_floors() {
+        use SettingsSection::*;
+        // Wide enough for everyone: nothing moves.
+        let wide = settings_columns(Ssh, false, 1440.);
+        assert_eq!((wide.nav, wide.ssh_list), (NAV_W, SSH_LIST_W));
+        // The reported window — half of a 1440pt screen, three columns on SSH.
+        // Both lists give, neither past its floor, and the detail comes out at
+        // its preferred width instead of the 336 it used to be left with.
+        let half = settings_columns(Ssh, false, 900.);
+        assert!(half.nav < NAV_W && half.ssh_list < SSH_LIST_W);
+        assert!(half.nav >= NAV_W_MIN && half.ssh_list >= SSH_LIST_W_MIN);
+        assert_eq!(
+            settings_row_width(Ssh, false, 900., 1.).round(),
+            CONTENT_W,
+            "the SSH detail should get its preferred width at 900pt"
+        );
+        // The narrowest window that turns up: both at the floor, page readable.
+        let tiny = settings_columns(Ssh, false, NARROWEST_WINDOW);
+        assert_eq!((tiny.nav, tiny.ssh_list), (NAV_W_MIN, SSH_LIST_W_MIN));
+        assert_eq!(
+            settings_row_width(Ssh, false, NARROWEST_WINDOW, 1.),
+            CONTENT_MIN_W
+        );
+    }
+
+    /// The thresholds are widths a *label* needs, and a reader who scaled the
+    /// interface up scaled every label with it while the slider beside it kept
+    /// the px width it was built at. A window that reads fine at the default
+    /// font is a starved label column at the largest one.
+    #[test]
+    fn the_stacking_width_follows_the_interface_font() {
+        use crate::core::config::UI_FONT_SIZE_MAX;
+        use SettingsSection::*;
+        let large = UI_FONT_SIZE_MAX / UI_FONT_SIZE_DEFAULT;
+        // Side by side at the default font...
+        assert!(settings_row_width(Appearance, false, 900., 1.) >= STACK_ROW_BELOW);
+        // ...and stacked at the largest, where the same row holds half as much.
+        assert!(
+            settings_row_width(Appearance, false, 900., large) < STACK_ROW_BELOW * large,
+            "a 900pt window at the largest interface font has to stack"
+        );
+        // The reading column grows with the font, so a wide window does not.
+        assert!(settings_row_width(Appearance, false, 1600., large) >= STACK_ROW_BELOW * large);
+    }
+
+    /// The theme panel took its 300px from the page and from nothing else, so
+    /// a half-width window with it open rendered a description one character
+    /// wide. It now shrinks with everything else, and stops being a column at
+    /// all once even that is not enough.
+    #[test]
+    fn the_theme_panel_yields_before_the_page_does() {
+        use SettingsSection::*;
+        assert!(settings_row_width(Appearance, true, 900., 1.) < STACK_ROW_BELOW);
+        assert!(
+            settings_row_width(Appearance, true, 900., 1.)
+                < settings_row_width(Appearance, false, 900., 1.)
+        );
+        // Beside the page while both fit — which, with the panel and the nav
+        // both allowed down to their floors, still holds at 720.
+        assert!(!settings_columns(Appearance, true, 900.).panel_overlays);
+        assert!(!settings_columns(Appearance, true, 720.).panel_overlays);
+        // ...and over it once they do not, at which point the page is back to
+        // the width it has with the panel closed.
+        assert!(settings_columns(Appearance, true, 641.).panel_overlays);
+        assert_eq!(
+            settings_row_width(Appearance, true, 641., 1.),
+            settings_row_width(Appearance, false, 641., 1.)
+        );
+        // The panel is the only chrome that can leave, so it has to leave in
+        // time: at 641 there is no arrangement in which it and a readable page
+        // both fit in a row.
+        assert!(
+            NARROWEST_WINDOW - NAV_W_MIN - THEME_PANEL_W_MIN - PAGE_PAD < CONTENT_MIN_W,
+            "the overlay threshold has to fire at the narrowest window"
+        );
+        // Wide enough and the cap is the reading column either way.
+        assert_eq!(
+            settings_row_width(Appearance, true, 1600., 1.),
+            READING_COLUMN
+        );
+    }
+
+    #[test]
+    fn a_row_is_marked_by_its_label_or_by_the_keywords_behind_it() {
+        // Straight label hit.
+        assert!(row_matches_query(
+            SettingsSection::Appearance,
+            "Blur",
+            "blur"
+        ));
+        // Keyword hit: nothing on the About page contains "persist", but the
+        // index says the "How shells work" block answers it.
+        assert!(row_matches_query(
+            SettingsSection::About,
+            t(L10nKey::SettingsSearchHowShellsWorkTitle),
+            "persist"
+        ));
+        // A row on some other page is not a hit just because the query matches
+        // an entry elsewhere.
+        assert!(!row_matches_query(
+            SettingsSection::Terminal,
+            "Blur",
+            "persist"
+        ));
+        // An empty query marks nothing at all, so no page ever renders greyed
+        // out just because the field is focused.
+        assert!(!row_matches_query(SettingsSection::Appearance, "Blur", ""));
+    }
+
+    #[test]
+    fn a_query_that_matches_nothing_is_distinguishable_from_one_that_does() {
+        assert_eq!(total_match_count("zzqqxx"), 0);
+        assert!(total_match_count("blur") > 0);
+        assert!(total_match_count("persist") > 0);
+    }
+
+    #[test]
+    fn the_how_shells_work_entry_has_something_to_point_at() {
+        // The index promised this page an explanation of the one thing that
+        // makes tty7 different; for a long time it pointed at nothing.
+        assert!(
+            !t(L10nKey::SettingsHowShellsWorkBody).is_empty(),
+            "the About page has no body copy for its own search entry"
+        );
+        assert_eq!(
+            best_matching_section("persist").map(|s| s.profile_label()),
+            Some(SettingsSection::About.profile_label())
+        );
+    }
 
     #[test]
     fn settings_row_identity_depends_only_on_its_stable_label() {
@@ -5294,6 +6437,22 @@ mod tests {
             ("known_hosts", Ssh),
             ("claude", Agents),
             ("symlink", Agents),
+            // Rows the index had no entry for at all, so the query counted
+            // nothing, no badge appeared and no row lit up: the whole Updates
+            // group on About, and Smooth scrolling between two rows that were
+            // both findable.
+            ("smooth", Terminal),
+            ("nightly", About),
+            ("channel", About),
+            ("metered", About),
+            ("automatic", About),
+            // A headline feature the index had never heard of: "background
+            // image" matched nothing, and typing it walked the page to About
+            // because "background" alone hits Download updates in the
+            // background.
+            ("background image", Appearance),
+            ("wallpaper", Appearance),
+            ("image opacity", Appearance),
         ];
         #[cfg(target_os = "windows")]
         cases.extend([
@@ -5317,7 +6476,7 @@ mod tests {
     fn command_line_tool_is_searchable_under_agents() {
         let entry = settings_search_entries()
             .iter()
-            .find(|entry| entry.title == L10nKey::SettingsSearchCommandLineToolTitle)
+            .find(|entry| entry.title == L10nKey::SettingsInstallCliOnPath)
             .expect("the CLI setting should be searchable");
 
         assert_eq!(entry.section.profile_label(), "settings:agents");
@@ -5336,6 +6495,7 @@ mod tests {
             "History search",
             "Dim inactive panes",
             "Option (⌥) acts as Meta",
+            "Install the tty7 command on PATH",
         ] {
             assert!(
                 settings_search_entries()

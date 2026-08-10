@@ -34,6 +34,11 @@ pub(crate) struct OpenFile {
     pub(crate) conflict: bool,
     pub(crate) preview: bool,
     pub(crate) wrap: bool,
+    /// The rendered-Markdown pane's own scroll. Per file, so switching away
+    /// and back lands where you were reading — and so the pane can carry the
+    /// scrollbar every other scrolling surface in tty7 has. The editor itself
+    /// gets one from `Input`.
+    pub(crate) preview_scroll: gpui::ScrollHandle,
     _sub: Subscription,
     _observe: Subscription,
 }
@@ -500,6 +505,7 @@ impl Tty7App {
                 conflict: false,
                 preview: false,
                 wrap: false,
+                preview_scroll: gpui::ScrollHandle::new(),
                 _sub: sub,
                 _observe: observe,
             },
@@ -540,6 +546,14 @@ impl Tty7App {
         if self.tab_code().is_some_and(|c| c.active_file().is_some()) {
             self.focus_editor(window, cx);
         } else {
+            // With no file to show, the panel says "Open a file from the file
+            // tree" and hands the tree the focus — but nothing was putting the
+            // tree on screen, so ⌘⇧E on a fresh tab opened an empty editor
+            // pointing at a panel the reader could not see or reach from
+            // there. Reveal it, then focus it.
+            if !self.file_tree_on_screen(cx) {
+                self.set_right_panel_tab(crate::core::config::RightPanelTab::Files, cx);
+            }
             self.file_tree.focus_handle.focus(window, cx);
         }
         cx.notify();
@@ -623,8 +637,21 @@ impl Tty7App {
                 );
                 let wrote = result.is_ok();
                 match result {
-                    Ok(mtime) => f.disk_mtime = mtime,
-                    Err(e) => HostOps::notify_err(window, cx, t(L10nKey::EditorSaveFailed), &e),
+                    Ok(mtime) => {
+                        f.disk_mtime = mtime;
+                    }
+                    Err(e) => {
+                        // "Save failed" did not say which file, and with more
+                        // than one editor tab open that is the first thing you
+                        // need to know.
+                        let name = f
+                            .path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| f.path.display().to_string());
+                        let context = t_fmt(L10nKey::EditorSaveFailed, &[("name", &name)]);
+                        HostOps::notify_err(window, cx, &context, &e);
+                    }
                 }
                 if landing.clean {
                     f.dirty = false;
@@ -687,10 +714,17 @@ impl Tty7App {
             PromptLevel::Warning,
             &t_fmt(L10nKey::EditorUnsavedChanges, &[("name", &name)]),
             None,
+            // Cancel sits between Save and Discard on purpose. The platform
+            // renders the first button as the default and lays the rest out
+            // beside it, so Discard was landing directly next to the key that
+            // Return presses. Apple separates them for exactly this reason.
+            // Three answers, so the shared helper does not fit: Save keeps
+            // index 0 (rightmost, Return), Cancel takes Escape, and Discard
+            // sits on the far left where nothing lands by reflex.
             &[
-                t(L10nKey::Save),
-                t(L10nKey::EditorDiscard),
-                t(L10nKey::Cancel),
+                gpui::PromptButton::ok(t(L10nKey::Save)),
+                gpui::PromptButton::cancel(t(L10nKey::Cancel)),
+                gpui::PromptButton::ok(t(L10nKey::EditorDiscard)),
             ],
             cx,
         );
@@ -699,7 +733,7 @@ impl Tty7App {
             let Ok(choice) = answer.await else { return };
             let _ = app.update_in(cx, |app, window, cx| match choice {
                 0 => app.editor_save_file(id, true, window, cx),
-                1 => {
+                2 => {
                     if let Some((tab_ix, ix)) = app.editor_file_position(id) {
                         app.editor_remove_file_in(tab_ix, ix, cx);
                     }
@@ -883,15 +917,28 @@ impl Tty7App {
             None => self.render_editor_empty(cx).into_any_element(),
             Some(f) if f.preview => {
                 let markdown = f.input.read(cx).text().to_string();
-                div()
-                    .id("editor-md-preview")
+                let scroll = f.preview_scroll.clone();
+                // The bar's wrapper takes its height from `flex_1`, so it needs
+                // a column with a definite height to grow inside — hand it one
+                // rather than dropping it straight into the overlay, or the
+                // pane sizes to its content and there is nothing left to
+                // scroll.
+                v_flex()
                     .size_full()
-                    .overflow_y_scroll()
-                    .px_4()
-                    .py_3()
-                    .child(gpui_component::text::TextView::markdown(
-                        "editor-md-preview-body",
-                        markdown,
+                    .child(crate::ui::scrollbar::with_vertical_scrollbar(
+                        "editor-md-preview-scrollbar",
+                        div()
+                            .id("editor-md-preview")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&scroll)
+                            .px_4()
+                            .py_3()
+                            .child(gpui_component::text::TextView::markdown(
+                                "editor-md-preview-body",
+                                markdown,
+                            )),
+                        &scroll,
                     ))
                     .into_any_element()
             }

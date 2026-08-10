@@ -7,6 +7,7 @@ use crate::core::config::RightPanelTab;
 use crate::core::git::status::{DecoStatus, DirRollup, StatusIndex};
 use crate::terminal::git_data::index_of;
 use crate::ui::app::Tty7App;
+use crate::ui::file_copy;
 use crate::ui::host_ops::{ByHost, HostId, HostOps, InFlight, SharedHost, WatchSub};
 use crate::ui::host_registry::HostRegistry;
 use crate::ui::i18n::{L10nKey, t, t_fmt};
@@ -49,6 +50,36 @@ pub(crate) struct TreeRow {
     pub depth: usize,
     pub is_root: bool,
     pub expanded: bool,
+    /// Stands in for the children of `entry` when there are none to draw.
+    /// Without it, a directory still being listed, one that is genuinely empty,
+    /// one whose contents are all hidden, and one the OS refused to read all
+    /// render as the same nothing.
+    pub note: Option<TreeNote>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TreeNote {
+    Loading,
+    Empty,
+    HiddenOnly,
+    Unreadable,
+    /// The search stopped at `SEARCH_LIMIT`; the list is a prefix, not the
+    /// whole answer, and has to say so.
+    SearchCapped,
+}
+
+/// `landed` is how many entries the listing returned, or `None` when nothing
+/// has come back yet — which is the whole difference between "empty" and
+/// "still working". A non-zero count with no visible rows means the hidden
+/// filter took them all, and calling that "empty" is a lie the user can
+/// disprove with one keystroke.
+fn dir_note(unreadable: bool, landed: Option<usize>) -> TreeNote {
+    match (unreadable, landed) {
+        (true, _) => TreeNote::Unreadable,
+        (false, None) => TreeNote::Loading,
+        (false, Some(0)) => TreeNote::Empty,
+        (false, Some(_)) => TreeNote::HiddenOnly,
+    }
 }
 
 pub(crate) enum TreeEdit {
@@ -125,6 +156,10 @@ impl SearchState {
 pub(crate) struct FileTreeState {
     children: ByHost<PathBuf, Vec<TreeEntry>>,
     loads: InFlight<DirKey>,
+    /// Directories whose last listing came back as a failure rather than as an
+    /// empty result. `read_dir` used to be `unwrap_or_default()`ed, so a
+    /// permission-denied folder was indistinguishable from an empty one.
+    unreadable: HashSet<DirKey>,
     stale: HashSet<DirKey>,
     repo_roots: ByHost<PathBuf, PathBuf>,
     repo_root_loads: InFlight<DirKey>,
@@ -167,6 +202,7 @@ impl FileTreeState {
             watch_host: None,
             children: ByHost::default(),
             loads: InFlight::default(),
+            unreadable: HashSet::new(),
             stale: HashSet::new(),
             repo_roots: ByHost::default(),
             repo_root_loads: InFlight::default(),
@@ -320,8 +356,10 @@ impl FileTreeState {
                 let dir = dir.clone();
                 let root = root.clone();
                 move |h| {
-                    let entries = h.read_dir(&dir, Some(&root)).unwrap_or_default();
-                    entries
+                    let listing = h.read_dir(&dir, Some(&root));
+                    let readable = listing.is_ok();
+                    let entries = listing
+                        .unwrap_or_default()
                         .into_iter()
                         .map(|e| TreeEntry {
                             path: h.join(&dir, &e.name),
@@ -329,10 +367,16 @@ impl FileTreeState {
                             is_dir: e.is_dir,
                             ignored: e.ignored,
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    (readable, entries)
                 }
             },
-            move |app, entries, cx| {
+            move |app, (readable, entries), cx| {
+                if readable {
+                    app.file_tree.unreadable.remove(&key);
+                } else {
+                    app.file_tree.unreadable.insert(key.clone());
+                }
                 let landed = app.file_tree.land_load(&key, id, dir.clone(), entries);
                 if landed.changed {
                     cx.notify();
@@ -417,7 +461,8 @@ impl FileTreeState {
     }
 
     fn search_rows(&self) -> Vec<TreeRow> {
-        self.search
+        let mut rows: Vec<TreeRow> = self
+            .search
             .hits
             .iter()
             .map(|e| TreeRow {
@@ -425,8 +470,24 @@ impl FileTreeState {
                 depth: 0,
                 is_root: false,
                 expanded: false,
+                note: None,
             })
-            .collect()
+            .collect();
+        if rows.len() >= SEARCH_LIMIT {
+            rows.push(TreeRow {
+                entry: TreeEntry {
+                    name: String::new(),
+                    path: PathBuf::new(),
+                    is_dir: false,
+                    ignored: false,
+                },
+                depth: 0,
+                is_root: false,
+                expanded: false,
+                note: Some(TreeNote::SearchCapped),
+            });
+        }
+        rows
     }
 
     pub(crate) fn visible_rows(
@@ -451,6 +512,7 @@ impl FileTreeState {
                 depth: 0,
                 is_root: true,
                 expanded: true,
+                note: None,
             });
             self.flatten_dir(host, root, 1, expanded, &mut rows);
         }
@@ -466,22 +528,49 @@ impl FileTreeState {
         out: &mut Vec<TreeRow>,
     ) {
         let Some(entries) = self.children.get(host, &dir.to_path_buf()) else {
+            out.push(self.note_row(host, dir, depth, None));
             return;
         };
+        let mut shown = 0usize;
         for e in entries {
             if !self.show_hidden && e.name.starts_with('.') {
                 continue;
             }
+            shown += 1;
             let is_expanded = e.is_dir && expanded.contains(&e.path);
             out.push(TreeRow {
                 entry: e.clone(),
                 depth,
                 is_root: false,
                 expanded: is_expanded,
+                note: None,
             });
             if is_expanded {
                 self.flatten_dir(host, &e.path, depth + 1, expanded, out);
             }
+        }
+        if shown == 0 {
+            out.push(self.note_row(host, dir, depth, Some(entries.len())));
+        }
+    }
+
+    /// Why an expanded directory drew no children. `landed` is the number of
+    /// entries the listing actually returned, or `None` when nothing has landed
+    /// yet — that is the difference between "empty" and "still working".
+    fn note_row(&self, host: HostId, dir: &Path, depth: usize, landed: Option<usize>) -> TreeRow {
+        let key: DirKey = (host, dir.to_path_buf());
+        let note = dir_note(self.unreadable.contains(&key), landed);
+        TreeRow {
+            entry: TreeEntry {
+                name: String::new(),
+                path: dir.to_path_buf(),
+                is_dir: true,
+                ignored: false,
+            },
+            depth,
+            is_root: false,
+            expanded: false,
+            note: Some(note),
         }
     }
 
@@ -843,9 +932,14 @@ impl Tty7App {
         let Some(code) = self.tab_code() else {
             return;
         };
-        let rows = self
+        // Placeholder rows explain an absence; they are not files, so the
+        // cursor must not be able to land on one.
+        let rows: Vec<TreeRow> = self
             .file_tree
-            .visible_rows(host, &code.roots, &code.expanded);
+            .visible_rows(host, &code.roots, &code.expanded)
+            .into_iter()
+            .filter(|r| r.note.is_none())
+            .collect();
         if rows.is_empty() {
             return;
         }
@@ -1077,11 +1171,11 @@ impl Tty7App {
             PromptLevel::Warning,
             &t_fmt(L10nKey::FileTreeDeleteTitle, &[("name", &name)]),
             Some(detail),
-            &[t(L10nKey::Cancel), t(L10nKey::Delete)],
+            &crate::ui::confirm_answers(t(L10nKey::Delete), t(L10nKey::Cancel)),
             cx,
         );
         cx.spawn_in(window, async move |app, cx| {
-            let Ok(1) = answer.await else { return };
+            let Ok(0) = answer.await else { return };
             let _ = app.update_in(cx, |app, window, cx| {
                 let Some(host) = app.active_host(cx) else {
                     return;
@@ -1105,6 +1199,10 @@ impl Tty7App {
                     code.selected = None;
                 }
                 let target = path.clone();
+                // "Delete failed: Permission denied" leaves out the one thing
+                // you need in a tree of files, the same way "Save failed" used
+                // to in the editor.
+                let failed_name = name.clone();
                 HostOps::run_in(
                     host,
                     window,
@@ -1120,7 +1218,10 @@ impl Tty7App {
                                 HostOps::notify_err(
                                     window,
                                     cx,
-                                    t(L10nKey::FileTreeDeleteFailed),
+                                    &t_fmt(
+                                        L10nKey::FileTreeDeleteFailed,
+                                        &[("name", &failed_name)],
+                                    ),
                                     &e,
                                 );
                             }
@@ -1129,6 +1230,98 @@ impl Tty7App {
                     },
                 );
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Copy what was dropped on the tree into `dir`.
+    ///
+    /// The drop is the whole gesture: the panel does not ask where to put the
+    /// files, it puts them where the cursor was. The one question it does ask
+    /// is about replacing something already there, and that question is asked
+    /// before anything has been written.
+    fn file_tree_drop_paths(
+        &mut self,
+        sources: Vec<PathBuf>,
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tree_copy_into(sources, dir, false, window, cx);
+    }
+
+    fn file_tree_copy_into(
+        &mut self,
+        sources: Vec<PathBuf>,
+        dir: PathBuf,
+        overwrite: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        let Some(host) = self.active_host(cx) else {
+            return;
+        };
+        let id = host.id();
+        let asked_for = sources.clone();
+        let target = dir.clone();
+        HostOps::run_in(
+            host,
+            window,
+            cx,
+            move |h| file_copy::copy_into_dir(h, &sources, &target, overwrite),
+            move |app, report: file_copy::DropReport, window, cx| {
+                if !report.copied.is_empty() {
+                    app.file_tree.invalidate_dir(id, &dir);
+                }
+                if !report.conflicts.is_empty() {
+                    app.file_tree_confirm_replace(asked_for, dir, report.conflicts, window, cx);
+                } else if let Some((name, e)) = report.errors.first() {
+                    // One notification for the drop, not one per file: a folder
+                    // of unreadable files would otherwise bury the screen.
+                    let context = match report.errors.len() {
+                        1 => t_fmt(L10nKey::FileDropFailed, &[("name", name)]),
+                        n => t_fmt(
+                            L10nKey::FileDropFailedMany,
+                            &[("name", name), ("n", &(n - 1).to_string())],
+                        ),
+                    };
+                    HostOps::notify_err(window, cx, &context, e);
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn file_tree_confirm_replace(
+        &mut self,
+        sources: Vec<PathBuf>,
+        dir: PathBuf,
+        conflicts: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = match conflicts.as_slice() {
+            [one] => t_fmt(L10nKey::FileDropReplaceTitle, &[("name", one)]),
+            many => t_fmt(
+                L10nKey::FileDropReplaceManyTitle,
+                &[("n", &many.len().to_string())],
+            ),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(t(L10nKey::FileDropReplaceBody)),
+            &crate::ui::confirm_answers(t(L10nKey::FileDropReplace), t(L10nKey::Cancel)),
+            cx,
+        );
+        cx.spawn_in(window, async move |app, cx| {
+            let Ok(0) = answer.await else { return };
+            let _ = app.update_in(cx, |app, window, cx| {
+                app.file_tree_copy_into(sources, dir, true, window, cx);
             });
         })
         .detach();
@@ -1206,6 +1399,21 @@ impl Tty7App {
             }
             self.file_tree.visible_rows(host_id, &roots, &expanded)
         };
+        // A search that found nothing, and a tab with no directory behind it,
+        // both used to render as an empty column that looks identical to a
+        // tree still loading.
+        let blank = rows.is_empty().then(|| {
+            let text = match self.file_tree_searching(cx) {
+                true => t_fmt(L10nKey::SettingsNothingMatches, &[("query", &query)]),
+                false => t(L10nKey::OpenFileFromTree).to_string(),
+            };
+            div()
+                .px_3()
+                .py_4()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(text)
+        });
         let column = v_flex()
             .id("right-panel-tree-rows")
             .flex_1()
@@ -1218,10 +1426,25 @@ impl Tty7App {
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 this.file_tree_key_down(ev, window, cx);
             }))
+            .children(blank)
             .children(rows.iter().flat_map(|row| {
                 let deco = row_decoration(&decor, &row.entry);
                 self.render_tree_row(row, deco, window, cx)
-            }));
+            }))
+            // Everything the rows do not cover — the gap below the last one,
+            // and the whole column while the tree is still empty — belongs to
+            // the top of the tree. A row under the cursor wins: gpui hands a
+            // drop to the innermost target first, and it stops there.
+            .when_some(roots.first().cloned(), |d, root| {
+                d.drag_over::<ExternalPaths>(|s, _, _, cx| {
+                    s.bg(cx.theme().drag_border.opacity(0.06))
+                })
+                .on_drop(cx.listener(
+                    move |this, paths: &ExternalPaths, window, cx| {
+                        this.file_tree_drop_paths(paths.paths().to_vec(), root.clone(), window, cx);
+                    },
+                ))
+            });
         crate::ui::scrollbar::with_vertical_scrollbar(
             "right-panel-tree-scrollbar",
             column,
@@ -1266,6 +1489,58 @@ impl Tty7App {
         let is_dir = row.entry.is_dir;
         let selected = self.tab_code().and_then(|c| c.selected.as_deref()) == Some(&*path);
         let muted = cx.theme().muted_foreground;
+
+        // A placeholder standing in for children that are not there. Not a
+        // file, so it takes none of the row machinery below — no hover, no
+        // selection, no context menu, no drag. It does take a drop: it is
+        // drawn inside a folder and it is the only thing in an empty one, so
+        // letting it fall through to the root would put files somewhere the
+        // cursor never was.
+        if let Some(note) = row.note {
+            let (key, ink) = match note {
+                TreeNote::Loading => (L10nKey::TreeDirLoading, muted),
+                TreeNote::Empty => (L10nKey::TreeDirEmpty, muted),
+                TreeNote::HiddenOnly => (L10nKey::TreeDirHiddenOnly, muted),
+                TreeNote::Unreadable => (L10nKey::TreeDirUnreadable, cx.theme().danger),
+                TreeNote::SearchCapped => (L10nKey::TreeSearchCapped, muted),
+            };
+            return vec![
+                h_flex()
+                    // Aligned with the label column of a real row at this
+                    // depth: 6 for the row's own inset, INDENT for the depth,
+                    // then the width of the icon and its gap.
+                    .pl(px(6.0 + row.depth as f32 * INDENT + 20.0))
+                    .py_1()
+                    .items_center()
+                    .text_xs()
+                    .italic()
+                    .text_color(ink)
+                    .child(match note {
+                        TreeNote::SearchCapped => t_fmt(key, &[("n", &SEARCH_LIMIT.to_string())]),
+                        _ => t(key).to_string(),
+                    })
+                    // Every note but the capped-search one stands for a real
+                    // directory, and carries its path; that one stands for the
+                    // rest of a search and has nowhere to put anything.
+                    .when(!path.as_os_str().is_empty(), |d| {
+                        d.drag_over::<ExternalPaths>(|s, _, _, cx| {
+                            s.bg(cx.theme().drag_border.opacity(0.14))
+                        })
+                        .on_drop(cx.listener(
+                            move |this, paths: &ExternalPaths, window, cx| {
+                                this.file_tree_drop_paths(
+                                    paths.paths().to_vec(),
+                                    path.clone(),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        ))
+                    })
+                    .into_any_element(),
+            ];
+        }
+
         let sf = cx.global::<crate::ui::presets::Surfaces>().popover;
         let dirty = self
             .tab_code()
@@ -1366,11 +1641,25 @@ impl Tty7App {
                     cx.new(|_| DragGhost { name })
                 }
             })
+            // The other direction: files dropped on this row are copied in.
+            // A folder takes them itself; a file stands in for the folder it
+            // is in, which is where "put it next to this one" lands.
+            .drag_over::<ExternalPaths>(|s, _, _, cx| s.bg(cx.theme().drag_border.opacity(0.14)))
+            .on_drop(cx.listener({
+                let dir = match is_dir {
+                    true => path.clone(),
+                    false => path.parent().unwrap_or(&path).to_path_buf(),
+                };
+                move |this, paths: &ExternalPaths, window, cx| {
+                    this.file_tree_drop_paths(paths.paths().to_vec(), dir.clone(), window, cx);
+                }
+            }))
             .context_menu({
                 let app = cx.entity().downgrade();
                 let path = path.clone();
                 let is_root = row.is_root;
                 let show_hidden = self.file_tree.show_hidden;
+                let paths_are_local = self.spawn_host(cx).is_local();
                 move |menu, _window, cx| {
                     let danger = cx.theme().danger;
                     Self::tree_row_context_menu(
@@ -1379,6 +1668,7 @@ impl Tty7App {
                         is_dir,
                         is_root,
                         show_hidden,
+                        paths_are_local,
                         danger,
                         &app,
                     )
@@ -1415,6 +1705,12 @@ impl Tty7App {
         is_dir: bool,
         is_root: bool,
         show_hidden: bool,
+        // The tree lists whatever host the workspace spawns on. Everything else
+        // in this menu goes through that host; the file manager only knows this
+        // machine, so over SSH the item would hand Finder a path that is not
+        // here — silently opening nothing, or the wrong thing if a local path
+        // happens to collide.
+        paths_are_local: bool,
         danger: gpui::Hsla,
         app: &gpui::WeakEntity<Self>,
     ) -> PopupMenu {
@@ -1514,19 +1810,16 @@ impl Tty7App {
             );
         }
 
-        menu = menu
-            .separator()
-            .item(
-                PopupMenuItem::new(t(L10nKey::FileTreeContextCopyPath)).on_click({
-                    let p = p.clone();
-                    move |_, _window, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                            p.display().to_string(),
-                        ));
-                    }
-                }),
-            )
-            .item(
+        menu = menu.separator().item(
+            PopupMenuItem::new(t(L10nKey::FileTreeContextCopyPath)).on_click({
+                let p = p.clone();
+                move |_, _window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(p.display().to_string()));
+                }
+            }),
+        );
+        if paths_are_local {
+            menu = menu.item(
                 PopupMenuItem::new(crate::ui::right_panel::reveal_label()).on_click({
                     let p = p.clone();
                     move |_, _window, cx| {
@@ -1534,6 +1827,7 @@ impl Tty7App {
                     }
                 }),
             );
+        }
 
         menu = menu.separator().item(dotfiles_menu_item(show_hidden, app));
 
@@ -1744,6 +2038,24 @@ mod tests {
             is_dir,
             ignored: false,
         }
+    }
+
+    #[test]
+    fn an_expanded_directory_says_why_it_has_no_children() {
+        // Still in flight.
+        assert_eq!(dir_note(false, None), TreeNote::Loading);
+        // A listing that came back with nothing in it.
+        assert_eq!(dir_note(false, Some(0)), TreeNote::Empty);
+        // Entries landed, but the hidden filter took every one of them.
+        assert_eq!(dir_note(false, Some(3)), TreeNote::HiddenOnly);
+        // A directory the OS refused. `read_dir` used to be
+        // `unwrap_or_default`ed, so this was byte-identical to Empty.
+        assert_eq!(dir_note(true, Some(0)), TreeNote::Unreadable);
+        assert_eq!(
+            dir_note(true, None),
+            TreeNote::Unreadable,
+            "a known failure outranks a retry still in flight"
+        );
     }
 
     #[test]
@@ -2322,19 +2634,19 @@ mod render_idle_gpui_tests {
 
     const BUDGET: u64 = 200;
 
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn serial() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn scratch(name: &str) -> PathBuf {
+    pub(super) fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tty7-idle-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::canonicalize(&dir).unwrap()
     }
 
-    fn files_panel_on(
+    pub(super) fn files_panel_on(
         cx: &mut TestAppContext,
         root: &Path,
     ) -> (
@@ -2387,12 +2699,14 @@ mod render_idle_gpui_tests {
         (app, vcx, pane)
     }
 
-    fn rows(app: &Entity<Tty7App>, vcx: &mut VisualTestContext) -> usize {
+    pub(super) fn rows(app: &Entity<Tty7App>, vcx: &mut VisualTestContext) -> usize {
         app.update_in(vcx, |app, _, _| {
             let code = app.tab_code().expect("panel state");
             app.file_tree
                 .visible_rows(HostId::LOCAL, &code.roots, &code.expanded)
-                .len()
+                .iter()
+                .filter(|r| r.note.is_none())
+                .count()
         })
     }
 
@@ -2402,7 +2716,7 @@ mod render_idle_gpui_tests {
         });
     }
 
-    fn settle(app: &Entity<Tty7App>, vcx: &mut VisualTestContext, root: &Path) {
+    pub(super) fn settle(app: &Entity<Tty7App>, vcx: &mut VisualTestContext, root: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
             vcx.background_executor.run_until_parked();
@@ -2921,5 +3235,117 @@ mod render_idle_gpui_tests {
         });
         assert_eq!(left, 0, "the marked listing was re-read once it came back");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// The drop end of the panel, driven through the real app: the copy runs on a
+/// `HostOps` worker and the tree has to catch up with what it wrote.
+///
+/// What these cannot reach is the hit test — whether the row under the cursor
+/// is the one that gets the drop is decided by gpui's hitbox stack, and there
+/// is no headless way to put a cursor over a row.
+#[cfg(all(test, unix))]
+mod drop_gpui_tests {
+    use super::render_idle_gpui_tests::{files_panel_on, rows, scratch, serial, settle};
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    /// The copy runs on a `HostOps` worker — a real OS thread the test
+    /// executor does not own, so parking it proves nothing about whether the
+    /// worker is done. This waits for the result instead of assuming it.
+    fn wait_until(
+        vcx: &mut VisualTestContext,
+        what: &str,
+        mut done: impl FnMut(&mut VisualTestContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            vcx.background_executor.run_until_parked();
+            if done(vcx) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[gpui::test]
+    fn a_dropped_file_is_copied_in_and_shows_up_in_the_tree(cx: &mut TestAppContext) {
+        let _serial = serial();
+        let root = scratch("drop-lands");
+        let from = scratch("drop-source");
+        std::fs::write(from.join("note.txt"), "hello").unwrap();
+        let (app, mut vcx, _pane) = files_panel_on(cx, &root);
+        let before = rows(&app, &mut vcx);
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.file_tree_drop_paths(vec![from.join("note.txt")], root.clone(), window, cx);
+        });
+        wait_until(&mut vcx, "the copy never landed", |_| {
+            root.join("note.txt").exists()
+        });
+        settle(&app, &mut vcx, &root);
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(rows(&app, &mut vcx), before + 1, "the tree never caught up");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&from);
+    }
+
+    #[gpui::test]
+    fn a_drop_over_a_name_that_is_taken_asks_before_it_writes(cx: &mut TestAppContext) {
+        let _serial = serial();
+        let root = scratch("drop-conflict-no");
+        std::fs::write(root.join("note.txt"), "old").unwrap();
+        let from = scratch("drop-conflict-no-source");
+        std::fs::write(from.join("note.txt"), "new").unwrap();
+        let (app, mut vcx, _pane) = files_panel_on(cx, &root);
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.file_tree_drop_paths(vec![from.join("note.txt")], root.clone(), window, cx);
+        });
+        wait_until(&mut vcx, "it overwrote without asking", |vcx| {
+            vcx.has_pending_prompt()
+        });
+        vcx.simulate_prompt_answer(t(L10nKey::Cancel));
+        settle(&app, &mut vcx, &root);
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "old",
+            "answering no still replaced the file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&from);
+    }
+
+    #[gpui::test]
+    fn answering_yes_replaces_what_was_there(cx: &mut TestAppContext) {
+        let _serial = serial();
+        let root = scratch("drop-conflict-yes");
+        std::fs::write(root.join("note.txt"), "old").unwrap();
+        let from = scratch("drop-conflict-yes-source");
+        std::fs::write(from.join("note.txt"), "new").unwrap();
+        let (app, mut vcx, _pane) = files_panel_on(cx, &root);
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.file_tree_drop_paths(vec![from.join("note.txt")], root.clone(), window, cx);
+        });
+        wait_until(&mut vcx, "it never asked", |vcx| vcx.has_pending_prompt());
+        vcx.simulate_prompt_answer(t(L10nKey::FileDropReplace));
+        wait_until(&mut vcx, "the replacement never landed", |_| {
+            std::fs::read_to_string(root.join("note.txt")).is_ok_and(|s| s == "new")
+        });
+        settle(&app, &mut vcx, &root);
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "new"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&from);
     }
 }

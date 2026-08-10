@@ -107,6 +107,8 @@ actions!(
         RestartSshSession,
         SendTab,
         SendBackTab,
+        SwitcherAcross,
+        SwitcherAcrossBack,
         Quit
     ]
 );
