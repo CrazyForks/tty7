@@ -17,6 +17,12 @@ pub enum SessionPane {
         cwd: Option<PathBuf>,
         #[serde(default)]
         pane_id: Option<u64>,
+        /// The shell this pane was running. Without it a pane that has to be
+        /// respawned — its daemon restarted, or this is a cold start — comes
+        /// back on whatever the default shell is, which is how a bash pane
+        /// turns into a PowerShell one.
+        #[serde(default)]
+        shell: Option<crate::daemon::protocol::ShellSpec>,
         #[serde(default)]
         ssh_spec: Option<Box<NativeSshSpec>>,
         #[serde(default)]

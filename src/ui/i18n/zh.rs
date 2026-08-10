@@ -1406,12 +1406,6 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
              新面板会从你已有的历史开始，而不是一片空白；面板关闭时，它新增的部分会写回原来的历史文件，不会丢。\
              只对 tty7 能接管的 bash 和 zsh 面板生效；用你自己参数启动的 shell 不受影响。"
         }
-        L10nKey::SettingsPersistScrollback => "把面板输出留在磁盘上",
-        L10nKey::SettingsPersistScrollbackDescription => {
-            "后台服务如果没来得及交接就没了（崩溃、重启机器），面板回来时会显示原先的内容，而不是一片空白。\
-             进程无论如何都救不回来，这里恢复的只是画面。它会把每个面板输出的末尾（有上限）写到磁盘上，\
-             包括那里打印过的一切：token、`env` 的输出、agent 的对话记录。关掉则这些输出只存在于内存里。"
-        }
         L10nKey::PanelMoreChangedFiles => "…还有 {count} 个变更文件——运行 git diff 查看。",
         L10nKey::PanelMoreChangedFiles => "…还有 {count} 个变更文件——运行 `git diff` 查看。",
         L10nKey::ScmFilesChanged => "{count} 个文件改动",

@@ -111,10 +111,8 @@ fn machine_file(dir: &tempfile::TempDir) -> PathBuf {
 
 fn seed(pane: u64, cwd: &str) -> PaneSeed {
     PaneSeed {
-        pane,
         cwd: Some(cwd.to_string()),
-        ssh_spec: None,
-        agent: None,
+        ..PaneSeed::bare(pane)
     }
 }
 

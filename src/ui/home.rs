@@ -293,6 +293,7 @@ mod tests {
 
     fn leaf(cwd: Option<&str>) -> SessionPane {
         SessionPane::Leaf {
+            shell: None,
             cwd: cwd.map(PathBuf::from),
             pane_id: None,
             ssh_spec: None,

@@ -2539,14 +2539,6 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.restore_session = on);
     }
 
-    /// The daemon reads this from the config file on its own — it is the one
-    /// holding the output — so there is nothing to tell it here. Turning it off
-    /// also removes what was already stored, which the daemon does on its next
-    /// pass rather than leaving the bytes behind.
-    pub(crate) fn set_persist_scrollback(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.update_config(cx, |cfg| cfg.persist_scrollback = on);
-    }
-
     /// Takes effect on the next pane: a shell is told where its history lives
     /// when it starts, and nothing can move it afterwards.
     pub(crate) fn set_per_pane_history(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -6566,6 +6558,7 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
             SessionPane::Leaf {
                 cwd: spawn.working_directory.clone(),
                 pane_id: spawn.restore_pane,
+                shell: spawn.shell.clone(),
                 ssh_spec: None,
                 agent: spawn.agent,
                 agent_session_id: spawn.agent_session_id.clone(),
@@ -6577,6 +6570,11 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
             SessionPane::Leaf {
                 cwd: view.spawnable_cwd(),
                 pane_id: Some(view.pane_id),
+                // `None` for a pane this window attached to rather than
+                // spawned: it never knew what was on the other end. The tree
+                // does — the daemon records it — and that is what a restore
+                // reads, so the gap here costs nothing it can see.
+                shell: view.shell_spec(),
                 ssh_spec: view.ssh_spec(),
                 agent: view.agent(),
                 agent_session_id: view.agent_session().and_then(|s| s.session_id),
@@ -6597,6 +6595,7 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
         Pane::Empty => SessionPane::Leaf {
             cwd: None,
             pane_id: None,
+            shell: None,
             ssh_spec: None,
             agent: None,
             agent_session_id: None,
@@ -6634,7 +6633,26 @@ pub(crate) fn alive_panes_on(
     }
 }
 
-fn pane_attachable(
+/// Whether this window may stand on `id` — as the pane it attaches to, or as
+/// the dead predecessor whose screen a fresh pane opens showing.
+///
+/// Liveness deliberately does not come into it, and that is the whole point.
+/// A pane missing from the listing is usually one whose daemon has just
+/// restarted, which is exactly when its stored screen is worth asking for.
+/// Ruling the id out there threw away the only thing that could ask: the
+/// window spawned a pane that had never heard of a predecessor, so no attach
+/// was tried, no restore was requested, and the screen the daemon still had on
+/// disk was swept a tick later, unread.
+///
+/// There used to be a second predicate here that also required the id to be
+/// listed, and the attach site consulted it. Nothing does now: the attach is
+/// simply tried, and a pane that really is gone fails it and falls through to
+/// the fresh spawn — the same outcome the listing was consulted to predict,
+/// reached by asking the daemon instead of guessing ahead of it.
+///
+/// Ownership does come into it. Another workspace's pane is not this window's
+/// to attach to, and its screen is not this window's to show.
+fn pane_free_for(
     alive: Option<&std::collections::HashMap<u64, Option<String>>>,
     id: u64,
     owner: crate::core::session::WorkspaceId,
@@ -6647,7 +6665,7 @@ fn pane_attachable(
         return true;
     };
     match alive.get(&id) {
-        None => false,
+        None => true,
         Some(None) => true,
         Some(Some(recorded)) => {
             // Only a workspace id is a claim. Anything else is a client
@@ -6736,6 +6754,7 @@ fn session_to_pane(
         SessionPane::Leaf {
             cwd,
             pane_id,
+            shell,
             ssh_spec,
             agent,
             agent_session_id,
@@ -6745,7 +6764,10 @@ fn session_to_pane(
                 leaf_shares_the_window_daemon(workspace.is_some(), ssh_spec.is_some());
             let restore = match workspace.is_some() {
                 true => (*pane_id).filter(|_| same_daemon),
-                false => (*pane_id).filter(|id| same_daemon && pane_attachable(alive, *id, owner)),
+                // Not `pane_attachable`: a dead pane's id is what the restore
+                // is keyed on, so it has to survive being dead. The attach is
+                // still attempted first and still gives way to a fresh spawn.
+                false => (*pane_id).filter(|id| same_daemon && pane_free_for(alive, *id, owner)),
             };
             if restore.is_none() {
                 if let Some(spec) = ssh_spec.clone() {
@@ -6762,7 +6784,7 @@ fn session_to_pane(
                 font_size,
                 cwd.clone(),
                 restore,
-                None,
+                shell.clone(),
                 window,
                 cx,
             ) {
@@ -7362,7 +7384,7 @@ mod window_drag_tests {
 mod tests {
     use super::{
         CloseReason, TabAgentSession, clear_window_override_values, close_prompt,
-        leaf_shares_the_window_daemon, mru_order, pane_attachable, parse_ssh_connect_input,
+        leaf_shares_the_window_daemon, mru_order, pane_free_for, parse_ssh_connect_input,
         parse_ssh_option_words,
     };
 
@@ -7475,31 +7497,55 @@ mod tests {
         .collect();
 
         assert!(
-            pane_attachable(Some(&alive), 1, ours),
+            pane_free_for(Some(&alive), 1, ours),
             "our own pane attaches"
         );
         assert!(
-            !pane_attachable(Some(&alive), 2, ours),
+            !pane_free_for(Some(&alive), 2, ours),
             "another workspace's pane must spawn fresh instead"
         );
         assert!(
-            pane_attachable(Some(&alive), 3, ours),
+            pane_free_for(Some(&alive), 3, ours),
             "an unowned pane is legacy"
         );
         assert!(
-            pane_attachable(Some(&alive), 5, ours),
+            pane_free_for(Some(&alive), 5, ours),
             "an owner that names no workspace is not a rival's claim: older CLIs \
              wrote their own name there, and respawning strands the live pane"
         );
         assert!(
-            !pane_attachable(Some(&alive), 4, ours),
-            "a dead id never attaches"
-        );
-        assert!(
-            pane_attachable(None, 4, ours),
+            pane_free_for(None, 4, ours),
             "a failed List says nothing about pane 4; the attach itself must decide, \
              because respawning on a transient RPC error destroys a live session"
         );
+    }
+
+    #[test]
+    fn a_dead_pane_keeps_its_id_so_its_screen_can_be_asked_for() {
+        let ours = crate::core::session::WorkspaceId::new();
+        let theirs = crate::core::session::WorkspaceId::new();
+        let alive: std::collections::HashMap<u64, Option<String>> =
+            [(1, Some(ours.to_string())), (2, Some(theirs.to_string()))]
+                .into_iter()
+                .collect();
+
+        // The restart case: every pane the window held is missing from the new
+        // daemon's listing. Their ids are the only handle on the screens it
+        // still has stored, so being dead must not erase them — this is what
+        // made a restarted server come back to a row of blank shells.
+        assert!(
+            pane_free_for(Some(&alive), 4, ours),
+            "a dead pane's id has to survive; the restore is keyed on it"
+        );
+
+        // What being free does not mean: helping yourself to a pane that is
+        // alive and belongs to another workspace, whose screen is not this
+        // window's to show either.
+        assert!(
+            !pane_free_for(Some(&alive), 2, ours),
+            "another workspace's pane is not ours to restore from"
+        );
+        assert!(pane_free_for(Some(&alive), 1, ours), "our own pane is ours");
     }
 
     #[test]

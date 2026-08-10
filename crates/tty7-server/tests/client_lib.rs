@@ -137,6 +137,7 @@ fn seed(pane: u64) -> PaneSeed {
         cwd: Some("/home/me/proj".into()),
         ssh_spec: None,
         agent: None,
+        shell: None,
     }
 }
 

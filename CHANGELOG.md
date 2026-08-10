@@ -48,6 +48,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shows through the whole workspace, and the settings panel stays opaque.
   macOS and Linux keep the existing blur toggle.
 
+- **Panes come back showing what was on them after the background service dies
+  unexpectedly** — a crash, a `kill -9` or a reboot takes the shells with it
+  either way, but the screens no longer go with them. A capped tail of each
+  pane's output is kept at `<config>/scrollback/*.bin` (0600 on unix, behind
+  the config directory's ACL on Windows; 256 KiB per pane, written at most
+  every 30s and only for panes whose output moved), and a pane that reopens on
+  a dead predecessor's id is handed it. A planned restart already carried the
+  live ptys across untouched; this covers the deaths nothing gets to prepare
+  for. There is no switch: the moment anyone learns they wanted this is the
+  moment a service has already died, so it is on for everyone. The bytes are
+  dropped as soon as nothing can ask for them — closing a pane deletes its
+  file at once, a restore consumes it, and a periodic pass collects the rest.
+  A pane's shell is recorded alongside, so a git bash pane no longer comes
+  back as PowerShell.
+
 ### Fixed
 
 - **An SFTP upload no longer sits in the browser under its temporary name** —

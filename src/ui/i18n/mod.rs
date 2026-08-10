@@ -1226,8 +1226,6 @@ l10n_keys! {
     PaneRestoredScreenBanner,
     AppRestartServerBodyInPlace,
     SettingsDaemonStaleDescInPlace,
-    SettingsPersistScrollback,
-    SettingsPersistScrollbackDescription,
     SettingsPerPaneHistory,
     SettingsPerPaneHistoryDescription,
 }
