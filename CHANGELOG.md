@@ -162,19 +162,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cost is one aggregate request per tick — the same one `tty7 agents` makes
   once. (by @yetone in #248)
 
-- **An orchestration skill for Claude Code** — a switch under
-  **Settings → Agents** installs `~/.claude/skills/tty7-orchestration`, a
-  skill teaching a *primary* agent the whole delegation loop: open a worker
-  pane, send it one bounded task, `wait` on it, answer what it asks, collect
-  the result, close the pane. A skill rather than a global instruction on
-  purpose — an earlier cut appended this to `~/.claude/CLAUDE.md`, which
-  taxed every session's context window and, worse, encouraged *every* agent
-  to go orchestrate its neighbours. As a skill, only its one-line
-  description rides in context until something explicitly reaches for it,
-  and worker agents never inherit orchestration authority. The file carries
-  an ownership marker: uninstall removes a file tty7 wrote and refuses to
-  touch one it didn't, so a hand-written skill that happens to share the
-  directory name survives. (#248)
+- **An agent-facing skill for the CLI** — the repo carries
+  [`skills/tty7`](skills/tty7/SKILL.md), which teaches a coding agent the
+  verbs above: work out which pane it is sitting in, split one, send a task
+  into another, capture what came back, run a command in a real PTY and pass
+  its exit code through. You install it yourself, with
+  `npx skills add l0ng-ai/tty7` — tty7 writes nothing into `~/.claude` for
+  it, and there is no switch in Settings that does.
+
+  A skill rather than a global instruction, on purpose: an earlier cut
+  appended this guidance to `~/.claude/CLAUDE.md`, which taxed every
+  session's context window and, worse, encouraged *every* agent to go drive
+  its neighbours. As a skill, only its one-line description rides in context
+  until something explicitly reaches for it.
 
 - **Smooth scrolling for wheel mice** — a notch now eases into place over a
   handful of frames instead of jumping the whole distance at once.

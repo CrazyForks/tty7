@@ -73,19 +73,23 @@ tty7 agents --json   # the same, parseable
 
 If you are an agent yourself, you are in that list too.
 
-## The Claude Code skill
+## Teaching an agent to do this
 
-**Settings → Agents** has a switch that installs
-`~/.claude/skills/tty7-orchestration` — a skill teaching a *primary* Claude Code
-agent this whole delegation loop: open a worker pane, send it one bounded task,
-`wait` on it, answer what it asks, collect the result, close the pane.
+tty7 installs nothing into `~/.claude` for it — no switch in **Settings →
+Agents** writes a skill, and none ever will. What the agent needs to know ships
+in the repository instead, as a skill you install yourself:
 
-It is a skill rather than a global instruction on purpose. Only its one-line
-description rides in context until something reaches for it, and worker agents
-never inherit orchestration authority.
+```bash
+npx skills add l0ng-ai/tty7
+```
 
-Uninstalling removes the file tty7 wrote and refuses to touch one it did not, so
-a hand-written skill that happens to share the directory name survives.
+That covers the pane-driving half — where it is, how to open a pane, send into
+one, read one back, and the rules below — see [the agent
+skill](/cli/agent-skill). The `wait` step is documented on this page.
+
+A skill rather than a global instruction, on purpose: only its one-line
+description rides in context until something reaches for it, so an agent that
+never touches another pane pays nothing for it.
 
 ## Rules of the road
 
