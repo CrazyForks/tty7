@@ -500,6 +500,13 @@ mod wsl_tests {
 
     #[test]
     fn listing_the_distros_does_not_wait_on_the_wsl_service() {
+        // Only the registry answer is meant to be fast. When there is none the
+        // fallback to `wsl.exe` is doing exactly what it exists for, and timing
+        // it would fail this test on every machine without WSL installed.
+        if super::registered_wsl_distros().is_none() {
+            eprintln!("skipping: the registry has no distro list to read");
+            return;
+        }
         let started = std::time::Instant::now();
         let _ = super::wsl_distros();
         let elapsed = started.elapsed();
@@ -508,19 +515,49 @@ mod wsl_tests {
             "the listing went to `wsl.exe` after all: {elapsed:?}"
         );
     }
+
+    /// The list is what the shell menu offers, so a distro that cannot open a
+    /// pane must not be on it: `wsl -l -q`, which this replaced, only ever
+    /// listed installed ones.
+    #[test]
+    fn a_distro_that_is_not_installed_is_not_offered() {
+        let Some(guids) = super::registry_user_subkeys(super::LXSS) else {
+            eprintln!("skipping: the registry has no distro list to read");
+            return;
+        };
+        let half_installed: Vec<String> = guids
+            .iter()
+            .map(|guid| format!(r"{}\{guid}", super::LXSS))
+            .filter(|key| super::registry_user_dword(key, "State").is_some_and(|state| state != 1))
+            .filter_map(|key| super::registry_user_string(&key, "DistributionName"))
+            .collect();
+        if half_installed.is_empty() {
+            eprintln!("skipping: every registered distro finished installing");
+            return;
+        }
+        let offered = super::wsl_distros();
+        for name in &half_installed {
+            assert!(
+                !offered.contains(name),
+                "unfinished distro {name:?} was offered in {offered:?}"
+            );
+        }
+    }
 }
 
 pub fn wsl_distros() -> Vec<String> {
     wsl_distros_probed().unwrap_or_default()
 }
 
+/// Where `wsl.exe` registers what is installed: one subkey per distro, named by
+/// GUID, carrying `DistributionName` and `State`.
+#[cfg(windows)]
+const LXSS: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
+
 /// The distro `wsl.exe` launches when no `--distribution` is given, read from
 /// the registry (`Lxss\DefaultDistribution` names the per-distro key that
 /// carries `DistributionName`). The registry rather than `wsl -l`: this runs
 /// on the pane-spawn path, where a microsecond read beats a subprocess.
-#[cfg(windows)]
-const LXSS: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
-
 #[cfg(windows)]
 pub fn default_wsl_distro() -> Option<String> {
     let guid = registry_user_string(LXSS, "DefaultDistribution")?;
@@ -639,17 +676,44 @@ fn worth_offering(name: &str) -> bool {
 /// fragment of their own, so reading both would list them twice. Nothing ships
 /// tty7 anything, so we take them all; skipping them here would hide the most
 /// ordinary distro on an up-to-date machine.
+///
+/// `State` we do read, the way Terminal does: a distro is only offered while it
+/// says 1, "installed". An install that was interrupted — `wsl --install` shut
+/// down halfway, a failed `--import`, one being uninstalled right now — leaves
+/// the key behind with a name and some other state, and `wsl -l -q` (which this
+/// replaced) never listed those. Offering one puts a distro in the shell menu
+/// that can only open a pane that dies of a WSL registration error.
+///
+/// `None` means "could not tell", never "there is nothing": the caller falls
+/// back to `wsl.exe` on it, and a caller further up keeps the last good list.
 #[cfg(windows)]
 fn registered_wsl_distros() -> Option<Vec<String>> {
-    let names = registry_user_subkeys(LXSS)?
+    let guids = registry_user_subkeys(LXSS)?;
+    let names: Vec<String> = guids
         .iter()
-        .filter_map(|guid| registry_user_string(&format!(r"{LXSS}\{guid}"), "DistributionName"))
+        .map(|guid| format!(r"{LXSS}\{guid}"))
+        // A key with no `State` at all is taken at its word: the absent value
+        // is not evidence of a broken install, and inventing one would be how
+        // this hides a working distro.
+        .filter(|key| registry_user_dword(key, "State").unwrap_or(INSTALLED) == INSTALLED)
+        .filter_map(|key| registry_user_string(&key, "DistributionName"))
         .filter(|name| worth_offering(name))
         .collect();
+
+    // Subkeys but nothing to show for them is not an answer either: every name
+    // unreadable has the shape of a permissions problem, not of a machine with
+    // no distros on it — that machine has an empty `Lxss`, and says so.
+    if names.is_empty() && !guids.is_empty() {
+        return None;
+    }
     Some(names)
 }
 
-#[cfg(all(windows, test))]
+/// `State` of a distro that finished installing and has not started leaving.
+#[cfg(windows)]
+const INSTALLED: u32 = 1;
+
+#[cfg(windows)]
 fn registry_user_dword(subkey: &str, value: &str) -> Option<u32> {
     use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 
@@ -675,8 +739,16 @@ fn registry_user_dword(subkey: &str, value: &str) -> Option<u32> {
     (rc == 0).then_some(data)
 }
 
+/// The names of a key's subkeys, or `None` if they could not all be read.
+///
+/// All or nothing on purpose. The list this feeds is what the shell menu offers,
+/// and a caller that cannot tell a short list from a complete one would quietly
+/// drop distros: the walk is by index, so a key that changes underneath it —
+/// `wsl --unregister` running right now, a Store install rewriting `Lxss` —
+/// ends early, and reporting that as the answer is worse than admitting it.
 #[cfg(windows)]
 fn registry_user_subkeys(subkey: &str) -> Option<Vec<String>> {
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_ITEMS;
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
     };
@@ -692,6 +764,7 @@ fn registry_user_subkeys(subkey: &str) -> Option<Vec<String>> {
     let mut names = Vec::new();
     // A registry key name is at most 255 characters, plus the terminator.
     let mut buf = [0u16; 256];
+    let mut ended_with = None;
     for index in 0.. {
         let mut len = buf.len() as u32;
         // SAFETY: `buf` really is `len` units long, and every pointer that is
@@ -709,9 +782,7 @@ fn registry_user_subkeys(subkey: &str) -> Option<Vec<String>> {
             )
         };
         if rc != 0 {
-            // Anything other than success ends the walk — ERROR_NO_MORE_ITEMS
-            // in the ordinary case, and for a key that changed underneath us,
-            // stopping early beats reporting a half-read list as an error.
+            ended_with = Some(rc);
             break;
         }
         names.push(String::from_utf16_lossy(&buf[..len as usize]));
@@ -719,7 +790,11 @@ fn registry_user_subkeys(subkey: &str) -> Option<Vec<String>> {
 
     // SAFETY: `key` was opened above and is not used after this.
     unsafe { RegCloseKey(key) };
-    Some(names)
+    // There is one honest way for the walk to end. Anything else — the key
+    // deleted underneath it, a name that would not fit — leaves a list that is
+    // short by an unknown amount, which nobody downstream can tell from a real
+    // one, so say nothing instead.
+    (ended_with == Some(ERROR_NO_MORE_ITEMS)).then_some(names)
 }
 
 #[cfg(windows)]
@@ -728,9 +803,10 @@ fn list_wsl_distros() -> Option<Vec<String>> {
         return Some(registered);
     }
 
-    // The key would not open, so this is either not a machine with WSL on it or
-    // something stranger. Ask the slow way rather than claim there is nothing.
-    log::debug!("no {LXSS} key; falling back to `wsl -l -q`");
+    // The registry would not answer — no `Lxss` key at all, or a walk of it that
+    // ended somewhere other than the end. Either way this is not a "there are no
+    // distros" to pass on, so ask the slow way rather than claim there is nothing.
+    log::debug!("{LXSS} gave no usable answer; falling back to `wsl -l -q`");
     let mut cmd = std::process::Command::new("wsl.exe");
     cmd.args(["-l", "-q"]);
     let output = match crate::core::proc::output_within(
