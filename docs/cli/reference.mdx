@@ -19,7 +19,7 @@ Set inside every tty7 pane, inherited by anything launched from one.
 
 | Variable | Meaning |
 |---|---|
-| `TTY7_PANE` | This pane's id, e.g. `71` or `%71` (both accepted). Default target of `split`, `send`, `capture`, `procs`, `pane close`. |
+| `TTY7_PANE` | This pane's id, e.g. `71` or `%71` (both accepted). Default target of `split`, `send`, `capture`, `procs`, `wait`, `pane close`. |
 | `TTY7_WS` | This pane's workspace id. Default for `run --keep`, `tab new`, `ws tree`. |
 | `TTY7_CONFIG_DIR` | The server's config dir — how the CLI finds the right server. You never pass a socket path. |
 
@@ -42,6 +42,16 @@ with `"exit_code_known": false` in the JSON — that is how you tell a real 1 fr
 a stand-in.
 
 ## Top-level verbs
+
+### `tty7 [PATH]`
+
+No subcommand means the GUI. A running window is asked to come forward and open
+a tab at `PATH`; if none is registered, the app is launched instead.
+JSON: `{"path","delivered","launched"}` — `delivered` says an existing window
+took it, `launched` that a new process was started.
+
+Without `PATH` it just activates the app. `-m` is refused: this verb drives the
+GUI on *this* machine.
 
 ### `tty7 ls`
 
@@ -115,8 +125,10 @@ JSON: `{"procs":[{"pid","name","depth","foreground"}],"ports":[{"port","pid","na
 ### `tty7 agents`
 
 Every pane running a recognised coding agent. Table:
-`PANE AGENT STATUS MESSAGE`, status one of `running` / `waiting` / `idle`.
-JSON: `{"agents":[...]}`.
+`PANE AGENT STATUS MESSAGE`, status one of `idle` / `working` / `waiting` /
+`done`. JSON: `{"agents":[...]}`, plus a `"diagnostics"` array when an agent's
+status hook is missing or out of date — that is why an agent can be listed with
+a status that never moves.
 
 ### `tty7 wait [%PANE] [--until STATE,…] [--changed] [--timeout SECS] [--interval MS]`
 
@@ -164,7 +176,7 @@ candidates.
 | Command | Effect | JSON |
 |---|---|---|
 | `ws ls` | Every workspace | `{"workspaces":[...]}` |
-| `ws tree [WORKSPACE]` | One workspace as a tree: tabs, split axes and ratios, panes with cwds | The whole workspace object: `{"id","name","last_active","tabs":[{"id","name","sidebar_group","root",…}]}` |
+| `ws tree [WORKSPACE]` | One workspace as a tree: tabs, split axes and ratios, panes with cwds | The whole workspace object: `{"id","name","last_active","active_tab","tabs":[{"id","name","sidebar_group","root",…}]}` |
 | `ws new [NAME]` | An empty workspace (no tab, no pane) | `{"id","name"}` |
 | `ws rename WORKSPACE NAME` | Name or rename | `{"id","name"}` |
 | `ws rm WORKSPACE` | Delete the workspace | `{"removed"}` |
@@ -217,9 +229,9 @@ a stand-in.
 | `pane close [%PANE]` | Close the pane; its shell is hung up | `{"closed"}` |
 
 `--all` is the one that shows leaks. Each entry is
-`{"pane","workspace","orphan","owner","title","cwd","live"}`: `owner` is
-`tty7-cli` for panes this CLI spawned, and `orphan: true` means no workspace
-holds it. An interrupted `run` and a removed workspace both leave orphans here.
+`{"pane","workspace","orphan","owner","title","cwd","live"}`: `owner` is the id
+of the workspace that owns the pane, and `orphan: true` means no workspace holds
+it. An interrupted `run` and a removed workspace both leave orphans here.
 
 `title` is usually the running command — `claude`, `nvim`, `cargo` — which makes
 `pane ls --all --json` a quick way to find "the pane running X".
@@ -250,4 +262,3 @@ These parse and then exit 1 with an explanation:
 
 - `ws stop` — the control dialect has no workspace-stop request yet
 - `machine connect` / `machine disconnect` — use the GUI's connection manager
-- bare `tty7 <path>` (launch or focus the GUI)
