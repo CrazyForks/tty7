@@ -224,6 +224,11 @@ l10n_keys! {
     SettingsImportAliases,
     SettingsImportAliasesDesc,
     SettingsImportNow,
+    SettingsImportUnreadable,
+    SettingsImportNoHosts,
+    SettingsImportSummary,
+    SettingsImportIgnored,
+    SettingsImportMoreOptions,
     SettingsDefaultsIntro,
     SettingsCopyAddress,
     SettingsDuplicate,
@@ -2004,6 +2009,8 @@ mod tests {
     fn plural_and_select_branches_are_translated() {
         let plural_keys = [
             L10nKey::SettingsAliasesLinked,
+            L10nKey::SettingsImportSummary,
+            L10nKey::SettingsImportIgnored,
             L10nKey::SettingsRulesOpenedWithConnection,
             L10nKey::SettingsOfflineMachines,
             L10nKey::PanelMoreChangedFiles,
