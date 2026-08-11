@@ -742,6 +742,15 @@ async fn restart_server(
     }
 }
 
+/// Prove (or recall) where this distro's server is, off the reactor — the probe
+/// is a chain of blocking `wsl.exe` calls the first time round.
+async fn ensure_wsl_server(distro: &str, setup: &RouteSetup) -> anyhow::Result<String> {
+    let distro = distro.to_string();
+    Ok(setup
+        .blocking(move || crate::daemon::install::wsl::ensure_wsl_server(&distro))
+        .await??)
+}
+
 async fn open_link(
     header: &RouteHeader,
     setup: &RouteSetup,
@@ -754,25 +763,32 @@ async fn open_link(
             Ok((link, Some(conn)))
         }
         RouteTarget::Wsl { distro } => {
-            let resolved = match header.server_command {
-                Some(_) => None,
-                None => {
-                    let distro = distro.clone();
-                    Some(
-                        setup
-                            .blocking(move || {
-                                crate::daemon::install::wsl::ensure_wsl_server(&distro)
-                            })
-                            .await??,
-                    )
+            if let Some(command) = header.server_command.as_deref() {
+                let link = RemoteLink::wsl_shell(distro, command, setup.channel)?;
+                return Ok((link, None));
+            }
+
+            let binary = ensure_wsl_server(distro, setup).await?;
+            match RemoteLink::wsl(distro, &binary, setup.channel) {
+                Ok(link) => Ok((link, None)),
+                // `ensure_wsl_server` answers from memory after the first pane,
+                // and the note it kept can be wrong in exactly one way: the
+                // binary is no longer at that path (the distro was reinstalled,
+                // someone cleaned the directory out). Starting the bridge is
+                // what finds out, so pay the full probe once more rather than
+                // fail a pane over a stale path — but only once, or a distro
+                // that genuinely cannot run it would loop.
+                Err(stale) => {
+                    log::info!(
+                        "wsl:{distro}: the remembered server would not start ({stale}); \
+                         looking again"
+                    );
+                    crate::daemon::install::wsl::forget_wsl_server(distro);
+                    let binary = ensure_wsl_server(distro, setup).await?;
+                    let link = RemoteLink::wsl(distro, &binary, setup.channel)?;
+                    Ok((link, None))
                 }
-            };
-            let link = match (header.server_command.as_deref(), resolved.as_deref()) {
-                (Some(command), _) => RemoteLink::wsl_shell(distro, command, setup.channel)?,
-                (None, Some(binary)) => RemoteLink::wsl(distro, binary, setup.channel)?,
-                (None, None) => unreachable!("resolved is Some whenever there is no override"),
-            };
-            Ok((link, None))
+            }
         }
         RouteTarget::LocalStdio { program, args } => {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
