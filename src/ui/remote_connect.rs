@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use gpui::{App, AppContext as _, BorrowAppContext as _, Global};
 
 use crate::core::config::Config;
-use crate::core::session::{RemoteTarget, WorkspaceId};
+use crate::core::session::{RemoteRef, RemoteTarget, WorkspaceId};
 use crate::daemon::control::{ControlHello, ControlRequest, ReplyOk};
 use crate::daemon::install::{
     InstallConfirm, InstallDecision, InstallPhase, InstallProgress, InstallRequest,
@@ -37,11 +37,7 @@ pub fn available_hosts(cx: &App) -> Vec<HostChoice> {
         seen.push(profile.name.clone());
         out.push(HostChoice {
             detail: endpoint_label(&profile.user, &profile.host, profile.port),
-            label: if profile.name.trim().is_empty() {
-                profile.host.clone()
-            } else {
-                profile.name.clone()
-            },
+            label: profile_label(profile),
             target,
         });
     }
@@ -68,12 +64,76 @@ pub fn available_hosts(cx: &App) -> Vec<HostChoice> {
     out
 }
 
-pub fn label_for(target: &RemoteTarget, cx: &App) -> String {
-    available_hosts(cx)
+/// A label for a bare target when no route snapshot is at hand (a pane's
+/// `PaneWorkspace` carries only the target): the live listing while it
+/// exists, the target's own spelling when that is human-readable, and the
+/// deleted-profile placeholder for the bare-UUID case (#485).
+pub fn target_label(cx: &App, target: &RemoteTarget) -> String {
+    if let Some(choice) = available_hosts(cx)
         .into_iter()
-        .find(|host| host.target == *target)
-        .map(|host| host.label)
-        .unwrap_or_else(|| target.to_string())
+        .find(|h| h.target == *target)
+    {
+        return choice.label;
+    }
+    match target {
+        RemoteTarget::Profile { .. } => t(L10nKey::RemoteProfileGone).to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether a route can still be turned into a connection: a `Profile` target
+/// dangles once the profile leaves the config, an `Alias` once the name
+/// leaves `~/.ssh/config` (#485). The route supervisor asks this four times a
+/// second; the alias half is mtime-cached in `ssh_config`.
+pub fn route_resolvable(cx: &App, target: &RemoteTarget) -> bool {
+    target.resolvable(&cx.global::<Config>().ssh_profiles, |alias| {
+        crate::core::ssh_config::alias_still_resolves(alias)
+    })
+}
+
+/// The name a route entry answers to: the live listing while the route still
+/// exists, then the remembered snapshot, and — for a profile entry saved
+/// before snapshots existed — a placeholder, but never the bare profile UUID
+/// (#485).
+pub fn route_label(cx: &App, host: &RemoteRef) -> String {
+    match live_label(cx, &host.target) {
+        Some(label) => label,
+        None => host.route_label(t(L10nKey::RemoteProfileGone)),
+    }
+}
+
+/// What the live config calls a target, reading memory only. Deliberately not
+/// `available_hosts`: `route_label` runs on the render path of every remote
+/// window (the workspace strip), and that listing re-reads `~/.ssh/config`
+/// off the disk. The two targets it answers are the two whose name lives
+/// somewhere other than the target itself; the rest spell themselves the same
+/// way the listing labels them, so falling through costs nothing.
+fn live_label(cx: &App, target: &RemoteTarget) -> Option<String> {
+    match target {
+        RemoteTarget::Profile { id } => cx
+            .global::<Config>()
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == *id)
+            .map(profile_label),
+        RemoteTarget::Wsl { .. } => wsl_hosts(cx)
+            .into_iter()
+            .find(|h| h.target == *target)
+            .map(|h| h.label),
+        RemoteTarget::Alias { .. }
+        | RemoteTarget::Direct { .. }
+        | RemoteTarget::LocalStdio { .. } => None,
+    }
+}
+
+/// What a profile calls itself in a host listing: its name, or the address
+/// when it was saved without one.
+fn profile_label(profile: &crate::core::ssh_profile::SshProfile) -> String {
+    if profile.name.trim().is_empty() {
+        profile.host.clone()
+    } else {
+        profile.name.clone()
+    }
 }
 
 pub fn filter_hosts(hosts: &[HostChoice], query: &str) -> Vec<HostChoice> {

@@ -3452,19 +3452,37 @@ impl Tty7App {
     }
 
     pub(crate) fn delete_profile(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(name) = cx
+        let Some(profile) = cx
             .global::<Config>()
             .ssh_profiles
             .iter()
             .find(|p| p.id == id)
-            .map(|p| p.name.clone())
+            .cloned()
         else {
             return;
         };
+        let name = profile.name.clone();
+        // The entries routing through this profile are forgotten along with
+        // it (#485) — say so up front, naming the endpoint: once the profile
+        // is gone, its address is the part nobody can reproduce (the route
+        // origins are in-memory, the keychain entry goes too). Entries with
+        // a live or in-flight link are excluded, and nothing is ever sent to
+        // the machine — the remote sessions keep running.
+        let cascade = crate::ui::windows::cascade_for_profile(cx, id);
+        let mut body = t(L10nKey::SettingsDeleteProfileBody).to_string();
+        if !cascade.is_empty() {
+            let endpoint = crate::core::session::RouteSnapshot::of_profile(&profile).endpoint();
+            body.push(' ');
+            body.push_str(&t_plural(
+                L10nKey::SettingsDeleteProfileCascade,
+                cascade.len(),
+                &[("endpoint", endpoint.as_str())],
+            ));
+        }
         let answer = window.prompt(
             gpui::PromptLevel::Warning,
             &t_fmt(L10nKey::FileTreeDeleteTitle, &[("name", &name)]),
-            Some(t(L10nKey::SettingsDeleteProfileBody)),
+            Some(&body),
             &crate::ui::confirm_answers(t(L10nKey::Delete), t(L10nKey::Cancel)),
             cx,
         );
@@ -3517,6 +3535,17 @@ impl Tty7App {
             };
             let account = crate::core::keychain::key_account_from_contents(&bytes);
             let _ = OsCredentialStore.delete_key_passphrase(&account);
+        }
+
+        // Forget the entries that routed through this profile (#485) —
+        // forgotten, not deleted: `forget_workspace` never sends
+        // `WorkspaceRemove`, so the remote sessions keep running and a new
+        // profile to the same machine rediscovers them. Recomputed here
+        // rather than carried from the prompt: the set can only have shrunk
+        // (a new live link) while the dialog was up.
+        let cascade = crate::ui::windows::cascade_for_profile(cx, id);
+        for workspace in cascade {
+            crate::ui::windows::forget_workspace(cx, workspace);
         }
         self.update_config(cx, |cfg| {
             cfg.ssh_profiles.retain(|p| p.id != id);

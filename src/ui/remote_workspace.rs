@@ -44,6 +44,10 @@ pub enum RemoteStatus {
         by: String,
     },
     Failed(String),
+    /// The route itself is gone — the profile was deleted or the alias left
+    /// the ssh config — so no reconnect can ever succeed (#485). Parked: no
+    /// retry button, just the truth plus the way back.
+    RouteLost,
 }
 
 impl RemoteStatus {
@@ -87,6 +91,10 @@ impl RemoteStatus {
                 L10nKey::RemoteStripFailed,
                 &[("machine", machine), ("error", e)],
             )),
+            RemoteStatus::RouteLost => Some(t_fmt(
+                L10nKey::RemoteStripRouteLost,
+                &[("machine", machine)],
+            )),
         }
     }
 
@@ -105,6 +113,9 @@ impl RemoteStatus {
             RemoteStatus::Preempted { .. } => Some(t(L10nKey::RemoteActionTakeBack)),
             RemoteStatus::Disconnected => Some(t(L10nKey::RemoteActionConnect)),
             RemoteStatus::Failed(_) => Some(t(L10nKey::RemoteActionRetry)),
+            // A retry on a dead route fails deterministically; the switcher
+            // row carries the honest actions (forget the entry, or dismiss).
+            RemoteStatus::RouteLost => None,
         }
     }
 
@@ -237,7 +248,7 @@ impl Tty7App {
 
     pub(crate) fn remote_machine_label(&self, cx: &gpui::App) -> String {
         match WorkspaceStore::remote_ref(cx, self.workspace) {
-            Some(host) => host.target.to_string(),
+            Some(host) => remote_connect::route_label(cx, &host),
             None => t(L10nKey::RemoteThisComputer).to_string(),
         }
     }
@@ -292,7 +303,8 @@ impl Tty7App {
     pub(crate) fn remote_status(&self, cx: &gpui::App) -> Option<RemoteStatus> {
         let own = WorkspaceStore::remote_ref(cx, self.workspace)?;
         let supervised = RemoteLinks::status_of(cx, self.workspace);
-        resolve_status(self.connect.as_ref(), &own.target, supervised)
+        let resolvable = remote_connect::route_resolvable(cx, &own.target);
+        resolve_status(self.connect.as_ref(), &own.target, supervised, resolvable)
     }
 
     pub(crate) fn remote_retry(&mut self, cx: &mut Context<Self>) {
@@ -772,6 +784,7 @@ fn resolve_status(
     connect: Option<&ConnectFlow>,
     own: &RemoteTarget,
     supervised: Option<RemoteStatus>,
+    route_resolvable: bool,
 ) -> Option<RemoteStatus> {
     let mine = connect.filter(|flow| flow.choice().is_some_and(|c| &c.target == own));
     if matches!(
@@ -779,6 +792,13 @@ fn resolve_status(
         Some(RemoteStatus::Attached | RemoteStatus::Preempted { .. })
     ) {
         return supervised;
+    }
+    // A route that no longer resolves parks the workspace (#485): nothing it
+    // could try would ever succeed, so say that instead of retrying. A live
+    // or preempted link outranks it — those panes work regardless of what
+    // happened to the profile that made them.
+    if !route_resolvable {
+        return Some(RemoteStatus::RouteLost);
     }
     match mine {
         Some(ConnectFlow::Connecting { .. }) => Some(RemoteStatus::Connecting),
@@ -1105,9 +1125,20 @@ fn pump_tick(cx: &mut gpui::App) -> bool {
             continue;
         }
 
+        // A route that no longer resolves — the profile was deleted, or the
+        // alias left the ssh config — can only fail, deterministically and
+        // forever (#485). Park the entry: drop any dead link state, but no
+        // backoff, no attempt, no error. Its label comes from the route
+        // snapshot, and the switcher offers to forget it.
+        let resolvable = remote_connect::route_resolvable(cx, &target);
         if remote_connect::HostLinks::get(cx, host).is_some() {
             remote_connect::HostLinks::remove(cx, host);
-            log::info!("lost the control connection to {target}; reconnecting");
+            if resolvable {
+                log::info!("lost the control connection to {target}; reconnecting");
+            }
+        }
+        if !resolvable {
+            continue;
         }
 
         let due = {
@@ -1285,6 +1316,19 @@ fn prune_suspended(
     bound: &[(HostId, RemoteTarget)],
 ) {
     suspended.retain(|host| bound.iter().any(|(id, _)| id == host));
+}
+
+/// Does this machine's entry survive a profile deletion (#485)? A live link
+/// or an in-flight attempt does: the connection holds an authenticated spec,
+/// not a profile reference, and forgetting the entry would release the link
+/// under any window still attached to it.
+pub(crate) fn link_alive_or_connecting(cx: &mut gpui::App, host: HostId) -> bool {
+    if remote_connect::HostLinks::get(cx, host).is_some() {
+        return true;
+    }
+    cx.try_global::<RemoteLinks>()
+        .and_then(|links| links.machines.get(&host))
+        .is_some_and(|link| link.attempting || matches!(link.state, LinkState::Connecting))
 }
 
 fn bound_machines(cx: &gpui::App) -> Vec<(HostId, RemoteTarget)> {
@@ -2179,7 +2223,7 @@ mod tests {
         let flow = failed_flow("build-box");
 
         assert_eq!(
-            resolve_status(Some(&flow), &target, Some(RemoteStatus::Attached)),
+            resolve_status(Some(&flow), &target, Some(RemoteStatus::Attached), true),
             Some(RemoteStatus::Attached),
             "the supervisor got through; the failure the window remembers is over"
         );
@@ -2189,7 +2233,8 @@ mod tests {
                 &target,
                 Some(RemoteStatus::Preempted {
                     by: "desktop".into()
-                })
+                }),
+                true
             ),
             Some(RemoteStatus::Preempted {
                 by: "desktop".into()
@@ -2197,9 +2242,53 @@ mod tests {
             "being displaced is news the failed connect cannot answer for"
         );
         assert_eq!(
-            resolve_status(Some(&flow), &target, Some(RemoteStatus::Disconnected)),
+            resolve_status(Some(&flow), &target, Some(RemoteStatus::Disconnected), true),
             Some(RemoteStatus::Failed("no route to host".into())),
             "with nothing better on offer the window's own failure still stands"
+        );
+    }
+
+    #[test]
+    fn a_route_that_no_longer_resolves_parks_the_workspace() {
+        // #485: the profile is gone, so retrying is pointless — but a link
+        // that is up, or one someone else has taken, still outranks it: those
+        // panes work no matter what happened to the profile that made them.
+        let (_, target) = machine("build-box");
+        let flow = failed_flow("build-box");
+
+        assert_eq!(
+            resolve_status(
+                Some(&flow),
+                &target,
+                Some(RemoteStatus::Disconnected),
+                false
+            ),
+            Some(RemoteStatus::RouteLost),
+            "nothing it could try would succeed, so say that instead of retrying"
+        );
+        assert_eq!(
+            resolve_status(None, &target, None, false),
+            Some(RemoteStatus::RouteLost),
+            "with no connect flow of its own either"
+        );
+        assert_eq!(
+            resolve_status(Some(&flow), &target, Some(RemoteStatus::Attached), false),
+            Some(RemoteStatus::Attached),
+            "a live link outranks a lost route"
+        );
+        assert_eq!(
+            resolve_status(
+                Some(&flow),
+                &target,
+                Some(RemoteStatus::Preempted {
+                    by: "desktop".into()
+                }),
+                false
+            ),
+            Some(RemoteStatus::Preempted {
+                by: "desktop".into()
+            }),
+            "so does being displaced — that is news a lost route cannot answer for"
         );
     }
 
@@ -2209,11 +2298,11 @@ mod tests {
         let flow = failed_flow("gpu-lab");
 
         assert_eq!(
-            resolve_status(Some(&flow), &target, Some(RemoteStatus::Attached)),
+            resolve_status(Some(&flow), &target, Some(RemoteStatus::Attached), true),
             Some(RemoteStatus::Attached)
         );
         assert_eq!(
-            resolve_status(Some(&flow), &target, Some(RemoteStatus::Disconnected)),
+            resolve_status(Some(&flow), &target, Some(RemoteStatus::Disconnected), true),
             Some(RemoteStatus::Disconnected),
             "a window on the build box has no business showing the GPU box's error"
         );

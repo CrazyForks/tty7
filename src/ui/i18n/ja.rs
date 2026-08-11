@@ -229,6 +229,11 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsDeleteProfileBody => {
             "保存されたパスワードも一緒に削除されます。同じアドレスを使う接続が他にある場合は残ります。"
         }
+        L10nKey::SettingsDeleteProfileCascade => {
+            "{endpoint} を参照しているリモートワークスペースのエントリが {count} 件あり、\
+             プロファイルと一緒にこのコンピュータから削除されます。リモートマシン上のセッションは\
+             維持され、新しいプロファイルで接続すればワークスペース一覧に再表示されます。"
+        }
         L10nKey::SettingsCouldntForgetPassword => {
             "{endpoint} のパスワードを消去できませんでした: {error}"
         }
@@ -1177,16 +1182,23 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::RemoteStripPreempted => "このワークスペースは {by} で開かれました",
         L10nKey::RemoteStripFailed => "{machine} に未接続です — {error}",
+        L10nKey::RemoteStripRouteLost => "{machine} の接続設定は存在しません — 再接続できません",
+        L10nKey::RemoteRouteParkedHint => {
+            "接続設定が存在しないため、自動再接続しません。リモートのセッションは残っています — \
+             新しいプロファイルでこのマシンに接続すると、ワークスペース一覧に再表示されます。"
+        }
         L10nKey::RemoteNoticePreempted => "別の場所で開かれました — 入力しても反映されません",
         L10nKey::RemoteNoticeDisconnected => "未接続です — 入力しても反映されません",
         L10nKey::RemoteActionRetryNow => "今すぐ再試行",
         L10nKey::RemoteActionTakeBack => "取り戻す",
         L10nKey::RemoteActionConnect => "接続",
         L10nKey::RemoteActionRetry => "再試行",
+        L10nKey::RemoteActionRemoveEntry => "エントリを削除",
         L10nKey::RemoteNoConnectionDetails => {
             "このウィンドウは {machine} 上のワークスペースですが、tty7 には接続情報がありません。SSH プロファイルか ~/.ssh/config に項目があるか確認してください"
         }
         L10nKey::RemoteThisComputer => "このコンピュータ",
+        L10nKey::RemoteProfileGone => "削除されたプロファイル",
         L10nKey::RemoteRestartTitle => "「{machine}」上の tty7 サーバーを再起動しますか？",
         L10nKey::RemoteRestartBody => {
             "これにより {machine} 上のすべてのシェルが停止します。表示されていないものも含め、実行中のものはすべて終了します。ワークスペースとレイアウトは保持され、新しいシェルで開きます"
@@ -1681,6 +1693,16 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
 
 pub fn translate_variant_ja(key: L10nKey, branch: &'static str) -> Option<&'static str> {
     let res = match (key, branch) {
+        (L10nKey::SettingsDeleteProfileCascade, "one") => {
+            "{endpoint} を参照しているリモートワークスペースのエントリが 1 件あり、\
+             プロファイルと一緒にこのコンピュータから削除されます。リモートマシン上のセッションは\
+             維持され、新しいプロファイルで接続すればワークスペース一覧に再表示されます。"
+        }
+        (L10nKey::SettingsDeleteProfileCascade, "other") => {
+            "{endpoint} を参照しているリモートワークスペースのエントリが {count} 件あり、\
+             プロファイルと一緒にこのコンピュータから削除されます。リモートマシン上のセッションは\
+             維持され、新しいプロファイルで接続すればワークスペース一覧に再表示されます。"
+        }
         (L10nKey::SettingsAliasesLinked, "zero") => "エイリアスはまだリンクされていません",
         (L10nKey::SettingsAliasesLinked, "one") => "エイリアス 1 件がリンクされています",
         (L10nKey::SettingsAliasesLinked, "other") => "エイリアス {count} 件がリンクされています",
