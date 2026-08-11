@@ -586,28 +586,49 @@ fn install_lock(distro: &str) -> Arc<Mutex<()>> {
 ///   below us without anyone asking.
 ///
 /// What is left is a path that could stop existing: the distro reinstalled, the
-/// binary deleted by hand. Spawning the bridge is what discovers that, so the
-/// router forgets the distro when the bridge will not start and proves it again
-/// from scratch. See `forget_wsl_server`.
-static READY: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// binary deleted by hand. Only the bridge discovers that, and only once it is
+/// running — so the router forgets the distro when a bridge dies without ever
+/// answering, and the pane after that proves it again. See `forget_wsl_server`.
+static READY: Mutex<Vec<(String, Proved)>> = Mutex::new(Vec::new());
 
-fn remembered(distro: &str) -> Option<String> {
+#[derive(Clone)]
+struct Proved {
+    binary: String,
+    /// The build mismatch the probe found, if it found one.
+    ///
+    /// Kept because the warning is produced inside `Installer::run`, and the
+    /// whole point of the note is that `run` does not happen again: without
+    /// this, only the first pane of the daemon's lifetime would ever hear that
+    /// a different build is serving the distro, and every window opened after
+    /// it — including a whole new GUI session, since the daemon outlives one —
+    /// would attach in silence.
+    mismatch: Option<super::MismatchedRemoteDaemon>,
+}
+
+fn remembered(distro: &str) -> Option<Proved> {
     READY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
         .find(|(d, _)| d == distro)
-        .map(|(_, binary)| binary.clone())
+        .map(|(_, proved)| proved.clone())
 }
 
-fn remember(distro: &str, binary: &str) {
+fn remember(distro: &str, proved: Proved) {
     let mut ready = READY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     match ready.iter_mut().find(|(d, _)| d == distro) {
-        Some((_, known)) => *known = binary.to_string(),
-        None => ready.push((distro.to_string(), binary.to_string())),
+        Some((_, known)) => *known = proved,
+        None => ready.push((distro.to_string(), proved)),
     }
+}
+
+/// Where this distro's server was last proved to be, or `None` if the next pane
+/// would have to go and ask. A hint for callers deciding whether a failure is
+/// worth re-proving; the answer itself comes from `ensure_wsl_server`.
+pub fn remembered_wsl_server(distro: &str) -> Option<String> {
+    remembered(distro).map(|proved| proved.binary)
 }
 
 /// Drop what we thought we knew about a distro, so the next `ensure_wsl_server`
@@ -621,16 +642,22 @@ pub fn forget_wsl_server(distro: &str) {
 
 pub fn ensure_wsl_server(distro: &str) -> io::Result<String> {
     validate_distro(distro)?;
-    if let Some(binary) = remembered(distro) {
-        return Ok(binary);
-    }
 
+    // Under the lock even when the answer is only going to be read, because the
+    // note names a file that `replace_wsl_server` is in the business of moving:
+    // reading it outside would let a pane spawn the very binary a replace is
+    // deleting. The lock is uncontended except during an install, and waiting
+    // for an install to finish is what a pane wants to do anyway.
     let lock = install_lock(distro);
     let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Someone may have proved it while this thread queued for the lock — which
-    // is exactly what happens when a window restores several panes at once.
-    if let Some(binary) = remembered(distro) {
-        return Ok(binary);
+    if let Some(proved) = remembered(distro) {
+        // Re-file the warning rather than re-run the probe that found it: this
+        // route's sink is a fresh one, and the client on the other end of it
+        // has not heard about the mismatch yet.
+        if let Some(mismatch) = proved.mismatch {
+            super::record_remote_mismatches(vec![mismatch]);
+        }
+        return Ok(proved.binary);
     }
 
     let ops = WslRemoteOps::new(distro);
@@ -658,7 +685,13 @@ pub fn ensure_wsl_server(distro: &str) -> io::Result<String> {
             ""
         },
     );
-    remember(distro, &report.paths.binary);
+    remember(
+        distro,
+        Proved {
+            binary: report.paths.binary.clone(),
+            mismatch: report.mismatch,
+        },
+    );
     Ok(report.paths.binary)
 }
 
@@ -1637,23 +1670,23 @@ mod tests {
         format!("tty7-no-such-distro-{test}")
     }
 
+    fn note(binary: &str) -> Proved {
+        Proved {
+            binary: binary.to_string(),
+            mismatch: None,
+        }
+    }
+
     #[test]
     fn a_remembered_distro_is_answered_without_asking_wsl_anything() {
         let distro = nowhere("remembered");
         let binary = "/home/me/.local/share/tty7/bin/tty7-server-c5p5";
-        remember(&distro, binary);
+        remember(&distro, note(binary));
 
-        // There is no such distribution, so an answer at all proves the probe
-        // was skipped — and a fast one proves it twice over.
-        let started = std::time::Instant::now();
+        // There is no such distribution, so a probe could only have failed:
+        // getting the path back at all is what proves none ran.
         let answered = ensure_wsl_server(&distro).expect("the note is the answer");
-        let elapsed = started.elapsed();
-
         assert_eq!(answered, binary);
-        assert!(
-            elapsed < Duration::from_millis(200),
-            "the probe ran anyway: {elapsed:?}"
-        );
 
         forget_wsl_server(&distro);
     }
@@ -1661,11 +1694,11 @@ mod tests {
     #[test]
     fn forgetting_sends_the_next_caller_back_to_the_distribution() {
         let distro = nowhere("forgotten");
-        remember(&distro, "/somewhere/tty7-server");
-        assert!(remembered(&distro).is_some());
+        remember(&distro, note("/somewhere/tty7-server"));
+        assert!(remembered_wsl_server(&distro).is_some());
 
         forget_wsl_server(&distro);
-        assert_eq!(remembered(&distro), None);
+        assert_eq!(remembered_wsl_server(&distro), None);
         assert!(
             ensure_wsl_server(&distro).is_err(),
             "a forgotten distro must be proved again, not assumed"
@@ -1675,21 +1708,21 @@ mod tests {
     #[test]
     fn what_is_remembered_is_per_distro_and_replaceable() {
         let (a, b) = (nowhere("map-a"), nowhere("map-b"));
-        remember(&a, "/a/tty7-server");
-        remember(&b, "/b/tty7-server");
-        assert_eq!(remembered(&a).as_deref(), Some("/a/tty7-server"));
+        remember(&a, note("/a/tty7-server"));
+        remember(&b, note("/b/tty7-server"));
+        assert_eq!(remembered_wsl_server(&a).as_deref(), Some("/a/tty7-server"));
 
         forget_wsl_server(&a);
-        assert_eq!(remembered(&a), None);
+        assert_eq!(remembered_wsl_server(&a), None);
         assert_eq!(
-            remembered(&b).as_deref(),
+            remembered_wsl_server(&b).as_deref(),
             Some("/b/tty7-server"),
             "forgetting one distro must not forget another"
         );
 
-        remember(&b, "/b/tty7-server-newer");
+        remember(&b, note("/b/tty7-server-newer"));
         assert_eq!(
-            remembered(&b).as_deref(),
+            remembered_wsl_server(&b).as_deref(),
             Some("/b/tty7-server-newer"),
             "a later answer replaces the earlier one"
         );
@@ -1699,12 +1732,77 @@ mod tests {
     #[test]
     fn a_restart_forgets_first_so_a_failed_one_leaves_no_stale_note() {
         let distro = nowhere("restart");
-        remember(&distro, "/x/tty7-server");
+        remember(&distro, note("/x/tty7-server"));
 
         // This cannot succeed — there is no such distribution — which is the
         // point: the note must be gone even though the work after it failed.
         let _ = restart_wsl_daemon(&distro);
-        assert_eq!(remembered(&distro), None);
+        assert_eq!(remembered_wsl_server(&distro), None);
+    }
+
+    #[test]
+    fn a_remembered_answer_waits_for_an_install_to_let_go_of_the_binary() {
+        let distro = nowhere("locked");
+        remember(&distro, note("/x/tty7-server"));
+
+        // Stand in for a `replace_wsl_server` in progress: it holds this lock
+        // while it moves the very file the note names.
+        let lock = install_lock(&distro);
+        let held = lock.lock().expect("a lock nobody else has");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asking = {
+            let distro = distro.clone();
+            std::thread::spawn(move || tx.send(ensure_wsl_server(&distro)))
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "the note was handed out while a replace was under way"
+        );
+
+        drop(held);
+        let answered = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("answered once the install let go")
+            .expect("the note is the answer");
+        assert_eq!(answered, "/x/tty7-server");
+        let _ = asking.join();
+
+        forget_wsl_server(&distro);
+    }
+
+    #[test]
+    fn a_remembered_mismatch_is_told_to_every_later_pane() {
+        let distro = nowhere("mismatch");
+        let entry = crate::daemon::install::MismatchedRemoteDaemon {
+            host: host_label(&distro),
+            running_version: Some("0.0.1".to_string()),
+            running_exe: Some("/x/tty7-server-someone-elses".to_string()),
+            wanted_version: "9.9.9".to_string(),
+        };
+        remember(
+            &distro,
+            Proved {
+                binary: "/x/tty7-server".to_string(),
+                mismatch: Some(entry.clone()),
+            },
+        );
+
+        // A later pane is a fresh route with a fresh sink, and the client on
+        // the other end of it has never been told.
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let answered =
+            crate::daemon::install::with_mismatch_sink(sink.clone(), || ensure_wsl_server(&distro))
+                .expect("the note is the answer");
+
+        assert_eq!(answered, "/x/tty7-server");
+        assert_eq!(
+            &*sink.lock().expect("the sink"),
+            &[entry],
+            "the warning stopped at the first pane"
+        );
+
+        forget_wsl_server(&distro);
     }
 
     #[test]

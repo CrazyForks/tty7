@@ -605,7 +605,25 @@ async fn drive(local: Stream, header: &RouteHeader) -> io::Result<()> {
     if !leftover.is_empty() {
         tokio::io::AsyncWriteExt::write_all(&mut *link, &leftover).await?;
     }
-    let (to_remote, to_local) = tokio::io::copy_bidirectional(&mut local, &mut *link).await?;
+    let copied = tokio::io::copy_bidirectional(&mut local, &mut *link).await;
+    // A bridge that never sent a byte never ran. This is where a stale note is
+    // actually found out: `wsl.exe` spawns quite happily with a server path
+    // that no longer exists inside the distro — the distro was reinstalled, the
+    // directory was cleaned out — and only fails once it is the shell trying to
+    // exec it. Forget the distro, so the pane after this one proves it again
+    // rather than repeating a failure that would otherwise outlive every window
+    // and last until tty7 itself restarts.
+    if let RouteTarget::Wsl { distro } = &header.target
+        && header.server_command.is_none()
+        && !copied
+            .as_ref()
+            .is_ok_and(|(_, from_remote)| *from_remote > 0)
+    {
+        log::info!("wsl:{distro}: the bridge closed without answering; proving it again next time");
+        crate::daemon::install::wsl::forget_wsl_server(distro);
+    }
+
+    let (to_remote, to_local) = copied?;
     log::debug!("routed connection closed after {to_remote} up / {to_local} down bytes");
     drop(conn);
     Ok(())
@@ -768,17 +786,14 @@ async fn open_link(
                 return Ok((link, None));
             }
 
+            let from_memory = crate::daemon::install::wsl::remembered_wsl_server(distro).is_some();
             let binary = ensure_wsl_server(distro, setup).await?;
             match RemoteLink::wsl(distro, &binary, setup.channel) {
                 Ok(link) => Ok((link, None)),
-                // `ensure_wsl_server` answers from memory after the first pane,
-                // and the note it kept can be wrong in exactly one way: the
-                // binary is no longer at that path (the distro was reinstalled,
-                // someone cleaned the directory out). Starting the bridge is
-                // what finds out, so pay the full probe once more rather than
-                // fail a pane over a stale path — but only once, or a distro
-                // that genuinely cannot run it would loop.
-                Err(stale) => {
+                // Only worth a second look when the path came from memory: one
+                // proved a moment ago will prove the same, and re-proving it
+                // just doubles the wait before the error reaches the user.
+                Err(stale) if from_memory => {
                     log::info!(
                         "wsl:{distro}: the remembered server would not start ({stale}); \
                          looking again"
@@ -788,6 +803,7 @@ async fn open_link(
                     let link = RemoteLink::wsl(distro, &binary, setup.channel)?;
                     Ok((link, None))
                 }
+                Err(e) => Err(e.into()),
             }
         }
         RouteTarget::LocalStdio { program, args } => {
