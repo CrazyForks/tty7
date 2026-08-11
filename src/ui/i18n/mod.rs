@@ -674,6 +674,8 @@ l10n_keys! {
     FileDropFailedMany,
     SshPromptNewKey,
     SshPromptOldKey,
+    SshPromptHostKeyNewAlgorithm,
+    SshPromptTypeYesToOverride,
     EditorCantOpen,
     EditorCantRead,
     EditorNotUtf8,
