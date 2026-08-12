@@ -63,7 +63,8 @@ documented in [skills/tty7/SKILL.md](skills/tty7/SKILL.md).
 Install the skill with:
 
 ```sh
-npx skills add l0ng-ai/tty7
+npx skills add l0ng-ai/tty7    # install
+npx skills update tty7         # update later
 ```
 
 ## Benchmarks

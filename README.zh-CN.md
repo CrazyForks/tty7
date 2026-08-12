@@ -63,7 +63,8 @@
 通过以下命令安装 skill：
 
 ```sh
-npx skills add l0ng-ai/tty7
+npx skills add l0ng-ai/tty7    # 安装
+npx skills update tty7         # 之后更新
 ```
 
 ## 基准测试

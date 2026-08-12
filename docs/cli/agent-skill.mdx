@@ -24,6 +24,19 @@ repository: a `SKILL.md` and a full command reference.
   [Orchestration →](/agents/orchestration)
 </Note>
 
+## Updating it
+
+`add` does not refresh a skill that is already installed — updating is its own
+command, and the skill is named `tty7`:
+
+```bash
+npx skills update tty7    # this one
+npx skills update         # everything you have installed
+```
+
+The CLI records where each skill came from, so `update` re-downloads only what
+has drifted. `npx skills remove tty7` takes it back out.
+
 ## What it teaches
 
 ### When to use a pane instead of a plain command
