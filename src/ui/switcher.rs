@@ -48,8 +48,6 @@ const KID_INDENT: f32 = 16.0;
 
 const ROW_PAD: f32 = 8.0;
 
-const TAB_PATH_W: f32 = 160.0;
-
 const PROGRESS_H: f32 = 3.0;
 
 /// `Failed` stays a unit variant so `Link` can be `Copy` and travel by value in
@@ -1796,6 +1794,11 @@ impl Tty7App {
             _ => muted,
         };
 
+        // Two lines rather than one, like the workspace rows below: the name
+        // is the main line, and the endpoint is the line under it. The
+        // endpoint keeps its natural width and the link status word — the
+        // trailing piece — truncates into whatever room is left, so neither
+        // the name nor the address can be crowded off the row.
         let head = h_flex()
             .id(gpui::SharedString::from(format!(
                 "switcher-host:{}",
@@ -1803,7 +1806,8 @@ impl Tty7App {
             )))
             .items_center()
             .gap(px(8.))
-            .h(px(HOST_H))
+            .min_h(px(HOST_H))
+            .py(px(4.))
             .px(px(ROW_PAD))
             .rounded(px(6.))
             .overflow_hidden()
@@ -1819,35 +1823,50 @@ impl Tty7App {
                     .text_color(if group.link == Link::Local { muted } else { fg }),
             ))
             .child(
-                div()
+                v_flex()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(fg)
-                    .child(group.label.clone()),
+                    .gap(px(1.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(fg)
+                            .child(group.label.clone()),
+                    )
+                    .when(
+                        !group.endpoint.is_empty() || dot.is_some() || word.is_some(),
+                        |col| {
+                            col.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(5.))
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .max_w(gpui::relative(1.0))
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(dim)
+                                            .child(group.endpoint.clone()),
+                                    )
+                                    .children(dot.map(|c| {
+                                        div().flex_shrink_0().size(px(6.)).rounded_full().bg(c)
+                                    }))
+                                    .children(word.map(|w| {
+                                        div()
+                                            .flex_shrink_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(word_color)
+                                            .child(w)
+                                    })),
+                            )
+                        },
+                    ),
             )
-            .when(!group.endpoint.is_empty(), |head| {
-                head.child(
-                    div()
-                        .flex_shrink_0()
-                        .max_w(px(TAB_PATH_W))
-                        .truncate()
-                        .text_xs()
-                        .text_color(dim)
-                        .child(group.endpoint.clone()),
-                )
-            })
-            .children(dot.map(|c| div().flex_shrink_0().size(px(6.)).rounded_full().bg(c)))
-            .children(word.map(|w| {
-                div()
-                    .flex_shrink_0()
-                    .ml(px(-2.))
-                    .text_xs()
-                    .text_color(word_color)
-                    .child(w)
-            }))
             .when(!group.rows.is_empty(), |head| {
                 head.child(
                     div()
@@ -2152,7 +2171,8 @@ impl Tty7App {
                         .id(("switcher-other", i))
                         .items_center()
                         .gap(px(8.))
-                        .h(px(ROW_H))
+                        .min_h(px(ROW_H))
+                        .py(px(4.))
                         .px(px(ROW_PAD))
                         .rounded(px(6.))
                         .overflow_hidden()
@@ -2167,23 +2187,27 @@ impl Tty7App {
                                 .size(px(ICON))
                                 .text_color(dim),
                         ))
+                        // Same two-line shape as the machine headers: the name
+                        // on top, the address on the line under it.
                         .child(
-                            div()
+                            v_flex()
                                 .flex_1()
                                 .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .text_color(muted)
-                                .child(host.label.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .max_w(px(TAB_PATH_W))
-                                .truncate()
-                                .text_xs()
-                                .text_color(dim)
-                                .child(host.detail.clone()),
+                                .gap(px(1.))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_sm()
+                                        .text_color(muted)
+                                        .child(host.label.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(dim)
+                                        .child(host.detail.clone()),
+                                ),
                         )
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.connect_to_host(choice.clone(), cx)
