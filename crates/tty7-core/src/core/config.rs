@@ -156,6 +156,11 @@ pub struct Config {
     pub custom_shells: Vec<CustomShell>,
 
     pub link_url: bool,
+    /// What a clicked file link opens in. `None` means the key predates this
+    /// setting; [`Config::sanitize`] resolves it, and every reader should go
+    /// through [`Config::file_open_mode`] rather than read it raw.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub link_file_open: Option<LinkFileOpen>,
     pub link_file_command: Option<String>,
     pub ssh_loopback_forward: bool,
     pub cursor_blink: bool,
@@ -517,6 +522,7 @@ impl Default for Config {
             shell: None,
             custom_shells: Vec::new(),
             link_url: true,
+            link_file_open: Some(LinkFileOpen::Internal),
             link_file_command: None,
             ssh_loopback_forward: false,
             cursor_blink: true,
@@ -595,6 +601,12 @@ impl Config {
         }
     }
 
+    /// What a clicked file link should open in, with the pre-setting default
+    /// filled in for a `Config` that never went through [`Self::sanitize`].
+    pub fn file_open_mode(&self) -> LinkFileOpen {
+        self.link_file_open.unwrap_or_default()
+    }
+
     fn sanitize(&mut self) {
         if !self.font_size.is_finite() || self.font_size <= 0.0 {
             self.font_size = Config::default().font_size;
@@ -634,6 +646,17 @@ impl Config {
         {
             self.link_file_command = None;
         }
+        // Absent means a config written before file links could open in the
+        // built-in editor. Anyone who had already pointed `link_file_command`
+        // at their own editor asked for that and keeps it; everyone else, who
+        // was silently getting the OS file association, gets the editor. A
+        // fresh `link_file_open` in a `Default` config would have taken the
+        // first group's editor away on upgrade.
+        self.link_file_open
+            .get_or_insert(match self.link_file_command {
+                Some(_) => LinkFileOpen::Command,
+                None => LinkFileOpen::Internal,
+            });
         // Normalise here so every reader can take the field as-is instead of
         // repeating a trim-and-drop-if-blank dance.
         self.http_proxy = self
@@ -874,6 +897,20 @@ pub enum RightPanelTab {
     Files,
 }
 
+/// What opens when a file link in the grid is clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkFileOpen {
+    /// tty7's own editor. The default, and the only one of the three that can
+    /// honour a `:line:column` suffix or open a file on a remote host.
+    #[default]
+    Internal,
+    /// Whatever the OS has the file associated with.
+    System,
+    /// [`Config::link_file_command`], for people who want their own editor.
+    Command,
+}
+
 /// How the diff overlay lays a file out. Side-by-side is the default because
 /// that is what everyone already sees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -963,6 +1000,59 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(back.ssh_warn_on_close);
         assert_eq!(back.ssh_profile_frecency.get(&id).unwrap().count, 4);
+    }
+
+    /// The upgrade path, which is the whole reason `link_file_open` is an
+    /// `Option`: whichever way a config written before this key existed is
+    /// read, it has to keep doing what it did yesterday.
+    #[test]
+    fn link_file_open_takes_its_default_from_the_config_it_upgrades() {
+        let mut had_a_command: Config =
+            serde_json::from_str(r#"{"link_file_command":"code --goto {path}"}"#).unwrap();
+        had_a_command.sanitize();
+        assert_eq!(
+            had_a_command.file_open_mode(),
+            LinkFileOpen::Command,
+            "someone who pointed this at their own editor asked for it and keeps it"
+        );
+        assert_eq!(
+            had_a_command.link_file_command.as_deref(),
+            Some("code --goto {path}")
+        );
+
+        let mut had_none: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        had_none.sanitize();
+        assert_eq!(
+            had_none.file_open_mode(),
+            LinkFileOpen::Internal,
+            "everyone else was silently getting the OS file association"
+        );
+
+        // A command that only ever held whitespace is no command at all —
+        // `sanitize` drops it, and the mode must not be decided on the corpse.
+        let mut blank: Config = serde_json::from_str(r#"{"link_file_command":"   "}"#).unwrap();
+        blank.sanitize();
+        assert_eq!(blank.link_file_command, None);
+        assert_eq!(blank.file_open_mode(), LinkFileOpen::Internal);
+
+        let mut chosen: Config =
+            serde_json::from_str(r#"{"link_file_open":"system","link_file_command":"code"}"#)
+                .unwrap();
+        chosen.sanitize();
+        assert_eq!(
+            chosen.file_open_mode(),
+            LinkFileOpen::System,
+            "an explicit choice outranks whatever the command box holds"
+        );
+
+        let json = serde_json::to_string(&chosen).unwrap();
+        assert!(json.contains("\"link_file_open\":\"system\""), "persisted");
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.file_open_mode(), LinkFileOpen::System);
+
+        // Unknown values fall back rather than refusing the whole file.
+        let garbage: Config = serde_json::from_str(r#"{"link_file_open":"emacs"}"#).unwrap();
+        assert_eq!(garbage.file_open_mode(), LinkFileOpen::Internal);
     }
 
     #[test]
