@@ -5,9 +5,138 @@ All notable changes to tty7 are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [26.8.3] - 2026-08-12
 
 ### Added
+
+- **A full Source Control panel** — the half-finished Changes tab is now a
+  working-tree panel with a real index. Files are grouped into merge, staged,
+  changes and untracked, with a file appearing in two groups when its status
+  says so; the rows stage, unstage, discard and open a diff, and a commit can
+  be written, amended, pushed, pulled or synced from the panel itself. The file
+  tree carries git decorations beside every entry, folded once per refresh
+  rather than once per frame. A diff opens from three sources — working tree,
+  staged, or a commit — behind a unified/side-by-side toggle that names which
+  one it is showing. Under the file list sits a commit history drawn with
+  lanes, paged as you scroll, with lane colours derived from the theme's own
+  `ansi16` and walked to a contrast floor so they stay apart on every builtin.
+  Anything that can lose work asks first, and the data layer is the single
+  place that decides what counts as destructive. **The control protocol does
+  not change** — an unmodified remote server serves all of it, push, pull and
+  fetch included, because the deadline that would have cut a long network
+  operation short was only ever enforced client-side. Non-UTF-8 paths are a
+  documented read-only limitation: those rows carry a tooltip rather than
+  sending git a pathspec nobody can spell. (#424)
+
+- **The interface has a font size of its own** — `ui_font_size` in
+  `config.json` scales the whole chrome, and every window's root sets it, so
+  sidebar, panels, menus and dialogs move together. It defaults to gpui's own
+  16, so an existing config renders exactly as before. The terminal grid is
+  unaffected: it stays absolute pixels off `font_size`, which means a display
+  that is not Retina can finally have readable chrome without touching the text
+  in the panes. The detail panel, which had carried a private run of pixel
+  sizes that put its primary text at the size everything else uses for
+  secondary text, is back on the same ladder as its neighbours, with mono a
+  notch under the sans it pairs with.
+
+- **A scrollback scrollbar down the right edge of a pane** — a pane's scroll
+  position lives in rows of scrollback rather than pixels of laid-out content,
+  so it had no handle to give a scrollbar. It now implements one over the grid
+  and draws the same bar the sidebar and every list already use — same theme,
+  same fade-out. The bar never drives the terminal: it records the row it
+  wants and the next render applies it, clearing the sub-line remainder and
+  cancelling an in-flight smooth scroll on the way. Scrollback piling up at the
+  live edge is deliberately not reported, so a pane printing a build log does
+  not hold a thumb on screen for as long as the output runs; every other
+  change passes through, including the history shrinking. (#480, #432)
+
+- **Zoom a pane's font with the platform modifier and the wheel** — holding
+  Cmd (Ctrl off macOS) and scrolling over a terminal resizes the font instead
+  of the scrollback, which is what you reach for when showing a pane to someone
+  else. A wheel detent is one step whatever the platform bills it as, and a
+  trackpad accumulates until the fingers have travelled three lines, so a flick
+  does not run the font end to end. Steps go out as the existing
+  increase/decrease actions, so the clamp and the saved setting stay in one
+  place.
+
+- **The command palette previews a theme while you arrow through the list** —
+  picking a theme used to close the palette, so seeing what one looked like
+  meant reopening it and retyping the search for every candidate. The
+  highlighted row is now applied to the running window and the picker stays
+  open: Return keeps it, Escape or any other way of closing puts the previous
+  theme back. A preview only touches the in-memory config, so arrowing through
+  the list never writes `config.json`, and the picker opens on the theme
+  already in use so opening it changes nothing by itself.
+
+- **The palette matches commands in every locale, not just the one on screen**
+  — the filter only ever saw the label it was rendering, so a window running in
+  Chinese answered "no matching commands" to `theme`. Each entry now carries
+  every locale's wording of its key, plus the stable command id, as hidden
+  search aliases: built once with the entry, never rendered, and scored just
+  below a hit on the visible label so what you can actually read still comes
+  first.
+
+- **fish history joins the Ctrl+R menu and inline completion**, locally and on
+  remote hosts. `fish_history` looks like YAML and is not — fish escapes only
+  `\` and newline and quotes nothing, so a YAML reader silently drops every
+  record holding a `: ` or a leading `[` and truncates anything with a ` #`,
+  which is most conventional-commit messages. It is read with a line scanner
+  shaped like fish's own reader instead. Each history file fetched from a
+  remote host now carries the name it came from, so the far end's fish records
+  reach the fish reader rather than arriving as literal `- cmd:` rows.
+  Multiline entries are skipped rather than half-recalled. (#421)
+
+- **The daemon upgrades in place instead of killing every shell** — picking up
+  a new build used to mean stopping the daemon, and stopping the daemon takes
+  every pane with it: the pty master is a descriptor that process holds, so its
+  death raises SIGHUP on the shell, the agent and the half-finished command.
+  The daemon now rewrites itself with `execve` on handoff — same pid, same
+  children, same descriptors, same locks — writing what it knows about each
+  pane into a blob and clearing `FD_CLOEXEC` on the ptys first. The restart
+  Settings offers for a quiet moment is still there for the cases handoff
+  cannot cover. (#449)
+
+- **The tab sidebar elides labels tail-first and explains itself on hover** —
+  a path keeps its leaf rather than its root, anything that is not a path keeps
+  both edges, and a hover card spells out in full whatever the row had to hide:
+  a renamed tab's real name, the terminal title behind a `Shell 3` placeholder,
+  the remote host. The card is decided by comparing what the row rendered
+  against what it rendered it from, so it never opens on a row that hid
+  nothing. (#446)
+
+- **The Info tab's rows do what they show** — the Session table used to render
+  every fact the same inert way, with two unlabelled actions in a strip four
+  rows below the path they acted on. A `changes` row is now the sidebar's green
+  and red `+N −M` and opens the same diff overlay; an agent row wears the
+  status dot its tab does; a port row hands over its address instead of leaving
+  it to be retyped; and what a row can do appears at the end of it on hover, in
+  the strip the Source Control rows already use. A port is only offered as
+  `localhost` when localhost actually reaches it — a server bound to
+  `172.17.0.1` is named by the address it really holds. (#531)
+
+- **Closing a tab asks before it ends work that is still running** — ⌘W was the
+  one action that permanently ended a shell in an app whose headline claim is
+  that shells outlive it, and a mid-turn coding agent, a forty-minute build and
+  an idle prompt all died identically and silently. Reopen Closed Tab was never
+  an undo: it restores the layout with a *fresh* shell. Closing now asks once,
+  naming what it would end, with Keep as the default button; an idle prompt
+  still closes without a word. A pane counts as busy only when the shell is
+  actually reporting, so a terminal without shell integration is not held
+  hostage by a question it cannot answer. Close Other Tabs and Tabs to the
+  Right skip anything that would raise a question rather than stacking one
+  dialog per tab.
+
+- **The opencode plugin reports its session id**, so a restarted pane can
+  resume the same session with `opencode --session <id>`. It also maps
+  `session.status` busy/idle for versions that no longer emit `session.idle`. A
+  task-tool subagent runs in a child session whose events are structurally
+  identical to the pane's own, so the bridge remembers child ids and lets their
+  events pass without touching the pane's session — otherwise the pane would
+  report and resume the subagent's session, and a subagent going idle would
+  call the pane done. (#481)
+
+- **A documentation site** — the docs are now a Mintlify site rather than a
+  handful of Markdown files in the repository. (#478)
 
 - **Drop files into the Files panel to copy them in** — the panel has always
   been a drag *source*; it now takes a drop as well. Files dragged in from the
@@ -144,12 +273,408 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Every confirmation answers the way the platform taught you it would** — the
+  action button is on the right and Cancel on the left, through one shared
+  helper. Answer 0 is drawn rightmost and takes Return, so the old
+  `&[Cancel, Delete]` put Delete exactly where a decade of macOS trains people
+  to click Cancel. Escape also cancels now, in all nineteen of them: gpui only
+  binds it on a button declared as the cancel, and every call site had been
+  passing plain strings.
+
+- **A search match is washed in the theme's accent, at a strength the theme can
+  afford** — the wash was drawn from the terminal palette's selection colour at
+  a fixed 1.45:1 against the background, which is less than a hairline is worth
+  spread over a whole cell, on a grid that is already grey on grey. The tint is
+  now the accent, the one colour the terminal surface has nothing else in, and
+  its strength is derived per theme from that palette's own text-contrast
+  budget rather than from a constant that has to be safe for the worst
+  palette. The current match drops its caret-coloured outline, which existed
+  only because the fill could not say "this one" on its own. (#470)
+
+- **The block cursor is drawn as reverse video** rather than as a 55% tint that
+  halved whatever contrast the caret had. On a wide character it inverts the
+  half holding the glyph.
+
+- **An inactive pane dims by blending its terminal colours toward the window
+  background** instead of being faded as a whole, and the fade is now worn by
+  the terminal rather than by the pane — which is what keeps the grab grip
+  legible on exactly the panes `dim_inactive_panes` fades, the ones being
+  reached for. (#464)
+
+- **The pane grip is three dots, the way Ghostty draws its own** — the bar a
+  pane was picked up by grew and recoloured under the pointer and appeared
+  whenever the pointer was anywhere in the pane at all: a mark on top of the
+  terminal wherever the mouse rested, and a target that moved while being
+  reached for. It is now three dots with 80×12 of reach around them and nothing
+  between the two states but ink, asked for by the pane's top fifth rather than
+  by the whole pane. The target is there for as long as the pane can be moved
+  and only the dots come and go, so a pointer going straight for the top of a
+  pane can press the grip on the frame it arrives; a 150 ms fade makes them
+  read as arriving rather than blinking. (#463)
+
+- **A WSL distro list comes from the registry rather than the WSL service** —
+  `wsl -l -q` has to reach the service, and reaching the service is the part
+  that can be slow, behind a hardcoded 3 s timeout that made the listing
+  all-or-nothing. On a machine where one round trip takes 3.3 s the call timed
+  out every time and no distro was ever offered in the shell menu: not slow,
+  absent. `Lxss` is where `wsl.exe` registers them, nothing is listening on it,
+  and it cannot hang; `wsl -l -q` stays as the fallback for when the key will
+  not open at all. Distros are filtered by `State`, so a cancelled install or a
+  failed `--import` no longer arrives in the menu and opens a pane that dies of
+  a registration error.
+
+- **Opening a WSL tab costs one probe instead of two** — every pane ran the
+  readiness probe from the client and then the daemon ran the identical probe
+  before opening the link: two rounds of five serial `wsl.exe` calls to learn
+  one fact, and the client's copy threw its answer away and kept only the
+  error. A distro also says once where its server is and is not asked again,
+  rather than re-proving `uname`, `$HOME`, a stat and a liveness check on every
+  pane. Measured on a distro already running and connected: 800 ms to open a
+  tab, down to 440 ms — and on the machine in #454, where a round trip takes
+  3.3 s, the duplicate alone was costing 15 s a tab.
+
 - **`tty7 pane close --json` now reports `{"closed": [ids]}`** rather than a
   single `{"closed": id}`, because the verb takes more than one pane. A batch
   that could not close everything exits 1 with `{"closed": […], "failed": […]}`
   and the complaint on stderr, so a retry knows what is left.
 
 ### Fixed
+
+- **Ctrl+C works in a pane on Windows again** — the daemon was created with
+  `CREATE_NEW_PROCESS_GROUP`, which disables Ctrl+C for the whole new group,
+  and Windows hands that state down to every descendant. Every ConPTY shell a
+  pane spawned inherited it and so did everything those shells ran: the pane
+  wrote 0x03 and conhost turned it into a keypress, but the `CTRL_C_EVENT`
+  never came, so `go run` and `npm install` carried on regardless. Git Bash
+  looked fine only because MSYS synthesises SIGINT from the byte itself.
+  `DETACHED_PROCESS` already left the daemon without a console for a control
+  event to arrive on, so the group flag bought nothing to begin with; both
+  daemon spawn paths and the headless CLI server now share one constant
+  without it, and a pane clears any inherited ignore before it opens the pty,
+  so a tty7 launched from a shell that already had the bit set is covered too.
+  (#459, #451, #314)
+
+- **Two tty7s on different config directories no longer erase each other's
+  workspaces** — the machine tree resolved from `$HOME` while everything else
+  an instance owns resolved from the config directory, so `--config-dir` moved
+  every part of an instance except the one that says which workspaces exist.
+  Two daemons, each holding its own lock and each certain it was the only
+  server on the machine, co-owned one `machine.json`; the tree is written
+  whole, so the second to flush replaced the first's workspaces with its own,
+  and the next daemon to start read the survivor's tree as the machine's. An
+  empty tree is indistinguishable from a machine that really has nothing on
+  it, so the GUI did what an empty tree means and forgot those workspaces for
+  good. A lock and the thing it protects have to be keyed alike. The daemon
+  adopts a legacy file on startup so the move itself loses nothing, and only
+  the instance running out of the config directory the machine resolves to on
+  its own is entitled to that adoption — otherwise a default install beside a
+  `--config-dir` one would rename the machine's tree into the wrong place.
+  (#462)
+
+- **A remote window that lost its first tree pull no longer sits empty until
+  you restart** — a window opening onto a remote workspace is blank until the
+  machine's tree is pulled and its tabs rebuilt, and a failed pull recorded a
+  debt on the promise that the next sync would settle it. Nothing settled it:
+  the hook that repays the debt ran for the local host and nowhere else, so on
+  a remote machine only a full reconnect, an edit in the window, or restarting
+  the app ever cleared it — and an empty window has nothing in it to edit. The
+  window sat on the home page with every tab and every shell still alive on the
+  machine. Both routine ways to fail a pull with a healthy link are covered
+  now: a tree read that overruns its ten seconds, and a workspace create that
+  loses a race with the priming pass running the same create from the other
+  side of the same window opening — that one is no longer treated as a failure
+  at all, the tree is simply read again. The retry is backed off, the backoff
+  ends with the run of failures rather than with the next success, and a window
+  left open on a machine that is really gone stops logging at warn once the
+  backoff settles at its cap. (#472)
+
+- **The macOS DMG builds again** — every release and nightly macOS job had been
+  dying in packaging with `hdiutil: create failed - No space left on device`,
+  after the build, the signing and the notarization had all succeeded. The
+  runner's disk was never full: the path in the error is the image being
+  created, so it was the volume that ran out. `hdiutil create -srcfolder` sizes
+  the image from the bytes it is about to copy and does not cover what the
+  filesystem spends carrying them, so a bundle that fits by measurement still
+  runs the volume dry partway through. The room is asked for explicitly now —
+  twice the content plus 64 MiB — and since the image is compressed on the way
+  out the slack is nearly free: 127 MiB of empty volume costs about 672 KiB in
+  the published DMG. This was a threshold rather than a cliff, which is why it
+  began without anyone touching packaging. (#477, #476)
+
+- **The CLI and the GUI agree on what exists** — five places where a workspace,
+  a tab or an attachment was real on one side of the socket and invisible on
+  the other, all rooted in the GUI keeping its own list of which workspaces
+  exist and consulting the machine tree only for the ones already in it, so
+  anything another client created was unreachable by construction. The switcher
+  now lists workspaces the machine holds that this client has never opened, and
+  opening one keeps its id instead of claiming a fresh one; opening a workspace
+  hydrates from the machine's tabs rather than saving an empty session over
+  them; a workspace removed with `ws rm` stays removed instead of being written
+  back under the same id and haunting the switcher until a restart; `tty7 ls`
+  can name the host holding a workspace; and `tab ls` / `ws tree` fall back
+  through name, agent, cwd leaf and process name rather than showing a blank.
+  (#423)
+
+- **A pane the CLI created can be attached to** — a pane's owner names the
+  workspace allowed to attach to it, and the CLI wrote a literal `tty7-cli`
+  there for every pane it made. A window opening on a CLI-built workspace found
+  none of them attachable: it spawned a fresh shell per tab, orphaned the live
+  ones, and — because the tree still carried each pane's agent session — greeted
+  the user with a failing `claude --resume <id>` in every one of them. Both
+  spawn paths pass the workspace id now, and restore treats an unparseable
+  owner as no claim at all, so panes stamped by an older CLI attach instead of
+  stranding. `pane ls --all`'s OWNER column shows a dash when it agrees with
+  WS, so what is left in it is exactly what is worth reading. (#425)
+
+- **A WSL pane starts when the distro's default shell is fish** — `wsl.exe --`
+  hands the command line to that default shell, which parsed the POSIX
+  bootstrap before `sh` could receive it, so the pane never started at all.
+  Every invocation carrying an argv goes out under `--exec` now. Those panes
+  then came up with no shell integration, because the bootstrap only had a bash
+  arm: no OSC 133 and no OSC 7, so no prompt marks, no exit status, no cwd, and
+  `tty7 wait` and busy/idle status dead in the pane. There is a fish arm now,
+  POSIX-quoted since `sh` parses the script rather than the user's own shell.
+  (#422)
+
+- **A remembered WSL server path repairs itself** — the note saying where a
+  distro's server lives had no working way to be wrong: its only repair fired
+  when spawning `wsl.exe` failed, and `wsl.exe` starts perfectly happily with a
+  server path that no longer exists inside the distro. The exec failure arrives
+  later as an EOF on the bridge, so a distro that was reinstalled or had its
+  bin directory cleaned out failed every WSL tab from then on with no way out
+  but restarting tty7. A bridge that closed without ever sending a byte never
+  ran, and after one of those the next pane proves the distro again. The note
+  is also read under the install lock now, so a window restoring panes can no
+  longer spawn the binary that a server update is in the middle of replacing.
+
+- **A half-read registry is no longer passed off as the distro list** — the
+  walk ended on any non-zero return and reported what it had, but only one of
+  those returns means "that was all of them"; the rest mean it stopped early,
+  and a failure at the very first index came back as an authoritative "there
+  are no distros". The sweep behind the shell menu keeps its last good list
+  only when the probe declines to answer, so that empty answer erased the
+  user's distros for the length of the TTL, with no error anywhere. The walk
+  says nothing now unless it reached the end.
+
+- **The Source Control panel is on the same font scale as the rest of the
+  window** — the panel was cut from a branch that copied the right panel's size
+  ramp hours before the interface font scale landed on main and moved that ramp
+  onto rems. The two sides touched different files, so the merge had nothing to
+  conflict over and the panel shipped a step small and deaf to `ui_font_size`
+  entirely — its primary text at the size its neighbours use for secondary
+  text, and a file row mixing a rem-sized status letter with a pixel-sized
+  path. Every size a reader reads is a rem now; pixels stay on what type sits
+  inside, and the row pitches and section heights grow with the type they hold.
+  The commit body's fold also folds: `line_clamp` limits the wrapped lines
+  within one logical line, and a commit message is the one string this panel
+  draws that is always hard-wrapped, so a clamp of four over a thirty-line body
+  laid out all thirty and Show more was a label with nothing behind it. It
+  clips a height now. (#557)
+
+- **A search highlight stays on its text while the pane is printing** — a match
+  point is a line of the grid it was scanned from, so every line that scrolled
+  off the top left each highlight washing the row its text had just left. The
+  stored points now slide with the text on every wakeup. The rescan behind them
+  was purely debounced, so a pane that never pauses — an agent streaming a
+  reply — never got one at all: the count froze and the highlights sat on text
+  that had since been rewritten in place. Output can now only push the deadline
+  out so far. (#559)
+
+- **A machine's name gets its own line in the switcher** — a group header drew
+  the machine name and its `user@host:port` on one row, and the endpoint was a
+  fixed-width item that claimed its space first, so a machine whose name ran
+  long read as a stub: `y...`, `GAEM...`. Both the header and the "other
+  machines" rows use the two-line shape the workspace rows under them already
+  use, with the name backed by the full row width and the endpoint and link
+  status underneath. Rows with neither stay single-line. (#560)
+
+- **The stray guide rail under a remote machine is gone** — expanding one in
+  the switcher drew a 1px vertical line left of the workspace avatars that
+  local groups never drew, so it read as a stray mark rather than an indent
+  guide, and it stopped short of the last row's midpoint leaving a dangling
+  stub. Remote rows indent exactly like the SSH host rows below them now.
+  (#536)
+
+- **The workspace discs in the switcher are legible** — the monogram disc was
+  drawn at 0.55 opacity on every row except the current workspace, and the
+  initial inside it is already the foreground at 0.65, so the letter landed at
+  about 0.36 and went illegible on exactly the rows the panel exists to let you
+  choose between. The liveness dot is painted on the wrapper rather than inside
+  the disc, so it never dimmed with it — a washed-out grey blob with a
+  full-strength green dot stuck to its corner, which is what made the column
+  look dirty rather than quiet. The dimming is gone; the current workspace was
+  already saying so three louder ways. (#483)
+
+- **Overlay scrollbars fade out again** — macOS reports that scrollbars should
+  not auto-hide for anyone with a mouse plugged in, and that was turned into
+  "always show" for every list in the app. The preference is about legacy
+  scrollbars, which take a gutter out of the layout; tty7's are overlay bars
+  painted on top of the content, so "always" parked an opaque bar over the
+  switcher's tab column for as long as the panel stayed open, with nothing to
+  fade it. (#471)
+
+- **A tab label is cut on grapheme clusters, not on chars** — the sidebar's
+  elision measures against real glyph widths but sliced by `char`, so it could
+  satisfy every width check and still hand back a torn cluster: a
+  zero-width joiner with nothing in front of it, a variation selector landing
+  on the ellipsis, half a flag rendering as a bare letter. Scanning budgets
+  from 30px to 200px over emoji fixtures, 48 widths produced output no font can
+  render as intended. A tab title carrying an emoji is not exotic — plenty of
+  TUIs and coding agents put one there. Widths are unchanged, since clusters
+  are measured the same way chars were. (#450)
+
+- **A multiline history entry draws on one menu row** — a command composed in
+  the inline editor keeps its newlines when it goes into the in-session
+  history, and gpui breaks text on `\n` whatever the white-space setting says,
+  so one such entry painted a dozen lines inside a one-line row and covered the
+  whole reverse-search menu. Line breaks are folded to a visible `↵` when
+  drawing — one char for one char, so the fuzzy matcher's highlight positions
+  still line up — and the stored entry is untouched, so recalling and running
+  it are unchanged. (#436)
+
+- **One Restart server button on the Settings page** — the in-place-update
+  notice carried its own while the Server section right below it carried an
+  identical one. The notice moved into that section, so the single button that
+  ends every running pane is the only one on the page. (#452)
+
+- **Several machines with outdated servers ask one question at a time** —
+  reconnecting to them raised one native modal per machine in a single pass,
+  stacked on each other, each about a machine the one in front of it did not
+  name. The queue is walked one question at a time now, and if the window goes
+  away with a question open the rest go back on the queue instead of being
+  swallowed.
+
+- **Gestures that did nothing at all** — a pass over the whole app, most of it
+  found by driving the UI rather than by reading the code:
+
+  - **Escape in a confirmation dialog** cancels, in all nineteen of them.
+  - **⌘P then Return** now runs the first row. The list started with nothing
+    selected and only picked a row when a *query* changed, so nothing showed
+    what Return was aimed at.
+  - **The palette's `→ edit` badge** is `⌘E`. Neither advertised gesture could
+    fire — `→` is eaten by the query field and `⌘↵` by Enter Full Screen — so a
+    saved SSH profile could not be opened for editing from the palette at all.
+  - **⌘G past the last match** wrapped to match 1 and left it behind the
+    floating search bar, reading "1/3" with nothing visible. The bar's rows
+    count as off screen now.
+  - **`ls | gre` + Tab** completes `grep` rather than filenames. The
+    command-position test was "everything before the cursor is whitespace",
+    true only at the very start of the line; over SSH it also spent a round
+    trip listing the remote cwd to do it. Same for `a && b` and `a; b`.
+  - **Typing or pasting while scrolled back** snaps the view to the prompt, so
+    your own keystrokes are not landing off screen.
+  - **Typing into a filled text box** — rename, prompts — replaces the text
+    instead of prepending to it. Every one of them opens with its contents
+    selected.
+  - **Double-clicking a file over SFTP** opens it; only folders used to
+    respond.
+  - **Tab inside the palette** stays in the palette, and in the switcher
+    crosses to the tab column, instead of escaping to the next focusable
+    button.
+  - **Reveal in Finder on a remote workspace** is hidden rather than handing
+    the local file manager a path on another machine. Copy Path stays.
+
+- **Things that failed silently now say so** — theme writes, theme
+  duplication, opening the themes folder, a server restart, a session restore
+  that came back short, an unparseable theme file, an SFTP overwrite, a search
+  count that hit its ceiling, a file-tree search that hit its ceiling, a delete
+  that did not go through, SSH auth with nothing to try, and an unknown action
+  in a keymap each either did nothing visible or blamed something else. All of
+  them now report what happened and, where there is one, what to do. The
+  sidebar's diff count no longer disagrees with the diff it opens, a
+  filtered-out SFTP directory is no longer called empty, and the theme picker
+  says when its filter matched nothing.
+
+- **A directory with no children says which kind of nothing it is** — the
+  listing error was discarded, so a folder the OS refused rendered
+  byte-identically to one that really is empty and to one still being read. An
+  expanded directory now draws Reading…, Empty, Only hidden files, or Could not
+  be read; arrow-key navigation skips those placeholders because they are not
+  files. The tree column and the tab sidebar get the same treatment when a
+  filter drops everything.
+
+- **Layout and hit targets** — the settings pages, the diff overlay, the
+  Markdown preview, the SFTP transfers list and the switcher's columns all
+  scrolled with no scrollbar and now have the one the rest of the app has. The
+  split divider takes an 8px grab, the same as the panel edges. Icon-only
+  buttons across the chrome get a 24×24 target without changing how they look,
+  and their tooltips print the chord. The active tab and the New Tab button
+  stay on the tab strip instead of scrolling out of reach. The switcher card
+  fits inside the window it floats over, and the window itself has a minimum
+  size. Below about 1000px the SSH host form stacks each control onto its own
+  line — rows measure the width they will actually get — rather than squeezing
+  the label column toward a letter per line and pushing Connect and the 2FA
+  option off screen. Nothing moves above the breakpoint.
+
+- **Contrast, colour and theming** — button labels, panel headings, tooltips,
+  menus, the command line and the splitters are drawn in the active preset's
+  own colours instead of ignoring it. Sidebar text, carets, hairlines and the
+  semantic inks that bypassed the contrast machinery are floored, and a
+  hairline is worth the same in every theme. Three faded states had two values
+  each, the app had two transition curves, and the theme card rounded unlike
+  the panel it sits in: one value, one duration and curve, one radius.
+
+- **An agent's state is not carried by hue alone** — Working, Needs input and
+  Done were a hue on a nine-pixel dot with no shape, label or tooltip
+  anywhere, and the pair that decides whether you go and look is amber versus
+  green, which is the pair red-green colour vision separates worst. Needs input
+  draws as a ring rather than a filled dot, the tab avatar has a tooltip naming
+  the agent and its state in all three locales, and a brand disc that lands
+  within 1.25:1 of the window fill — Codex and Grok both ship a pure black one,
+  which dissolves on a dark theme and leaves a white glyph floating — gets a
+  hairline.
+
+- **The palette stops showing recent commands twice** — the zero-query list
+  pushed a Recent section and then pushed every group containing those same
+  commands, so the five rows you use most were the five rows shown twice.
+  Promoting to Recent moves a command now rather than cloning it, and a group
+  left empty drops its header with it. Ranking also threw frecency away the
+  moment a character was typed, so the command someone runs every day stopped
+  floating exactly when they started reaching for it; a bounded bonus rides
+  along with the match score — enough to separate two comparable matches, not
+  enough to let a well-worn command outrank a plainly better one.
+
+- **SFTP transfers stop writing over files without a word** — downloading the
+  same file twice overwrote the first copy and uploading into the folder on
+  screen overwrote whatever was already there, neither with any warning and
+  neither recoverable. A download lands as `name (2).ext` the way a browser
+  does, still in one click; an upload asks once, naming what it would replace.
+  The upload check reads the listing already on screen rather than making a
+  round trip to ask.
+
+- **Escape no longer throws away an unsaved SSH connection** — editing a
+  profile and pressing Escape closed Settings and discarded the form. Whether
+  the form was dirty was already known — it is what enables Save — but was only
+  used to grey out a button. Escape, the close button and ⌘, ask now, with Keep
+  Editing as the default. The nineteen rows of SSH Advanced also carry six
+  quiet headings — Authentication, Proxies, Algorithms, Connection, Session,
+  Security — of two to four rows each; no row moved, the existing order already
+  grouped this way and never said so.
+
+- **Settings search marks what it counted** and scrolls the page to the hit,
+  including when the hit is a section header. Background images, Compression
+  and four other settings that were missing from the index are in it, and a
+  query that matches nothing on the current page no longer greys out a page you
+  are simply reading.
+
+- **Copy, i18n and discoverability** — every failure opens with "Could not", as
+  most already did; every popup menu is in the Title Case the rest use; the
+  background server has one name everywhere; settings labels are sentence case;
+  and no Markdown backticks are printed at the user. The terminal's right-click
+  menu was the last surface still hardcoded English in a three-locale app, and
+  it also used a fourth name for actions the menu bar, palette and Keybindings
+  already agree on. Chinese quotes names the way Chinese quotes them, Japanese
+  descriptions end the way the other eighty do, the 16 ANSI colours are named
+  rather than numbered, and the remote Files search box re-translates on a
+  language switch. The i18n parity test was a hand-maintained 900-line copy of
+  the key list and now sweeps a generated one, with a documented allow-list for
+  the keys that stay English — and the untranslated-string guard actually
+  guards. Completion specs got git's missing descriptions filled in, cargo's
+  `--color` described like the other 41, and a rustup flag that described
+  itself fixed; a candidate says when its description was cut. The Keybindings
+  page is grouped by command group, SSH is reachable from the menu bar, "Enter
+  Full Screen" no longer appears twice, ⌘W names the command it is about to
+  end, and the View menu teaches the right key for Zoom Pane.
 
 - **Switching workspaces no longer wipes the tab titles of the one you left** —
   in the switcher, the workspace the window was showing had properly named tabs
@@ -3146,7 +3671,17 @@ Initial release.
 - zsh shell integration (OSC 7 cwd + OSC 133 prompt marks) via a throwaway `ZDOTDIR`.
 - Native macOS light/dark themes that follow the system appearance.
 
-[Unreleased]: https://github.com/l0ng-ai/tty7/compare/v26.7.6...HEAD
+[26.8.3]: https://github.com/l0ng-ai/tty7/compare/v26.8.2...v26.8.3
+[26.8.2]: https://github.com/l0ng-ai/tty7/compare/v26.8.1...v26.8.2
+[26.8.1]: https://github.com/l0ng-ai/tty7/compare/v26.8.0...v26.8.1
+[26.8.0]: https://github.com/l0ng-ai/tty7/compare/v26.7.6...v26.8.0
+[26.7.6]: https://github.com/l0ng-ai/tty7/compare/v26.7.5...v26.7.6
+[26.7.5]: https://github.com/l0ng-ai/tty7/compare/v26.7.4...v26.7.5
+[26.7.4]: https://github.com/l0ng-ai/tty7/compare/v26.7.3...v26.7.4
+[26.7.3]: https://github.com/l0ng-ai/tty7/compare/v26.7.2...v26.7.3
+[26.7.2]: https://github.com/l0ng-ai/tty7/compare/v26.7.1...v26.7.2
+[26.7.1]: https://github.com/l0ng-ai/tty7/compare/v26.7.0...v26.7.1
+[26.7.0]: https://github.com/l0ng-ai/tty7/compare/v0.17.0...v26.7.0
 [0.10.0]: https://github.com/l0ng-ai/tty7/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/l0ng-ai/tty7/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/l0ng-ai/tty7/compare/v0.7.0...v0.8.0
