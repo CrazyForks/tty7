@@ -1580,27 +1580,7 @@ fn relink_panes(cx: &mut gpui::App, workspace: WorkspaceId) {
 fn server_restarted(cx: &mut gpui::App, host: HostId, peer: &RemoteHost) -> bool {
     let instance = peer.peer().instance.clone();
     let seen = &mut cx.default_global::<RemoteLinks>().instances;
-    note_instance(seen, host, &instance)
-}
-
-fn note_instance(
-    seen: &mut std::collections::HashMap<HostId, String>,
-    host: HostId,
-    instance: &str,
-) -> bool {
-    if instance.is_empty() {
-        return false;
-    }
-    match seen.insert(host, instance.to_string()) {
-        Some(before) if before != instance => {
-            log::info!(
-                "the tty7-server on this machine is a new process ({before} → {instance}); \
-                 its panes are gone"
-            );
-            true
-        }
-        _ => false,
-    }
+    crate::ui::tree_sync::note_instance(seen.entry(host).or_default(), &instance)
 }
 
 fn refresh_window_shells(cx: &mut gpui::App, workspace: WorkspaceId) {
@@ -1893,41 +1873,30 @@ mod tests {
         assert_eq!(flow.choice(), Some(&choice));
     }
 
-    #[test]
-    fn only_a_changed_instance_counts_as_a_restart() {
-        let mut seen = std::collections::HashMap::new();
-        let host = HostId::from_connection_key("ssh:build-box");
-
-        assert!(!note_instance(&mut seen, host, "abc"));
-        assert!(!note_instance(&mut seen, host, "abc"));
-        assert!(note_instance(&mut seen, host, "def"));
-        assert!(!note_instance(&mut seen, host, "def"));
-    }
-
-    #[test]
-    fn an_unknown_instance_is_not_a_restart_and_is_not_remembered() {
-        let mut seen = std::collections::HashMap::new();
-        let host = HostId::from_connection_key("ssh:build-box");
-
-        assert!(!note_instance(&mut seen, host, ""));
-        assert!(seen.is_empty(), "an unknown instance must not be recorded");
-        assert!(
-            !note_instance(&mut seen, host, "abc"),
-            "the first real instance is a first sighting, not a restart"
-        );
-    }
-
+    /// What the comparison itself answers is pinned where it now lives, in
+    /// `tree_sync`. What is this module's own is the slot it reads: one per
+    /// host, keyed the way `server_restarted` keys it, so a machine that
+    /// restarted says nothing about the one next to it.
     #[test]
     fn instances_are_per_machine() {
         let mut seen = std::collections::HashMap::new();
         let a = HostId::from_connection_key("ssh:box-a");
         let b = HostId::from_connection_key("ssh:box-b");
 
-        assert!(!note_instance(&mut seen, a, "a1"));
-        assert!(!note_instance(&mut seen, b, "b1"));
-        assert!(note_instance(&mut seen, a, "a2"));
+        assert!(!crate::ui::tree_sync::note_instance(
+            seen.entry(a).or_default(),
+            "a1"
+        ));
+        assert!(!crate::ui::tree_sync::note_instance(
+            seen.entry(b).or_default(),
+            "b1"
+        ));
+        assert!(crate::ui::tree_sync::note_instance(
+            seen.entry(a).or_default(),
+            "a2"
+        ));
         assert!(
-            !note_instance(&mut seen, b, "b1"),
+            !crate::ui::tree_sync::note_instance(seen.entry(b).or_default(), "b1"),
             "box-b never changed; box-a restarting is not its business"
         );
     }
